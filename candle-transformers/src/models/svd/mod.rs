@@ -50,6 +50,8 @@ impl SvdConfig {
     const DEFAULT_NUM_FRAMES: usize = 25;
     const DEFAULT_SCALE_FACTOR: f64 = 0.18215;
 
+    /// Returns the configuration shared by the `svd_xt_1_1` variant documented
+    /// in `tp/generative-models/scripts/sampling/configs/svd_xt_1_1.yaml`.
     pub fn svd_xt_1_1(
         width: Option<usize>,
         height: Option<usize>,
@@ -62,13 +64,17 @@ impl SvdConfig {
             num_frames,
             ..Default::default()
         };
+        let video_ae = VideoAutoencoderConfig {
+            num_frames,
+            ..Default::default()
+        };
         Self {
             width,
             height,
             num_frames,
             scale_factor: Self::DEFAULT_SCALE_FACTOR,
             video_unet,
-            video_ae: VideoAutoencoderConfig::default(),
+            video_ae,
             openclip: OpenClipVisionConfig::default(),
             edm: EdmDiscretizationConfig::default(),
         }
@@ -95,39 +101,50 @@ impl SvdConfig {
         OpenClipVisionModel::new(vs, self.openclip.clone())
     }
 
+    /// Constructs the `GeneralConditioner` layout defined in
+    /// `tp/generative-models/scripts/sampling/configs/svd_xt_1_1.yaml`, mirroring the
+    /// OpenCLIP predictor + timestep embedder stack.
     pub fn build_conditioner(
         &self,
         video_autoencoder: std::sync::Arc<VideoAutoencoder>,
         openclip: std::sync::Arc<OpenClipVisionModel>,
     ) -> GeneralConditioner {
         let embedders: Vec<Box<dyn ConditionEmbedder>> = vec![
-            Box::new(OpenClipImageEmbedder::new(
-                "cond_frames",
-                "cond_vision",
-                openclip.clone(),
-            )),
             Box::new(OpenClipImagePredictionEmbedder::new(
                 "cond_frames_without_noise",
                 "cond_pred",
                 openclip.clone(),
                 1,
             )),
+            Box::new(ConcatTimestepEmbedderNd::new("fps_id", "fps_vector", 256)),
             Box::new(ConcatTimestepEmbedderNd::new(
                 "motion_bucket_id",
                 "motion_vector",
                 256,
             )),
-            Box::new(ConcatTimestepEmbedderNd::new("fps_id", "fps_vector", 256)),
             Box::new(VideoPredictionEmbedderWithEncoder::new(
                 "cond_frames",
                 "cond_latents",
-                video_autoencoder,
+                video_autoencoder.clone(),
                 1,
+            )),
+            Box::new(ConcatTimestepEmbedderNd::new(
+                "cond_aug",
+                "cond_aug_vector",
+                256,
+            )),
+            Box::new(OpenClipImageEmbedder::new(
+                "cond_frames",
+                "cond_vision",
+                openclip.clone(),
             )),
         ];
         GeneralConditioner::new(embedders)
     }
 
+    /// Instantiates the sampler described in the `sampler_config` block of the
+    /// upstream `svd_xt_1_1` YAML reference, pairing EDM discretization with the
+    /// linear prediction guider.
     pub fn build_edm_sampler(&self) -> EulerEdmSampler {
         let guider = Arc::new(LinearPredictionGuider::new(
             3.0,
