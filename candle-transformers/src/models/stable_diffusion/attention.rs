@@ -1,5 +1,5 @@
 //! Attention Based Building Blocks
-use candle::{DType, IndexOp, Result, Tensor, D};
+use candle::{bail, DType, IndexOp, Result, Tensor, D};
 use candle_nn as nn;
 use candle_nn::Module;
 
@@ -431,6 +431,79 @@ impl SpatialTransformer {
                 .transpose(1, 2)?,
         };
         xs + residual
+    }
+
+    /// Returns the number of transformer blocks in this spatial transformer.
+    pub fn block_count(&self) -> usize {
+        self.transformer_blocks.len()
+    }
+
+    /// Applies normalization and projection to input (used by SpatialVideoTransformer).
+    /// Returns (inner_dim, normalized_and_projected_tensor)
+    pub fn norm_and_project_in(&self, xs: &Tensor) -> Result<(usize, Tensor, usize, usize)> {
+        let (batch, _channel, height, weight) = xs.dims4()?;
+        let xs = self.norm.forward(xs)?;
+        let (inner_dim, xs) = match &self.proj_in {
+            Proj::Conv2d(p) => {
+                let xs = p.forward(&xs)?;
+                let inner_dim = xs.dim(1)?;
+                let xs = xs
+                    .transpose(1, 2)?
+                    .t()?
+                    .reshape((batch, height * weight, inner_dim))?;
+                (inner_dim, xs)
+            }
+            Proj::Linear(p) => {
+                let inner_dim = xs.dim(1)?;
+                let xs = xs
+                    .transpose(1, 2)?
+                    .t()?
+                    .reshape((batch, height * weight, inner_dim))?;
+                (inner_dim, p.forward(&xs)?)
+            }
+        };
+        Ok((inner_dim, xs, height, weight))
+    }
+
+    /// Applies projection out and adds residual (used by SpatialVideoTransformer).
+    pub fn project_out_and_residual(
+        &self,
+        xs: &Tensor,
+        inner_dim: usize,
+        height: usize,
+        weight: usize,
+        residual: &Tensor,
+    ) -> Result<Tensor> {
+        let xs = match &self.proj_out {
+            Proj::Conv2d(p) => p.forward(
+                &xs.reshape((residual.dim(0)?, height, weight, inner_dim))?
+                    .t()?
+                    .transpose(1, 2)?,
+            )?,
+            Proj::Linear(p) => p
+                .forward(xs)?
+                .reshape((residual.dim(0)?, height, weight, inner_dim))?
+                .t()?
+                .transpose(1, 2)?,
+        };
+        xs + residual
+    }
+
+    /// Applies a single transformer block to the input.
+    pub fn apply_transformer_block(
+        &self,
+        xs: &Tensor,
+        block_index: usize,
+        context: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        if block_index >= self.transformer_blocks.len() {
+            bail!(
+                "block_index {} out of range (max {})",
+                block_index,
+                self.transformer_blocks.len() - 1
+            );
+        }
+        self.transformer_blocks[block_index].forward(xs, context)
     }
 }
 

@@ -4,7 +4,7 @@
 //!  2. Adding a video-aware decoder that blends spatial features with temporal
 //!     convolutions via gated mixing layers.
 //!
-//! Temporal mixing is controlled through `VideoResBlock` and the final `AE3DConv`.
+//! Temporal mixing is controlled through `VideoResBlock` and temporal 3D convolutions.
 use crate::models::stable_diffusion::vae::{AutoEncoderKL, AutoEncoderKLConfig};
 use crate::models::svd::video_unet::MergeStrategy;
 use candle::{bail, Module, Result, Tensor, D};
@@ -302,12 +302,12 @@ impl VideoResBlock {
 }
 
 #[derive(Debug)]
-struct AE3DConv {
+struct TemporalConv3D {
     conv: Conv2d,
     time_conv: TimeConv,
 }
 
-impl AE3DConv {
+impl TemporalConv3D {
     fn new(vs: VarBuilder, channels: usize, kernel: usize) -> Result<Self> {
         let conv = conv2d(
             channels,
@@ -440,7 +440,7 @@ pub struct VideoDecoder {
     mid_block_2: VideoResBlock,
     up_blocks: Vec<VideoUpBlock>,
     conv_norm_out: GroupNorm,
-    conv_out: AE3DConv,
+    conv_out: TemporalConv3D,
     config: VideoDecoderConfig,
 }
 
@@ -511,7 +511,7 @@ impl VideoDecoder {
             DEFAULT_NORM_EPS,
             vs.pp("conv_norm_out"),
         )?;
-        let conv_out = AE3DConv::new(
+        let conv_out = TemporalConv3D::new(
             vs.pp("conv_out"),
             config.ch * config.ch_mult[0],
             config.video_kernel_size,

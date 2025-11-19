@@ -14,9 +14,14 @@ pub mod conditioner;
 pub mod edm;
 pub mod openclip_vision;
 pub mod video_ae;
+pub mod video_attention;
 pub mod video_unet;
 
 pub use checkpoint::{SvdCheckpointAnalysis, SvdCheckpointComponent};
+pub use video_attention::{
+    SpatialVideoTransformer, SpatialVideoTransformerConfig, VideoTransformerBlock,
+};
+pub use video_unet::{AE3DConv, AlphaBlender, MergeStrategy, TimeConv, VideoResBlock};
 
 use candle::Result;
 use candle_nn::VarBuilder;

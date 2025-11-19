@@ -63,3 +63,43 @@ impl Module for Timesteps {
         }
     }
 }
+
+/// Label embedding for class conditioning (ADM - Adapter Diffusion Model style).
+///
+/// Implements sequential label embedding: linear → SiLU → linear
+/// Used for conditioning on discrete class labels or auxiliary information.
+///
+/// **Reference**: `tp/generative-models/sgm/modules/diffusionmodules/openaimodel.py`
+/// Mirrors the pattern from guided diffusion for ADM-style class conditioning.
+#[derive(Debug)]
+pub struct LabelEmbedding {
+    linear_1: nn::Linear,
+    linear_2: nn::Linear,
+}
+
+impl LabelEmbedding {
+    /// Creates a new sequential label embedding.
+    ///
+    /// # Arguments
+    /// * `vs` - VarBuilder for parameter management
+    /// * `num_classes` - Number of input classes (e.g., vocabulary size)
+    /// * `embed_dim` - Dimension of output embedding
+    ///
+    /// # Architecture
+    /// linear(num_classes → embed_dim) → SiLU → linear(embed_dim → embed_dim)
+    ///
+    /// This creates a learnable projection from discrete class indices to
+    /// a continuous embedding space, followed by nonlinear transformation.
+    pub fn new(vs: nn::VarBuilder, num_classes: usize, embed_dim: usize) -> Result<Self> {
+        let linear_1 = nn::linear(num_classes, embed_dim, vs.pp("linear_1"))?;
+        let linear_2 = nn::linear(embed_dim, embed_dim, vs.pp("linear_2"))?;
+        Ok(Self { linear_1, linear_2 })
+    }
+}
+
+impl Module for LabelEmbedding {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = nn::ops::silu(&self.linear_1.forward(xs)?)?;
+        self.linear_2.forward(&xs)
+    }
+}
