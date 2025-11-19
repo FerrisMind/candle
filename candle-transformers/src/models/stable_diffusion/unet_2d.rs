@@ -5,7 +5,7 @@
 use super::embeddings::{TimestepEmbedding, Timesteps};
 use super::unet_2d_blocks::*;
 use crate::models::with_tracing::{conv2d, Conv2d};
-use candle::{Result, Tensor};
+use candle::{DType, Device, Result, Tensor};
 use candle_nn as nn;
 use candle_nn::Module;
 
@@ -294,6 +294,20 @@ impl UNet2DConditionModel {
             span,
             config,
         })
+    }
+
+    /// Reuse the time projection and embedding that the UNet exposes.
+    pub fn compute_time_embedding(
+        &self,
+        batch_size: usize,
+        timestep: f64,
+        dtype: DType,
+        device: Device,
+    ) -> Result<Tensor> {
+        let emb = Tensor::ones(batch_size, dtype, &device)?;
+        let emb = (emb * timestep)?;
+        let emb = self.time_proj.forward(&emb)?;
+        self.time_embedding.forward(&emb)
     }
 
     pub fn forward(
