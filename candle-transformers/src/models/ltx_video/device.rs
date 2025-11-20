@@ -260,7 +260,7 @@ impl DeviceManager {
     pub fn available_memory_gb(&self) -> Option<f32> {
         match &self.device {
             #[cfg(feature = "cuda")]
-            Device::Cuda(cuda_device) => {
+            Device::Cuda(_cuda_device) => {
                 // Note: Candle doesn't expose CUDA memory info directly
                 // This is a placeholder for potential future implementation
                 None
