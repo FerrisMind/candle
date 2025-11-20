@@ -18,6 +18,7 @@
 //! ```
 
 pub mod attention;
+pub mod conditioning;
 pub mod embeddings;
 pub mod patchifier;
 pub mod scheduler;
@@ -31,6 +32,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub use attention::Attention;
+pub use conditioning::{
+    inject_conditioning, load_image, prepare_conditioning_latents, preprocess_image,
+    ConditioningItem,
+};
 pub use embeddings::{AdaLayerNormSingle, RoPEEmbedding};
 pub use patchifier::Patchifier;
 pub use scheduler::{RectifiedFlowConfig, RectifiedFlowScheduler};
