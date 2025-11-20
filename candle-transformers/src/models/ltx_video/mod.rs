@@ -28,6 +28,7 @@ pub mod text_encoder;
 pub mod transformer3d;
 pub mod vae;
 pub mod vae_blocks;
+pub mod video_output;
 
 use candle::{DType, Result};
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,10 @@ pub use scheduler::{RectifiedFlowConfig, RectifiedFlowScheduler};
 pub use text_encoder::{T5Config, T5TextEncoder, TextConditioning};
 pub use transformer3d::{BasicTransformerBlock, Transformer3D, Transformer3DConfig};
 pub use vae::{CausalVaeConfig, CausalVideoAutoencoder};
+pub use video_output::{
+    generate_video_output, save_frames_as_png, save_video_as_mp4, tensor_to_frames, VideoFormat,
+    VideoGenerationResult, VideoOutputConfig,
+};
 
 /// Main configuration struct for LTX-Video model
 #[derive(Clone, Debug, Serialize, Deserialize)]

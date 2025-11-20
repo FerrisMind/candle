@@ -8,8 +8,9 @@ use candle_nn::VarBuilder;
 use std::path::Path;
 
 use super::{
-    inject_conditioning, prepare_conditioning_latents, CausalVideoAutoencoder, LtxVideoConfig,
-    RectifiedFlowScheduler, T5TextEncoder, TextConditioning, Transformer3D,
+    generate_video_output, inject_conditioning, prepare_conditioning_latents,
+    CausalVideoAutoencoder, LtxVideoConfig, RectifiedFlowScheduler, T5TextEncoder,
+    TextConditioning, Transformer3D, VideoGenerationResult, VideoOutputConfig,
 };
 
 /// Main LTX-Video inference pipeline
@@ -494,6 +495,46 @@ impl LTXVideoPipeline {
     /// Get configuration
     pub fn config(&self) -> &LtxVideoConfig {
         &self.config
+    }
+
+    /// Save generated video to file
+    ///
+    /// # Arguments
+    /// * `video_tensor` - Tensor in (B, C, F, H, W) format with values [0, 255]
+    /// * `output_path` - Base path for output (without extension)
+    /// * `config` - Output configuration
+    ///
+    /// # Returns
+    /// Information about the generated files
+    pub fn save_video(
+        &self,
+        video_tensor: &Tensor,
+        output_path: impl AsRef<Path>,
+        config: &VideoOutputConfig,
+    ) -> Result<VideoGenerationResult> {
+        generate_video_output(video_tensor, output_path, config)
+    }
+
+    /// Generate and save video in a single call
+    ///
+    /// # Arguments
+    /// * `inputs` - Pipeline input parameters
+    /// * `output_path` - Base path for output (without extension)
+    /// * `video_config` - Video output configuration
+    ///
+    /// # Returns
+    /// Information about the generated files
+    pub fn generate_and_save(
+        &mut self,
+        inputs: PipelineInputs,
+        output_path: impl AsRef<Path>,
+        video_config: &VideoOutputConfig,
+    ) -> Result<VideoGenerationResult> {
+        // Generate video
+        let pipeline_output = self.generate(inputs)?;
+
+        // Save video
+        self.save_video(&pipeline_output.video, output_path, video_config)
     }
 }
 
