@@ -21,6 +21,7 @@ pub mod attention;
 pub mod embeddings;
 pub mod patchifier;
 pub mod scheduler;
+pub mod text_encoder;
 pub mod transformer3d;
 pub mod vae;
 pub mod vae_blocks;
@@ -33,6 +34,7 @@ pub use attention::Attention;
 pub use embeddings::{AdaLayerNormSingle, RoPEEmbedding};
 pub use patchifier::Patchifier;
 pub use scheduler::{RectifiedFlowConfig, RectifiedFlowScheduler};
+pub use text_encoder::{T5Config, T5TextEncoder, TextConditioning};
 pub use transformer3d::{BasicTransformerBlock, Transformer3D, Transformer3DConfig};
 pub use vae::{CausalVaeConfig, CausalVideoAutoencoder};
 
@@ -47,6 +49,7 @@ pub struct LtxVideoConfig {
     /// Model architecture
     pub transformer: Transformer3DConfig,
     pub vae: CausalVaeConfig,
+    pub text_encoder: T5Config,
 
     /// Sampling parameters
     pub scheduler: RectifiedFlowConfig,
@@ -69,6 +72,7 @@ impl LtxVideoConfig {
             num_frames: 121,
             transformer: Transformer3DConfig::ltxv_2b_0_9_8_distilled(),
             vae: CausalVaeConfig::default(),
+            text_encoder: T5Config::default(),
             scheduler: RectifiedFlowConfig::default(),
             guidance_scale: 1.0,
             num_inference_steps: 50,
