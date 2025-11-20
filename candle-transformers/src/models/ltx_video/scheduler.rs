@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn test_scheduler_creation() {
         let config = RectifiedFlowConfig::default();
-        let scheduler = RectifiedFlowScheduler::new(config).unwrap();
+        let scheduler = RectifiedFlowScheduler::new(config);
         assert_eq!(scheduler.num_inference_steps, 50);
     }
 
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn test_set_timesteps() {
         let config = RectifiedFlowConfig::default();
-        let mut scheduler = RectifiedFlowScheduler::new(config).unwrap();
+        let mut scheduler = RectifiedFlowScheduler::new(config);
         scheduler.set_timesteps(25, None).unwrap();
         assert_eq!(scheduler.num_inference_steps(), 25);
     }
@@ -329,7 +329,7 @@ mod tests {
             shift_mode: ShiftMode::Uniform,
             shift_terminal: 0.1,
         };
-        let mut scheduler = RectifiedFlowScheduler::new(config).unwrap();
+        let mut scheduler = RectifiedFlowScheduler::new(config);
         scheduler.set_timesteps(10, None).unwrap();
 
         let timesteps = scheduler.timesteps();
@@ -354,7 +354,7 @@ mod tests {
             },
             shift_terminal: 0.1,
         };
-        let mut scheduler = RectifiedFlowScheduler::new(config).unwrap();
+        let mut scheduler = RectifiedFlowScheduler::new(config);
         scheduler.set_timesteps(10, None).unwrap();
 
         let timesteps = scheduler.timesteps();
@@ -371,7 +371,7 @@ mod tests {
             },
             shift_terminal: 0.1,
         };
-        let mut scheduler = RectifiedFlowScheduler::new(config).unwrap();
+        let mut scheduler = RectifiedFlowScheduler::new(config);
         scheduler.set_timesteps(8, None).unwrap();
 
         let timesteps = scheduler.timesteps();
@@ -382,7 +382,7 @@ mod tests {
     #[test]
     fn test_custom_timesteps() {
         let config = RectifiedFlowConfig::default();
-        let mut scheduler = RectifiedFlowScheduler::new(config).unwrap();
+        let mut scheduler = RectifiedFlowScheduler::new(config);
 
         let custom_timesteps = vec![1.0, 0.75, 0.5, 0.25, 0.1];
         scheduler
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn test_scale_noise() {
         let config = RectifiedFlowConfig::default();
-        let scheduler = RectifiedFlowScheduler::new(config).unwrap();
+        let scheduler = RectifiedFlowScheduler::new(config);
         let device = Device::Cpu;
 
         // Create test tensors
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn test_apply_guidance() {
         let config = RectifiedFlowConfig::default();
-        let scheduler = RectifiedFlowScheduler::new(config).unwrap();
+        let scheduler = RectifiedFlowScheduler::new(config);
         let device = Device::Cpu;
 
         let cond = Tensor::ones(&[2, 4, 8, 8], candle::DType::F32, &device).unwrap();
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn test_euler_step() {
         let config = RectifiedFlowConfig::default();
-        let mut scheduler = RectifiedFlowScheduler::new(config).unwrap();
+        let mut scheduler = RectifiedFlowScheduler::new(config);
         scheduler.set_timesteps(10, None).unwrap();
 
         let device = Device::Cpu;
@@ -478,7 +478,7 @@ mod tests {
             },
             shift_terminal: 0.1,
         };
-        let mut scheduler = RectifiedFlowScheduler::new(config).unwrap();
+        let mut scheduler = RectifiedFlowScheduler::new(config);
         scheduler.set_timesteps(8, None).unwrap();
 
         // Test resolution-dependent shifting
@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn test_zero_steps_error() {
         let config = RectifiedFlowConfig::default();
-        let mut scheduler = RectifiedFlowScheduler::new(config).unwrap();
+        let mut scheduler = RectifiedFlowScheduler::new(config);
         let result = scheduler.set_timesteps(0, None);
         assert!(result.is_err());
     }

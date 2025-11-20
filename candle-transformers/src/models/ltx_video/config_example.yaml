@@ -1,0 +1,88 @@
+# LTX-Video Configuration Example
+# This file demonstrates multi-backend support configuration
+
+# Pipeline configuration
+width: 768
+height: 512
+num_frames: 121
+guidance_scale: 1.0
+num_inference_steps: 50
+
+# Backend selection
+# Options:
+#   - "auto": Auto-detect best available backend (default)
+#   - "cpu": Force CPU execution
+#   - "cuda": Use CUDA GPU (first available)
+#   - "cuda:0", "cuda:1": Use specific CUDA GPU by index
+#   - "metal": Use Metal GPU on macOS (first available)
+#   - "metal:0": Use specific Metal GPU by index
+backend: "auto"
+
+# Precision settings
+# Options: "float32", "float16", "bfloat16"
+# - float32: Best accuracy, highest memory (~8GB for 2B model)
+# - bfloat16: Good accuracy, ~50% memory reduction (~4GB for 2B model) - Recommended
+# - float16: Lower accuracy, ~50% memory reduction
+dtype: "bfloat16"
+
+# Transformer 3D configuration
+transformer:
+  num_layers: 28
+  num_attention_heads: 24
+  attention_head_dim: 96
+  in_channels: 128
+  cross_attention_dim: 4096
+  patch_size_t: 1
+  patch_size_h: 2
+  patch_size_w: 2
+  use_rope: true
+  rope_theta: 10000.0
+  qk_norm: true
+
+# Causal VAE configuration
+vae:
+  in_channels: 3
+  out_channels: 3
+  latent_channels: 128
+  block_out_channels: [128, 256, 512, 512]
+  layers_per_block: 3
+  temporal_compression: 4
+  spatial_compression: 8
+  use_timestep_conditioning: true
+
+# T5 text encoder configuration
+text_encoder:
+  model_name: "PixArt-alpha/PixArt-XL-2-1024-MS"
+  max_length: 512
+  hidden_size: 4096
+
+# Rectified Flow scheduler configuration
+scheduler:
+  num_train_timesteps: 1000
+  shift_mode: "LinearQuadratic"
+  shift_terminal: 0.1
+  threshold: 0.1397
+  linear_steps: null
+
+# Optional: Skip transformer blocks for faster inference
+# Example: skip_block_list: [5, 10, 15] to skip blocks 5, 10, and 15
+skip_block_list: null
+
+# Backend-specific optimization notes:
+#
+# CPU Backend:
+# - Uses MKL (Intel) or Accelerate (Apple) if available
+# - Slower than GPU but no memory limits
+# - Best for testing or systems without GPU
+#
+# CUDA Backend:
+# - Requires NVIDIA GPU with CUDA support
+# - Very fast, especially with cuDNN and Flash Attention
+# - Memory limited by GPU VRAM (typically 8-24GB)
+# - Use bfloat16 to reduce memory usage
+#
+# Metal Backend (macOS):
+# - Uses Apple Silicon GPU (M1/M2/M3)
+# - Fast performance on Apple Silicon
+# - Shares memory with system (unified memory architecture)
+# - Use bfloat16 for better performance

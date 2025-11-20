@@ -19,6 +19,7 @@
 
 pub mod attention;
 pub mod conditioning;
+pub mod device;
 pub mod embeddings;
 pub mod patchifier;
 pub mod pipeline;
@@ -37,6 +38,7 @@ pub use conditioning::{
     inject_conditioning, load_image, prepare_conditioning_latents, preprocess_image,
     ConditioningItem,
 };
+pub use device::{Backend, DeviceManager, MemoryEstimator};
 pub use embeddings::{AdaLayerNormSingle, RoPEEmbedding};
 pub use patchifier::Patchifier;
 pub use pipeline::{LTXVideoPipeline, PipelineInputs, PipelineOutput};
@@ -66,6 +68,10 @@ pub struct LtxVideoConfig {
     /// Precision settings
     pub dtype: String, // "float32", "float16", "bfloat16"
 
+    /// Backend selection (auto-detect if None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>, // "auto", "cpu", "cuda", "metal"
+
     /// Optional skip layer configuration
     pub skip_block_list: Option<Vec<usize>>,
 }
@@ -84,6 +90,7 @@ impl LtxVideoConfig {
             guidance_scale: 1.0,
             num_inference_steps: 50,
             dtype: "float32".to_string(),
+            backend: None,
             skip_block_list: None,
         }
     }
@@ -154,6 +161,76 @@ impl LtxVideoConfig {
             ))),
         }
     }
+
+    /// Get the size in bytes for the configured dtype
+    pub fn dtype_bytes(&self) -> Result<usize> {
+        match self.dtype.as_str() {
+            "float32" | "f32" => Ok(4),
+            "float16" | "f16" => Ok(2),
+            "bfloat16" | "bf16" => Ok(2),
+            _ => Err(candle::Error::Msg(format!(
+                "Unsupported dtype: {}",
+                self.dtype
+            ))),
+        }
+    }
+
+    /// Create a device manager from configuration
+    pub fn create_device_manager(&self) -> Result<DeviceManager> {
+        use device::Backend;
+
+        match self.backend.as_deref() {
+            None | Some("auto") => DeviceManager::auto(),
+            Some("cpu") => DeviceManager::new(Backend::Cpu),
+            Some("cuda") => DeviceManager::new(Backend::Cuda(0)),
+            Some(backend) if backend.starts_with("cuda:") => {
+                let idx = backend
+                    .strip_prefix("cuda:")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .ok_or_else(|| {
+                        candle::Error::Msg(format!("Invalid CUDA device index: {}", backend))
+                    })?;
+                DeviceManager::new(Backend::Cuda(idx))
+            }
+            Some("metal") => DeviceManager::new(Backend::Metal(0)),
+            Some(backend) if backend.starts_with("metal:") => {
+                let idx = backend
+                    .strip_prefix("metal:")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .ok_or_else(|| {
+                        candle::Error::Msg(format!("Invalid Metal device index: {}", backend))
+                    })?;
+                DeviceManager::new(Backend::Metal(idx))
+            }
+            Some(backend) => Err(candle::Error::Msg(format!(
+                "Unknown backend: {}. Valid options: auto, cpu, cuda, cuda:N, metal, metal:N",
+                backend
+            ))),
+        }
+    }
+
+    /// Estimate memory requirements for this configuration
+    pub fn estimate_memory(&self) -> Result<MemoryEstimator> {
+        use device::MemoryEstimator;
+
+        let mut estimator = MemoryEstimator::new();
+
+        // Estimate model memory (2B parameters for 2B model variant)
+        let num_parameters = 2_000_000_000; // 2B model
+        let dtype_bytes = self.dtype_bytes()?;
+        estimator.estimate_model_memory(num_parameters, dtype_bytes);
+
+        // Estimate activation memory
+        estimator.estimate_activation_memory(
+            1, // batch size
+            self.num_frames,
+            self.height,
+            self.width,
+            dtype_bytes,
+        );
+
+        Ok(estimator)
+    }
 }
 
 #[cfg(test)]
@@ -200,7 +277,7 @@ mod tests {
     #[test]
     fn test_latent_shape() {
         let config = LtxVideoConfig::ltxv_2b_0_9_8_distilled();
-        let (frames, channels, height, width) = config.latent_shape();
+        let (_frames, channels, height, width) = config.latent_shape();
         assert_eq!(channels, 128);
         assert_eq!(height, config.height / 8);
         assert_eq!(width, config.width / 8);

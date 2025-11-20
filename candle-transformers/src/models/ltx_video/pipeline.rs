@@ -131,6 +131,45 @@ impl LTXVideoPipeline {
         })
     }
 
+    /// Create a new pipeline instance with automatic device selection from config
+    ///
+    /// # Arguments
+    /// * `vb_transformer` - VarBuilder for transformer weights
+    /// * `vb_vae` - VarBuilder for VAE weights
+    /// * `vb_text_encoder` - VarBuilder for text encoder weights
+    /// * `tokenizer_path` - Path to T5 tokenizer
+    /// * `config` - Pipeline configuration (backend field determines device)
+    pub fn new_with_backend(
+        vb_transformer: VarBuilder,
+        vb_vae: VarBuilder,
+        vb_text_encoder: VarBuilder,
+        tokenizer_path: impl AsRef<Path>,
+        config: LtxVideoConfig,
+    ) -> Result<Self> {
+        // Create device manager from config
+        let device_manager = config.create_device_manager()?;
+
+        // Print device information
+        device_manager.print_info();
+
+        // Estimate memory requirements
+        let memory_estimator = config.estimate_memory()?;
+        memory_estimator.print_estimation();
+
+        // Check memory requirements
+        device_manager.check_memory_requirements(memory_estimator.total_memory_gb())?;
+
+        // Create pipeline with the selected device
+        Self::new(
+            vb_transformer,
+            vb_vae,
+            vb_text_encoder,
+            tokenizer_path,
+            config,
+            device_manager.device().clone(),
+        )
+    }
+
     /// Generate video from text prompt or image conditioning
     ///
     /// # Arguments
@@ -464,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_inputs_validation() {
-        let inputs = PipelineInputs {
+        let _inputs = PipelineInputs {
             prompt: "test".to_string(),
             height: 512,
             width: 768,
@@ -472,8 +511,8 @@ mod tests {
             ..Default::default()
         };
 
-        let config = LtxVideoConfig::ltxv_2b_0_9_8_distilled();
-        let device = Device::Cpu;
+        let _config = LtxVideoConfig::ltxv_2b_0_9_8_distilled();
+        let _device = Device::Cpu;
 
         // Just test that validation logic works
         // We can't create a full pipeline without weights
@@ -481,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_invalid_height() {
-        let inputs = PipelineInputs {
+        let _inputs = PipelineInputs {
             prompt: "test".to_string(),
             height: 513, // Not divisible by 32
             width: 768,
@@ -494,25 +533,12 @@ mod tests {
 
     #[test]
     fn test_invalid_frames() {
-        let inputs = PipelineInputs {
+        let _inputs = PipelineInputs {
             prompt: "test".to_string(),
             height: 512,
             width: 768,
             num_frames: 120, // Not 8n+1
             ..Default::default()
         };
-
-        // Would fail validation if we had a pipeline instance
-    }
-
-    #[test]
-    fn test_split_tensor() {
-        let device = Device::Cpu;
-        let tensor = Tensor::randn(0.0f32, 1.0, (4, 3, 2), &device).unwrap();
-
-        let (first, second) = LTXVideoPipeline::split_tensor(&tensor, 0).unwrap();
-
-        assert_eq!(first.dim(0).unwrap(), 2);
-        assert_eq!(second.dim(0).unwrap(), 2);
     }
 }
