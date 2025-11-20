@@ -56,6 +56,7 @@ impl RectifiedFlowConfig {
 }
 
 /// Rectified Flow Scheduler for diffusion sampling
+#[derive(Clone)]
 pub struct RectifiedFlowScheduler {
     #[allow(dead_code)]
     config: RectifiedFlowConfig,
@@ -65,13 +66,12 @@ pub struct RectifiedFlowScheduler {
 
 impl RectifiedFlowScheduler {
     /// Create a new RectifiedFlowScheduler
-    pub fn new(config: RectifiedFlowConfig) -> Result<Self> {
-        config.validate()?;
-        Ok(Self {
+    pub fn new(config: RectifiedFlowConfig) -> Self {
+        Self {
             config,
             timesteps: Vec::new(),
             num_inference_steps: 50,
-        })
+        }
     }
 
     /// Set the number of inference steps and generate timesteps

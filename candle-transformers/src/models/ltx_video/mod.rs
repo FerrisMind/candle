@@ -21,6 +21,7 @@ pub mod attention;
 pub mod conditioning;
 pub mod embeddings;
 pub mod patchifier;
+pub mod pipeline;
 pub mod scheduler;
 pub mod text_encoder;
 pub mod transformer3d;
@@ -38,6 +39,7 @@ pub use conditioning::{
 };
 pub use embeddings::{AdaLayerNormSingle, RoPEEmbedding};
 pub use patchifier::Patchifier;
+pub use pipeline::{LTXVideoPipeline, PipelineInputs, PipelineOutput};
 pub use scheduler::{RectifiedFlowConfig, RectifiedFlowScheduler};
 pub use text_encoder::{T5Config, T5TextEncoder, TextConditioning};
 pub use transformer3d::{BasicTransformerBlock, Transformer3D, Transformer3DConfig};
