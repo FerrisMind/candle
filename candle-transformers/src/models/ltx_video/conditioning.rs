@@ -1,3 +1,4 @@
+use super::error::LtxVideoError;
 use super::vae::CausalVideoAutoencoder;
 use candle::{Device, Result, Tensor};
 use image::{DynamicImage, GenericImageView};
@@ -122,19 +123,19 @@ pub fn inject_conditioning(
     generated_latents: &Tensor,
     conditioning_items: &[ConditioningItem],
     temporal_compression: usize,
-) -> Result<Tensor> {
+) -> std::result::Result<Tensor, LtxVideoError> {
     let mut output = generated_latents.clone();
-    let (b, c, f_lat, h, w) = output.dims5()?;
+    let (b, c, f_lat, h, w) = output.dims5().map_err(LtxVideoError::CandleError)?;
 
     for item in conditioning_items {
         let start_latent_idx = item.frame_idx / temporal_compression;
-        let (_, _, cond_f, _, _) = item.latents.dims5()?;
+        let (_, _, cond_f, _, _) = item.latents.dims5().map_err(LtxVideoError::CandleError)?;
 
         if start_latent_idx + cond_f > f_lat {
-            return Err(candle::Error::Msg(format!(
-                "Conditioning frames out of bounds: start={}, len={}, total={}",
-                start_latent_idx, cond_f, f_lat
-            )));
+            return Err(LtxVideoError::ConditioningFrameOutOfBounds(
+                start_latent_idx + cond_f,
+                f_lat,
+            ));
         }
 
         // Slice assign
@@ -150,11 +151,20 @@ pub fn inject_conditioning(
         // For blending, we first extract, blend, then assign.
         if (item.scale - 1.0).abs() < 1e-6 {
             // Hard replacement
-            output = output.slice_assign(&ranges, &item.latents)?;
+            output = output
+                .slice_assign(&ranges, &item.latents)
+                .map_err(LtxVideoError::CandleError)?;
         } else {
-            let current_slice = output.narrow(2, start_latent_idx, cond_f)?;
-            let blended = ((&current_slice * (1.0 - item.scale))? + (&item.latents * item.scale)?)?;
-            output = output.slice_assign(&ranges, &blended)?;
+            let current_slice = output
+                .narrow(2, start_latent_idx, cond_f)
+                .map_err(LtxVideoError::CandleError)?;
+            let blended = ((&current_slice * (1.0 - item.scale))
+                .map_err(LtxVideoError::CandleError)?
+                + (&item.latents * item.scale).map_err(LtxVideoError::CandleError)?)
+            .map_err(LtxVideoError::CandleError)?;
+            output = output
+                .slice_assign(&ranges, &blended)
+                .map_err(LtxVideoError::CandleError)?;
         }
     }
     Ok(output)

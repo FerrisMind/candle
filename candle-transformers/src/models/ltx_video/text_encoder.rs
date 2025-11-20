@@ -11,6 +11,7 @@ use std::path::Path;
 use tokenizers::Tokenizer;
 
 use crate::models::t5::{self, Config as T5ModelConfig, T5EncoderModel};
+use crate::quantized_var_builder;
 
 /// Configuration shared between the LTX-Video pipeline and the T5 text encoder.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -273,6 +274,123 @@ impl T5TextEncoder {
 struct TokenizedText {
     tokens: Tensor,
     attention_mask: Tensor,
+}
+
+/// Quantized T5 text encoder using GGUF format (no dequantization during loading).
+/// Keeps quantized tensors throughout inference for memory efficiency.
+pub struct T5TextEncoderQuantized {
+    encoder: crate::models::quantized_t5::T5EncoderModel,
+    tokenizer: Tokenizer,
+    device: Device,
+    max_length: usize,
+    pad_token_id: u32,
+}
+
+impl T5TextEncoderQuantized {
+    /// Creates a new quantized text encoder from a tokenizer and GGUF VarBuilder.
+    /// Tensors remain quantized throughout - dequantization happens only during compute.
+    pub fn new(
+        vb: quantized_var_builder::VarBuilder,
+        tokenizer: Tokenizer,
+        _cfg: &T5Config,
+    ) -> Result<Self> {
+        let device = vb.device().clone();
+
+        // Use default quantized T5 config (T5-XXL compatible)
+        // Note: We're ignoring the T5Config passed in because quantized_t5::Config fields are private
+        // For now, we use the default which matches T5-XXL requirements
+        let t5_config_quantized = crate::models::quantized_t5::Config::default();
+        let pad_token_id = t5_config_quantized.pad_token_id as u32;
+
+        let encoder = crate::models::quantized_t5::T5EncoderModel::load(vb, &t5_config_quantized)?;
+
+        Ok(Self {
+            encoder,
+            tokenizer,
+            device,
+            max_length: 512, // Default T5 max length
+            pad_token_id,
+        })
+    }
+
+    /// Encode the provided prompts and generate attention masks.
+    /// Works identically to T5TextEncoder but with quantized weights.
+    pub fn encode<T, U>(
+        &mut self,
+        prompts: &[T],
+        negative_prompts: Option<&[U]>,
+        max_length: Option<usize>,
+    ) -> Result<TextConditioning>
+    where
+        T: AsRef<str>,
+        U: AsRef<str>,
+    {
+        let seq_len = match max_length {
+            Some(value) if value > 0 => value,
+            None => self.max_length,
+            _ => {
+                return Err(Error::Msg(
+                    "max_length must be a positive number".to_string(),
+                ))
+            }
+        };
+
+        let normalized_prompts = T5TextEncoder::normalize(prompts);
+        if normalized_prompts.is_empty() {
+            return Err(Error::Msg("At least one prompt is required".to_string()));
+        }
+        let batch_size = normalized_prompts.len();
+        let prompt_input = self.tokenize(&normalized_prompts, seq_len)?;
+        let prompt_embeds = self.encoder.forward(&prompt_input.tokens)?;
+
+        let negative_texts = T5TextEncoder::build_negative(batch_size, negative_prompts)?;
+        let negative_input = self.tokenize(&negative_texts, seq_len)?;
+        let negative_prompt_embeds = self.encoder.forward(&negative_input.tokens)?;
+
+        Ok(TextConditioning {
+            prompt_embeds,
+            prompt_attention_mask: prompt_input.attention_mask,
+            negative_prompt_embeds,
+            negative_prompt_attention_mask: negative_input.attention_mask,
+        })
+    }
+
+    /// Returns the maximum token length enforced by this encoder.
+    pub fn max_length(&self) -> usize {
+        self.max_length
+    }
+
+    fn tokenize(&self, texts: &[String], seq_len: usize) -> Result<TokenizedText> {
+        let batch_size = texts.len();
+        let mut ids = Vec::with_capacity(batch_size * seq_len);
+        let mut mask = Vec::with_capacity(batch_size * seq_len);
+
+        for text in texts {
+            let encoding = self
+                .tokenizer
+                .encode(text.as_str(), true)
+                .map_err(|e| Error::Msg(format!("Tokenizer error: {}", e)))?;
+
+            let truncated_len = encoding.get_ids().len().min(seq_len);
+            ids.extend(encoding.get_ids().iter().take(truncated_len).copied());
+            mask.extend(std::iter::repeat_n(1u32, truncated_len));
+
+            if truncated_len < seq_len {
+                let pad_len = seq_len - truncated_len;
+                ids.extend(std::iter::repeat_n(self.pad_token_id, pad_len));
+                mask.extend(std::iter::repeat_n(0u32, pad_len));
+            }
+        }
+
+        let tokens = Tensor::new(ids.as_slice(), &self.device)?.reshape((batch_size, seq_len))?;
+        let attention_mask =
+            Tensor::new(mask.as_slice(), &self.device)?.reshape((batch_size, seq_len))?;
+
+        Ok(TokenizedText {
+            tokens,
+            attention_mask,
+        })
+    }
 }
 
 #[cfg(test)]

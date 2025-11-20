@@ -12,20 +12,21 @@ use serde::{Deserialize, Serialize};
 /// Configuration for the 3D Transformer model
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Transformer3DConfig {
-    pub num_layers: usize,                 // 28 for 2B model
-    pub num_attention_heads: usize,        // 24
-    pub attention_head_dim: usize,         // 96
-    pub in_channels: usize,                // 128 (VAE latent channels)
-    pub cross_attention_dim: usize,        // 4096 (T5 embedding dim)
-    pub patch_size: (usize, usize, usize), // (1, 2, 2) for (t, h, w)
-    pub use_rope: bool,                    // true
-    pub rope_theta: f64,                   // 10000.0
-    pub qk_norm: bool,                     // true
-    pub hidden_act: String,                // "gelu"
-    pub hidden_dropout_prob: f64,          // 0.0
-    pub attention_probs_dropout_prob: f64, // 0.0
-    pub initializer_range: f64,            // 0.02
-    pub layer_norm_eps: f64,               // 1e-6
+    pub num_layers: usize,                   // 28 for 2B model
+    pub num_attention_heads: usize,          // 24
+    pub attention_head_dim: usize,           // 96
+    pub in_channels: usize,                  // 128 (VAE latent channels)
+    pub cross_attention_dim: usize,          // 4096 (T5 embedding dim)
+    pub patch_size: (usize, usize, usize),   // (1, 2, 2) for (t, h, w)
+    pub use_rope: bool,                      // true
+    pub rope_theta: f64,                     // 10000.0
+    pub qk_norm: bool,                       // true
+    pub hidden_act: String,                  // "gelu"
+    pub hidden_dropout_prob: f64,            // 0.0
+    pub attention_probs_dropout_prob: f64,   // 0.0
+    pub initializer_range: f64,              // 0.02
+    pub layer_norm_eps: f64,                 // 1e-6
+    pub skip_block_list: Option<Vec<usize>>, // List of block indices to skip
 }
 
 impl Transformer3DConfig {
@@ -46,6 +47,7 @@ impl Transformer3DConfig {
             attention_probs_dropout_prob: 0.0,
             initializer_range: 0.02,
             layer_norm_eps: 1e-6,
+            skip_block_list: None,
         }
     }
 
@@ -321,7 +323,11 @@ impl Transformer3D {
         let rope_refs = rope_cos_sin.as_ref().map(|(c, s)| (c, s));
 
         // 5. Transformer blocks
-        for block in &self.transformer_blocks {
+        let skip_blocks = self._config.skip_block_list.as_deref().unwrap_or(&[]);
+        for (i, block) in self.transformer_blocks.iter().enumerate() {
+            if skip_blocks.contains(&i) {
+                continue;
+            }
             hidden_states = block.forward(
                 &hidden_states,
                 encoder_hidden_states,

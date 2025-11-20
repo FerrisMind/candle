@@ -2,16 +2,19 @@
 //!
 //! This module implements the main inference pipeline that orchestrates all components
 //! for end-to-end video generation. It supports both text-to-video and image-to-video modes.
+//! Additionally, it supports loading text encoder from quantized GGUF format for memory efficiency.
 
 use candle::{Device, Result, Tensor};
 use candle_nn::VarBuilder;
 use std::path::Path;
 
 use super::{
-    generate_video_output, inject_conditioning, prepare_conditioning_latents,
+    error::LtxVideoError, generate_video_output, inject_conditioning, prepare_conditioning_latents,
     CausalVideoAutoencoder, LtxVideoConfig, RectifiedFlowScheduler, T5TextEncoder,
-    TextConditioning, Transformer3D, VideoGenerationResult, VideoOutputConfig,
+    T5TextEncoderQuantized, TextConditioning, Transformer3D, VideoGenerationResult,
+    VideoOutputConfig,
 };
+use crate::quantized_var_builder;
 
 /// Main LTX-Video inference pipeline
 pub struct LTXVideoPipeline {
@@ -103,7 +106,9 @@ impl LTXVideoPipeline {
         device: Device,
     ) -> Result<Self> {
         // Validate configuration
-        config.validate()?;
+        config
+            .validate()
+            .map_err(|e| candle::Error::Msg(e.to_string()))?;
 
         // Initialize transformer
         let transformer = Transformer3D::new(vb_transformer.clone(), config.transformer.clone())?;
@@ -148,7 +153,9 @@ impl LTXVideoPipeline {
         config: LtxVideoConfig,
     ) -> Result<Self> {
         // Create device manager from config
-        let device_manager = config.create_device_manager()?;
+        let device_manager = config
+            .create_device_manager()
+            .map_err(|e| candle::Error::Msg(e.to_string()))?;
 
         // Print device information
         device_manager.print_info();
@@ -171,6 +178,33 @@ impl LTXVideoPipeline {
         )
     }
 
+    /// Load text encoder from GGUF format (quantized, no dequantization)
+    ///
+    /// This is a helper method that loads a quantized T5 text encoder from GGUF format.
+    /// Unlike loading from safetensors, weights remain quantized throughout inference,
+    /// providing significant memory savings (approximately 75% reduction).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let gguf_vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(
+    ///     "t5-xxl.gguf", &device
+    /// )?;
+    /// let mut text_encoder = T5TextEncoderQuantized::new(gguf_vb, tokenizer, &config)?;
+    ///
+    /// let embeddings = text_encoder.encode(&["Hello world"], None, None)?;
+    /// ```
+    pub fn load_text_encoder_quantized_gguf(
+        gguf_path: impl AsRef<Path>,
+        tokenizer_path: impl AsRef<Path>,
+        config: &super::T5Config,
+        device: &Device,
+    ) -> Result<T5TextEncoderQuantized> {
+        let gguf_vb = quantized_var_builder::VarBuilder::from_gguf(gguf_path, device)?;
+        let tokenizer = T5TextEncoder::load_tokenizer(tokenizer_path)?;
+        T5TextEncoderQuantized::new(gguf_vb, tokenizer, config)
+    }
+
     /// Generate video from text prompt or image conditioning
     ///
     /// # Arguments
@@ -180,7 +214,8 @@ impl LTXVideoPipeline {
     /// Generated video tensor in (B, C, F, H, W) format with values in [0, 255] range
     pub fn generate(&mut self, inputs: PipelineInputs) -> Result<PipelineOutput> {
         // Validate inputs
-        self.validate_inputs(&inputs)?;
+        self.validate_inputs(&inputs)
+            .map_err(|e| candle::Error::Msg(e.to_string()))?;
 
         println!("Starting LTX-Video generation...");
         println!("  Resolution: {}x{}", inputs.width, inputs.height);
@@ -302,7 +337,9 @@ impl LTXVideoPipeline {
             conditioning_frames,
             conditioning_indices,
             &self.device,
-            self.config.get_dtype()?,
+            self.config
+                .get_dtype()
+                .map_err(|e| candle::Error::Msg(e.to_string()))?,
         )?;
 
         // Get temporal compression for inject_conditioning
@@ -317,6 +354,7 @@ impl LTXVideoPipeline {
 
         // Inject conditioning into latents
         inject_conditioning(latents, &updated_items, temporal_compression)
+            .map_err(|e| candle::Error::Msg(e.to_string()))
     }
 
     /// Main denoising loop with classifier-free guidance
@@ -410,27 +448,18 @@ impl LTXVideoPipeline {
     }
 
     /// Validate pipeline inputs
-    fn validate_inputs(&self, inputs: &PipelineInputs) -> Result<()> {
+    fn validate_inputs(&self, inputs: &PipelineInputs) -> std::result::Result<(), LtxVideoError> {
         // Validate height and width
         if !inputs.height.is_multiple_of(32) {
-            return Err(candle::Error::Msg(format!(
-                "Height {} must be divisible by 32",
-                inputs.height
-            )));
+            return Err(LtxVideoError::InvalidDimension("Height".to_string(), 32));
         }
         if !inputs.width.is_multiple_of(32) {
-            return Err(candle::Error::Msg(format!(
-                "Width {} must be divisible by 32",
-                inputs.width
-            )));
+            return Err(LtxVideoError::InvalidDimension("Width".to_string(), 32));
         }
 
         // Validate num_frames follows 8n+1 pattern
         if (inputs.num_frames as i32 - 1) % 8 != 0 {
-            return Err(candle::Error::Msg(format!(
-                "Number of frames {} must follow pattern 8n+1 (e.g., 9, 17, 25, 121, 257)",
-                inputs.num_frames
-            )));
+            return Err(LtxVideoError::InvalidFrameCount(inputs.num_frames));
         }
 
         // Validate conditioning
@@ -438,7 +467,7 @@ impl LTXVideoPipeline {
             (&inputs.conditioning_frames, &inputs.conditioning_indices)
         {
             if frames.len() != indices.len() {
-                return Err(candle::Error::Msg(format!(
+                return Err(LtxVideoError::ConfigError(format!(
                     "Conditioning frames count ({}) must match indices count ({})",
                     frames.len(),
                     indices.len()
@@ -448,18 +477,17 @@ impl LTXVideoPipeline {
             // Validate all indices are within bounds
             for &idx in indices.iter() {
                 if idx >= inputs.num_frames {
-                    return Err(candle::Error::Msg(format!(
-                        "Conditioning frame index {} is out of bounds (max: {})",
+                    return Err(LtxVideoError::ConditioningFrameOutOfBounds(
                         idx,
-                        inputs.num_frames - 1
-                    )));
+                        inputs.num_frames - 1,
+                    ));
                 }
             }
         }
 
         // Validate guidance scale
         if inputs.guidance_scale < 0.0 {
-            return Err(candle::Error::Msg(format!(
+            return Err(LtxVideoError::ConfigError(format!(
                 "Guidance scale must be >= 0.0, got {}",
                 inputs.guidance_scale
             )));
@@ -467,7 +495,7 @@ impl LTXVideoPipeline {
 
         // Validate conditioning strength
         if inputs.conditioning_strength < 0.0 || inputs.conditioning_strength > 1.0 {
-            return Err(candle::Error::Msg(format!(
+            return Err(LtxVideoError::ConfigError(format!(
                 "Conditioning strength must be in [0.0, 1.0], got {}",
                 inputs.conditioning_strength
             )));

@@ -21,6 +21,7 @@ pub mod attention;
 pub mod conditioning;
 pub mod device;
 pub mod embeddings;
+pub mod error;
 pub mod patchifier;
 pub mod pipeline;
 pub mod scheduler;
@@ -31,6 +32,7 @@ pub mod vae_blocks;
 pub mod video_output;
 
 use candle::{DType, Result};
+use error::LtxVideoError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -44,7 +46,7 @@ pub use embeddings::{AdaLayerNormSingle, RoPEEmbedding};
 pub use patchifier::Patchifier;
 pub use pipeline::{LTXVideoPipeline, PipelineInputs, PipelineOutput};
 pub use scheduler::{RectifiedFlowConfig, RectifiedFlowScheduler};
-pub use text_encoder::{T5Config, T5TextEncoder, TextConditioning};
+pub use text_encoder::{T5Config, T5TextEncoder, T5TextEncoderQuantized, TextConditioning};
 pub use transformer3d::{BasicTransformerBlock, Transformer3D, Transformer3DConfig};
 pub use vae::{CausalVaeConfig, CausalVideoAutoencoder};
 pub use video_output::{
@@ -94,7 +96,7 @@ impl LtxVideoConfig {
             scheduler: RectifiedFlowConfig::default(),
             guidance_scale: 1.0,
             num_inference_steps: 50,
-            dtype: "float32".to_string(),
+            dtype: "f8_e4m3fn".to_string(),
             backend: None,
             skip_block_list: None,
         }
@@ -114,27 +116,18 @@ impl LtxVideoConfig {
     }
 
     /// Validate configuration parameters
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> std::result::Result<(), LtxVideoError> {
         // Validate height and width are divisible by 32
         if !self.height.is_multiple_of(32) {
-            return Err(candle::Error::Msg(format!(
-                "Height {} must be divisible by 32",
-                self.height
-            )));
+            return Err(LtxVideoError::InvalidDimension("Height".to_string(), 32));
         }
         if !self.width.is_multiple_of(32) {
-            return Err(candle::Error::Msg(format!(
-                "Width {} must be divisible by 32",
-                self.width
-            )));
+            return Err(LtxVideoError::InvalidDimension("Width".to_string(), 32));
         }
 
         // Validate num_frames follows 8n+1 pattern
         if (self.num_frames as i32 - 1) % 8 != 0 {
-            return Err(candle::Error::Msg(format!(
-                "Number of frames {} must follow pattern 8n+1 (e.g., 9, 17, 25, 121, 257)",
-                self.num_frames
-            )));
+            return Err(LtxVideoError::InvalidFrameCount(self.num_frames));
         }
 
         Ok(())
@@ -155,59 +148,61 @@ impl LtxVideoConfig {
     }
 
     /// Get the DType from the dtype string
-    pub fn get_dtype(&self) -> Result<DType> {
+    pub fn get_dtype(&self) -> std::result::Result<DType, LtxVideoError> {
         match self.dtype.as_str() {
-            "float32" | "f32" => Ok(DType::F32),
-            "float16" | "f16" => Ok(DType::F16),
             "bfloat16" | "bf16" => Ok(DType::BF16),
-            _ => Err(candle::Error::Msg(format!(
-                "Unsupported dtype: {}",
-                self.dtype
-            ))),
+            "f8_e4m3fn" | "fp8" => Ok(DType::F8E4M3),
+            _ => Err(LtxVideoError::UnsupportedDType(self.dtype.clone())),
         }
     }
 
     /// Get the size in bytes for the configured dtype
-    pub fn dtype_bytes(&self) -> Result<usize> {
+    pub fn dtype_bytes(&self) -> std::result::Result<usize, LtxVideoError> {
         match self.dtype.as_str() {
-            "float32" | "f32" => Ok(4),
-            "float16" | "f16" => Ok(2),
             "bfloat16" | "bf16" => Ok(2),
-            _ => Err(candle::Error::Msg(format!(
-                "Unsupported dtype: {}",
-                self.dtype
-            ))),
+            "f8_e4m3fn" | "fp8" => Ok(1),
+            _ => Err(LtxVideoError::UnsupportedDType(self.dtype.clone())),
         }
     }
 
     /// Create a device manager from configuration
-    pub fn create_device_manager(&self) -> Result<DeviceManager> {
+    pub fn create_device_manager(&self) -> std::result::Result<DeviceManager, LtxVideoError> {
         use device::Backend;
 
         match self.backend.as_deref() {
-            None | Some("auto") => DeviceManager::auto(),
-            Some("cpu") => DeviceManager::new(Backend::Cpu),
-            Some("cuda") => DeviceManager::new(Backend::Cuda(0)),
+            None | Some("auto") => Ok(DeviceManager::auto()?),
+            Some("cpu") => DeviceManager::new(Backend::Cpu).map_err(LtxVideoError::CandleError),
+            Some("cuda") => {
+                DeviceManager::new(Backend::Cuda(0)).map_err(LtxVideoError::CandleError)
+            }
             Some(backend) if backend.starts_with("cuda:") => {
                 let idx = backend
                     .strip_prefix("cuda:")
                     .and_then(|s| s.parse::<usize>().ok())
                     .ok_or_else(|| {
-                        candle::Error::Msg(format!("Invalid CUDA device index: {}", backend))
+                        LtxVideoError::BackendError(format!(
+                            "Invalid CUDA device index: {}",
+                            backend
+                        ))
                     })?;
-                DeviceManager::new(Backend::Cuda(idx))
+                DeviceManager::new(Backend::Cuda(idx)).map_err(LtxVideoError::CandleError)
             }
-            Some("metal") => DeviceManager::new(Backend::Metal(0)),
+            Some("metal") => {
+                DeviceManager::new(Backend::Metal(0)).map_err(LtxVideoError::CandleError)
+            }
             Some(backend) if backend.starts_with("metal:") => {
                 let idx = backend
                     .strip_prefix("metal:")
                     .and_then(|s| s.parse::<usize>().ok())
                     .ok_or_else(|| {
-                        candle::Error::Msg(format!("Invalid Metal device index: {}", backend))
+                        LtxVideoError::BackendError(format!(
+                            "Invalid Metal device index: {}",
+                            backend
+                        ))
                     })?;
-                DeviceManager::new(Backend::Metal(idx))
+                DeviceManager::new(Backend::Metal(idx)).map_err(LtxVideoError::CandleError)
             }
-            Some(backend) => Err(candle::Error::Msg(format!(
+            Some(backend) => Err(LtxVideoError::BackendError(format!(
                 "Unknown backend: {}. Valid options: auto, cpu, cuda, cuda:N, metal, metal:N",
                 backend
             ))),
@@ -222,7 +217,9 @@ impl LtxVideoConfig {
 
         // Estimate model memory (2B parameters for 2B model variant)
         let num_parameters = 2_000_000_000; // 2B model
-        let dtype_bytes = self.dtype_bytes()?;
+        let dtype_bytes = self
+            .dtype_bytes()
+            .map_err(|e| candle::Error::Msg(e.to_string()))?;
         estimator.estimate_model_memory(num_parameters, dtype_bytes);
 
         // Estimate activation memory
@@ -292,19 +289,10 @@ mod tests {
     fn test_get_dtype() {
         let mut config = LtxVideoConfig::ltxv_2b_0_9_8_distilled();
 
-        config.dtype = "float32".to_string();
-        assert_eq!(config.get_dtype().unwrap(), DType::F32);
-
-        config.dtype = "f32".to_string();
-        assert_eq!(config.get_dtype().unwrap(), DType::F32);
-
-        config.dtype = "float16".to_string();
-        assert_eq!(config.get_dtype().unwrap(), DType::F16);
-
         config.dtype = "bfloat16".to_string();
         assert_eq!(config.get_dtype().unwrap(), DType::BF16);
 
-        config.dtype = "invalid".to_string();
-        assert!(config.get_dtype().is_err());
+        config.dtype = "fp8".to_string();
+        assert_eq!(config.get_dtype().unwrap(), DType::F8E4M3);
     }
 }
