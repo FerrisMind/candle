@@ -41,6 +41,11 @@ const KERNEL_FILES: [&str; 33] = [
 ];
 
 fn main() -> Result<()> {
+    // Unset NVCC_CCBIN to avoid issues with paths containing spaces when calling cl.exe via nvcc on Windows.
+    // nvcc will find cl.exe in the PATH, which is already set up by the VS Developer Command Prompt.
+    unsafe {
+        std::env::remove_var("NVCC_CCBIN");
+    }
     println!("cargo::rerun-if-changed=build.rs");
     for kernel_file in KERNEL_FILES.iter() {
         println!("cargo::rerun-if-changed={kernel_file}");
