@@ -424,6 +424,26 @@ impl candle::CustomOp1 for SoftmaxLastDim {
             candle::MetalStorage::new(output, device.clone(), elem_count, storage.dtype());
         Ok((newstorage, layout.shape().clone()))
     }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        storage: &candle::WgpuStorage,
+        layout: &Layout,
+    ) -> Result<(candle::WgpuStorage, Shape)> {
+        let storage = storage.softmax_last_dim(layout)?;
+        Ok((storage, layout.shape().clone()))
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        storage: &candle::VulkanStorage,
+        layout: &Layout,
+    ) -> Result<(candle::VulkanStorage, Shape)> {
+        let storage = storage.softmax_last_dim(layout)?;
+        Ok((storage, layout.shape().clone()))
+    }
 }
 
 pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
@@ -616,6 +636,30 @@ impl candle::CustomOp2 for RmsNorm {
         .map_err(candle::Error::wrap)?;
         let newstorage = candle::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        s1: &candle::WgpuStorage,
+        l1: &Layout,
+        s2: &candle::WgpuStorage,
+        l2: &Layout,
+    ) -> Result<(candle::WgpuStorage, Shape)> {
+        let storage = s1.rms_norm(l1, s2, l2, self.eps)?;
+        Ok((storage, l1.shape().clone()))
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        s1: &candle::VulkanStorage,
+        l1: &Layout,
+        s2: &candle::VulkanStorage,
+        l2: &Layout,
+    ) -> Result<(candle::VulkanStorage, Shape)> {
+        let storage = s1.rms_norm(l1, s2, l2, self.eps)?;
+        Ok((storage, l1.shape().clone()))
     }
 }
 

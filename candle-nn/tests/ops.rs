@@ -334,3 +334,68 @@ test_device!(rms_norml, rms_norml_cpu, rms_norml_gpu, rms_norml_metal);
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);
+
+#[test]
+#[ignore = "requires a usable wgpu adapter and driver"]
+#[cfg(feature = "wgpu")]
+fn softmax_wgpu() -> Result<()> {
+    let device = Device::new_wgpu(0)?;
+    softmax_last_dim_backend(&device)
+}
+
+#[test]
+#[ignore = "requires a usable wgpu adapter and driver"]
+#[cfg(feature = "wgpu")]
+fn rms_norm_wgpu() -> Result<()> {
+    let device = Device::new_wgpu(0)?;
+    rms_norm_backend(&device)
+}
+
+#[test]
+#[ignore = "requires a usable Vulkan compute device and driver"]
+#[cfg(feature = "vulkan")]
+fn softmax_vulkan() -> Result<()> {
+    let device = Device::new_vulkan(0)?;
+    softmax_last_dim_backend(&device)
+}
+
+#[test]
+#[ignore = "requires a usable Vulkan compute device and driver"]
+#[cfg(feature = "vulkan")]
+fn rms_norm_vulkan() -> Result<()> {
+    let device = Device::new_vulkan(0)?;
+    rms_norm_backend(&device)
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn softmax_last_dim_backend(device: &Device) -> Result<()> {
+    let tensor = Tensor::new(
+        &[
+            [3f32.ln(), 1f32.ln(), 4f32.ln()],
+            [1f32.ln(), 5f32.ln(), 9f32.ln()],
+        ],
+        device,
+    )?;
+    let t = candle_nn::ops::softmax_last_dim(&tensor)?;
+    assert_eq!(
+        candle::test_utils::to_vec2_round(&t, 4)?,
+        &[[0.375, 0.125, 0.5], [0.0667, 0.3333, 0.6]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn rms_norm_backend(device: &Device) -> Result<()> {
+    let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
+    let tensor = Tensor::new(data, device)?;
+    let alpha = Tensor::new(&[1f32, 2f32, 3f32], device)?;
+    let t = candle_nn::ops::rms_norm(&tensor, &alpha, 1e-5)?;
+    assert_eq!(
+        candle::test_utils::to_vec3_round(&t, 4)?,
+        &[
+            [[1.019, 0.6794, 4.0762], [0.1674, 1.6744, 4.521]],
+            [[0.4714, 0.4714, 4.9497], [1.206, 0.603, 3.6181]]
+        ]
+    );
+    Ok(())
+}

@@ -1,5 +1,5 @@
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{DType, Device, IndexOp, Result, Tensor};
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use half::f16;
 
@@ -71,7 +71,11 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     smoke_f16_elementwise_ops(device)?;
     smoke_f32_binary_broadcast_and_strided_layout(device)?;
     smoke_strided_contiguous_copy(device)?;
+    if device.is_wgpu() {
+        smoke_strided_const_set(device)?;
+    }
     smoke_f32_sum_last_dim(device)?;
+    smoke_f32_argmax_last_dim(device)?;
     smoke_f32_extended_unary_ops(device)?;
 
     device.synchronize()?;
@@ -218,6 +222,11 @@ fn smoke_f16_elementwise_ops(device: &Device) -> Result<()> {
         &[[0.25, 2.0], [-6.0, 16.0]],
         1e-3,
     );
+    assert_close(
+        &xs.elu(1.0)?.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+        &[[0.25, 1.0], [std::f32::consts::E.powf(-2.0) - 1.0, 4.0]],
+        2e-3,
+    );
 
     let positive = Tensor::from_slice(
         &[
@@ -292,6 +301,24 @@ fn smoke_strided_contiguous_copy(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_strided_const_set(device: &Device) -> Result<()> {
+    let xs = Tensor::zeros((2, 3), DType::F32, device)?;
+    xs.i((.., 1))?.const_set(7.0f32.into())?;
+    assert_eq!(xs.to_vec2::<f32>()?, [[0.0, 7.0, 0.0], [0.0, 7.0, 0.0]]);
+
+    let halves = Tensor::zeros((2, 3), DType::F16, device)?;
+    halves.i((1, ..))?.const_set(f16::from_f32(2.5).into())?;
+    assert_eq!(
+        halves.to_vec2::<f16>()?,
+        [
+            [f16::from_f32(0.0), f16::from_f32(0.0), f16::from_f32(0.0)],
+            [f16::from_f32(2.5), f16::from_f32(2.5), f16::from_f32(2.5)],
+        ]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_f32_sum_last_dim(device: &Device) -> Result<()> {
     let xs = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), device)?;
     assert_eq!(xs.sum_keepdim(1)?.to_vec2::<f32>()?, [[6.0], [15.0]]);
@@ -306,6 +333,23 @@ fn smoke_f32_sum_last_dim(device: &Device) -> Result<()> {
     assert_eq!(
         ys.sum_keepdim(2)?.to_vec3::<f32>()?,
         [[[3.0], [7.0]], [[30.0], [70.0]], [[300.0], [700.0]]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_argmax_last_dim(device: &Device) -> Result<()> {
+    let xs = Tensor::from_slice(&[1.0f32, 4.0, 2.0, 9.0, 3.0, 5.0], (2, 3), device)?;
+    assert_eq!(xs.argmax_keepdim(1)?.to_vec2::<u32>()?, [[1], [0]]);
+
+    let ys = Tensor::from_slice(
+        &[1.0f32, 7.0, 3.0, 4.0, 8.0, 5.0, 6.0, 2.0],
+        (2, 2, 2),
+        device,
+    )?;
+    assert_eq!(
+        ys.argmax_keepdim(2)?.to_vec3::<u32>()?,
+        [[[1], [1]], [[0], [0]]]
     );
     Ok(())
 }
@@ -359,6 +403,11 @@ fn smoke_f32_extended_unary_ops(device: &Device) -> Result<()> {
         &xs.affine(2.0, -0.5)?.to_vec2::<f32>()?,
         &[[0.0, 1.5], [7.5, 17.5]],
         1e-6,
+    );
+    assert_close(
+        &xs.powf(1.5)?.to_vec2::<f32>()?,
+        &[[0.125, 1.0], [8.0, 27.0]],
+        1e-5,
     );
     let elu_input = Tensor::from_slice(&[-1.0f32, 0.0, 1.0, 2.0], (2, 2), device)?;
     assert_close(

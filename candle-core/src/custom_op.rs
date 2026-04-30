@@ -1,6 +1,9 @@
 use crate::op::{BackpropOp, Op};
 use crate::tensor::from_storage;
-use crate::{CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor};
+use crate::{
+    CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor, VulkanStorage,
+    WgpuStorage,
+};
 use std::sync::Arc;
 
 /// Unary ops that can be defined in user-land.
@@ -29,6 +32,22 @@ pub trait CustomOp1 {
     ) -> Result<(MetalStorage, Shape)> {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn wgpu_fwd(&self, _storage: &WgpuStorage, _layout: &Layout) -> Result<(WgpuStorage, Shape)> {
+        Err(crate::Error::Msg(
+            format!("no wgpu implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn vulkan_fwd(
+        &self,
+        _storage: &VulkanStorage,
+        _layout: &Layout,
+    ) -> Result<(VulkanStorage, Shape)> {
+        Err(crate::Error::Msg(
+            format!("no vulkan implementation for {}", self.name()).into(),
         ))
     }
 
@@ -78,6 +97,30 @@ pub trait CustomOp2 {
     ) -> Result<(MetalStorage, Shape)> {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn wgpu_fwd(
+        &self,
+        _: &WgpuStorage,
+        _: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+    ) -> Result<(WgpuStorage, Shape)> {
+        Err(crate::Error::Msg(
+            format!("no wgpu implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn vulkan_fwd(
+        &self,
+        _: &VulkanStorage,
+        _: &Layout,
+        _: &VulkanStorage,
+        _: &Layout,
+    ) -> Result<(VulkanStorage, Shape)> {
+        Err(crate::Error::Msg(
+            format!("no vulkan implementation for {}", self.name()).into(),
         ))
     }
 
@@ -136,6 +179,34 @@ pub trait CustomOp3 {
     ) -> Result<(MetalStorage, Shape)> {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn wgpu_fwd(
+        &self,
+        _: &WgpuStorage,
+        _: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+    ) -> Result<(WgpuStorage, Shape)> {
+        Err(crate::Error::Msg(
+            format!("no wgpu implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn vulkan_fwd(
+        &self,
+        _: &VulkanStorage,
+        _: &Layout,
+        _: &VulkanStorage,
+        _: &Layout,
+        _: &VulkanStorage,
+        _: &Layout,
+    ) -> Result<(VulkanStorage, Shape)> {
+        Err(crate::Error::Msg(
+            format!("no vulkan implementation for {}", self.name()).into(),
         ))
     }
 

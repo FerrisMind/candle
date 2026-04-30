@@ -283,13 +283,14 @@ impl Storage {
                 let (storage, shape) = c.metal_fwd(storage, l)?;
                 Ok((Self::Metal(storage), shape))
             }
-            Self::Wgpu(_storage) => {
-                Err(Error::Msg(format!("wgpu custom op {} not implemented", c.name()).into()).bt())
+            Self::Wgpu(storage) => {
+                let (storage, shape) = c.wgpu_fwd(storage, l)?;
+                Ok((Self::Wgpu(storage), shape))
             }
-            Self::Vulkan(_storage) => Err(Error::Msg(
-                format!("vulkan custom op {} not implemented", c.name()).into(),
-            )
-            .bt()),
+            Self::Vulkan(storage) => {
+                let (storage, shape) = c.vulkan_fwd(storage, l)?;
+                Ok((Self::Vulkan(storage), shape))
+            }
         }
     }
 
@@ -314,13 +315,14 @@ impl Storage {
                 let (s, shape) = c.metal_fwd(s1, l1, s2, l2)?;
                 Ok((Self::Metal(s), shape))
             }
-            (Self::Wgpu(_), Self::Wgpu(_)) => {
-                Err(Error::Msg(format!("wgpu custom op {} not implemented", c.name()).into()).bt())
+            (Self::Wgpu(s1), Self::Wgpu(s2)) => {
+                let (s, shape) = c.wgpu_fwd(s1, l1, s2, l2)?;
+                Ok((Self::Wgpu(s), shape))
             }
-            (Self::Vulkan(_), Self::Vulkan(_)) => Err(Error::Msg(
-                format!("vulkan custom op {} not implemented", c.name()).into(),
-            )
-            .bt()),
+            (Self::Vulkan(s1), Self::Vulkan(s2)) => {
+                let (s, shape) = c.vulkan_fwd(s1, l1, s2, l2)?;
+                Ok((Self::Vulkan(s), shape))
+            }
             _ => unreachable!(),
         }
     }
@@ -349,13 +351,14 @@ impl Storage {
                 let (s, shape) = c.metal_fwd(s1, l1, s2, l2, s3, l3)?;
                 Ok((Self::Metal(s), shape))
             }
-            (Self::Wgpu(_), Self::Wgpu(_), Self::Wgpu(_)) => {
-                Err(Error::Msg(format!("wgpu custom op {} not implemented", c.name()).into()).bt())
+            (Self::Wgpu(s1), Self::Wgpu(s2), Self::Wgpu(s3)) => {
+                let (s, shape) = c.wgpu_fwd(s1, l1, s2, l2, s3, l3)?;
+                Ok((Self::Wgpu(s), shape))
             }
-            (Self::Vulkan(_), Self::Vulkan(_), Self::Vulkan(_)) => Err(Error::Msg(
-                format!("vulkan custom op {} not implemented", c.name()).into(),
-            )
-            .bt()),
+            (Self::Vulkan(s1), Self::Vulkan(s2), Self::Vulkan(s3)) => {
+                let (s, shape) = c.vulkan_fwd(s1, l1, s2, l2, s3, l3)?;
+                Ok((Self::Vulkan(s), shape))
+            }
             _ => unreachable!(),
         }
     }

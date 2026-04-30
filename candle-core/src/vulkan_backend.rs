@@ -111,6 +111,28 @@ struct GgmlSumRowsParams {
     ne0_1l: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GgmlSoftmaxParams {
+    kx: u32,
+    ky: u32,
+    ne00: u32,
+    ne01: u32,
+    ne02: u32,
+    ne12: u32,
+    ne13: u32,
+    nb11: u32,
+    nb12: u32,
+    nb13: u32,
+    scale: f32,
+    max_bias: f32,
+    m0: f32,
+    m1: f32,
+    n_head_log2: u32,
+    nrows_x: u32,
+    has_sinks: u32,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum VulkanError {
     #[error("{0}")]
@@ -986,6 +1008,167 @@ impl VulkanStorage {
         )?;
         Ok(dst)
     }
+
+    fn run_argmax_last_dim(&self, layout: &Layout) -> Result<Self> {
+        if !layout.is_contiguous() || layout.start_offset() != 0 {
+            return Err(unsupported("argmax strided"));
+        }
+        let rank = layout.dims().len();
+        let kx = *layout
+            .dims()
+            .last()
+            .ok_or_else(|| unsupported("argmax scalar"))?;
+        let mut dst_dims_candle = layout.dims().to_vec();
+        dst_dims_candle[rank - 1] = 1;
+        let dst_shape = Shape::from(dst_dims_candle);
+        let rows = dst_shape.elem_count();
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::U32)? };
+        let params = GgmlHeadParams {
+            kx: kx.try_into()?,
+            ky: rows.try_into()?,
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0.0,
+            param4: 0.0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("argmax_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader argmax_f32 not generated".into()).bt())?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            rows.try_into()?,
+            Some((0, self.device.inner.subgroup_size)),
+        )?;
+        Ok(dst)
+    }
+
+    pub fn softmax_last_dim(&self, layout: &Layout) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan softmax").bt());
+        }
+        if !layout.is_contiguous() || layout.start_offset() != 0 {
+            return Err(unsupported("softmax strided"));
+        }
+        let rank = layout.dims().len();
+        if rank == 0 {
+            return Err(unsupported("softmax scalar"));
+        }
+        let (dims, _) = dims4_ggml(layout)?;
+        let count = layout.shape().elem_count();
+        let rows = count / layout.dims()[rank - 1];
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        let params = GgmlSoftmaxParams {
+            kx: dims[0],
+            ky: 0,
+            ne00: dims[0],
+            ne01: dims[1],
+            ne02: dims[2],
+            ne12: 1,
+            ne13: 1,
+            nb11: 0,
+            nb12: 0,
+            nb13: 0,
+            scale: 1.0,
+            max_bias: 0.0,
+            m0: 0.0,
+            m1: 0.0,
+            n_head_log2: 0,
+            nrows_x: rows.try_into()?,
+            has_sinks: 0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("soft_max_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader soft_max_f32 not generated".into()).bt())?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            rows.try_into()?,
+            Some((0, self.device.inner.subgroup_size)),
+        )?;
+        Ok(dst)
+    }
+
+    pub fn rms_norm(
+        &self,
+        layout: &Layout,
+        alpha: &Self,
+        alpha_layout: &Layout,
+        eps: f32,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 || alpha.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan rms_norm").bt());
+        }
+        if !layout.is_contiguous()
+            || layout.start_offset() != 0
+            || !alpha_layout.is_contiguous()
+            || alpha_layout.start_offset() != 0
+        {
+            return Err(unsupported("rms_norm strided"));
+        }
+        let (src_dims, src_strides) = dims4_ggml(layout)?;
+        let (alpha_dims, alpha_strides) = dims4_ggml(alpha_layout)?;
+        let count = layout.shape().elem_count();
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        let dst_strides = contiguous_strides_ggml(src_dims);
+        let params = GgmlBinaryParams {
+            ne: count.try_into()?,
+            ne00: src_dims[0],
+            ne01: src_dims[1],
+            ne02: src_dims[2],
+            ne03: src_dims[3],
+            nb00: src_strides[0],
+            nb01: src_strides[1],
+            nb02: src_strides[2],
+            nb03: src_strides[3],
+            ne10: alpha_dims[0],
+            ne11: alpha_dims[1],
+            ne12: alpha_dims[2],
+            ne13: alpha_dims[3],
+            nb10: alpha_strides[0],
+            nb11: alpha_strides[1],
+            nb12: alpha_strides[2],
+            nb13: alpha_strides[3],
+            ne20: src_dims[0],
+            ne21: src_dims[1],
+            ne22: src_dims[2],
+            ne23: src_dims[3],
+            nb20: dst_strides[0],
+            nb21: dst_strides[1],
+            nb22: dst_strides[2],
+            nb23: dst_strides[3],
+            misalign_offsets: 0,
+            param1: eps,
+            param2: 0.0,
+            param3: 0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(alpha.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("rms_norm_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader rms_norm_f32 not generated".into()).bt())?;
+        let rows = count / layout.dims()[layout.dims().len() - 1];
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            rows.try_into()?,
+            Some((1, 1)),
+        )?;
+        Ok(dst)
+    }
 }
 
 impl Drop for VulkanBuffer {
@@ -1071,30 +1254,43 @@ impl BackendStorage for VulkanStorage {
         if self.dtype != DType::F32 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan powf").bt());
         }
-        let _ = (layout, e);
-        Err(unsupported("powf"))
+        let spirv = candle_vulkan_kernels::spirv("powf_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader powf_f32 not generated".into()).bt())?;
+        self.run_unary_generic_with_params(layout, spirv, e as f32, 0.0)
     }
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
-        if self.dtype != DType::F32 {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan elu").bt());
         }
         if alpha != 1.0 {
             return Err(unsupported("elu alpha"));
         }
-        let spirv = candle_vulkan_kernels::spirv("elu_f32")
-            .ok_or_else(|| Error::Msg("vulkan shader elu_f32 not generated".into()).bt())?;
+        let suffix = match self.dtype {
+            DType::F32 => "f32",
+            DType::F16 => "f16",
+            _ => unreachable!(),
+        };
+        let name = format!("elu_{suffix}");
+        let spirv = candle_vulkan_kernels::spirv(&name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated").into()).bt())?;
         self.run_unary_head(layout, spirv)
     }
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
-        if op != ReduceOp::Sum {
-            return Err(unsupported("reduce"));
-        }
         if self.dtype != DType::F32 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan reduce").bt());
         }
         let rank = layout.dims().len();
-        if rank == 0 || reduce_dims != [rank - 1] {
-            return Err(unsupported("reduce sum non-last-dim"));
+        if rank == 0 {
+            return Err(unsupported("reduce scalar"));
+        }
+        if reduce_dims != [rank - 1] {
+            return Err(unsupported("reduce non-last-dim"));
+        }
+        if op == ReduceOp::ArgMax {
+            return self.run_argmax_last_dim(layout);
+        }
+        if op != ReduceOp::Sum {
+            return Err(unsupported("reduce"));
         }
         self.run_sum_rows(layout)
     }
