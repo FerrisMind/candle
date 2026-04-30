@@ -203,6 +203,26 @@ impl candle::CustomOp1 for Sigmoid {
         Ok((new_storage, layout.shape().clone()))
     }
 
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        storage: &candle::WgpuStorage,
+        layout: &Layout,
+    ) -> Result<(candle::WgpuStorage, Shape)> {
+        let storage = storage.sigmoid(layout)?;
+        Ok((storage, layout.shape().clone()))
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        storage: &candle::VulkanStorage,
+        layout: &Layout,
+    ) -> Result<(candle::VulkanStorage, Shape)> {
+        let storage = storage.sigmoid(layout)?;
+        Ok((storage, layout.shape().clone()))
+    }
+
     fn bwd(&self, _arg: &Tensor, res: &Tensor, grad_res: &Tensor) -> Result<Option<Tensor>> {
         // d/dx sigmoid(x) = (1 - sigmoid(x)) * sigmoid(x)
         let d_dx_sigmoid = res.ones_like()?.sub(res)?.mul(res)?;

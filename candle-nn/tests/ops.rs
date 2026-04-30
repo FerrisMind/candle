@@ -352,6 +352,14 @@ fn rms_norm_wgpu() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires a usable wgpu adapter and driver"]
+#[cfg(feature = "wgpu")]
+fn sigmoid_wgpu() -> Result<()> {
+    let device = Device::new_wgpu(0)?;
+    sigmoid_backend(&device)
+}
+
+#[test]
 #[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn softmax_vulkan() -> Result<()> {
@@ -367,6 +375,14 @@ fn rms_norm_vulkan() -> Result<()> {
     rms_norm_backend(&device)
 }
 
+#[test]
+#[ignore = "requires a usable Vulkan compute device and driver"]
+#[cfg(feature = "vulkan")]
+fn sigmoid_vulkan() -> Result<()> {
+    let device = Device::new_vulkan(0)?;
+    sigmoid_backend(&device)
+}
+
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn softmax_last_dim_backend(device: &Device) -> Result<()> {
     let tensor = Tensor::new(
@@ -380,6 +396,21 @@ fn softmax_last_dim_backend(device: &Device) -> Result<()> {
     assert_eq!(
         candle::test_utils::to_vec2_round(&t, 4)?,
         &[[0.375, 0.125, 0.5], [0.0667, 0.3333, 0.6]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn sigmoid_backend(device: &Device) -> Result<()> {
+    let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
+    let tensor = Tensor::new(data, device)?;
+    let t = candle_nn::ops::sigmoid(&tensor)?;
+    assert_eq!(
+        candle::test_utils::to_vec3_round(&t, 4)?,
+        &[
+            [[0.9526, 0.7311, 0.982], [0.7311, 0.9933, 0.9999]],
+            [[0.8808, 0.7311, 0.9991], [0.9997, 0.8808, 0.9997]]
+        ]
     );
     Ok(())
 }

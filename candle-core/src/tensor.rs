@@ -1176,7 +1176,46 @@ impl Tensor {
 
     /// Clamp the tensor values to be between `min` and `max`.
     pub fn clamp<T1: TensorOrScalar, T2: TensorOrScalar>(&self, min: T1, max: T2) -> Result<Self> {
-        self.maximum(min)?.minimum(max)
+        let min = min.to_tensor_scalar()?;
+        let max = max.to_tensor_scalar()?;
+        if self.dtype() == DType::F32 {
+            if let (
+                crate::scalar::TensorScalar::Scalar(min_t),
+                crate::scalar::TensorScalar::Scalar(max_t),
+            ) = (&min, &max)
+            {
+                let is_wgpu_or_vulkan =
+                    matches!(&*self.storage(), Storage::Wgpu(_) | Storage::Vulkan(_));
+                if is_wgpu_or_vulkan {
+                    let storage = self.storage().clamp(
+                        self.layout(),
+                        min_t.to_scalar::<f32>()?,
+                        max_t.to_scalar::<f32>()?,
+                    )?;
+                    return Ok(from_storage(
+                        storage,
+                        self.shape().clone(),
+                        BackpropOp::none(),
+                        false,
+                    ));
+                }
+            }
+        }
+        let min = match min {
+            crate::scalar::TensorScalar::Tensor(t) => t,
+            crate::scalar::TensorScalar::Scalar(t) => t
+                .to_dtype(self.dtype())?
+                .to_device(self.device())?
+                .broadcast_as(self.shape())?,
+        };
+        let max = match max {
+            crate::scalar::TensorScalar::Tensor(t) => t,
+            crate::scalar::TensorScalar::Scalar(t) => t
+                .to_dtype(self.dtype())?
+                .to_device(self.device())?
+                .broadcast_as(self.shape())?,
+        };
+        self.maximum(&min)?.minimum(&max)
     }
 
     /// Interpolate the input tensor to the `target_size` size, taking the value of the nearest element.
@@ -2816,6 +2855,27 @@ impl Tensor {
         let rank = self.rank();
         if rank == 0 {
             return Ok(self.clone());
+        }
+        if self.dtype() == DType::F32 {
+            let last = rank - 1;
+            let is_wgpu_or_vulkan =
+                matches!(&*self.storage(), Storage::Wgpu(_) | Storage::Vulkan(_));
+            if is_wgpu_or_vulkan {
+                if dim != last {
+                    return self
+                        .transpose(dim, last)?
+                        .contiguous()?
+                        .cumsum(last)?
+                        .transpose(dim, last);
+                }
+                let storage = self.storage().cumsum_last_dim(self.layout())?;
+                return Ok(from_storage(
+                    storage,
+                    self.shape().clone(),
+                    BackpropOp::none(),
+                    false,
+                ));
+            }
         }
         let n_axis = self.dim(dim)?;
         let triu = Tensor::triu2(n_axis, self.dtype(), self.device())?;

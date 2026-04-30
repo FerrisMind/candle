@@ -23,6 +23,14 @@ pub trait BackendStorage: Sized {
 
     fn reduce_op(&self, _: ReduceOp, _: &Layout, _: &[usize]) -> Result<Self>;
 
+    fn cumsum_last_dim(&self, _: &Layout) -> Result<Self> {
+        Err(crate::Error::Msg("backend op cumsum_last_dim not implemented".into()).bt())
+    }
+
+    fn clamp(&self, _: &Layout, _: f32, _: f32) -> Result<Self> {
+        Err(crate::Error::Msg("backend op clamp not implemented".into()).bt())
+    }
+
     fn cmp(&self, _: CmpOp, _: &Self, _: &Layout, _: &Layout) -> Result<Self>;
 
     fn to_dtype(&self, _: &Layout, _: DType) -> Result<Self>;

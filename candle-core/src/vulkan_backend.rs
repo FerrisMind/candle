@@ -430,6 +430,16 @@ impl VulkanDevice {
         push_constants: Option<&[u8]>,
         workgroups: u32,
     ) -> Result<()> {
+        self.run_compute_3d(spirv, bindings, push_constants, (workgroups, 1, 1))
+    }
+
+    fn run_compute_3d(
+        &self,
+        spirv: &[u32],
+        bindings: &[VulkanBinding<'_>],
+        push_constants: Option<&[u8]>,
+        workgroups: (u32, u32, u32),
+    ) -> Result<()> {
         self.run_compute_specialized(spirv, bindings, push_constants, workgroups, None)
     }
 
@@ -438,8 +448,8 @@ impl VulkanDevice {
         spirv: &[u32],
         bindings: &[VulkanBinding<'_>],
         push_constants: Option<&[u8]>,
-        workgroups: u32,
-        specialization_u32: Option<(u32, u32)>,
+        workgroups: (u32, u32, u32),
+        specialization_u32: Option<&[(u32, u32)]>,
     ) -> Result<()> {
         unsafe {
             let shader_info = vk::ShaderModuleCreateInfo::default().code(spirv);
@@ -465,8 +475,8 @@ impl VulkanDevice {
         shader: vk::ShaderModule,
         bindings: &[VulkanBinding<'_>],
         push_constants: Option<&[u8]>,
-        workgroups: u32,
-        specialization_u32: Option<(u32, u32)>,
+        workgroups: (u32, u32, u32),
+        specialization_u32: Option<&[(u32, u32)]>,
     ) -> Result<()> {
         let layout_bindings = bindings
             .iter()
@@ -503,21 +513,25 @@ impl VulkanDevice {
             .create_pipeline_layout(&pipeline_layout_info, None)
             .map_err(Error::wrap)?;
         let entry = CString::new("main").map_err(Error::wrap)?;
-        let spec_entry;
-        let spec_data;
+        let mut spec_entries = Vec::new();
+        let mut spec_data = Vec::new();
         let spec_info;
         let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader)
             .name(&entry);
-        if let Some((constant_id, value)) = specialization_u32 {
-            spec_entry = vk::SpecializationMapEntry::default()
-                .constant_id(constant_id)
-                .offset(0)
-                .size(std::mem::size_of::<u32>());
-            spec_data = value.to_ne_bytes();
+        if let Some(specialization_u32) = specialization_u32 {
+            for (idx, &(constant_id, value)) in specialization_u32.iter().enumerate() {
+                spec_entries.push(
+                    vk::SpecializationMapEntry::default()
+                        .constant_id(constant_id)
+                        .offset((idx * std::mem::size_of::<u32>()) as u32)
+                        .size(std::mem::size_of::<u32>()),
+                );
+                spec_data.extend_from_slice(&value.to_ne_bytes());
+            }
             spec_info = vk::SpecializationInfo::default()
-                .map_entries(std::slice::from_ref(&spec_entry))
+                .map_entries(&spec_entries)
                 .data(&spec_data);
             stage = stage.specialization_info(&spec_info);
         }
@@ -629,7 +643,7 @@ impl VulkanDevice {
         }
         self.inner
             .device
-            .cmd_dispatch(command_buffer, workgroups, 1, 1);
+            .cmd_dispatch(command_buffer, workgroups.0, workgroups.1, workgroups.2);
         self.inner
             .device
             .end_command_buffer(command_buffer)
@@ -1003,8 +1017,8 @@ impl VulkanStorage {
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
-            rows,
-            Some((0, self.device.inner.subgroup_size)),
+            (rows, 1, 1),
+            Some(&[(0, self.device.inner.subgroup_size)]),
         )?;
         Ok(dst)
     }
@@ -1041,8 +1055,54 @@ impl VulkanStorage {
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
-            rows.try_into()?,
-            Some((0, self.device.inner.subgroup_size)),
+            (rows.try_into()?, 1, 1),
+            Some(&[(0, self.device.inner.subgroup_size)]),
+        )?;
+        Ok(dst)
+    }
+
+    fn run_cumsum_last_dim(&self, layout: &Layout) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan cumsum").bt());
+        }
+        if !layout.is_contiguous() || layout.start_offset() > u16::MAX as usize {
+            return Err(unsupported("cumsum strided"));
+        }
+        let (src_dims, src_strides) = dims4_ggml(layout)?;
+        let rows = src_dims[1] * src_dims[2] * src_dims[3];
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        let dst_strides = contiguous_strides_ggml(src_dims);
+        let (ne0_12mp, ne0_12l) = fastdiv_values(src_dims[1] * src_dims[2]);
+        let (ne0_1mp, ne0_1l) = fastdiv_values(src_dims[1]);
+        let params = GgmlSumRowsParams {
+            n_cols: src_dims[0],
+            ne01: src_dims[1],
+            ne02: src_dims[2],
+            nb01: src_strides[1],
+            nb02: src_strides[2],
+            nb03: src_strides[3],
+            nb11: dst_strides[1],
+            nb12: dst_strides[2],
+            nb13: dst_strides[3],
+            weight: 1.0,
+            misalign_offsets: (layout.start_offset() as u32) << 16,
+            ne0_12mp,
+            ne0_12l,
+            ne0_1mp,
+            ne0_1l,
+        };
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("cumsum_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader cumsum_f32 not generated".into()).bt())?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (rows, 1, 1),
+            Some(&[(0, 128), (1, self.device.inner.subgroup_size), (2, 4)]),
         )?;
         Ok(dst)
     }
@@ -1093,8 +1153,8 @@ impl VulkanStorage {
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
-            rows.try_into()?,
-            Some((0, self.device.inner.subgroup_size)),
+            (rows.try_into()?, 1, 1),
+            Some(&[(0, self.device.inner.subgroup_size)]),
         )?;
         Ok(dst)
     }
@@ -1164,8 +1224,102 @@ impl VulkanStorage {
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
-            rows.try_into()?,
-            Some((1, 1)),
+            (rows.try_into()?, 1, 1),
+            Some(&[(1, 1)]),
+        )?;
+        Ok(dst)
+    }
+
+    pub fn sigmoid(&self, layout: &Layout) -> Result<Self> {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan sigmoid").bt());
+        }
+        let (spirv, kind) = unary_spirv("sigmoid", self.dtype)?;
+        match kind {
+            VulkanUnaryKind::Head => self.run_unary_head(layout, spirv),
+            VulkanUnaryKind::Generic => self.run_unary_generic(layout, spirv),
+        }
+    }
+
+    fn run_index_select_f32(
+        &self,
+        ids: &Self,
+        src_l: &Layout,
+        ids_l: &Layout,
+        dim: usize,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan index_select").bt());
+        }
+        if ids.dtype != DType::U32 {
+            return Err(Error::UnsupportedDTypeForOp(ids.dtype, "vulkan index_select ids").bt());
+        }
+        if !src_l.is_contiguous() {
+            return Err(unsupported("index_select strided"));
+        }
+        if src_l.start_offset() > u16::MAX as usize || ids_l.start_offset() > u8::MAX as usize {
+            return Err(unsupported("index_select offset"));
+        }
+        let ids_len = match ids_l.dims() {
+            [ids_len] => *ids_len,
+            _ => return Err(unsupported("index_select ids rank")),
+        };
+        let left_size: usize = src_l.dims()[..dim].iter().product();
+        let right_size: usize = src_l.dims()[dim + 1..].iter().product();
+        let src_dim = src_l.dims()[dim];
+        let mut dst_dims = src_l.dims().to_vec();
+        dst_dims[dim] = ids_len;
+        let dst_shape = Shape::from(dst_dims);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
+        let params = GgmlBinaryParams {
+            ne: (left_size * ids_len * right_size).try_into()?,
+            ne00: right_size.try_into()?,
+            ne01: src_dim.try_into()?,
+            ne02: left_size.try_into()?,
+            ne03: 1,
+            nb00: 1,
+            nb01: right_size.try_into()?,
+            nb02: (src_dim * right_size).try_into()?,
+            nb03: (src_dim * right_size * left_size).try_into()?,
+            ne10: ids_len.try_into()?,
+            ne11: left_size.try_into()?,
+            ne12: 1,
+            ne13: 1,
+            nb10: ids_l.stride()[0].try_into()?,
+            nb11: 0,
+            nb12: 0,
+            nb13: 0,
+            ne20: right_size.try_into()?,
+            ne21: ids_len.try_into()?,
+            ne22: left_size.try_into()?,
+            ne23: 1,
+            nb20: 1,
+            nb21: right_size.try_into()?,
+            nb22: (ids_len * right_size).try_into()?,
+            nb23: (left_size * ids_len * right_size).try_into()?,
+            misalign_offsets: ((src_l.start_offset() as u32) << 16)
+                | ((ids_l.start_offset() as u32) << 8),
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(ids.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("get_rows_f32_f32").ok_or_else(|| {
+            Error::Msg("vulkan shader get_rows_f32_f32 not generated".into()).bt()
+        })?;
+        self.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (
+                right_size.div_ceil(512).try_into()?,
+                ids_len.try_into()?,
+                left_size.try_into()?,
+            ),
         )?;
         Ok(dst)
     }
@@ -1293,6 +1447,17 @@ impl BackendStorage for VulkanStorage {
             return Err(unsupported("reduce"));
         }
         self.run_sum_rows(layout)
+    }
+    fn cumsum_last_dim(&self, layout: &Layout) -> Result<Self> {
+        self.run_cumsum_last_dim(layout)
+    }
+    fn clamp(&self, layout: &Layout, min: f32, max: f32) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan clamp").bt());
+        }
+        let spirv = candle_vulkan_kernels::spirv("clamp_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader clamp_f32 not generated".into()).bt())?;
+        self.run_unary_generic_with_params(layout, spirv, min, max)
     }
     fn cmp(&self, _: CmpOp, _: &Self, _: &Layout, _: &Layout) -> Result<Self> {
         Err(unsupported("cmp"))
@@ -1470,8 +1635,8 @@ impl BackendStorage for VulkanStorage {
     ) -> Result<()> {
         Err(unsupported("scatter_add"))
     }
-    fn index_select(&self, _: &Self, _: &Layout, _: &Layout, _: usize) -> Result<Self> {
-        Err(unsupported("index_select"))
+    fn index_select(&self, ids: &Self, src_l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
+        self.run_index_select_f32(ids, src_l, ids_l, dim)
     }
     fn index_add(
         &self,

@@ -71,11 +71,14 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     smoke_f16_elementwise_ops(device)?;
     smoke_f32_binary_broadcast_and_strided_layout(device)?;
     smoke_strided_contiguous_copy(device)?;
+    smoke_f32_cat_repeat_pad(device)?;
     if device.is_wgpu() {
         smoke_strided_const_set(device)?;
     }
     smoke_f32_sum_last_dim(device)?;
+    smoke_f32_cumsum(device)?;
     smoke_f32_argmax_last_dim(device)?;
+    smoke_f32_index_select(device)?;
     smoke_f32_extended_unary_ops(device)?;
 
     device.synchronize()?;
@@ -301,6 +304,25 @@ fn smoke_strided_contiguous_copy(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_cat_repeat_pad(device: &Device) -> Result<()> {
+    let xs = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (2, 2), device)?;
+    let ys = Tensor::from_slice(&[10.0f32, 20.0, 30.0, 40.0], (2, 2), device)?;
+    assert_eq!(
+        Tensor::cat(&[&xs, &ys], 1)?.to_vec2::<f32>()?,
+        [[1.0, 2.0, 10.0, 20.0], [3.0, 4.0, 30.0, 40.0]]
+    );
+    assert_eq!(
+        xs.repeat((1, 2))?.to_vec2::<f32>()?,
+        [[1.0, 2.0, 1.0, 2.0], [3.0, 4.0, 3.0, 4.0]]
+    );
+    assert_eq!(
+        xs.pad_with_zeros(1, 1, 2)?.to_vec2::<f32>()?,
+        [[0.0, 1.0, 2.0, 0.0, 0.0], [0.0, 3.0, 4.0, 0.0, 0.0]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_strided_const_set(device: &Device) -> Result<()> {
     let xs = Tensor::zeros((2, 3), DType::F32, device)?;
     xs.i((.., 1))?.const_set(7.0f32.into())?;
@@ -338,6 +360,30 @@ fn smoke_f32_sum_last_dim(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_cumsum(device: &Device) -> Result<()> {
+    let xs = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 10.0, 20.0, 30.0], (2, 3), device)?;
+    assert_eq!(
+        xs.cumsum(1)?.to_vec2::<f32>()?,
+        [[1.0, 3.0, 6.0], [10.0, 30.0, 60.0]]
+    );
+    assert_eq!(
+        xs.cumsum(0)?.to_vec2::<f32>()?,
+        [[1.0, 2.0, 3.0], [11.0, 22.0, 33.0]]
+    );
+
+    let ys = Tensor::from_slice(
+        &[1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0],
+        (2, 2, 2),
+        device,
+    )?;
+    assert_eq!(
+        ys.cumsum(2)?.to_vec3::<f32>()?,
+        [[[1.0, 3.0], [3.0, 7.0]], [[10.0, 30.0], [30.0, 70.0]]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_f32_argmax_last_dim(device: &Device) -> Result<()> {
     let xs = Tensor::from_slice(&[1.0f32, 4.0, 2.0, 9.0, 3.0, 5.0], (2, 3), device)?;
     assert_eq!(xs.argmax_keepdim(1)?.to_vec2::<u32>()?, [[1], [0]]);
@@ -350,6 +396,31 @@ fn smoke_f32_argmax_last_dim(device: &Device) -> Result<()> {
     assert_eq!(
         ys.argmax_keepdim(2)?.to_vec3::<u32>()?,
         [[[1], [1]], [[0], [0]]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_index_select(device: &Device) -> Result<()> {
+    let xs = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 10.0, 20.0, 30.0], (2, 3), device)?;
+    let ids = Tensor::from_slice(&[1u32, 0], (2,), device)?;
+    assert_eq!(
+        xs.index_select(&ids, 0)?.to_vec2::<f32>()?,
+        [[10.0, 20.0, 30.0], [1.0, 2.0, 3.0]]
+    );
+    assert_eq!(
+        xs.index_select(&ids, 1)?.to_vec2::<f32>()?,
+        [[2.0, 1.0], [20.0, 10.0]]
+    );
+
+    let ys = Tensor::from_slice(
+        &[1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0],
+        (2, 2, 2),
+        device,
+    )?;
+    assert_eq!(
+        ys.index_select(&ids, 1)?.to_vec3::<f32>()?,
+        [[[3.0, 4.0], [1.0, 2.0]], [[30.0, 40.0], [10.0, 20.0]]]
     );
     Ok(())
 }
@@ -402,6 +473,11 @@ fn smoke_f32_extended_unary_ops(device: &Device) -> Result<()> {
     assert_close(
         &xs.affine(2.0, -0.5)?.to_vec2::<f32>()?,
         &[[0.0, 1.5], [7.5, 17.5]],
+        1e-6,
+    );
+    assert_close(
+        &xs.clamp(0.5f32, 4.5f32)?.to_vec2::<f32>()?,
+        &[[0.5, 1.0], [4.0, 4.5]],
         1e-6,
     );
     assert_close(

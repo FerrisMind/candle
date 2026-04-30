@@ -39,6 +39,7 @@ pub enum DType {
 pub enum UnaryOp {
     Abs,
     Ceil,
+    Clamp,
     Cos,
     Elu,
     Exp,
@@ -82,6 +83,7 @@ impl UnaryOp {
         match self {
             Self::Abs => "ABS",
             Self::Ceil => "CEIL",
+            Self::Clamp => "CLAMP",
             Self::Cos => "COS",
             Self::Elu => "ELU",
             Self::Exp => "EXP",
@@ -159,6 +161,13 @@ pub fn argmax_shader(workgroup_size: u32) -> Option<String> {
     Some(preprocess(source, &defines, &replacements, DType::F32))
 }
 
+pub fn cumsum_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("cumsum.wgsl")?.source();
+    let defines = vec!["WG_SIZE".to_string()];
+    let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
 pub fn softmax_shader(workgroup_size: u32) -> Option<String> {
     let source = get("soft_max.wgsl")?.source();
     let defines = vec!["WG_SIZE".to_string()];
@@ -171,6 +180,21 @@ pub fn rms_norm_mul_shader(workgroup_size: u32) -> Option<String> {
     let defines = vec!["WG_SIZE".to_string()];
     let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
     Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
+pub fn get_rows_f32_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("get_rows.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let defines = vec!["F32".to_string()];
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        ("BLOCK_SIZE".to_string(), "1".to_string()),
+        ("SRC_TYPE".to_string(), "f32".to_string()),
+        ("DST_TYPE".to_string(), "f32".to_string()),
+    ];
+    Some(preprocess(&source, &defines, &replacements, DType::F32))
 }
 
 pub fn fill_inplace_shader(dtype: DType, workgroup_size: u32) -> String {

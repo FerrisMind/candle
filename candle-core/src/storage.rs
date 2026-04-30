@@ -244,6 +244,56 @@ impl Storage {
         }
     }
 
+    pub(crate) fn cumsum_last_dim(&self, layout: &Layout) -> Result<Self> {
+        match self {
+            Storage::Cpu(storage) => {
+                let storage = storage.cumsum_last_dim(layout)?;
+                Ok(Self::Cpu(storage))
+            }
+            Self::Cuda(storage) => {
+                let storage = storage.cumsum_last_dim(layout)?;
+                Ok(Self::Cuda(storage))
+            }
+            Self::Metal(storage) => {
+                let storage = storage.cumsum_last_dim(layout)?;
+                Ok(Self::Metal(storage))
+            }
+            Self::Wgpu(storage) => {
+                let storage = storage.cumsum_last_dim(layout)?;
+                Ok(Self::Wgpu(storage))
+            }
+            Self::Vulkan(storage) => {
+                let storage = storage.cumsum_last_dim(layout)?;
+                Ok(Self::Vulkan(storage))
+            }
+        }
+    }
+
+    pub(crate) fn clamp(&self, layout: &Layout, min: f32, max: f32) -> Result<Self> {
+        match self {
+            Storage::Cpu(storage) => {
+                let storage = storage.clamp(layout, min, max)?;
+                Ok(Self::Cpu(storage))
+            }
+            Self::Cuda(storage) => {
+                let storage = storage.clamp(layout, min, max)?;
+                Ok(Self::Cuda(storage))
+            }
+            Self::Metal(storage) => {
+                let storage = storage.clamp(layout, min, max)?;
+                Ok(Self::Metal(storage))
+            }
+            Self::Wgpu(storage) => {
+                let storage = storage.clamp(layout, min, max)?;
+                Ok(Self::Wgpu(storage))
+            }
+            Self::Vulkan(storage) => {
+                let storage = storage.clamp(layout, min, max)?;
+                Ok(Self::Vulkan(storage))
+            }
+        }
+    }
+
     pub(crate) fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
         match self {
             Storage::Cpu(storage) => {
