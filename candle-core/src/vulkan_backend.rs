@@ -54,6 +54,43 @@ struct GgmlBinaryParams {
     param3: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GgmlUnaryParams {
+    ne: u32,
+    ne00: u32,
+    ne01: u32,
+    ne02: u32,
+    ne03: u32,
+    nb00: u32,
+    nb01: u32,
+    nb02: u32,
+    nb03: u32,
+    ne10: u32,
+    ne11: u32,
+    ne12: u32,
+    ne13: u32,
+    nb10: u32,
+    nb11: u32,
+    nb12: u32,
+    nb13: u32,
+    misalign_offsets: u32,
+    param1: f32,
+    param2: f32,
+    ne0_012mp: u32,
+    ne0_012l: u32,
+    ne0_01mp: u32,
+    ne0_01l: u32,
+    ne0_0mp: u32,
+    ne0_0l: u32,
+    ne1_012mp: u32,
+    ne1_012l: u32,
+    ne1_01mp: u32,
+    ne1_01l: u32,
+    ne1_0mp: u32,
+    ne1_0l: u32,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum VulkanError {
     #[error("{0}")]
@@ -79,7 +116,7 @@ struct VulkanInner {
     device: ash::Device,
     queue_family_index: u32,
     queue: vk::Queue,
-    allocator: Mutex<Allocator>,
+    allocator: Mutex<Option<Allocator>>,
 }
 
 impl std::fmt::Debug for VulkanInner {
@@ -242,11 +279,15 @@ impl VulkanDevice {
         let buffer =
             unsafe { self.inner.device.create_buffer(&info, None) }.map_err(Error::wrap)?;
         let requirements = unsafe { self.inner.device.get_buffer_memory_requirements(buffer) };
-        let allocation = self
+        let mut allocator = self
             .inner
             .allocator
             .lock()
-            .map_err(|e| Error::wrap(e.to_string()))?
+            .map_err(|e| Error::wrap(e.to_string()))?;
+        let allocator = allocator
+            .as_mut()
+            .ok_or_else(|| Error::msg("vulkan allocator already dropped"))?;
+        let allocation = allocator
             .allocate(&AllocationCreateDesc {
                 name,
                 requirements,
@@ -566,39 +607,69 @@ impl VulkanBinding<'_> {
     }
 }
 
-fn dims4(layout: &Layout) -> Result<([u32; 4], [u32; 4])> {
+fn dims4_ggml(layout: &Layout) -> Result<([u32; 4], [u32; 4])> {
     if layout.dims().len() > 4 {
         crate::bail!("vulkan backend supports up to rank-4 tensors for this op")
     }
     let mut dims = [1u32; 4];
     let mut strides = [0u32; 4];
-    for (idx, dim) in layout.dims().iter().enumerate() {
+    for (idx, dim) in layout.dims().iter().rev().enumerate() {
         dims[idx] = (*dim).try_into()?;
     }
-    for (idx, stride) in layout.stride().iter().enumerate() {
+    for (idx, stride) in layout.stride().iter().rev().enumerate() {
         strides[idx] = (*stride).try_into()?;
     }
     Ok((dims, strides))
 }
 
-fn unary_spirv(op: &str) -> Result<&'static [u32]> {
+fn contiguous_strides_ggml(dims: [u32; 4]) -> [u32; 4] {
+    [1, dims[0], dims[0] * dims[1], dims[0] * dims[1] * dims[2]]
+}
+
+fn fastdiv_values(d: u32) -> (u32, u32) {
+    let d = d.max(1);
+    let mut l = 0u32;
+    while l < 32 && (1u32 << l) < d {
+        l += 1;
+    }
+    let mp = (((1u64 << 32) * ((1u64 << l) - u64::from(d))) / u64::from(d) + 1) as u32;
+    (mp, l)
+}
+
+#[derive(Clone, Copy)]
+enum VulkanUnaryKind {
+    Head,
+    Generic,
+}
+
+fn unary_spirv(op: &str) -> Result<(&'static [u32], VulkanUnaryKind)> {
     let name = match op {
         "abs" => "abs_f32",
         "ceil" => "ceil_f32",
+        "cos" => "cos_f32",
         "exp" => "exp_f32",
         "floor" => "floor_f32",
         "gelu" => "gelu_f32",
         "gelu_erf" => "gelu_erf_f32",
+        "log" => "log_f32",
         "neg" => "neg_f32",
         "relu" => "relu_f32",
         "round" => "round_f32",
         "sign" => "sgn_f32",
         "silu" => "silu_f32",
+        "sin" => "sin_f32",
+        "sqr" => "sqr_f32",
+        "sqrt" => "sqrt_f32",
         "tanh" => "tanh_f32",
         _ => return Err(unsupported("unary")),
     };
-    candle_vulkan_kernels::spirv(name)
-        .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated").into()).bt())
+    let kind = match op {
+        "cos" | "log" | "sin" | "sqr" | "sqrt" => VulkanUnaryKind::Generic,
+        _ => VulkanUnaryKind::Head,
+    };
+    let spirv = candle_vulkan_kernels::spirv(name)
+        .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated").into()).bt())?;
+    Ok((spirv, kind))
 }
 
 fn binary_spirv(op: &str) -> Result<&'static [u32]> {
@@ -614,7 +685,7 @@ fn binary_spirv(op: &str) -> Result<&'static [u32]> {
 }
 
 impl VulkanStorage {
-    fn run_unary_like(&self, layout: &Layout, spirv: &[u32]) -> Result<Self> {
+    fn run_unary_head(&self, layout: &Layout, spirv: &[u32]) -> Result<Self> {
         if !layout.is_contiguous() || layout.start_offset() != 0 {
             return Err(unsupported("unary strided"));
         }
@@ -637,20 +708,81 @@ impl VulkanStorage {
             .run_compute(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
         Ok(dst)
     }
+
+    fn run_unary_generic(&self, layout: &Layout, spirv: &[u32]) -> Result<Self> {
+        if layout.start_offset() != 0 {
+            return Err(unsupported("unary offset"));
+        }
+        let count = layout.shape().elem_count();
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        let (src_dims, src_strides) = dims4_ggml(layout)?;
+        let dst_dims = src_dims;
+        let dst_strides = contiguous_strides_ggml(dst_dims);
+        let (ne0_012mp, ne0_012l) = fastdiv_values(src_dims[2] * src_dims[1] * src_dims[0]);
+        let (ne0_01mp, ne0_01l) = fastdiv_values(src_dims[1] * src_dims[0]);
+        let (ne0_0mp, ne0_0l) = fastdiv_values(src_dims[0]);
+        let (ne1_012mp, ne1_012l) = fastdiv_values(dst_dims[2] * dst_dims[1] * dst_dims[0]);
+        let (ne1_01mp, ne1_01l) = fastdiv_values(dst_dims[1] * dst_dims[0]);
+        let (ne1_0mp, ne1_0l) = fastdiv_values(dst_dims[0]);
+        let params = GgmlUnaryParams {
+            ne: count.try_into()?,
+            ne00: src_dims[0],
+            ne01: src_dims[1],
+            ne02: src_dims[2],
+            ne03: src_dims[3],
+            nb00: src_strides[0],
+            nb01: src_strides[1],
+            nb02: src_strides[2],
+            nb03: src_strides[3],
+            ne10: dst_dims[0],
+            ne11: dst_dims[1],
+            ne12: dst_dims[2],
+            ne13: dst_dims[3],
+            nb10: dst_strides[0],
+            nb11: dst_strides[1],
+            nb12: dst_strides[2],
+            nb13: dst_strides[3],
+            misalign_offsets: 0,
+            param1: 0.0,
+            param2: 0.0,
+            ne0_012mp,
+            ne0_012l,
+            ne0_01mp,
+            ne0_01l,
+            ne0_0mp,
+            ne0_0l,
+            ne1_012mp,
+            ne1_012l,
+            ne1_01mp,
+            ne1_01l,
+            ne1_0mp,
+            ne1_0l,
+        };
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let workgroups = (count as u32).div_ceil(512);
+        self.device
+            .run_compute(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+        Ok(dst)
+    }
 }
 
 impl Drop for VulkanBuffer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.inner.device.device_wait_idle();
+            self.device.inner.device.destroy_buffer(self.buffer, None);
             if let Ok(mut allocation) = self.allocation.lock() {
                 if let Some(allocation) = allocation.take() {
                     if let Ok(mut allocator) = self.device.inner.allocator.lock() {
-                        let _ = allocator.free(allocation);
+                        if let Some(allocator) = allocator.as_mut() {
+                            let _ = allocator.free(allocation);
+                        }
                     }
                 }
             }
-            self.device.inner.device.destroy_buffer(self.buffer, None);
         }
     }
 }
@@ -659,6 +791,9 @@ impl Drop for VulkanInner {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Ok(mut allocator) = self.allocator.lock() {
+                let _ = allocator.take();
+            }
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -725,7 +860,7 @@ impl BackendStorage for VulkanStorage {
         }
         let spirv = candle_vulkan_kernels::spirv("elu_f32")
             .ok_or_else(|| Error::Msg("vulkan shader elu_f32 not generated".into()).bt())?;
-        self.run_unary_like(layout, spirv)
+        self.run_unary_head(layout, spirv)
     }
     fn reduce_op(&self, _: ReduceOp, _: &Layout, _: &[usize]) -> Result<Self> {
         Err(unsupported("reduce"))
@@ -740,8 +875,11 @@ impl BackendStorage for VulkanStorage {
         if self.dtype != DType::F32 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan unary").bt());
         }
-        let spirv = unary_spirv(B::NAME)?;
-        self.run_unary_like(layout, &spirv)
+        let (spirv, kind) = unary_spirv(B::NAME)?;
+        match kind {
+            VulkanUnaryKind::Head => self.run_unary_head(layout, spirv),
+            VulkanUnaryKind::Generic => self.run_unary_generic(layout, spirv),
+        }
     }
     fn binary_impl<B: BinaryOpT>(
         &self,
@@ -766,8 +904,8 @@ impl BackendStorage for VulkanStorage {
         if lhs_layout.start_offset() != 0 || rhs_layout.start_offset() != 0 {
             return Err(unsupported("binary offset"));
         }
-        let (lhs_dims, lhs_strides) = dims4(lhs_layout)?;
-        let (rhs_dims, rhs_strides) = dims4(rhs_layout)?;
+        let (lhs_dims, lhs_strides) = dims4_ggml(lhs_layout)?;
+        let (rhs_dims, rhs_strides) = dims4_ggml(rhs_layout)?;
         let count = lhs_layout.shape().elem_count();
         let dst = unsafe { self.device.alloc_uninit(lhs_layout.shape(), self.dtype)? };
         let params = GgmlBinaryParams {
@@ -1058,7 +1196,7 @@ impl BackendDevice for VulkanDevice {
                 device,
                 queue_family_index,
                 queue,
-                allocator: Mutex::new(allocator),
+                allocator: Mutex::new(Some(allocator)),
             }),
         })
     }

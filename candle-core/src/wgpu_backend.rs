@@ -310,10 +310,10 @@ fn dims4(layout: &Layout) -> Result<([u32; 4], [u32; 4])> {
     }
     let mut dims = [1u32; 4];
     let mut strides = [0u32; 4];
-    for (idx, dim) in layout.dims().iter().enumerate() {
+    for (idx, dim) in layout.dims().iter().rev().enumerate() {
         dims[idx] = (*dim).try_into()?;
     }
-    for (idx, stride) in layout.stride().iter().enumerate() {
+    for (idx, stride) in layout.stride().iter().rev().enumerate() {
         strides[idx] = (*stride).try_into()?;
     }
     Ok((dims, strides))
@@ -548,7 +548,7 @@ impl WgpuStorage {
             .queue
             .write_buffer(&param_buffer, 0, any_as_bytes(&params));
         let entries = [
-            storage_entry(0, true),
+            storage_entry(0, false),
             storage_entry(1, false),
             uniform_entry(2),
         ];
@@ -708,8 +708,8 @@ impl BackendStorage for WgpuStorage {
             .queue
             .write_buffer(&param_buffer, 0, any_as_bytes(&params));
         let entries = [
-            storage_entry(0, true),
-            storage_entry(1, true),
+            storage_entry(0, false),
+            storage_entry(1, false),
             storage_entry(2, false),
             uniform_entry(3),
         ];

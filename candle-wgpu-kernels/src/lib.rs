@@ -97,7 +97,7 @@ impl UnaryOp {
             Self::Silu => "SILU",
             Self::Sin => "SIN",
             Self::Sqrt => "SQRT",
-            Self::Square => "SQUARE",
+            Self::Square => "SQR",
             Self::Step => "STEP",
             Self::Tanh => "TANH",
         }
