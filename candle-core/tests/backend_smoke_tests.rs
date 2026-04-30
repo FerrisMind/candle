@@ -48,7 +48,6 @@ fn backend_smoke_vulkan_f32_upload_unary_binary_roundtrip() -> Result<()> {
 
     smoke_f32_upload_unary_binary_roundtrip(&device)?;
     smoke_i32_to_f32_dtype_conversion(&device)?;
-    smoke_vulkan_f16_dtype_conversion(&device)?;
     smoke_unsupported_matmul_is_explicit(&device, "vulkan backend op matmul not implemented")?;
     Ok(())
 }
@@ -68,7 +67,10 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
 
     smoke_non_f32_upload_download(device)?;
     smoke_f32_to_i32_dtype_conversion(device)?;
+    smoke_f32_f16_dtype_conversion(device)?;
+    smoke_f16_elementwise_ops(device)?;
     smoke_f32_binary_broadcast_and_strided_layout(device)?;
+    smoke_strided_contiguous_copy(device)?;
     smoke_f32_sum_last_dim(device)?;
     smoke_f32_extended_unary_ops(device)?;
 
@@ -153,8 +155,8 @@ fn smoke_i32_to_f32_dtype_conversion(device: &Device) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "vulkan")]
-fn smoke_vulkan_f16_dtype_conversion(device: &Device) -> Result<()> {
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_f16_dtype_conversion(device: &Device) -> Result<()> {
     let xs = Tensor::from_slice(&[0.5f32, -1.5, 3.0, 4.25], (2, 2), device)?;
     assert_eq!(
         xs.to_dtype(DType::F16)?.to_vec2::<f16>()?,
@@ -173,6 +175,74 @@ fn smoke_vulkan_f16_dtype_conversion(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f16_elementwise_ops(device: &Device) -> Result<()> {
+    let xs = Tensor::from_slice(
+        &[
+            f16::from_f32(0.25),
+            f16::from_f32(1.0),
+            f16::from_f32(-2.0),
+            f16::from_f32(4.0),
+        ],
+        (2, 2),
+        device,
+    )?;
+
+    assert_close(
+        &xs.relu()?.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+        &[[0.25, 1.0], [0.0, 4.0]],
+        1e-3,
+    );
+    assert_close(
+        &xs.neg()?.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+        &[[-0.25, -1.0], [2.0, -4.0]],
+        1e-3,
+    );
+
+    let ys = Tensor::from_slice(
+        &[
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+            f16::from_f32(3.0),
+            f16::from_f32(4.0),
+        ],
+        (2, 2),
+        device,
+    )?;
+    assert_close(
+        &xs.add(&ys)?.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+        &[[1.25, 3.0], [1.0, 8.0]],
+        1e-3,
+    );
+    assert_close(
+        &xs.mul(&ys)?.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+        &[[0.25, 2.0], [-6.0, 16.0]],
+        1e-3,
+    );
+
+    let positive = Tensor::from_slice(
+        &[
+            f16::from_f32(0.25),
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+            f16::from_f32(4.0),
+        ],
+        (2, 2),
+        device,
+    )?;
+    assert_close(
+        &positive
+            .log()?
+            .exp()?
+            .to_dtype(DType::F32)?
+            .to_vec2::<f32>()?,
+        &[[0.25, 1.0], [2.0, 4.0]],
+        3e-3,
+    );
+
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_f32_binary_broadcast_and_strided_layout(device: &Device) -> Result<()> {
     let lhs = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), device)?;
     let rhs = Tensor::from_slice(&[10.0f32, 20.0, 30.0], (1, 3), device)?;
@@ -186,6 +256,37 @@ fn smoke_f32_binary_broadcast_and_strided_layout(device: &Device) -> Result<()> 
     assert_eq!(
         transposed.broadcast_add(&row)?.to_vec2::<f32>()?,
         [[11.0, 24.0], [12.0, 25.0], [13.0, 26.0]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_strided_contiguous_copy(device: &Device) -> Result<()> {
+    let xs = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), device)?;
+    assert_eq!(
+        xs.t()?.contiguous()?.to_vec2::<f32>()?,
+        [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]]
+    );
+
+    let halves = Tensor::from_slice(
+        &[
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+            f16::from_f32(3.0),
+            f16::from_f32(4.0),
+            f16::from_f32(5.0),
+            f16::from_f32(6.0),
+        ],
+        (2, 3),
+        device,
+    )?;
+    assert_eq!(
+        halves.t()?.contiguous()?.to_vec2::<f16>()?,
+        [
+            [f16::from_f32(1.0), f16::from_f32(4.0)],
+            [f16::from_f32(2.0), f16::from_f32(5.0)],
+            [f16::from_f32(3.0), f16::from_f32(6.0)]
+        ]
     );
     Ok(())
 }

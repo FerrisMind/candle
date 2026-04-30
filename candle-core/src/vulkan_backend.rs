@@ -696,45 +696,61 @@ enum VulkanUnaryKind {
     Generic,
 }
 
-fn unary_spirv(op: &str) -> Result<(&'static [u32], VulkanUnaryKind)> {
-    let name = match op {
-        "abs" => "abs_f32",
-        "ceil" => "ceil_f32",
-        "cos" => "cos_f32",
-        "exp" => "exp_f32",
-        "floor" => "floor_f32",
-        "gelu" => "gelu_f32",
-        "gelu_erf" => "gelu_erf_f32",
-        "log" => "log_f32",
-        "neg" => "neg_f32",
-        "relu" => "relu_f32",
-        "round" => "round_f32",
-        "sign" => "sgn_f32",
-        "silu" => "silu_f32",
-        "sin" => "sin_f32",
-        "sqr" => "sqr_f32",
-        "sqrt" => "sqrt_f32",
-        "tanh" => "tanh_f32",
+fn unary_spirv(op: &str, dtype: DType) -> Result<(&'static [u32], VulkanUnaryKind)> {
+    let suffix = match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        _ => return Err(Error::UnsupportedDTypeForOp(dtype, "vulkan unary").bt()),
+    };
+    let stem = match op {
+        "abs" => "abs",
+        "ceil" => "ceil",
+        "cos" if dtype == DType::F32 => "cos",
+        "exp" => "exp",
+        "floor" => "floor",
+        "gelu" => "gelu",
+        "gelu_erf" => "gelu_erf",
+        "gelu_quick" => "gelu_quick",
+        "hardsigmoid" => "hardsigmoid",
+        "hardswish" => "hardswish",
+        "log" => "log",
+        "neg" => "neg",
+        "relu" => "relu",
+        "round" => "round",
+        "sign" => "sgn",
+        "sigmoid" => "sigmoid",
+        "silu" => "silu",
+        "sin" if dtype == DType::F32 => "sin",
+        "sqr" if dtype == DType::F32 => "sqr",
+        "sqrt" if dtype == DType::F32 => "sqrt",
+        "tanh" => "tanh",
         _ => return Err(unsupported("unary")),
     };
+    let name = format!("{stem}_{suffix}");
     let kind = match op {
         "cos" | "log" | "sin" | "sqr" | "sqrt" => VulkanUnaryKind::Generic,
         _ => VulkanUnaryKind::Head,
     };
-    let spirv = candle_vulkan_kernels::spirv(name)
+    let spirv = candle_vulkan_kernels::spirv(&name)
         .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated").into()).bt())?;
     Ok((spirv, kind))
 }
 
-fn binary_spirv(op: &str) -> Result<&'static [u32]> {
-    let name = match op {
-        "add" => "add_f32_f32_f32",
-        "div" => "div_f32_f32_f32",
-        "mul" => "mul_f32_f32_f32",
-        "sub" => "sub_f32_f32_f32",
+fn binary_spirv(op: &str, dtype: DType) -> Result<&'static [u32]> {
+    let suffix = match dtype {
+        DType::F32 => "f32_f32_f32",
+        DType::F16 => "f16_f16_f16",
+        _ => return Err(Error::UnsupportedDTypeForOp(dtype, "vulkan binary").bt()),
+    };
+    let stem = match op {
+        "add" => "add",
+        "div" => "div",
+        "mul" => "mul",
+        "sub" => "sub",
         _ => return Err(unsupported("binary")),
     };
-    candle_vulkan_kernels::spirv(name)
+    let name = format!("{stem}_{suffix}");
+    candle_vulkan_kernels::spirv(&name)
         .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated").into()).bt())
 }
 
@@ -855,6 +871,70 @@ impl VulkanStorage {
 
     fn run_unary_generic(&self, layout: &Layout, spirv: &[u32]) -> Result<Self> {
         self.run_unary_generic_with_params(layout, spirv, 0.0, 0.0)
+    }
+
+    fn run_copy_into(
+        &self,
+        layout: &Layout,
+        dst: &Self,
+        dst_offset: usize,
+        spirv: &[u32],
+    ) -> Result<()> {
+        if layout.start_offset() > u16::MAX as usize || dst_offset > u16::MAX as usize {
+            return Err(unsupported("copy_strided_src_offset"));
+        }
+        let count = layout.shape().elem_count();
+        let (src_dims, src_strides) = dims4_ggml(layout)?;
+        let dst_dims = src_dims;
+        let dst_strides = contiguous_strides_ggml(dst_dims);
+        let (ne0_012mp, ne0_012l) = fastdiv_values(src_dims[0] * src_dims[1] * src_dims[2]);
+        let (ne0_01mp, ne0_01l) = fastdiv_values(src_dims[0] * src_dims[1]);
+        let (ne0_0mp, ne0_0l) = fastdiv_values(src_dims[0]);
+        let (ne1_012mp, ne1_012l) = fastdiv_values(dst_dims[0] * dst_dims[1] * dst_dims[2]);
+        let (ne1_01mp, ne1_01l) = fastdiv_values(dst_dims[0] * dst_dims[1]);
+        let (ne1_0mp, ne1_0l) = fastdiv_values(dst_dims[0]);
+        let params = GgmlUnaryParams {
+            ne: count.try_into()?,
+            ne00: src_dims[0],
+            ne01: src_dims[1],
+            ne02: src_dims[2],
+            ne03: src_dims[3],
+            nb00: src_strides[0],
+            nb01: src_strides[1],
+            nb02: src_strides[2],
+            nb03: src_strides[3],
+            ne10: dst_dims[0],
+            ne11: dst_dims[1],
+            ne12: dst_dims[2],
+            ne13: dst_dims[3],
+            nb10: dst_strides[0],
+            nb11: dst_strides[1],
+            nb12: dst_strides[2],
+            nb13: dst_strides[3],
+            misalign_offsets: ((layout.start_offset() as u32) << 16) | dst_offset as u32,
+            param1: 0.0,
+            param2: 0.0,
+            ne0_012mp,
+            ne0_012l,
+            ne0_01mp,
+            ne0_01l,
+            ne0_0mp,
+            ne0_0l,
+            ne1_012mp,
+            ne1_012l,
+            ne1_01mp,
+            ne1_01l,
+            ne1_0mp,
+            ne1_0l,
+        };
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let workgroups = (count as u32).div_ceil(512);
+        self.device
+            .run_compute(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+        Ok(())
     }
 
     fn run_sum_rows(&self, layout: &Layout) -> Result<Self> {
@@ -1026,10 +1106,10 @@ impl BackendStorage for VulkanStorage {
         self.run_unary_generic_with_params_dtype(layout, spirv, 0.0, 0.0, dtype)
     }
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
-        if self.dtype != DType::F32 {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan unary").bt());
         }
-        let (spirv, kind) = unary_spirv(B::NAME)?;
+        let (spirv, kind) = unary_spirv(B::NAME, self.dtype)?;
         match kind {
             VulkanUnaryKind::Head => self.run_unary_head(layout, spirv),
             VulkanUnaryKind::Generic => self.run_unary_generic(layout, spirv),
@@ -1041,8 +1121,11 @@ impl BackendStorage for VulkanStorage {
         lhs_layout: &Layout,
         rhs_layout: &Layout,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 || rhs.dtype != DType::F32 {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan binary").bt());
+        }
+        if rhs.dtype != self.dtype {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan binary").bt());
         }
         self.device
             .same_device(&rhs.device)
@@ -1098,7 +1181,7 @@ impl BackendStorage for VulkanStorage {
             VulkanBinding::Storage(rhs.buffer.as_ref()),
             VulkanBinding::Storage(dst.buffer.as_ref()),
         ];
-        let spirv = binary_spirv(B::NAME)?;
+        let spirv = binary_spirv(B::NAME, self.dtype)?;
         let workgroups = (count as u32).div_ceil(512);
         self.device
             .run_compute(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
@@ -1224,7 +1307,13 @@ impl BackendStorage for VulkanStorage {
             )
         }
         if !src_l.is_contiguous() {
-            return Err(unsupported("copy_strided_src_non_contiguous"));
+            match self.dtype {
+                DType::F32 | DType::F16 => {
+                    let spirv = copy_spirv(self.dtype, self.dtype)?;
+                    return self.run_copy_into(src_l, dst, dst_offset, spirv);
+                }
+                _ => return Err(unsupported("copy_strided_src_non_contiguous")),
+            }
         }
         let elem_size = self.dtype.size_in_bytes();
         if elem_size == 0 {

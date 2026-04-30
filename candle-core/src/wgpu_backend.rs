@@ -104,6 +104,7 @@ struct WgpuInner {
     ordinal: usize,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    features: wgpu::Features,
 }
 
 #[derive(Debug, Clone)]
@@ -358,8 +359,19 @@ fn contiguous_strides(dims: [u32; 4]) -> [u32; 4] {
     [1, dims[0], dims[0] * dims[1], dims[0] * dims[1] * dims[2]]
 }
 
-fn unary_shader(op: &str) -> Result<String> {
+fn wgpu_kernel_dtype(dtype: DType) -> Result<candle_wgpu_kernels::DType> {
+    match dtype {
+        DType::F32 => Ok(candle_wgpu_kernels::DType::F32),
+        DType::F16 => Ok(candle_wgpu_kernels::DType::F16),
+        _ => Err(Error::UnsupportedDTypeForOp(dtype, "wgpu shader").bt()),
+    }
+}
+
+fn unary_shader(op: &str, dtype: DType) -> Result<String> {
     if op == "recip" {
+        if dtype != DType::F32 {
+            return Err(unsupported("unary recip f16"));
+        }
         return Ok(custom_unary_wgsl("1.0 / x"));
     }
     let op = match op {
@@ -385,16 +397,22 @@ fn unary_shader(op: &str) -> Result<String> {
     };
     Ok(candle_wgpu_kernels::shader(
         candle_wgpu_kernels::ShaderOp::Unary(op),
-        candle_wgpu_kernels::DType::F32,
+        wgpu_kernel_dtype(dtype)?,
         WG_SIZE,
     ))
 }
 
-fn binary_shader(op: &str) -> Result<String> {
+fn binary_shader(op: &str, dtype: DType) -> Result<String> {
     if op == "maximum" {
+        if dtype != DType::F32 {
+            return Err(unsupported("binary maximum f16"));
+        }
         return Ok(custom_binary_wgsl("max(a, b)"));
     }
     if op == "minimum" {
+        if dtype != DType::F32 {
+            return Err(unsupported("binary minimum f16"));
+        }
         return Ok(custom_binary_wgsl("min(a, b)"));
     }
     let op = match op {
@@ -406,7 +424,7 @@ fn binary_shader(op: &str) -> Result<String> {
     };
     Ok(candle_wgpu_kernels::shader(
         candle_wgpu_kernels::ShaderOp::Binary(op),
-        candle_wgpu_kernels::DType::F32,
+        wgpu_kernel_dtype(dtype)?,
         WG_SIZE,
     ))
 }
@@ -414,7 +432,10 @@ fn binary_shader(op: &str) -> Result<String> {
 fn copy_shader(src: DType, dst: DType) -> Result<String> {
     let defines = match (src, dst) {
         (DType::F32, DType::F32) => ["SRC_F32", "DST_F32"],
+        (DType::F32, DType::F16) => ["SRC_F32", "DST_F16"],
         (DType::F32, DType::I32) => ["SRC_F32", "DST_I32"],
+        (DType::F16, DType::F32) => ["SRC_F16", "DST_F32"],
+        (DType::F16, DType::F16) => ["SRC_F16", "DST_F16"],
         _ => return Err(unsupported("to_dtype")),
     };
     let source = candle_wgpu_kernels::get("cpy.wgsl")
@@ -663,14 +684,25 @@ impl WgpuStorage {
     }
 
     fn run_copy_to_dtype(&self, layout: &Layout, dtype: DType, shader: &str) -> Result<Self> {
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), dtype)? };
+        self.run_copy_into(layout, &dst, 0, shader)?;
+        Ok(dst)
+    }
+
+    fn run_copy_into(
+        &self,
+        layout: &Layout,
+        dst: &Self,
+        dst_offset: usize,
+        shader: &str,
+    ) -> Result<()> {
         let (src_dims, src_strides) = dims4(layout)?;
         let dst_strides = contiguous_strides(src_dims);
         let count = layout.shape().elem_count();
-        let dst = unsafe { self.device.alloc_uninit(layout.shape(), dtype)? };
         let params = CopyParams {
             ne: count.try_into()?,
             offset_src: layout.start_offset().try_into()?,
-            offset_dst: 0,
+            offset_dst: dst_offset.try_into()?,
             stride_src0: src_strides[0],
             stride_src1: src_strides[1],
             stride_src2: src_strides[2],
@@ -713,7 +745,7 @@ impl WgpuStorage {
         let workgroups = (count as u32).div_ceil(WG_SIZE);
         self.device
             .run_compute(shader, &entries, &bindings, workgroups, "candle-wgpu-copy")?;
-        Ok(dst)
+        Ok(())
     }
 }
 
@@ -853,7 +885,20 @@ impl BackendStorage for WgpuStorage {
     }
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
         match (self.dtype, dtype) {
-            (DType::F32, DType::F32) | (DType::F32, DType::I32) => {
+            (DType::F32, DType::F16) | (DType::F16, DType::F32) | (DType::F16, DType::F16)
+                if !self
+                    .device
+                    .inner
+                    .features
+                    .contains(wgpu::Features::SHADER_F16) =>
+            {
+                Err(unsupported("to_dtype f16"))
+            }
+            (DType::F32, DType::F32)
+            | (DType::F32, DType::F16)
+            | (DType::F32, DType::I32)
+            | (DType::F16, DType::F32)
+            | (DType::F16, DType::F16) => {
                 let shader = copy_shader(self.dtype, dtype)?;
                 self.run_copy_to_dtype(layout, dtype, &shader)
             }
@@ -861,10 +906,19 @@ impl BackendStorage for WgpuStorage {
         }
     }
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
-        if self.dtype != DType::F32 {
+        if self.dtype == DType::F16
+            && !self
+                .device
+                .inner
+                .features
+                .contains(wgpu::Features::SHADER_F16)
+        {
+            return Err(unsupported("unary f16"));
+        }
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu unary").bt());
         }
-        let shader = unary_shader(B::NAME)?;
+        let shader = unary_shader(B::NAME, self.dtype)?;
         self.run_unary_like(layout, &shader, "candle-wgpu-unary")
     }
     fn binary_impl<B: BinaryOpT>(
@@ -873,8 +927,20 @@ impl BackendStorage for WgpuStorage {
         lhs_layout: &Layout,
         rhs_layout: &Layout,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 || rhs.dtype != DType::F32 {
+        if self.dtype == DType::F16
+            && !self
+                .device
+                .inner
+                .features
+                .contains(wgpu::Features::SHADER_F16)
+        {
+            return Err(unsupported("binary f16"));
+        }
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu binary").bt());
+        }
+        if rhs.dtype != self.dtype {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "wgpu binary").bt());
         }
         self.device
             .same_device(&rhs.device)
@@ -941,7 +1007,7 @@ impl BackendStorage for WgpuStorage {
         ];
         let workgroups = (count as u32).div_ceil(WG_SIZE);
         self.device.run_compute(
-            &binary_shader(B::NAME)?,
+            &binary_shader(B::NAME, self.dtype)?,
             &entries,
             &bindings,
             workgroups,
@@ -1069,7 +1135,22 @@ impl BackendStorage for WgpuStorage {
             )
         }
         if !src_l.is_contiguous() {
-            return Err(unsupported("copy_strided_src_non_contiguous"));
+            if self.dtype == DType::F16
+                && !self
+                    .device
+                    .inner
+                    .features
+                    .contains(wgpu::Features::SHADER_F16)
+            {
+                return Err(unsupported("copy_strided_src_f16"));
+            }
+            match self.dtype {
+                DType::F32 | DType::F16 => {
+                    let shader = copy_shader(self.dtype, self.dtype)?;
+                    return self.run_copy_into(src_l, dst, dst_offset, &shader);
+                }
+                _ => return Err(unsupported("copy_strided_src_non_contiguous")),
+            }
         }
         let elem_size = self.dtype.size_in_bytes();
         if elem_size == 0 {
@@ -1169,8 +1250,11 @@ impl BackendDevice for WgpuDevice {
             compatible_surface: None,
         }))
         .map_err(|e| Error::wrap(e))?;
+        let adapter_features = adapter.features();
+        let required_features = adapter_features & wgpu::Features::SHADER_F16;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("candle-wgpu"),
+            required_features,
             ..Default::default()
         }))
         .map_err(|e| Error::wrap(e))?;
@@ -1179,6 +1263,7 @@ impl BackendDevice for WgpuDevice {
                 ordinal,
                 device,
                 queue,
+                features: required_features,
             }),
         })
     }
