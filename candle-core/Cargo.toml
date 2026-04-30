@@ -14,9 +14,13 @@ accelerate-src = { workspace = true, optional = true }
 byteorder = { workspace = true }
 candle-kernels = { workspace = true, optional = true }
 candle-metal-kernels = { workspace = true, optional = true }
+candle-wgpu-kernels = { workspace = true, optional = true }
+candle-vulkan-kernels = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
 objc2-foundation = { workspace = true, optional = true }
 cudarc = { workspace = true, optional = true }
+ash = { workspace = true, optional = true }
+gpu-allocator = { workspace = true, optional = true }
 gemm = { workspace = true }
 half = { workspace = true }
 float8 = { workspace = true }
@@ -26,11 +30,13 @@ libm = { workspace = true }
 memmap2 = { workspace = true }
 num-traits = { workspace = true }
 num_cpus = { workspace = true }
+pollster = { workspace = true, optional = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 rayon = { workspace = true }
 safetensors = { workspace = true }
 thiserror = { workspace = true }
+wgpu = { workspace = true, optional = true }
 yoke = { workspace = true }
 zip = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -57,6 +63,8 @@ metal = [
     "dep:candle-metal-kernels",
     "candle-ug?/metal",
 ]
+wgpu = ["dep:wgpu", "dep:pollster", "dep:candle-wgpu-kernels"]
+vulkan = ["dep:ash", "dep:gpu-allocator", "dep:candle-vulkan-kernels"]
 ug = ["dep:candle-ug"]
 
 [[bench]]

@@ -1,0 +1,12 @@
+[package]
+name = "candle-wgpu-kernels"
+version = "0.10.2"
+edition = "2021"
+
+description = "WGPU kernels for Candle"
+repository = "https://github.com/huggingface/candle"
+keywords = ["wgpu", "tensor", "machine-learning"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]

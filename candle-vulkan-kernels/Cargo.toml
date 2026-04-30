@@ -1,0 +1,12 @@
+[package]
+name = "candle-vulkan-kernels"
+version = "0.10.2"
+edition = "2021"
+
+description = "Vulkan kernels for Candle"
+repository = "https://github.com/huggingface/candle"
+keywords = ["vulkan", "tensor", "machine-learning"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]

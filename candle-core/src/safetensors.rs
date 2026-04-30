@@ -9,6 +9,7 @@
 //! Tensors can also be serialized to safetensor format using the `save` function or
 //! `Tensor::save_safetensors` method.
 //!
+use crate::backend::BackendDevice;
 use crate::op::BackpropOp;
 use crate::storage::Storage;
 use crate::tensor::from_storage;
@@ -274,6 +275,24 @@ impl Tensor {
                     Device::Metal(_) => {
                         return Err(Error::Msg("Metal support not compiled".to_string()));
                     }
+                    Device::Wgpu(device) => {
+                        Storage::Wgpu(device.storage_from_cpu_storage_owned(match dtype {
+                            DType::F6E2M3 => crate::cpu_backend::CpuStorage::F6E2M3(data.to_vec()),
+                            DType::F6E3M2 => crate::cpu_backend::CpuStorage::F6E3M2(data.to_vec()),
+                            DType::F4 => crate::cpu_backend::CpuStorage::F4(data.to_vec()),
+                            DType::F8E8M0 => crate::cpu_backend::CpuStorage::F8E8M0(data.to_vec()),
+                            _ => unreachable!(),
+                        })?)
+                    }
+                    Device::Vulkan(device) => {
+                        Storage::Vulkan(device.storage_from_cpu_storage_owned(match dtype {
+                            DType::F6E2M3 => crate::cpu_backend::CpuStorage::F6E2M3(data.to_vec()),
+                            DType::F6E3M2 => crate::cpu_backend::CpuStorage::F6E3M2(data.to_vec()),
+                            DType::F4 => crate::cpu_backend::CpuStorage::F4(data.to_vec()),
+                            DType::F8E8M0 => crate::cpu_backend::CpuStorage::F8E8M0(data.to_vec()),
+                            _ => unreachable!(),
+                        })?)
+                    }
                 };
 
                 let op = BackpropOp::none();
@@ -369,6 +388,24 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
         #[cfg(not(feature = "metal"))]
         Device::Metal(_) => {
             return Err(Error::Msg("Metal support not compiled".to_string()));
+        }
+        Device::Wgpu(device) => {
+            Storage::Wgpu(device.storage_from_cpu_storage_owned(match dtype {
+                DType::F6E2M3 => crate::cpu_backend::CpuStorage::F6E2M3(data.to_vec()),
+                DType::F6E3M2 => crate::cpu_backend::CpuStorage::F6E3M2(data.to_vec()),
+                DType::F4 => crate::cpu_backend::CpuStorage::F4(data.to_vec()),
+                DType::F8E8M0 => crate::cpu_backend::CpuStorage::F8E8M0(data.to_vec()),
+                _ => unreachable!(),
+            })?)
+        }
+        Device::Vulkan(device) => {
+            Storage::Vulkan(device.storage_from_cpu_storage_owned(match dtype {
+                DType::F6E2M3 => crate::cpu_backend::CpuStorage::F6E2M3(data.to_vec()),
+                DType::F6E3M2 => crate::cpu_backend::CpuStorage::F6E3M2(data.to_vec()),
+                DType::F4 => crate::cpu_backend::CpuStorage::F4(data.to_vec()),
+                DType::F8E8M0 => crate::cpu_backend::CpuStorage::F8E8M0(data.to_vec()),
+                _ => unreachable!(),
+            })?)
         }
     };
 

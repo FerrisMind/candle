@@ -48,3 +48,8 @@ bria.mp3
 bria.safetensors
 bria.wav
 bench_results/
+
+# Local Codex/agent session guidance.
+AGENTS.md
+.agent/
+.codex/
