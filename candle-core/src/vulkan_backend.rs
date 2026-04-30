@@ -91,6 +91,26 @@ struct GgmlUnaryParams {
     ne1_0l: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GgmlSumRowsParams {
+    n_cols: u32,
+    ne01: u32,
+    ne02: u32,
+    nb01: u32,
+    nb02: u32,
+    nb03: u32,
+    nb11: u32,
+    nb12: u32,
+    nb13: u32,
+    weight: f32,
+    misalign_offsets: u32,
+    ne0_12mp: u32,
+    ne0_12l: u32,
+    ne0_1mp: u32,
+    ne0_1l: u32,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum VulkanError {
     #[error("{0}")]
@@ -113,6 +133,7 @@ struct VulkanInner {
     _entry: ash::Entry,
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
+    subgroup_size: u32,
     device: ash::Device,
     queue_family_index: u32,
     queue: vk::Queue,
@@ -124,6 +145,7 @@ impl std::fmt::Debug for VulkanInner {
         f.debug_struct("VulkanInner")
             .field("ordinal", &self.ordinal)
             .field("physical_device", &self.physical_device)
+            .field("subgroup_size", &self.subgroup_size)
             .field("queue_family_index", &self.queue_family_index)
             .finish_non_exhaustive()
     }
@@ -386,6 +408,17 @@ impl VulkanDevice {
         push_constants: Option<&[u8]>,
         workgroups: u32,
     ) -> Result<()> {
+        self.run_compute_specialized(spirv, bindings, push_constants, workgroups, None)
+    }
+
+    fn run_compute_specialized(
+        &self,
+        spirv: &[u32],
+        bindings: &[VulkanBinding<'_>],
+        push_constants: Option<&[u8]>,
+        workgroups: u32,
+        specialization_u32: Option<(u32, u32)>,
+    ) -> Result<()> {
         unsafe {
             let shader_info = vk::ShaderModuleCreateInfo::default().code(spirv);
             let shader = self
@@ -393,7 +426,13 @@ impl VulkanDevice {
                 .device
                 .create_shader_module(&shader_info, None)
                 .map_err(Error::wrap)?;
-            let result = self.run_compute_with_shader(shader, bindings, push_constants, workgroups);
+            let result = self.run_compute_with_shader(
+                shader,
+                bindings,
+                push_constants,
+                workgroups,
+                specialization_u32,
+            );
             self.inner.device.destroy_shader_module(shader, None);
             result
         }
@@ -405,6 +444,7 @@ impl VulkanDevice {
         bindings: &[VulkanBinding<'_>],
         push_constants: Option<&[u8]>,
         workgroups: u32,
+        specialization_u32: Option<(u32, u32)>,
     ) -> Result<()> {
         let layout_bindings = bindings
             .iter()
@@ -441,10 +481,24 @@ impl VulkanDevice {
             .create_pipeline_layout(&pipeline_layout_info, None)
             .map_err(Error::wrap)?;
         let entry = CString::new("main").map_err(Error::wrap)?;
-        let stage = vk::PipelineShaderStageCreateInfo::default()
+        let spec_entry;
+        let spec_data;
+        let spec_info;
+        let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader)
             .name(&entry);
+        if let Some((constant_id, value)) = specialization_u32 {
+            spec_entry = vk::SpecializationMapEntry::default()
+                .constant_id(constant_id)
+                .offset(0)
+                .size(std::mem::size_of::<u32>());
+            spec_data = value.to_ne_bytes();
+            spec_info = vk::SpecializationInfo::default()
+                .map_entries(std::slice::from_ref(&spec_entry))
+                .data(&spec_data);
+            stage = stage.specialization_info(&spec_info);
+        }
         let pipeline_info = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(pipeline_layout);
@@ -684,6 +738,20 @@ fn binary_spirv(op: &str) -> Result<&'static [u32]> {
         .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated").into()).bt())
 }
 
+fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
+    let name = match (src, dst) {
+        (DType::F32, DType::F32) => "cpy_f32_f32",
+        (DType::F32, DType::I32) => "cpy_f32_i32",
+        (DType::I32, DType::F32) => "cpy_i32_f32",
+        (DType::F32, DType::F16) => "cpy_f32_f16",
+        (DType::F16, DType::F32) => "cpy_f16_f32",
+        (DType::F16, DType::F16) => "cpy_f16_f16",
+        _ => return Err(unsupported("to_dtype")),
+    };
+    candle_vulkan_kernels::spirv(name)
+        .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated").into()).bt())
+}
+
 impl VulkanStorage {
     fn run_unary_head(&self, layout: &Layout, spirv: &[u32]) -> Result<Self> {
         if !layout.is_contiguous() || layout.start_offset() != 0 {
@@ -709,12 +777,29 @@ impl VulkanStorage {
         Ok(dst)
     }
 
-    fn run_unary_generic(&self, layout: &Layout, spirv: &[u32]) -> Result<Self> {
+    fn run_unary_generic_with_params(
+        &self,
+        layout: &Layout,
+        spirv: &[u32],
+        param1: f32,
+        param2: f32,
+    ) -> Result<Self> {
+        self.run_unary_generic_with_params_dtype(layout, spirv, param1, param2, self.dtype)
+    }
+
+    fn run_unary_generic_with_params_dtype(
+        &self,
+        layout: &Layout,
+        spirv: &[u32],
+        param1: f32,
+        param2: f32,
+        dst_dtype: DType,
+    ) -> Result<Self> {
         if layout.start_offset() != 0 {
             return Err(unsupported("unary offset"));
         }
         let count = layout.shape().elem_count();
-        let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), dst_dtype)? };
         let (src_dims, src_strides) = dims4_ggml(layout)?;
         let dst_dims = src_dims;
         let dst_strides = contiguous_strides_ggml(dst_dims);
@@ -743,8 +828,8 @@ impl VulkanStorage {
             nb12: dst_strides[2],
             nb13: dst_strides[3],
             misalign_offsets: 0,
-            param1: 0.0,
-            param2: 0.0,
+            param1,
+            param2,
             ne0_012mp,
             ne0_012l,
             ne0_01mp,
@@ -765,6 +850,60 @@ impl VulkanStorage {
         let workgroups = (count as u32).div_ceil(512);
         self.device
             .run_compute(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+        Ok(dst)
+    }
+
+    fn run_unary_generic(&self, layout: &Layout, spirv: &[u32]) -> Result<Self> {
+        self.run_unary_generic_with_params(layout, spirv, 0.0, 0.0)
+    }
+
+    fn run_sum_rows(&self, layout: &Layout) -> Result<Self> {
+        if layout.start_offset() > u16::MAX as usize {
+            return Err(unsupported("sum_rows offset"));
+        }
+        let rank = layout.dims().len();
+        let (src_dims, src_strides) = dims4_ggml(layout)?;
+        let mut dst_dims_candle = layout.dims().to_vec();
+        dst_dims_candle[rank - 1] = 1;
+        let dst_shape = Shape::from(dst_dims_candle);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
+
+        let mut dst_dims = src_dims;
+        dst_dims[0] = 1;
+        let dst_strides = contiguous_strides_ggml(dst_dims);
+        let rows = src_dims[1] * src_dims[2] * src_dims[3];
+        let (ne0_12mp, ne0_12l) = fastdiv_values(src_dims[1] * src_dims[2]);
+        let (ne0_1mp, ne0_1l) = fastdiv_values(src_dims[1]);
+        let params = GgmlSumRowsParams {
+            n_cols: src_dims[0],
+            ne01: src_dims[1],
+            ne02: src_dims[2],
+            nb01: src_strides[1],
+            nb02: src_strides[2],
+            nb03: src_strides[3],
+            nb11: dst_strides[1],
+            nb12: dst_strides[2],
+            nb13: dst_strides[3],
+            weight: 1.0,
+            misalign_offsets: (layout.start_offset() as u32) << 16,
+            ne0_12mp,
+            ne0_12l,
+            ne0_1mp,
+            ne0_1l,
+        };
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("sum_rows_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader sum_rows_f32 not generated".into()).bt())?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            rows,
+            Some((0, self.device.inner.subgroup_size)),
+        )?;
         Ok(dst)
     }
 }
@@ -841,8 +980,12 @@ impl BackendStorage for VulkanStorage {
         if self.dtype != DType::F32 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan affine").bt());
         }
-        let _ = (layout, mul, add);
-        Err(unsupported("affine"))
+        if !layout.is_contiguous() || layout.start_offset() != 0 {
+            return Err(unsupported("affine strided"));
+        }
+        let spirv = candle_vulkan_kernels::spirv("scale_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader scale_f32 not generated".into()).bt())?;
+        self.run_unary_generic_with_params(layout, spirv, mul as f32, add as f32)
     }
     fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
         if self.dtype != DType::F32 {
@@ -862,14 +1005,25 @@ impl BackendStorage for VulkanStorage {
             .ok_or_else(|| Error::Msg("vulkan shader elu_f32 not generated".into()).bt())?;
         self.run_unary_head(layout, spirv)
     }
-    fn reduce_op(&self, _: ReduceOp, _: &Layout, _: &[usize]) -> Result<Self> {
-        Err(unsupported("reduce"))
+    fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
+        if op != ReduceOp::Sum {
+            return Err(unsupported("reduce"));
+        }
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan reduce").bt());
+        }
+        let rank = layout.dims().len();
+        if rank == 0 || reduce_dims != [rank - 1] {
+            return Err(unsupported("reduce sum non-last-dim"));
+        }
+        self.run_sum_rows(layout)
     }
     fn cmp(&self, _: CmpOp, _: &Self, _: &Layout, _: &Layout) -> Result<Self> {
         Err(unsupported("cmp"))
     }
-    fn to_dtype(&self, _: &Layout, _: DType) -> Result<Self> {
-        Err(unsupported("to_dtype"))
+    fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+        let spirv = copy_spirv(self.dtype, dtype)?;
+        self.run_unary_generic_with_params_dtype(layout, spirv, 0.0, 0.0, dtype)
     }
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
         if self.dtype != DType::F32 {
@@ -1157,6 +1311,14 @@ impl BackendDevice for VulkanDevice {
             .get(ordinal)
             .or_else(|| physical_devices.first())
             .ok_or_else(|| Error::msg("no vulkan physical device found"))?;
+        let mut subgroup_properties = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut physical_device_properties =
+            vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup_properties);
+        unsafe {
+            instance
+                .get_physical_device_properties2(physical_device, &mut physical_device_properties);
+        }
+        let subgroup_size = subgroup_properties.subgroup_size.max(1);
         let queue_family_index = unsafe {
             instance
                 .get_physical_device_queue_family_properties(physical_device)
@@ -1193,6 +1355,7 @@ impl BackendDevice for VulkanDevice {
                 _entry: entry,
                 instance,
                 physical_device,
+                subgroup_size,
                 device,
                 queue_family_index,
                 queue,

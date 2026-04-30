@@ -47,6 +47,41 @@ struct BinaryParams {
     _pad0: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SumRowsParams {
+    offset_src: u32,
+    offset_dst: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CopyParams {
+    ne: u32,
+    offset_src: u32,
+    offset_dst: u32,
+    stride_src0: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    stride_dst0: u32,
+    stride_dst1: u32,
+    stride_dst2: u32,
+    stride_dst3: u32,
+    src_ne0: u32,
+    src_ne1: u32,
+    src_ne2: u32,
+    dst_ne0: u32,
+    dst_ne1: u32,
+    dst_ne2: u32,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum WgpuError {
     #[error("{0}")]
@@ -319,6 +354,10 @@ fn dims4(layout: &Layout) -> Result<([u32; 4], [u32; 4])> {
     Ok((dims, strides))
 }
 
+fn contiguous_strides(dims: [u32; 4]) -> [u32; 4] {
+    [1, dims[0], dims[0] * dims[1], dims[0] * dims[1] * dims[2]]
+}
+
 fn unary_shader(op: &str) -> Result<String> {
     if op == "recip" {
         return Ok(custom_unary_wgsl("1.0 / x"));
@@ -372,6 +411,66 @@ fn binary_shader(op: &str) -> Result<String> {
     ))
 }
 
+fn copy_shader(src: DType, dst: DType) -> Result<String> {
+    let defines = match (src, dst) {
+        (DType::F32, DType::F32) => ["SRC_F32", "DST_F32"],
+        (DType::F32, DType::I32) => ["SRC_F32", "DST_I32"],
+        _ => return Err(unsupported("to_dtype")),
+    };
+    let source = candle_wgpu_kernels::get("cpy.wgsl")
+        .ok_or_else(|| Error::Msg("wgpu shader cpy.wgsl not embedded".into()).bt())?
+        .source()
+        .replace("WG_SIZE", &WG_SIZE.to_string());
+    let mut out = String::new();
+    let mut active = true;
+    let mut branch_taken = false;
+    let mut replacements: Vec<(&str, &str)> = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed == "enable f16;" {
+            if defines.iter().any(|d| d.ends_with("F16")) {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
+        if let Some(name) = trimmed.strip_prefix("#ifdef ") {
+            active = defines.iter().any(|d| d == &name.trim());
+            branch_taken = active;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("#elif defined(") {
+            let name = rest.trim_end_matches(')').trim();
+            active = !branch_taken && defines.iter().any(|d| d == &name);
+            branch_taken |= active;
+            continue;
+        }
+        if trimmed == "#endif" {
+            active = true;
+            branch_taken = false;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("#define ") {
+            if active {
+                let mut parts = rest.split_whitespace();
+                if let (Some(name), Some(value)) = (parts.next(), parts.next()) {
+                    replacements.push((name, value));
+                }
+            }
+            continue;
+        }
+        if active {
+            let mut expanded = line.to_string();
+            for (name, value) in &replacements {
+                expanded = expanded.replace(name, value);
+            }
+            out.push_str(&expanded);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
 fn custom_binary_wgsl(expr: &str) -> String {
     format!(
         r#"
@@ -398,8 +497,8 @@ struct Params {{
     _pad0: u32,
 }};
 
-@group(0) @binding(0) var<storage, read> src0: array<f32>;
-@group(0) @binding(1) var<storage, read> src1: array<f32>;
+@group(0) @binding(0) var<storage, read_write> src0: array<f32>;
+@group(0) @binding(1) var<storage, read_write> src1: array<f32>;
 @group(0) @binding(2) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
@@ -459,7 +558,7 @@ struct Params {{
     _pad0: u32,
     _pad1: u32,
 }};
-@group(0) @binding(0) var<storage, read> src: array<f32>;
+@group(0) @binding(0) var<storage, read_write> src: array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
 @compute @workgroup_size({WG_SIZE})
@@ -562,6 +661,60 @@ impl WgpuStorage {
             .run_compute(shader, &entries, &bindings, workgroups, label)?;
         Ok(dst)
     }
+
+    fn run_copy_to_dtype(&self, layout: &Layout, dtype: DType, shader: &str) -> Result<Self> {
+        let (src_dims, src_strides) = dims4(layout)?;
+        let dst_strides = contiguous_strides(src_dims);
+        let count = layout.shape().elem_count();
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), dtype)? };
+        let params = CopyParams {
+            ne: count.try_into()?,
+            offset_src: layout.start_offset().try_into()?,
+            offset_dst: 0,
+            stride_src0: src_strides[0],
+            stride_src1: src_strides[1],
+            stride_src2: src_strides[2],
+            stride_src3: src_strides[3],
+            stride_dst0: dst_strides[0],
+            stride_dst1: dst_strides[1],
+            stride_dst2: dst_strides[2],
+            stride_dst3: dst_strides[3],
+            src_ne0: src_dims[0],
+            src_ne1: src_dims[1],
+            src_ne2: src_dims[2],
+            dst_ne0: src_dims[0],
+            dst_ne1: src_dims[1],
+            dst_ne2: src_dims[2],
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-copy-params"),
+                size: std::mem::size_of::<CopyParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+        let workgroups = (count as u32).div_ceil(WG_SIZE);
+        self.device
+            .run_compute(shader, &entries, &bindings, workgroups, "candle-wgpu-copy")?;
+        Ok(dst)
+    }
 }
 
 impl BackendStorage for WgpuStorage {
@@ -631,14 +784,81 @@ impl BackendStorage for WgpuStorage {
         ));
         self.run_unary_like(layout, &shader, "candle-wgpu-elu")
     }
-    fn reduce_op(&self, _: ReduceOp, _: &Layout, _: &[usize]) -> Result<Self> {
-        Err(unsupported("reduce"))
+    fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
+        if op != ReduceOp::Sum {
+            return Err(unsupported("reduce"));
+        }
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu reduce").bt());
+        }
+        let rank = layout.dims().len();
+        if rank == 0 || reduce_dims != [rank - 1] {
+            return Err(unsupported("reduce sum non-last-dim"));
+        }
+        let (dims, strides) = dims4(layout)?;
+        let mut dst_dims = layout.dims().to_vec();
+        dst_dims[rank - 1] = 1;
+        let dst_shape = Shape::from(dst_dims);
+        let rows = dst_shape.elem_count();
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
+        let params = SumRowsParams {
+            offset_src: layout.start_offset().try_into()?,
+            offset_dst: 0,
+            stride_src1: strides[1],
+            stride_src2: strides[2],
+            stride_src3: strides[3],
+            ne0: dims[0],
+            ne1: dims[1],
+            ne2: dims[2],
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-sum-rows-params"),
+                size: std::mem::size_of::<SumRowsParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::get("sum_rows.wgsl")
+            .ok_or_else(|| Error::Msg("wgpu shader sum_rows.wgsl not embedded".into()).bt())?
+            .source()
+            .replace("WG_SIZE", &WG_SIZE.to_string());
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            rows as u32,
+            "candle-wgpu-sum-rows",
+        )?;
+        Ok(dst)
     }
     fn cmp(&self, _: CmpOp, _: &Self, _: &Layout, _: &Layout) -> Result<Self> {
         Err(unsupported("cmp"))
     }
-    fn to_dtype(&self, _: &Layout, _: DType) -> Result<Self> {
-        Err(unsupported("to_dtype"))
+    fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+        match (self.dtype, dtype) {
+            (DType::F32, DType::F32) | (DType::F32, DType::I32) => {
+                let shader = copy_shader(self.dtype, dtype)?;
+                self.run_copy_to_dtype(layout, dtype, &shader)
+            }
+            _ => Err(unsupported("to_dtype")),
+        }
     }
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
         if self.dtype != DType::F32 {
