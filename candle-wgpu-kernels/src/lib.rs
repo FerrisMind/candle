@@ -197,6 +197,43 @@ pub fn get_rows_f32_shader(workgroup_size: u32) -> Option<String> {
     Some(preprocess(&source, &defines, &replacements, DType::F32))
 }
 
+pub fn matmul_f32_shader() -> Option<String> {
+    let source = get("mul_mat.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let defines = vec!["FLOAT".to_string()];
+    let replacements = vec![
+        ("SRC0_TYPE".to_string(), "f32".to_string()),
+        ("SRC1_TYPE".to_string(), "f32".to_string()),
+    ];
+    Some(preprocess(&source, &defines, &replacements, DType::F32))
+}
+
+pub fn conv2d_f32_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("conv2d.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let defines = vec![
+        "WEIGHT_F32".to_string(),
+        "INPUT_F32".to_string(),
+        "OUTPUT_F32".to_string(),
+    ];
+    let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    Some(preprocess(&source, &defines, &replacements, DType::F32))
+}
+
+pub fn im2col_f32_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("im2col.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let defines = vec!["INPUT_F32".to_string(), "OUTPUT_F32".to_string()];
+    let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    Some(preprocess(&source, &defines, &replacements, DType::F32))
+}
+
 pub fn fill_inplace_shader(dtype: DType, workgroup_size: u32) -> String {
     let mut defines = vec![
         "WG_SIZE".to_string(),

@@ -1187,11 +1187,9 @@ impl Tensor {
                 let is_wgpu_or_vulkan =
                     matches!(&*self.storage(), Storage::Wgpu(_) | Storage::Vulkan(_));
                 if is_wgpu_or_vulkan {
-                    let storage = self.storage().clamp(
-                        self.layout(),
-                        min_t.to_scalar::<f32>()?,
-                        max_t.to_scalar::<f32>()?,
-                    )?;
+                    let min = min_t.to_dtype(self.dtype())?.to_scalar::<f32>()?;
+                    let max = max_t.to_dtype(self.dtype())?.to_scalar::<f32>()?;
+                    let storage = self.storage().clamp(self.layout(), min, max)?;
                     return Ok(from_storage(
                         storage,
                         self.shape().clone(),

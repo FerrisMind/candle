@@ -230,6 +230,91 @@ struct CopyParams {
     dst_ne2: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MulMatParams {
+    offset_src0: u32,
+    offset_src1: u32,
+    offset_dst: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    stride_01: u32,
+    stride_11: u32,
+    stride_02: u32,
+    stride_12: u32,
+    stride_03: u32,
+    stride_13: u32,
+    bs02: u32,
+    bs03: u32,
+    broadcast2: u32,
+    broadcast3: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Conv2dParams {
+    offset_w: u32,
+    offset_i: u32,
+    offset_o: u32,
+    sw0: u32,
+    sw1: u32,
+    sw2: u32,
+    sw3: u32,
+    si0: u32,
+    si1: u32,
+    si2: u32,
+    si3: u32,
+    so0: u32,
+    so1: u32,
+    so2: u32,
+    so3: u32,
+    kw: u32,
+    kh: u32,
+    ic: u32,
+    iw: u32,
+    ih: u32,
+    ow: u32,
+    oh: u32,
+    oc_out: u32,
+    n_out: u32,
+    s0: u32,
+    s1: u32,
+    p0: u32,
+    p1: u32,
+    d0: u32,
+    d1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Im2ColParams {
+    offset_i: u32,
+    offset_o: u32,
+    si0: u32,
+    si1: u32,
+    si2: u32,
+    si3: u32,
+    so0: u32,
+    so1: u32,
+    so2: u32,
+    so3: u32,
+    kw: u32,
+    kh: u32,
+    ic: u32,
+    iw: u32,
+    ih: u32,
+    n: u32,
+    ow: u32,
+    oh: u32,
+    s0: u32,
+    s1: u32,
+    p0: u32,
+    p1: u32,
+    d0: u32,
+    d1: u32,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum WgpuError {
     #[error("{0}")]
@@ -517,6 +602,50 @@ fn dims4(layout: &Layout) -> Result<([u32; 4], [u32; 4])> {
 
 fn contiguous_strides(dims: [u32; 4]) -> [u32; 4] {
     [1, dims[0], dims[0] * dims[1], dims[0] * dims[1] * dims[2]]
+}
+
+fn nearest_interp_weights(in_size: usize, out_size: usize) -> Vec<f32> {
+    let mut weights = vec![0f32; in_size * out_size];
+    let scale = in_size as f64 / out_size as f64;
+    for out_idx in 0..out_size {
+        let src_idx = usize::min(in_size - 1, (out_idx as f64 * scale) as usize);
+        weights[src_idx * out_size + out_idx] = 1.0;
+    }
+    weights
+}
+
+fn bilinear_interp_weights(
+    in_size: usize,
+    out_size: usize,
+    align_corners: bool,
+    scale_factor: Option<f64>,
+) -> Vec<f32> {
+    let scale = if align_corners {
+        if out_size > 1 {
+            (in_size - 1) as f64 / (out_size - 1) as f64
+        } else {
+            0.0
+        }
+    } else if let Some(scale_factor) = scale_factor {
+        1.0 / scale_factor
+    } else {
+        in_size as f64 / out_size as f64
+    };
+    let mut weights = vec![0f32; in_size * out_size];
+    for out_idx in 0..out_size {
+        let src = if align_corners {
+            scale * out_idx as f64
+        } else {
+            scale * (out_idx as f64 + 0.5) - 0.5
+        };
+        let src = src.max(0.0);
+        let idx0 = src.floor() as usize;
+        let idx1 = (idx0 + 1).min(in_size - 1);
+        let weight = (src - idx0 as f64).clamp(0.0, 1.0) as f32;
+        weights[idx0 * out_size + out_idx] += 1.0 - weight;
+        weights[idx1 * out_size + out_idx] += weight;
+    }
+    weights
 }
 
 fn wgpu_kernel_dtype(dtype: DType) -> Result<candle_wgpu_kernels::DType> {
@@ -1436,6 +1565,534 @@ impl WgpuStorage {
         debug_assert_eq!(dst.count, dst_el);
         Ok(dst)
     }
+
+    fn run_matmul_f32(
+        &self,
+        rhs: &Self,
+        (b, m, n, k): (usize, usize, usize, usize),
+        lhs_l: &Layout,
+        rhs_l: &Layout,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 || rhs.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu matmul").bt());
+        }
+        let rank = lhs_l.dims().len();
+        if rank != rhs_l.dims().len() || rank < 2 || rank > 4 {
+            return Err(unsupported("matmul rank"));
+        }
+        if b != lhs_l.dims()[..rank - 2].iter().product::<usize>() {
+            return Err(unsupported("matmul batch"));
+        }
+
+        let mut lhs_contiguous = None;
+        let (lhs, lhs_layout) = if lhs_l.is_contiguous() && lhs_l.start_offset() == 0 {
+            (self, lhs_l.clone())
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(lhs_l.shape(), self.dtype)? };
+            self.copy_strided_src(&mut tmp, 0, lhs_l)?;
+            lhs_contiguous = Some(tmp);
+            (
+                lhs_contiguous.as_ref().unwrap(),
+                Layout::contiguous(lhs_l.shape().clone()),
+            )
+        };
+
+        let rhs_t_src_layout = rhs_l.transpose(rank - 2, rank - 1)?;
+        let rhs_t_shape = rhs_t_src_layout.shape().clone();
+        let mut rhs_t = unsafe { rhs.device.alloc_uninit(&rhs_t_shape, rhs.dtype)? };
+        rhs.copy_strided_src(&mut rhs_t, 0, &rhs_t_src_layout)?;
+
+        let lhs_stride = lhs_layout.stride();
+        let rhs_t_stride = rhs_t_shape.stride_contiguous();
+        let bs02 = if rank >= 3 {
+            lhs_layout.dims()[rank - 3]
+        } else {
+            1
+        };
+        let bs03 = if rank >= 4 {
+            lhs_layout.dims()[rank - 4]
+        } else {
+            1
+        };
+        let lhs_stride_batch_inner = if rank >= 3 {
+            lhs_stride[rank - 3]
+        } else {
+            m * k
+        };
+        let lhs_stride_batch_outer = if rank >= 4 {
+            lhs_stride[rank - 4]
+        } else {
+            b * m * k
+        };
+        let rhs_stride_batch_inner = if rank >= 3 {
+            rhs_t_stride[rank - 3]
+        } else {
+            n * k
+        };
+        let rhs_stride_batch_outer = if rank >= 4 {
+            rhs_t_stride[rank - 4]
+        } else {
+            b * n * k
+        };
+
+        let dst_shape = Shape::from(vec![b, m, n]);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
+        let params = MulMatParams {
+            offset_src0: 0,
+            offset_src1: lhs_layout.start_offset().try_into()?,
+            offset_dst: 0,
+            m: n.try_into()?,
+            n: m.try_into()?,
+            k: k.try_into()?,
+            stride_01: k.try_into()?,
+            stride_11: lhs_stride[rank - 2].try_into()?,
+            stride_02: rhs_stride_batch_inner.try_into()?,
+            stride_12: lhs_stride_batch_inner.try_into()?,
+            stride_03: rhs_stride_batch_outer.try_into()?,
+            stride_13: lhs_stride_batch_outer.try_into()?,
+            bs02: bs02.try_into()?,
+            bs03: bs03.try_into()?,
+            broadcast2: 1,
+            broadcast3: 1,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-matmul-params"),
+                size: std::mem::size_of::<MulMatParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &rhs_t.buffer),
+            buffer_binding(1, &lhs.buffer),
+            buffer_binding(2, &dst.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::matmul_f32_shader()
+            .ok_or_else(|| Error::Msg("wgpu shader mul_mat.wgsl not embedded".into()).bt())?;
+        let workgroups = (b * m * n).try_into().map(|v: u32| v.div_ceil(WG_SIZE))?;
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-matmul",
+        )?;
+        drop(lhs_contiguous);
+        Ok(dst)
+    }
+
+    fn run_conv1d_f32(
+        &self,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv1D,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 || kernel.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu conv1d").bt());
+        }
+        let src_stride = layout.stride();
+        let kernel_stride = kernel_l.stride();
+        let input_l = Layout::new(
+            Shape::from(vec![params.b_size, params.c_in, 1, params.l_in]),
+            vec![
+                src_stride[0],
+                src_stride[1],
+                src_stride[2] * params.l_in,
+                src_stride[2],
+            ],
+            layout.start_offset(),
+        );
+        let kernel_2d_l = Layout::new(
+            Shape::from(vec![params.c_out, params.c_in, 1, params.k_size]),
+            vec![
+                kernel_stride[0],
+                kernel_stride[1],
+                kernel_stride[2] * params.k_size,
+                kernel_stride[2],
+            ],
+            kernel_l.start_offset(),
+        );
+        let (input_dims, input_strides) = dims4(&input_l)?;
+        let (kernel_dims, kernel_strides) = dims4(&kernel_2d_l)?;
+        let out_shape = Shape::from(params.out_dims());
+        let out_shader_shape = Shape::from(vec![params.b_size, params.c_out, 1, params.l_out()]);
+        let out_shader_layout = Layout::contiguous(out_shader_shape);
+        let (out_dims, out_strides) = dims4(&out_shader_layout)?;
+        let dst = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
+        let shader = candle_wgpu_kernels::conv2d_f32_shader(WG_SIZE)
+            .ok_or_else(|| Error::Msg("wgpu shader conv2d.wgsl not embedded".into()).bt())?;
+        let params = Conv2dParams {
+            offset_w: kernel_l.start_offset().try_into()?,
+            offset_i: layout.start_offset().try_into()?,
+            offset_o: 0,
+            sw0: kernel_strides[0],
+            sw1: kernel_strides[1],
+            sw2: kernel_strides[2],
+            sw3: kernel_strides[3],
+            si0: input_strides[0],
+            si1: input_strides[1],
+            si2: input_strides[2],
+            si3: input_strides[3],
+            so0: out_strides[0],
+            so1: out_strides[1],
+            so2: out_strides[2],
+            so3: out_strides[3],
+            kw: kernel_dims[0],
+            kh: kernel_dims[1],
+            ic: kernel_dims[2],
+            iw: input_dims[0],
+            ih: input_dims[1],
+            ow: out_dims[0],
+            oh: out_dims[1],
+            oc_out: out_dims[2],
+            n_out: out_dims[3],
+            s0: params.stride.try_into()?,
+            s1: 1,
+            p0: params.padding.try_into()?,
+            p1: 0,
+            d0: params.dilation.try_into()?,
+            d1: 1,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-conv1d-params"),
+                size: std::mem::size_of::<Conv2dParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &kernel.buffer),
+            buffer_binding(1, &self.buffer),
+            buffer_binding(2, &dst.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let workgroups = (out_shape.elem_count() as u32).div_ceil(WG_SIZE);
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-conv1d",
+        )?;
+        Ok(dst)
+    }
+
+    fn run_conv2d_f32(
+        &self,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv2D,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 || kernel.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu conv2d").bt());
+        }
+        let (input_dims, input_strides) = dims4(layout)?;
+        let (kernel_dims, kernel_strides) = dims4(kernel_l)?;
+        let out_shape = Shape::from(params.out_dims());
+        let out_layout = Layout::contiguous(out_shape.clone());
+        let (out_dims, out_strides) = dims4(&out_layout)?;
+        let dst = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
+        let shader = candle_wgpu_kernels::conv2d_f32_shader(WG_SIZE)
+            .ok_or_else(|| Error::Msg("wgpu shader conv2d.wgsl not embedded".into()).bt())?;
+        let params = Conv2dParams {
+            offset_w: kernel_l.start_offset().try_into()?,
+            offset_i: layout.start_offset().try_into()?,
+            offset_o: 0,
+            sw0: kernel_strides[0],
+            sw1: kernel_strides[1],
+            sw2: kernel_strides[2],
+            sw3: kernel_strides[3],
+            si0: input_strides[0],
+            si1: input_strides[1],
+            si2: input_strides[2],
+            si3: input_strides[3],
+            so0: out_strides[0],
+            so1: out_strides[1],
+            so2: out_strides[2],
+            so3: out_strides[3],
+            kw: kernel_dims[0],
+            kh: kernel_dims[1],
+            ic: kernel_dims[2],
+            iw: input_dims[0],
+            ih: input_dims[1],
+            ow: out_dims[0],
+            oh: out_dims[1],
+            oc_out: out_dims[2],
+            n_out: out_dims[3],
+            s0: params.stride.try_into()?,
+            s1: params.stride.try_into()?,
+            p0: params.padding.try_into()?,
+            p1: params.padding.try_into()?,
+            d0: params.dilation.try_into()?,
+            d1: params.dilation.try_into()?,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-conv2d-params"),
+                size: std::mem::size_of::<Conv2dParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &kernel.buffer),
+            buffer_binding(1, &self.buffer),
+            buffer_binding(2, &dst.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let workgroups = (out_shape.elem_count() as u32).div_ceil(WG_SIZE);
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-conv2d",
+        )?;
+        Ok(dst)
+    }
+
+    fn run_upsample_nearest1d_f32(&self, layout: &Layout, out_l: usize) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu upsample_nearest1d").bt());
+        }
+        let (b, c, l) = layout.shape().dims3()?;
+        let rows = b * c;
+        let mut src_contiguous = None;
+        let (src, src_l) = if layout.is_contiguous() && layout.start_offset() == 0 {
+            (self, Layout::contiguous((rows, l)))
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            self.copy_strided_src(&mut tmp, 0, layout)?;
+            src_contiguous = Some(tmp);
+            (
+                src_contiguous.as_ref().unwrap(),
+                Layout::contiguous((rows, l)),
+            )
+        };
+        let weights = nearest_interp_weights(l, out_l);
+        let weight_storage = self.device.storage_from_slice(&weights)?;
+        let weight_l = Layout::contiguous((l, out_l));
+        let out = src.matmul(&weight_storage, (1, rows, out_l, l), &src_l, &weight_l)?;
+        drop(src_contiguous);
+        Ok(out)
+    }
+
+    fn run_upsample2d_f32(
+        &self,
+        layout: &Layout,
+        out_h: usize,
+        out_w: usize,
+        h_weights: Vec<f32>,
+        w_weights: Vec<f32>,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu upsample2d").bt());
+        }
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let bc = b * c;
+        let mut src_contiguous = None;
+        let (src, src_l) = if layout.is_contiguous() && layout.start_offset() == 0 {
+            (self, Layout::contiguous((bc * h, w)))
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            self.copy_strided_src(&mut tmp, 0, layout)?;
+            src_contiguous = Some(tmp);
+            (
+                src_contiguous.as_ref().unwrap(),
+                Layout::contiguous((bc * h, w)),
+            )
+        };
+
+        let w_storage = self.device.storage_from_slice(&w_weights)?;
+        let w_l = Layout::contiguous((w, out_w));
+        let width = src.matmul(&w_storage, (1, bc * h, out_w, w), &src_l, &w_l)?;
+
+        let width_l = Layout::new(
+            Shape::from(vec![bc, out_w, h]),
+            vec![h * out_w, 1, out_w],
+            0,
+        );
+        let h_storage = self.device.storage_from_slice(&h_weights)?;
+        let h_l = Layout::new(Shape::from(vec![bc, h, out_h]), vec![0, out_h, 1], 0);
+        let height = width.matmul(&h_storage, (bc, out_w, out_h, h), &width_l, &h_l)?;
+
+        let height_l = Layout::contiguous((bc, out_w, out_h)).transpose(1, 2)?;
+        let out_shape = Shape::from(vec![b, c, out_h, out_w]);
+        let mut out = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
+        height.copy_strided_src(&mut out, 0, &height_l)?;
+        drop(src_contiguous);
+        Ok(out)
+    }
+
+    fn run_pool2d_im2col_f32(
+        &self,
+        layout: &Layout,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        max_pool: bool,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu pool2d").bt());
+        }
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let out_h = (h - kernel_size.0) / stride.0 + 1;
+        let out_w = (w - kernel_size.1) / stride.1 + 1;
+        let bc = b * c;
+        let k = kernel_size.0 * kernel_size.1;
+
+        let mut src_contiguous = None;
+        let (input, input_l) = if layout.is_contiguous() && layout.start_offset() == 0 {
+            (self, Layout::contiguous((bc, 1, h, w)))
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            self.copy_strided_src(&mut tmp, 0, layout)?;
+            src_contiguous = Some(tmp);
+            (
+                src_contiguous.as_ref().unwrap(),
+                Layout::contiguous((bc, 1, h, w)),
+            )
+        };
+
+        let col_shape = Shape::from(vec![bc, out_h, out_w, k]);
+        let col_l = Layout::contiguous(col_shape.clone());
+        let col = unsafe { self.device.alloc_uninit(&col_shape, self.dtype)? };
+        let (input_dims, input_strides) = dims4(&input_l)?;
+        let (col_dims, col_strides) = dims4(&col_l)?;
+        let shader = candle_wgpu_kernels::im2col_f32_shader(WG_SIZE)
+            .ok_or_else(|| Error::Msg("wgpu shader im2col.wgsl not embedded".into()).bt())?;
+        let params = Im2ColParams {
+            offset_i: 0,
+            offset_o: 0,
+            si0: input_strides[0],
+            si1: input_strides[1],
+            si2: input_strides[2],
+            si3: input_strides[3],
+            so0: col_strides[0],
+            so1: col_strides[1],
+            so2: col_strides[2],
+            so3: col_strides[3],
+            kw: kernel_size.1.try_into()?,
+            kh: kernel_size.0.try_into()?,
+            ic: 1,
+            iw: input_dims[0],
+            ih: input_dims[1],
+            n: input_dims[3],
+            ow: col_dims[2],
+            oh: col_dims[1],
+            s0: stride.1.try_into()?,
+            s1: stride.0.try_into()?,
+            p0: 0,
+            p1: 0,
+            d0: 1,
+            d1: 1,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-pool2d-im2col-params"),
+                size: std::mem::size_of::<Im2ColParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &input.buffer),
+            buffer_binding(1, &col.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+        let workgroups = (col_shape.elem_count() as u32).div_ceil(WG_SIZE);
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-pool2d-im2col",
+        )?;
+        drop(src_contiguous);
+
+        let out_col_shape = Shape::from(vec![bc, out_h, out_w, 1]);
+        let out_col_l = Layout::contiguous(out_col_shape.clone());
+        if !max_pool {
+            let sum = <Self as BackendStorage>::reduce_op(&col, ReduceOp::Sum, &col_l, &[3])?;
+            return <Self as BackendStorage>::affine(&sum, &out_col_l, 1.0 / k as f64, 0.0);
+        }
+
+        let col_strides = col_l.stride();
+        let mut acc = None;
+        for k_idx in 0..k {
+            let col_k_l = Layout::new(
+                out_col_shape.clone(),
+                vec![
+                    col_strides[0],
+                    col_strides[1],
+                    col_strides[2],
+                    col_strides[3],
+                ],
+                k_idx,
+            );
+            let mut col_k = unsafe { self.device.alloc_uninit(&out_col_shape, self.dtype)? };
+            col.copy_strided_src(&mut col_k, 0, &col_k_l)?;
+            acc = Some(if let Some(prev) = acc.take() {
+                <Self as BackendStorage>::binary_impl::<crate::op::Maximum>(
+                    &prev, &col_k, &out_col_l, &out_col_l,
+                )?
+            } else {
+                col_k
+            });
+        }
+        acc.ok_or_else(|| Error::Msg("pool2d empty kernel".into()).bt())
+    }
 }
 
 impl BackendStorage for WgpuStorage {
@@ -1729,12 +2386,12 @@ impl BackendStorage for WgpuStorage {
     }
     fn conv1d(
         &self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &crate::conv::ParamsConv1D,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
-        Err(unsupported("conv1d"))
+        self.run_conv1d_f32(layout, kernel, kernel_l, params)
     }
     fn conv_transpose1d(
         &self,
@@ -1747,12 +2404,12 @@ impl BackendStorage for WgpuStorage {
     }
     fn conv2d(
         &self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &crate::conv::ParamsConv2D,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        Err(unsupported("conv2d"))
+        self.run_conv2d_f32(layout, kernel, kernel_l, params)
     }
     fn conv_transpose2d(
         &self,
@@ -1763,28 +2420,52 @@ impl BackendStorage for WgpuStorage {
     ) -> Result<Self> {
         Err(unsupported("conv_transpose2d"))
     }
-    fn avg_pool2d(&self, _: &Layout, _: (usize, usize), _: (usize, usize)) -> Result<Self> {
-        Err(unsupported("avg_pool2d"))
+    fn avg_pool2d(
+        &self,
+        layout: &Layout,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+    ) -> Result<Self> {
+        self.run_pool2d_im2col_f32(layout, kernel_size, stride, false)
     }
-    fn max_pool2d(&self, _: &Layout, _: (usize, usize), _: (usize, usize)) -> Result<Self> {
-        Err(unsupported("max_pool2d"))
+    fn max_pool2d(
+        &self,
+        layout: &Layout,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+    ) -> Result<Self> {
+        self.run_pool2d_im2col_f32(layout, kernel_size, stride, true)
     }
-    fn upsample_nearest1d(&self, _: &Layout, _: usize) -> Result<Self> {
-        Err(unsupported("upsample_nearest1d"))
+    fn upsample_nearest1d(&self, layout: &Layout, out_l: usize) -> Result<Self> {
+        self.run_upsample_nearest1d_f32(layout, out_l)
     }
-    fn upsample_nearest2d(&self, _: &Layout, _: usize, _: usize) -> Result<Self> {
-        Err(unsupported("upsample_nearest2d"))
+    fn upsample_nearest2d(&self, layout: &Layout, out_h: usize, out_w: usize) -> Result<Self> {
+        let (_, _, h, w) = layout.shape().dims4()?;
+        self.run_upsample2d_f32(
+            layout,
+            out_h,
+            out_w,
+            nearest_interp_weights(h, out_h),
+            nearest_interp_weights(w, out_w),
+        )
     }
     fn upsample_bilinear2d(
         &self,
-        _: &Layout,
-        _: usize,
-        _: usize,
-        _: bool,
-        _: Option<f64>,
-        _: Option<f64>,
+        layout: &Layout,
+        out_h: usize,
+        out_w: usize,
+        align_corners: bool,
+        scale_h: Option<f64>,
+        scale_w: Option<f64>,
     ) -> Result<Self> {
-        Err(unsupported("upsample_bilinear2d"))
+        let (_, _, h, w) = layout.shape().dims4()?;
+        self.run_upsample2d_f32(
+            layout,
+            out_h,
+            out_w,
+            bilinear_interp_weights(h, out_h, align_corners, scale_h),
+            bilinear_interp_weights(w, out_w, align_corners, scale_w),
+        )
     }
     fn gather(&self, _: &Layout, _: &Self, _: &Layout, _: usize) -> Result<Self> {
         Err(unsupported("gather"))
@@ -1827,12 +2508,12 @@ impl BackendStorage for WgpuStorage {
     }
     fn matmul(
         &self,
-        _: &Self,
-        _: (usize, usize, usize, usize),
-        _: &Layout,
-        _: &Layout,
+        rhs: &Self,
+        bmnk: (usize, usize, usize, usize),
+        lhs_l: &Layout,
+        rhs_l: &Layout,
     ) -> Result<Self> {
-        Err(unsupported("matmul"))
+        self.run_matmul_f32(rhs, bmnk, lhs_l, rhs_l)
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {

@@ -133,6 +133,70 @@ struct GgmlSoftmaxParams {
     has_sinks: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VulkanMatmulParams {
+    m: u32,
+    n: u32,
+    k: u32,
+    stride_a: u32,
+    stride_b: u32,
+    stride_d: u32,
+    batch_stride_a: u32,
+    batch_stride_b: u32,
+    batch_stride_d: u32,
+    base_work_group_z: u32,
+    num_batches: u32,
+    k_split: u32,
+    ne02: u32,
+    ne12: u32,
+    broadcast2: u32,
+    broadcast3: u32,
+    padded_n: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VulkanIm2ColParams {
+    dst_addr: [u32; 2],
+    batch_offset: u32,
+    offset_delta: u32,
+    ic: u32,
+    iw: u32,
+    ih: u32,
+    ow: u32,
+    oh: u32,
+    kw: u32,
+    kh: u32,
+    oh_batch: u32,
+    chw: u32,
+    s0: i32,
+    s1: i32,
+    p0: i32,
+    p1: i32,
+    d0: i32,
+    d1: i32,
+    batch_ic: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VulkanPool2dParams {
+    iw: u32,
+    ih: u32,
+    ow: u32,
+    oh: u32,
+    oc: u32,
+    pelements: u32,
+    op: u32,
+    k0: i32,
+    k1: i32,
+    s0: i32,
+    s1: i32,
+    p0: i32,
+    p1: i32,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum VulkanError {
     #[error("{0}")]
@@ -714,6 +778,50 @@ fn dims4_ggml(layout: &Layout) -> Result<([u32; 4], [u32; 4])> {
 
 fn contiguous_strides_ggml(dims: [u32; 4]) -> [u32; 4] {
     [1, dims[0], dims[0] * dims[1], dims[0] * dims[1] * dims[2]]
+}
+
+fn nearest_interp_weights(in_size: usize, out_size: usize) -> Vec<f32> {
+    let mut weights = vec![0f32; in_size * out_size];
+    let scale = in_size as f64 / out_size as f64;
+    for out_idx in 0..out_size {
+        let src_idx = usize::min(in_size - 1, (out_idx as f64 * scale) as usize);
+        weights[src_idx * out_size + out_idx] = 1.0;
+    }
+    weights
+}
+
+fn bilinear_interp_weights(
+    in_size: usize,
+    out_size: usize,
+    align_corners: bool,
+    scale_factor: Option<f64>,
+) -> Vec<f32> {
+    let scale = if align_corners {
+        if out_size > 1 {
+            (in_size - 1) as f64 / (out_size - 1) as f64
+        } else {
+            0.0
+        }
+    } else if let Some(scale_factor) = scale_factor {
+        1.0 / scale_factor
+    } else {
+        in_size as f64 / out_size as f64
+    };
+    let mut weights = vec![0f32; in_size * out_size];
+    for out_idx in 0..out_size {
+        let src = if align_corners {
+            scale * out_idx as f64
+        } else {
+            scale * (out_idx as f64 + 0.5) - 0.5
+        };
+        let src = src.max(0.0);
+        let idx0 = src.floor() as usize;
+        let idx1 = (idx0 + 1).min(in_size - 1);
+        let weight = (src - idx0 as f64).clamp(0.0, 1.0) as f32;
+        weights[idx0 * out_size + out_idx] += 1.0 - weight;
+        weights[idx1 * out_size + out_idx] += weight;
+    }
+    weights
 }
 
 fn fastdiv_values(d: u32) -> (u32, u32) {
@@ -1323,6 +1431,470 @@ impl VulkanStorage {
         )?;
         Ok(dst)
     }
+
+    fn run_matmul_f32(
+        &self,
+        rhs: &Self,
+        (b, m, n, k): (usize, usize, usize, usize),
+        lhs_l: &Layout,
+        rhs_l: &Layout,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 || rhs.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan matmul").bt());
+        }
+        let rank = lhs_l.dims().len();
+        if rank != rhs_l.dims().len() || rank < 2 || rank > 4 {
+            return Err(unsupported("matmul rank"));
+        }
+        if b != lhs_l.dims()[..rank - 2].iter().product::<usize>() {
+            return Err(unsupported("matmul batch"));
+        }
+
+        let mut lhs_contiguous = None;
+        let (lhs, lhs_layout) = if lhs_l.is_contiguous() && lhs_l.start_offset() == 0 {
+            (self, lhs_l.clone())
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(lhs_l.shape(), self.dtype)? };
+            self.copy_strided_src(&mut tmp, 0, lhs_l)?;
+            lhs_contiguous = Some(tmp);
+            (
+                lhs_contiguous.as_ref().unwrap(),
+                Layout::contiguous(lhs_l.shape().clone()),
+            )
+        };
+
+        let rhs_t_src_layout = rhs_l.transpose(rank - 2, rank - 1)?;
+        let rhs_t_shape = rhs_t_src_layout.shape().clone();
+        let mut rhs_t = unsafe { rhs.device.alloc_uninit(&rhs_t_shape, rhs.dtype)? };
+        rhs.copy_strided_src(&mut rhs_t, 0, &rhs_t_src_layout)?;
+
+        let lhs_stride = lhs_layout.stride();
+        let rhs_t_stride = rhs_t_shape.stride_contiguous();
+        let bs02 = if rank >= 3 {
+            lhs_layout.dims()[rank - 3]
+        } else {
+            1
+        };
+        let lhs_stride_batch_inner = if rank >= 3 {
+            lhs_stride[rank - 3]
+        } else {
+            m * k
+        };
+        let rhs_stride_batch_inner = if rank >= 3 {
+            rhs_t_stride[rank - 3]
+        } else {
+            n * k
+        };
+
+        let dst_shape = Shape::from(vec![b, m, n]);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
+        let params = VulkanMatmulParams {
+            m: n.try_into()?,
+            n: m.try_into()?,
+            k: k.try_into()?,
+            stride_a: k.try_into()?,
+            stride_b: lhs_stride[rank - 2].try_into()?,
+            stride_d: n.try_into()?,
+            batch_stride_a: rhs_stride_batch_inner.try_into()?,
+            batch_stride_b: lhs_stride_batch_inner.try_into()?,
+            batch_stride_d: (m * n).try_into()?,
+            base_work_group_z: 0,
+            num_batches: b.try_into()?,
+            k_split: k.try_into()?,
+            ne02: bs02.try_into()?,
+            ne12: bs02.try_into()?,
+            broadcast2: 1,
+            broadcast3: 1,
+            padded_n: m.try_into()?,
+        };
+        let bindings = [
+            VulkanBinding::Storage(rhs_t.buffer.as_ref()),
+            VulkanBinding::Storage(lhs.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("matmul_f32_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader matmul_f32_f32 not generated".into()).bt())?;
+        let spec = [
+            (0, 64),
+            (1, 64),
+            (2, 64),
+            (4, 32),
+            (5, 32),
+            (6, 2),
+            (7, 4),
+            (8, 2),
+            (10, self.device.inner.subgroup_size.max(1)),
+        ];
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (
+                n.div_ceil(64).try_into()?,
+                m.div_ceil(64).try_into()?,
+                b.try_into()?,
+            ),
+            Some(&spec),
+        )?;
+        drop(lhs_contiguous);
+        Ok(dst)
+    }
+
+    fn run_im2col_conv1d_f32(
+        &self,
+        layout: &Layout,
+        params: &crate::conv::ParamsConv1D,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan im2col conv1d").bt());
+        }
+        let src_stride = layout.stride();
+        let input_l = Layout::new(
+            Shape::from(vec![params.b_size, params.c_in, 1, params.l_in]),
+            vec![
+                src_stride[0],
+                src_stride[1],
+                src_stride[2] * params.l_in,
+                src_stride[2],
+            ],
+            layout.start_offset(),
+        );
+        let mut input_contiguous = None;
+        let input = if input_l.is_contiguous() && input_l.start_offset() == 0 {
+            self
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(input_l.shape(), self.dtype)? };
+            self.copy_strided_src(&mut tmp, 0, &input_l)?;
+            input_contiguous = Some(tmp);
+            input_contiguous.as_ref().unwrap()
+        };
+        let l_out = params.l_out();
+        let chw = params.c_in * params.k_size;
+        let out_shape = Shape::from((params.b_size * l_out, chw));
+        let dst = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
+        let push = VulkanIm2ColParams {
+            dst_addr: [0, 0],
+            batch_offset: (params.c_in * params.l_in).try_into()?,
+            offset_delta: params.l_in.try_into()?,
+            ic: params.c_in.try_into()?,
+            iw: params.l_in.try_into()?,
+            ih: 1,
+            ow: l_out.try_into()?,
+            oh: 1,
+            kw: params.k_size.try_into()?,
+            kh: 1,
+            oh_batch: params.b_size.try_into()?,
+            chw: chw.try_into()?,
+            s0: params.stride.try_into()?,
+            s1: 1,
+            p0: params.padding.try_into()?,
+            p1: 0,
+            d0: params.dilation.try_into()?,
+            d1: 1,
+            batch_ic: (params.b_size * params.c_in).try_into()?,
+        };
+        let bindings = [
+            VulkanBinding::Storage(input.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("im2col_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader im2col_f32 not generated".into()).bt())?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&push)),
+            (
+                chw.div_ceil(512).try_into()?,
+                l_out.try_into()?,
+                params.b_size.try_into()?,
+            ),
+            Some(&[(0, 32)]),
+        )?;
+        drop(input_contiguous);
+        Ok(dst)
+    }
+
+    fn run_conv1d_f32(
+        &self,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv1D,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 || kernel.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan conv1d").bt());
+        }
+        let col = self.run_im2col_conv1d_f32(layout, params)?;
+        let b = params.b_size;
+        let n = params.c_out;
+        let l_out = params.l_out();
+        let k = params.k_size * params.c_in;
+        let m = l_out;
+        let col_l = Layout::contiguous((b * m, k));
+
+        let mut kernel_contiguous = None;
+        let (kernel_matmul, kernel_l_mm) = if kernel_l.is_contiguous()
+            && kernel_l.start_offset() == 0
+        {
+            (
+                kernel,
+                Layout::contiguous_with_offset((n, k), 0).transpose(0, 1)?,
+            )
+        } else {
+            let mut tmp = unsafe { kernel.device.alloc_uninit(kernel_l.shape(), kernel.dtype)? };
+            kernel.copy_strided_src(&mut tmp, 0, kernel_l)?;
+            kernel_contiguous = Some(tmp);
+            (
+                kernel_contiguous.as_ref().unwrap(),
+                Layout::contiguous_with_offset((n, k), 0).transpose(0, 1)?,
+            )
+        };
+
+        let res = col.matmul(kernel_matmul, (1, b * m, n, k), &col_l, &kernel_l_mm)?;
+        let res_l = Layout::contiguous((b, l_out, n)).transpose(1, 2)?;
+        let mut out = unsafe {
+            self.device
+                .alloc_uninit(&Shape::from(params.out_dims()), res.dtype)?
+        };
+        res.copy_strided_src(&mut out, 0, &res_l)?;
+        drop(kernel_contiguous);
+        Ok(out)
+    }
+
+    fn run_im2col_f32(&self, layout: &Layout, params: &crate::conv::ParamsConv2D) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan im2col").bt());
+        }
+        let mut input_contiguous = None;
+        let input = if layout.is_contiguous() && layout.start_offset() == 0 {
+            self
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            self.copy_strided_src(&mut tmp, 0, layout)?;
+            input_contiguous = Some(tmp);
+            input_contiguous.as_ref().unwrap()
+        };
+        let h_out = params.out_h();
+        let w_out = params.out_w();
+        let chw = params.c_in * params.k_h * params.k_w;
+        let out_shape = Shape::from((params.b_size * h_out * w_out, chw));
+        let dst = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
+        let push = VulkanIm2ColParams {
+            dst_addr: [0, 0],
+            batch_offset: (params.c_in * params.i_h * params.i_w).try_into()?,
+            offset_delta: (params.i_h * params.i_w).try_into()?,
+            ic: params.c_in.try_into()?,
+            iw: params.i_w.try_into()?,
+            ih: params.i_h.try_into()?,
+            ow: w_out.try_into()?,
+            oh: h_out.try_into()?,
+            kw: params.k_w.try_into()?,
+            kh: params.k_h.try_into()?,
+            oh_batch: (params.b_size * h_out).try_into()?,
+            chw: chw.try_into()?,
+            s0: params.stride.try_into()?,
+            s1: params.stride.try_into()?,
+            p0: params.padding.try_into()?,
+            p1: params.padding.try_into()?,
+            d0: params.dilation.try_into()?,
+            d1: params.dilation.try_into()?,
+            batch_ic: (params.b_size * params.c_in).try_into()?,
+        };
+        let bindings = [
+            VulkanBinding::Storage(input.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("im2col_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader im2col_f32 not generated".into()).bt())?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&push)),
+            (
+                chw.div_ceil(512).try_into()?,
+                w_out.try_into()?,
+                (params.b_size * h_out).try_into()?,
+            ),
+            Some(&[(0, 32)]),
+        )?;
+        drop(input_contiguous);
+        Ok(dst)
+    }
+
+    fn run_conv2d_f32(
+        &self,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv2D,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 || kernel.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan conv2d").bt());
+        }
+        let col = self.run_im2col_f32(layout, params)?;
+        let h_out = params.out_h();
+        let w_out = params.out_w();
+        let b = params.b_size;
+        let n = params.c_out;
+        let k = params.k_h * params.k_w * params.c_in;
+        let m = h_out * w_out;
+        let col_l = Layout::contiguous((b * m, k));
+
+        let mut kernel_contiguous = None;
+        let (kernel_matmul, kernel_l_mm) = if kernel_l.is_contiguous()
+            && kernel_l.start_offset() == 0
+        {
+            (
+                kernel,
+                Layout::contiguous_with_offset((n, k), 0).transpose(0, 1)?,
+            )
+        } else {
+            let mut tmp = unsafe { kernel.device.alloc_uninit(kernel_l.shape(), kernel.dtype)? };
+            kernel.copy_strided_src(&mut tmp, 0, kernel_l)?;
+            kernel_contiguous = Some(tmp);
+            (
+                kernel_contiguous.as_ref().unwrap(),
+                Layout::contiguous_with_offset((n, k), 0).transpose(0, 1)?,
+            )
+        };
+
+        let res = col.matmul(kernel_matmul, (1, b * m, n, k), &col_l, &kernel_l_mm)?;
+        let res_l = Layout::contiguous((b, h_out, w_out, n))
+            .transpose(1, 2)?
+            .transpose(1, 3)?;
+        let mut out = unsafe { self.device.alloc_uninit(res_l.shape(), res.dtype)? };
+        res.copy_strided_src(&mut out, 0, &res_l)?;
+        drop(kernel_contiguous);
+        Ok(out)
+    }
+
+    fn run_upsample_nearest1d_f32(&self, layout: &Layout, out_l: usize) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan upsample_nearest1d").bt());
+        }
+        let (b, c, l) = layout.shape().dims3()?;
+        let rows = b * c;
+        let mut src_contiguous = None;
+        let (src, src_l) = if layout.is_contiguous() && layout.start_offset() == 0 {
+            (self, Layout::contiguous((rows, l)))
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            self.copy_strided_src(&mut tmp, 0, layout)?;
+            src_contiguous = Some(tmp);
+            (
+                src_contiguous.as_ref().unwrap(),
+                Layout::contiguous((rows, l)),
+            )
+        };
+        let weights = nearest_interp_weights(l, out_l);
+        let weight_storage = self.device.storage_from_slice(&weights)?;
+        let weight_l = Layout::contiguous((l, out_l));
+        let out = src.matmul(&weight_storage, (1, rows, out_l, l), &src_l, &weight_l)?;
+        drop(src_contiguous);
+        Ok(out)
+    }
+
+    fn run_upsample2d_f32(
+        &self,
+        layout: &Layout,
+        out_h: usize,
+        out_w: usize,
+        h_weights: Vec<f32>,
+        w_weights: Vec<f32>,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan upsample2d").bt());
+        }
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let bc = b * c;
+        let mut src_contiguous = None;
+        let (src, src_l) = if layout.is_contiguous() && layout.start_offset() == 0 {
+            (self, Layout::contiguous((bc * h, w)))
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            self.copy_strided_src(&mut tmp, 0, layout)?;
+            src_contiguous = Some(tmp);
+            (
+                src_contiguous.as_ref().unwrap(),
+                Layout::contiguous((bc * h, w)),
+            )
+        };
+
+        let w_storage = self.device.storage_from_slice(&w_weights)?;
+        let w_l = Layout::contiguous((w, out_w));
+        let width = src.matmul(&w_storage, (1, bc * h, out_w, w), &src_l, &w_l)?;
+
+        let width_l = Layout::new(
+            Shape::from(vec![bc, out_w, h]),
+            vec![h * out_w, 1, out_w],
+            0,
+        );
+        let h_storage = self.device.storage_from_slice(&h_weights)?;
+        let h_l = Layout::new(Shape::from(vec![bc, h, out_h]), vec![0, out_h, 1], 0);
+        let height = width.matmul(&h_storage, (bc, out_w, out_h, h), &width_l, &h_l)?;
+
+        let height_l = Layout::contiguous((bc, out_w, out_h)).transpose(1, 2)?;
+        let out_shape = Shape::from(vec![b, c, out_h, out_w]);
+        let mut out = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
+        height.copy_strided_src(&mut out, 0, &height_l)?;
+        drop(src_contiguous);
+        Ok(out)
+    }
+
+    fn run_pool2d_f32(
+        &self,
+        layout: &Layout,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        max_pool: bool,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan pool2d").bt());
+        }
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let out_h = (h - kernel_size.0) / stride.0 + 1;
+        let out_w = (w - kernel_size.1) / stride.1 + 1;
+        let mut input_contiguous = None;
+        let input = if layout.is_contiguous() && layout.start_offset() == 0 {
+            self
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            self.copy_strided_src(&mut tmp, 0, layout)?;
+            input_contiguous = Some(tmp);
+            input_contiguous.as_ref().unwrap()
+        };
+        let out_shape = Shape::from(vec![b, c, out_h, out_w]);
+        let dst = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
+        let push = VulkanPool2dParams {
+            iw: w.try_into()?,
+            ih: h.try_into()?,
+            ow: out_w.try_into()?,
+            oh: out_h.try_into()?,
+            oc: c.try_into()?,
+            pelements: out_shape.elem_count().try_into()?,
+            op: if max_pool { 0 } else { 1 },
+            k0: kernel_size.0.try_into()?,
+            k1: kernel_size.1.try_into()?,
+            s0: stride.0.try_into()?,
+            s1: stride.1.try_into()?,
+            p0: 0,
+            p1: 0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(input.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("pool2d_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader pool2d_f32 not generated".into()).bt())?;
+        self.device.run_compute(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&push)),
+            (out_shape.elem_count() as u32).div_ceil(512),
+        )?;
+        drop(input_contiguous);
+        Ok(dst)
+    }
 }
 
 impl Drop for VulkanBuffer {
@@ -1553,12 +2125,12 @@ impl BackendStorage for VulkanStorage {
     }
     fn conv1d(
         &self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &crate::conv::ParamsConv1D,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
-        Err(unsupported("conv1d"))
+        self.run_conv1d_f32(layout, kernel, kernel_l, params)
     }
     fn conv_transpose1d(
         &self,
@@ -1571,12 +2143,12 @@ impl BackendStorage for VulkanStorage {
     }
     fn conv2d(
         &self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &crate::conv::ParamsConv2D,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        Err(unsupported("conv2d"))
+        self.run_conv2d_f32(layout, kernel, kernel_l, params)
     }
     fn conv_transpose2d(
         &self,
@@ -1587,28 +2159,52 @@ impl BackendStorage for VulkanStorage {
     ) -> Result<Self> {
         Err(unsupported("conv_transpose2d"))
     }
-    fn avg_pool2d(&self, _: &Layout, _: (usize, usize), _: (usize, usize)) -> Result<Self> {
-        Err(unsupported("avg_pool2d"))
+    fn avg_pool2d(
+        &self,
+        layout: &Layout,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+    ) -> Result<Self> {
+        self.run_pool2d_f32(layout, kernel_size, stride, false)
     }
-    fn max_pool2d(&self, _: &Layout, _: (usize, usize), _: (usize, usize)) -> Result<Self> {
-        Err(unsupported("max_pool2d"))
+    fn max_pool2d(
+        &self,
+        layout: &Layout,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+    ) -> Result<Self> {
+        self.run_pool2d_f32(layout, kernel_size, stride, true)
     }
-    fn upsample_nearest1d(&self, _: &Layout, _: usize) -> Result<Self> {
-        Err(unsupported("upsample_nearest1d"))
+    fn upsample_nearest1d(&self, layout: &Layout, out_l: usize) -> Result<Self> {
+        self.run_upsample_nearest1d_f32(layout, out_l)
     }
-    fn upsample_nearest2d(&self, _: &Layout, _: usize, _: usize) -> Result<Self> {
-        Err(unsupported("upsample_nearest2d"))
+    fn upsample_nearest2d(&self, layout: &Layout, out_h: usize, out_w: usize) -> Result<Self> {
+        let (_, _, h, w) = layout.shape().dims4()?;
+        self.run_upsample2d_f32(
+            layout,
+            out_h,
+            out_w,
+            nearest_interp_weights(h, out_h),
+            nearest_interp_weights(w, out_w),
+        )
     }
     fn upsample_bilinear2d(
         &self,
-        _: &Layout,
-        _: usize,
-        _: usize,
-        _: bool,
-        _: Option<f64>,
-        _: Option<f64>,
+        layout: &Layout,
+        out_h: usize,
+        out_w: usize,
+        align_corners: bool,
+        scale_h: Option<f64>,
+        scale_w: Option<f64>,
     ) -> Result<Self> {
-        Err(unsupported("upsample_bilinear2d"))
+        let (_, _, h, w) = layout.shape().dims4()?;
+        self.run_upsample2d_f32(
+            layout,
+            out_h,
+            out_w,
+            bilinear_interp_weights(h, out_h, align_corners, scale_h),
+            bilinear_interp_weights(w, out_w, align_corners, scale_w),
+        )
     }
     fn gather(&self, _: &Layout, _: &Self, _: &Layout, _: usize) -> Result<Self> {
         Err(unsupported("gather"))
@@ -1651,12 +2247,12 @@ impl BackendStorage for VulkanStorage {
     }
     fn matmul(
         &self,
-        _: &Self,
-        _: (usize, usize, usize, usize),
-        _: &Layout,
-        _: &Layout,
+        rhs: &Self,
+        bmnk: (usize, usize, usize, usize),
+        lhs_l: &Layout,
+        rhs_l: &Layout,
     ) -> Result<Self> {
-        Err(unsupported("matmul"))
+        self.run_matmul_f32(rhs, bmnk, lhs_l, rhs_l)
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {

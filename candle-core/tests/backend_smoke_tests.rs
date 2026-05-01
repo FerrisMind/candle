@@ -28,6 +28,22 @@ fn backend_smoke_vulkan_feature_flag_is_not_visible() {
 }
 
 #[test]
+#[cfg(not(feature = "wgpu"))]
+fn backend_smoke_dummy_wgpu_does_not_claim_bf16() {
+    let device = candle_core::Device::Wgpu(candle_core::WgpuDevice);
+    assert!(!device.supports_bf16());
+    assert_eq!(device.bf16_default_to_f32(), candle_core::DType::F32);
+}
+
+#[test]
+#[cfg(not(feature = "vulkan"))]
+fn backend_smoke_dummy_vulkan_does_not_claim_bf16() {
+    let device = candle_core::Device::Vulkan(candle_core::VulkanDevice);
+    assert!(!device.supports_bf16());
+    assert_eq!(device.bf16_default_to_f32(), candle_core::DType::F32);
+}
+
+#[test]
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
 fn backend_smoke_wgpu_f32_upload_unary_binary_roundtrip() -> Result<()> {
@@ -35,7 +51,6 @@ fn backend_smoke_wgpu_f32_upload_unary_binary_roundtrip() -> Result<()> {
     assert!(device.is_wgpu());
 
     smoke_f32_upload_unary_binary_roundtrip(&device)?;
-    smoke_unsupported_matmul_is_explicit(&device, "wgpu backend op matmul not implemented")?;
     Ok(())
 }
 
@@ -48,12 +63,14 @@ fn backend_smoke_vulkan_f32_upload_unary_binary_roundtrip() -> Result<()> {
 
     smoke_f32_upload_unary_binary_roundtrip(&device)?;
     smoke_i32_to_f32_dtype_conversion(&device)?;
-    smoke_unsupported_matmul_is_explicit(&device, "vulkan backend op matmul not implemented")?;
     Ok(())
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
+    assert!(!device.supports_bf16());
+    assert_eq!(device.bf16_default_to_f32(), DType::F32);
+
     let xs = Tensor::from_slice(&[-2.0f32, -1.0, 0.0, 3.0], (2, 2), device)?;
     assert_eq!(xs.to_vec2::<f32>()?, [[-2.0, -1.0], [0.0, 3.0]]);
 
@@ -79,6 +96,11 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     smoke_f32_cumsum(device)?;
     smoke_f32_argmax_last_dim(device)?;
     smoke_f32_index_select(device)?;
+    smoke_f32_matmul(device)?;
+    smoke_f32_conv1d(device)?;
+    smoke_f32_conv2d(device)?;
+    smoke_f32_upsample(device)?;
+    smoke_f32_pool2d(device)?;
     smoke_f32_extended_unary_ops(device)?;
 
     device.synchronize()?;
@@ -426,6 +448,131 @@ fn smoke_f32_index_select(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_matmul(device: &Device) -> Result<()> {
+    let lhs = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), device)?;
+    let rhs = Tensor::from_slice(&[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0], (3, 2), device)?;
+    assert_eq!(
+        lhs.matmul(&rhs)?.to_vec2::<f32>()?,
+        [[58.0, 64.0], [139.0, 154.0]]
+    );
+
+    let lhs_b = Tensor::from_slice(
+        &[
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 2.0, 0.0, 1.0, 3.0, 4.0, 5.0,
+        ],
+        (2, 2, 3),
+        device,
+    )?;
+    let rhs_b = Tensor::from_slice(
+        &[
+            7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
+        ],
+        (2, 3, 2),
+        device,
+    )?;
+    assert_eq!(
+        lhs_b.matmul(&rhs_b)?.to_vec3::<f32>()?,
+        [[[58.0, 64.0], [139.0, 154.0]], [[7.0, 10.0], [40.0, 52.0]]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_conv1d(device: &Device) -> Result<()> {
+    let input = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, 1, 4), device)?;
+    let kernel = Tensor::from_slice(&[1.0f32, 0.0, 1.0], (1, 1, 3), device)?;
+    assert_eq!(
+        input.conv1d(&kernel, 0, 1, 1, 1)?.to_vec3::<f32>()?,
+        [[[4.0, 6.0]]]
+    );
+
+    assert_eq!(
+        input.conv1d(&kernel, 1, 1, 1, 1)?.to_vec3::<f32>()?,
+        [[[2.0, 4.0, 6.0, 3.0]]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_conv2d(device: &Device) -> Result<()> {
+    let input = Tensor::from_slice(
+        &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+        (1, 1, 3, 3),
+        device,
+    )?;
+    let kernel = Tensor::from_slice(&[1.0f32, 0.0, 0.0, 1.0], (1, 1, 2, 2), device)?;
+    assert_eq!(
+        input
+            .conv2d(&kernel, 0, 1, 1, 1)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        [6.0, 8.0, 12.0, 14.0]
+    );
+
+    let padded = input.conv2d(&kernel, 1, 1, 1, 1)?;
+    assert_eq!(padded.dims(), &[1, 1, 4, 4]);
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_upsample(device: &Device) -> Result<()> {
+    let line = Tensor::from_slice(&[1.0f32, 2.0, 3.0], (1, 1, 3), device)?;
+    assert_eq!(
+        line.upsample_nearest1d(5)?.to_vec3::<f32>()?,
+        [[[1.0, 1.0, 2.0, 2.0, 3.0]]]
+    );
+
+    let image = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, 1, 2, 2), device)?;
+    assert_eq!(
+        image
+            .upsample_nearest2d(3, 4)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        [1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0]
+    );
+    assert_eq!(
+        image
+            .upsample_bilinear2d(3, 3, true)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        [1.0, 1.5, 2.0, 2.0, 2.5, 3.0, 3.0, 3.5, 4.0]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_pool2d(device: &Device) -> Result<()> {
+    let image = Tensor::from_slice(
+        &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+        (1, 1, 3, 3),
+        device,
+    )?;
+    assert_eq!(
+        image.avg_pool2d((2, 2))?.flatten_all()?.to_vec1::<f32>()?,
+        [3.0]
+    );
+    assert_eq!(
+        image.max_pool2d((2, 2))?.flatten_all()?.to_vec1::<f32>()?,
+        [5.0]
+    );
+    assert_eq!(
+        image
+            .avg_pool2d_with_stride((2, 2), (1, 1))?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        [3.0, 4.0, 6.0, 7.0]
+    );
+    assert_eq!(
+        image
+            .max_pool2d_with_stride((2, 2), (1, 1))?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        [5.0, 6.0, 8.0, 9.0]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_f32_extended_unary_ops(device: &Device) -> Result<()> {
     let xs = Tensor::from_slice(&[0.25f32, 1.0, 4.0, 9.0], (2, 2), device)?;
     assert_close(
@@ -476,7 +623,7 @@ fn smoke_f32_extended_unary_ops(device: &Device) -> Result<()> {
         1e-6,
     );
     assert_close(
-        &xs.clamp(0.5f32, 4.5f32)?.to_vec2::<f32>()?,
+        &xs.clamp(0.5, 4.5)?.to_vec2::<f32>()?,
         &[[0.5, 1.0], [4.0, 4.5]],
         1e-6,
     );
@@ -506,19 +653,4 @@ fn assert_close(actual: &[Vec<f32>], expected: &[[f32; 2]; 2], tol: f32) {
             );
         }
     }
-}
-
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
-fn smoke_unsupported_matmul_is_explicit(device: &Device, expected: &str) -> Result<()> {
-    let lhs = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (2, 2), device)?;
-    let rhs = Tensor::from_slice(&[1.0f32, 0.0, 0.0, 1.0], (2, 2), device)?;
-    let err = lhs
-        .matmul(&rhs)
-        .expect_err("matmul must be explicit unsupported");
-    let msg = err.to_string();
-    assert!(
-        msg.contains(expected),
-        "expected error containing {expected:?}, got {msg:?}"
-    );
-    Ok(())
 }
