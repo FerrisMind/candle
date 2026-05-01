@@ -100,6 +100,7 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     smoke_f32_index_select(device)?;
     smoke_f32_gather_last_dim(device)?;
     smoke_f32_scatter_set_last_dim(device)?;
+    smoke_f32_gather_scatter_non_last_dim(device)?;
     smoke_f32_matmul(device)?;
     smoke_f32_conv1d(device)?;
     smoke_f32_conv2d(device)?;
@@ -566,6 +567,29 @@ fn smoke_f32_scatter_set_last_dim(device: &Device) -> Result<()> {
     assert_eq!(
         dst.to_vec2::<f32>()?,
         [[10.0, 0.0, 30.0, 0.0], [0.0, 200.0, 0.0, 400.0]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_gather_scatter_non_last_dim(device: &Device) -> Result<()> {
+    let xs = Tensor::from_slice(&[1.0f32, 10.0, 2.0, 20.0, 3.0, 30.0], (3, 2), device)?;
+    let ids = Tensor::from_slice(&[0u32, 1, 2, 0], (2, 2), device)?;
+
+    let cpu = Device::Cpu;
+    let xs_cpu = Tensor::from_slice(&[1.0f32, 10.0, 2.0, 20.0, 3.0, 30.0], (3, 2), &cpu)?;
+    let ids_cpu = Tensor::from_slice(&[0u32, 1, 2, 0], (2, 2), &cpu)?;
+    let expected_gather = xs_cpu.gather(&ids_cpu, 0)?.to_vec2::<f32>()?;
+    assert_eq!(xs.gather(&ids, 0)?.to_vec2::<f32>()?, expected_gather);
+
+    let base = Tensor::zeros((3, 2), DType::F32, device)?;
+    let src = Tensor::from_slice(&[7.0f32, 70.0, 8.0, 80.0], (2, 2), device)?;
+    let base_cpu = Tensor::zeros((3, 2), DType::F32, &cpu)?;
+    let src_cpu = Tensor::from_slice(&[7.0f32, 70.0, 8.0, 80.0], (2, 2), &cpu)?;
+    let expected_scatter = base_cpu.scatter(&ids_cpu, &src_cpu, 0)?.to_vec2::<f32>()?;
+    assert_eq!(
+        base.scatter(&ids, &src, 0)?.to_vec2::<f32>()?,
+        expected_scatter
     );
     Ok(())
 }
