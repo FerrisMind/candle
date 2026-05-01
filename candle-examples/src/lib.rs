@@ -5,28 +5,42 @@ pub mod coco_classes;
 pub mod imagenet;
 pub mod token_output_stream;
 pub mod wav;
-use candle::utils::{cuda_is_available, metal_is_available};
+use candle::utils::{
+    cuda_is_available, metal_is_available, vulkan_is_available, wgpu_is_available,
+};
 use candle::{Device, Result, Tensor};
+use std::env;
 
 pub fn device(cpu: bool) -> Result<Device> {
-    if cpu {
+    if cpu || matches!(env::var("CANDLE_DEVICE").ok().as_deref(), Some("cpu")) {
         Ok(Device::Cpu)
-    } else if cuda_is_available() {
-        Ok(Device::new_cuda(0)?)
-    } else if metal_is_available() {
-        Ok(Device::new_metal(0)?)
     } else {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            println!(
-                "Running on CPU, to run on GPU(metal), build this example with `--features metal`"
-            );
+        match env::var("CANDLE_DEVICE").ok().as_deref() {
+            Some("cuda") => Ok(Device::new_cuda(0)?),
+            Some("wgpu") => Ok(Device::new_wgpu(0)?),
+            Some("vulkan") => Ok(Device::new_vulkan(0)?),
+            Some("metal") => Ok(Device::new_metal(0)?),
+            Some(device) => candle::bail!("unsupported CANDLE_DEVICE value: {device}"),
+            None if cuda_is_available() => Ok(Device::new_cuda(0)?),
+            None if wgpu_is_available() => Ok(Device::new_wgpu(0)?),
+            None if vulkan_is_available() => Ok(Device::new_vulkan(0)?),
+            None if metal_is_available() => Ok(Device::new_metal(0)?),
+            None => {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    println!(
+                        "Running on CPU, to run on GPU(metal), build this example with `--features metal`, `wgpu`, or `vulkan`"
+                    );
+                }
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                {
+                    println!(
+                        "Running on CPU, to run on GPU, build this example with `--features cuda`, `wgpu`, or `vulkan`"
+                    );
+                }
+                Ok(Device::Cpu)
+            }
         }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            println!("Running on CPU, to run on GPU, build this example with `--features cuda`");
-        }
-        Ok(Device::Cpu)
     }
 }
 

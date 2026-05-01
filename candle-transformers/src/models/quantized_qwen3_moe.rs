@@ -1,13 +1,13 @@
 use super::quantized_qwen3::{Gguf, RotaryEmbedding};
 use super::with_tracing::QMatMul;
 use crate::fused_moe::{FusedMoeGGUF, MoeCfg};
-use crate::quantized_nn::RmsNorm;
+use crate::quantized_nn::{QEmbedding, RmsNorm};
 use crate::utils::repeat_kv;
 use candle::quantized::gguf_file;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::ConcatKvCache;
 use candle_nn::Linear;
-use candle_nn::{Embedding, Module};
+use candle_nn::Module;
 use std::sync::Arc;
 #[derive(Debug, Clone)]
 struct Mlp {
@@ -233,7 +233,7 @@ impl LayerWeights {
 }
 
 pub struct GGUFQWenMoE {
-    tok_embeddings: Embedding,
+    tok_embeddings: QEmbedding,
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     output: QMatMul,
@@ -300,14 +300,13 @@ impl GGUFQWenMoE {
             decoder_sparse_step: None,
         };
 
-        let tok_embeddings = gg.tensor("token_embd.weight")?;
-        let tok_embeddings = tok_embeddings.dequantize(device)?;
+        let tok_embeddings = Arc::new(gg.tensor("token_embd.weight")?);
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
         let output = match gg.qmatmul("output.weight") {
             Ok(v) => v,
             _ => {
                 // use tie_word_embeddings
-                gg.qmatmul("token_embd.weight")?
+                QMatMul::from_weights(tok_embeddings.clone())?
             }
         };
 
@@ -382,7 +381,7 @@ impl GGUFQWenMoE {
         }
 
         Ok(Self {
-            tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
+            tok_embeddings: QEmbedding::from_arc(tok_embeddings),
             layers,
             norm,
             output,

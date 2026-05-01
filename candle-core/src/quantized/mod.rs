@@ -1368,6 +1368,15 @@ impl QTensor {
         self.storage.data()
     }
 
+    pub fn embedding(&self, ids: &Tensor) -> Result<Tensor> {
+        let (_, hidden_size) = self.shape.dims2()?;
+        let flat_ids = ids.flatten_all()?;
+        let gathered = self.index_select_rows0_f32(&flat_ids)?;
+        let mut out_dims = ids.dims().to_vec();
+        out_dims.push(hidden_size);
+        gathered.reshape(out_dims)
+    }
+
     fn index_select_rows0_f32(&self, ids: &Tensor) -> Result<Tensor> {
         if ids.rank() != 1 {
             crate::bail!(

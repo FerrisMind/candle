@@ -8,6 +8,7 @@ use crate::models::with_tracing::QMatMul;
 use crate::quantized_var_builder::VarBuilder;
 use candle::quantized::QTensor;
 use candle::{Module, Result, Tensor};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct Embedding {
@@ -32,6 +33,26 @@ impl Module for Embedding {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         self.inner.forward(xs)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QEmbedding {
+    weights: Arc<QTensor>,
+    span: tracing::Span,
+}
+
+impl QEmbedding {
+    pub fn from_arc(weights: Arc<QTensor>) -> Self {
+        let span = tracing::span!(tracing::Level::TRACE, "q-embedding");
+        Self { weights, span }
+    }
+}
+
+impl Module for QEmbedding {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        self.weights.embedding(xs)
     }
 }
 

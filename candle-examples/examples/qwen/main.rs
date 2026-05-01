@@ -216,6 +216,10 @@ struct Args {
     #[arg(long)]
     weight_path: Option<String>,
 
+    /// Use a specific dtype for loading the model weights.
+    #[arg(long)]
+    dtype: Option<String>,
+
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
     #[arg(long, default_value_t = 1.1)]
     repeat_penalty: f32,
@@ -330,13 +334,11 @@ fn main() -> Result<()> {
 
     let filenames = match args.weight_path {
         Some(path) => {
-            if std::path::Path::new(&path)
-                .join("model.safetensors.index.json")
-                .exists()
-            {
+            let path = std::path::Path::new(&path);
+            if path.join("model.safetensors.index.json").exists() {
                 candle_examples::hub_load_local_safetensors(path, "model.safetensors.index.json")?
             } else {
-                vec!["model.safetensors".into()]
+                vec![path.join("model.safetensors")]
             }
         }
         None => match args.model {
@@ -367,10 +369,13 @@ fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
     let device = candle_examples::device(args.cpu)?;
-    let dtype = if device.is_cuda() || device.is_metal() {
-        DType::BF16
-    } else {
-        DType::F32
+    let dtype = match args.dtype.as_deref() {
+        Some("f16") => DType::F16,
+        Some("bf16") => DType::BF16,
+        Some("f32") => DType::F32,
+        Some(dtype) => anyhow::bail!("Unsupported dtype {dtype}"),
+        None if device.is_cuda() || device.is_metal() => DType::BF16,
+        None => DType::F32,
     };
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
     let model = match args.model {

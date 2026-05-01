@@ -7,13 +7,16 @@
 //! - [Qwen3 Models](https://huggingface.co/Qwen/Qwen3-0.6B) (architecture based on official implementations)
 //!
 use super::with_tracing::QMatMul;
-use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
+use crate::{
+    quantized_nn::{QEmbedding, RmsNorm},
+    utils::repeat_kv,
+};
 use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Result, Storage, Tensor};
 use candle_nn::attention::cpu_flash::causal::causal_decode_f32_interleaved;
 use candle_nn::attention::{flash_attn, AttnMask};
 use candle_nn::kv_cache::{ConcatKvCache, InterleavedKvCache, RawInterleavedKvCache};
-use candle_nn::{Activation, Embedding, Module};
+use candle_nn::{Activation, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
@@ -450,7 +453,7 @@ impl LayerWeights {
 
 #[derive(Debug, Clone)]
 pub struct ModelWeights {
-    embed_tokens: Embedding,
+    embed_tokens: QEmbedding,
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     lm_head: QMatMul,
@@ -490,8 +493,8 @@ impl ModelWeights {
             None => DType::F16,
         };
 
-        let embed_tensor = gg.tensor("token_embd.weight")?;
-        let embed_tokens = Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
+        let embed_tensor = Arc::new(gg.tensor("token_embd.weight")?);
+        let embed_tokens = QEmbedding::from_arc(embed_tensor.clone());
 
         let rotary = Arc::new(RotaryEmbedding::new(
             dtype,
@@ -517,11 +520,10 @@ impl ModelWeights {
 
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
         // Load output projection tensor, falling back to tied embeddings like gemma3
-        let lm_head_tensor = match gg.tensor("output.weight") {
-            Ok(tensor) => tensor,
-            Err(_) => gg.tensor("token_embd.weight")?,
+        let lm_head = match gg.tensor("output.weight") {
+            Ok(tensor) => QMatMul::from_weights(Arc::new(tensor))?,
+            Err(_) => QMatMul::from_weights(embed_tensor)?,
         };
-        let lm_head = QMatMul::from_weights(lm_head_tensor.into())?;
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
         Ok(Self {
