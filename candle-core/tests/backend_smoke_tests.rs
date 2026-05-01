@@ -110,6 +110,7 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     smoke_f32_cmp_where(device)?;
     smoke_f32_scatter_add_and_index_add(device)?;
     smoke_f32_extended_unary_ops(device)?;
+    smoke_rank5_unary_binary_fallback(device)?;
 
     device.synchronize()?;
     Ok(())
@@ -859,6 +860,31 @@ fn smoke_f32_extended_unary_ops(device: &Device) -> Result<()> {
         &elu_input.elu(1.0)?.to_vec2::<f32>()?,
         &[[std::f32::consts::E.recip() - 1.0, 0.0], [1.0, 2.0]],
         1e-5,
+    );
+
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_rank5_unary_binary_fallback(device: &Device) -> Result<()> {
+    let xs = Tensor::from_slice(
+        &[-2.0f32, -1.0, 0.0, 1.0, 2.0, 3.0],
+        (1, 1, 1, 2, 3),
+        device,
+    )?;
+    let relu = xs.relu()?;
+    assert_eq!(relu.dims(), &[1, 1, 1, 2, 3]);
+    assert_eq!(
+        relu.flatten_all()?.to_vec1::<f32>()?,
+        [0.0, 0.0, 0.0, 1.0, 2.0, 3.0]
+    );
+
+    let ys = Tensor::from_slice(&[10.0f32, 20.0, 30.0], (1, 1, 1, 1, 3), device)?;
+    let add = xs.broadcast_add(&ys)?;
+    assert_eq!(add.dims(), &[1, 1, 1, 2, 3]);
+    assert_eq!(
+        add.flatten_all()?.to_vec1::<f32>()?,
+        [8.0, 19.0, 30.0, 11.0, 22.0, 33.0]
     );
 
     Ok(())

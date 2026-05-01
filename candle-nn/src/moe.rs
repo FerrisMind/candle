@@ -3,7 +3,144 @@
 use candle::cuda_backend::kernels::ffi;
 #[allow(unused_imports)]
 use candle::quantized::{self, QTensor};
-use candle::{Result, Tensor};
+use candle::{DType, Result, Tensor};
+
+fn moe_gemm_fallback(
+    input: &Tensor,
+    weights: &Tensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+) -> Result<Tensor> {
+    let (input_rows, size_k_input) = input.dims2()?;
+    let (num_experts, size_n, size_k_weights) = weights.dims3()?;
+    if size_k_input != size_k_weights {
+        candle::bail!(
+            "moe_gemm input/weight last dim mismatch: input={size_k_input}, weights={size_k_weights}"
+        );
+    }
+    if topk == 0 {
+        candle::bail!("moe_gemm topk must be > 0")
+    }
+    if sorted_token_ids.rank() != 1 || experts_ids.rank() != 1 {
+        candle::bail!(
+            "moe_gemm expects 1D sorted_token_ids/experts_ids, got {:?} and {:?}",
+            sorted_token_ids.shape(),
+            experts_ids.shape()
+        );
+    }
+    let assignments = sorted_token_ids.dim(0)?;
+    if assignments != experts_ids.dim(0)? {
+        candle::bail!(
+            "moe_gemm sorted_token_ids/experts_ids length mismatch: {} vs {}",
+            assignments,
+            experts_ids.dim(0)?
+        );
+    }
+    if assignments % topk != 0 {
+        candle::bail!("moe_gemm assignments ({assignments}) must be divisible by topk ({topk})")
+    }
+    let tokens = assignments / topk;
+
+    match topk_weights {
+        None if input_rows != tokens => {
+            candle::bail!(
+                "moe_gemm expected input rows == tokens ({tokens}) when topk_weights is None, got {input_rows}"
+            )
+        }
+        Some(_) if input_rows != assignments => {
+            candle::bail!(
+                "moe_gemm expected input rows == assignments ({assignments}) when topk_weights is set, got {input_rows}"
+            )
+        }
+        _ => {}
+    }
+
+    if let Some(topk_weights) = topk_weights {
+        let topk_shape = topk_weights.dims2()?;
+        if topk_shape != (tokens, topk) {
+            candle::bail!(
+                "moe_gemm topk_weights shape mismatch, expected ({tokens}, {topk}) got {:?}",
+                topk_weights.shape()
+            );
+        }
+    }
+
+    let sorted_token_ids = if sorted_token_ids.dtype() == DType::U32 {
+        sorted_token_ids.clone()
+    } else {
+        sorted_token_ids.to_dtype(DType::U32)?
+    };
+    let experts_ids = if experts_ids.dtype() == DType::U32 {
+        experts_ids.clone()
+    } else {
+        experts_ids.to_dtype(DType::U32)?
+    };
+
+    let pos_to_expert = Tensor::zeros((assignments,), DType::U32, input.device())?;
+    pos_to_expert.scatter_set(&sorted_token_ids, &experts_ids, 0)?;
+    let max_expert_id = pos_to_expert.max_all()?.to_scalar::<u32>()? as usize;
+    if max_expert_id >= num_experts {
+        candle::bail!("moe_gemm expert id {max_expert_id} out of range for {num_experts} experts");
+    }
+
+    let selected_weights = weights.index_select(&pos_to_expert, 0)?;
+    let rows = match topk_weights {
+        None => input
+            .unsqueeze(1)?
+            .repeat((1, topk, 1))?
+            .reshape((assignments, size_k_input))?,
+        Some(_) => input.clone(),
+    };
+    let mut out = rows
+        .unsqueeze(1)?
+        .matmul(&selected_weights.transpose(1, 2)?)?
+        .squeeze(1)?;
+    if let Some(topk_weights) = topk_weights {
+        let gating = topk_weights
+            .reshape((assignments, 1))?
+            .to_dtype(out.dtype())?;
+        out = out.broadcast_mul(&gating)?;
+    }
+    if out.dims2()? != (assignments, size_n) {
+        candle::bail!(
+            "moe_gemm fallback produced unexpected output shape {:?}, expected ({assignments}, {size_n})",
+            out.shape()
+        );
+    }
+    Ok(out)
+}
+
+fn moe_gemm_gguf_fallback(
+    input: &Tensor,
+    weights: &QTensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    is_prefill: bool,
+    dtype: DType,
+) -> Result<Tensor> {
+    let deq_weights = if is_prefill && matches!(dtype, DType::F16 | DType::BF16) {
+        weights.dequantize_f16(input.device())?
+    } else {
+        weights.dequantize(input.device())?
+    };
+    let input = if input.dtype() == deq_weights.dtype() {
+        input.clone()
+    } else {
+        input.to_dtype(deq_weights.dtype())?
+    };
+    moe_gemm_fallback(
+        &input,
+        &deq_weights,
+        topk_weights,
+        sorted_token_ids,
+        experts_ids,
+        topk,
+    )
+}
 
 #[cfg(feature = "cuda")]
 pub fn moe_gemm(
@@ -16,8 +153,18 @@ pub fn moe_gemm(
     is_prefill: bool,
 ) -> Result<Tensor> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
-    use candle::DType;
     use half::{bf16, f16};
+
+    if !input.device().is_cuda() {
+        return moe_gemm_fallback(
+            input,
+            weights,
+            topk_weights,
+            sorted_token_ids,
+            experts_ids,
+            topk,
+        );
+    }
 
     fn cuda_fwd<
         T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
@@ -153,15 +300,22 @@ pub fn moe_gemm(
 
 #[cfg(not(feature = "cuda"))]
 pub fn moe_gemm(
-    _: &Tensor,
-    _: &Tensor,
-    _: &Option<Tensor>,
-    _: &Tensor,
-    _: &Tensor,
-    _: usize,
-    _: bool,
+    input: &Tensor,
+    weights: &Tensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    _is_prefill: bool,
 ) -> Result<Tensor> {
-    candle::bail!("moe_gemm is only implemented for the cuda backend")
+    moe_gemm_fallback(
+        input,
+        weights,
+        topk_weights,
+        sorted_token_ids,
+        experts_ids,
+        topk,
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -178,8 +332,20 @@ pub fn moe_gemm_gguf(
 ) -> Result<Tensor> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::quantized::GgmlDType;
-    use candle::DType;
     use half::{bf16, f16};
+
+    if !input.device().is_cuda() {
+        return moe_gemm_gguf_fallback(
+            input,
+            weights,
+            topk_weights,
+            sorted_token_ids,
+            experts_ids,
+            topk,
+            is_prefill,
+            dtype,
+        );
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn cuda_fwd(
@@ -339,14 +505,23 @@ pub fn moe_gemm_gguf(
 #[cfg(not(feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gemm_gguf(
-    _: &Tensor,
-    _: &QTensor,
-    _: &Option<Tensor>,
-    _: &Tensor,
-    _: &Tensor,
-    _: usize,
-    _: bool,
-    _: candle::DType,
+    input: &Tensor,
+    weights: &QTensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    is_prefill: bool,
+    dtype: candle::DType,
 ) -> Result<Tensor> {
-    candle::bail!("moe_gemm_gguf is only implemented for the cuda backend")
+    moe_gemm_gguf_fallback(
+        input,
+        weights,
+        topk_weights,
+        sorted_token_ids,
+        experts_ids,
+        topk,
+        is_prefill,
+        dtype,
+    )
 }
