@@ -181,6 +181,26 @@ pub fn argsort_shader(workgroup_size: u32, asc: bool) -> Option<String> {
     Some(preprocess(source, &defines, &replacements, DType::F32))
 }
 
+pub fn argsort_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    let source = get("argsort_merge.wgsl")?.source();
+    let mut defines = vec!["WG_SIZE".to_string()];
+    if asc {
+        defines.push("ORDER == 0".to_string());
+    }
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        (
+            "ORDER".to_string(),
+            if asc {
+                "0".to_string()
+            } else {
+                "1".to_string()
+            },
+        ),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
 pub fn cumsum_shader(workgroup_size: u32) -> Option<String> {
     let source = get("cumsum.wgsl")?.source();
     let defines = vec!["WG_SIZE".to_string()];

@@ -124,6 +124,31 @@ struct ArgsortParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct ArgsortMergeParams {
+    offset_src: u32,
+    offset_in: u32,
+    offset_out: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    stride_idx1: u32,
+    stride_idx2: u32,
+    stride_idx3: u32,
+    stride_out1: u32,
+    stride_out2: u32,
+    stride_out3: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
+    top_k: u32,
+    len: u32,
+    nm: u32,
+    nrows: u32,
+    _pad0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct CumsumParams {
     offset_src: u32,
     offset_dst: u32,
@@ -1279,6 +1304,90 @@ impl WgpuStorage {
         Ok(dst)
     }
 
+    fn run_reduce_extrema_last_dim(&self, layout: &Layout, op: ReduceOp) -> Result<Self> {
+        let mut materialized_storage;
+        let materialized_layout;
+        let src;
+        let src_layout;
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            src = self;
+            src_layout = layout;
+        } else {
+            materialized_storage = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized_storage, 0, layout)?;
+            materialized_layout = Layout::contiguous(layout.shape());
+            src = &materialized_storage;
+            src_layout = &materialized_layout;
+        }
+
+        let rank = src_layout.dims().len();
+        let mut ids_dims = src_layout.dims().to_vec();
+        ids_dims[rank - 1] = 1;
+        let ids_layout = Layout::contiguous(Shape::from(ids_dims));
+
+        match op {
+            ReduceOp::ArgMax => src.run_argmax_last_dim(src_layout),
+            ReduceOp::Max => {
+                let ids = src.run_argmax_last_dim(src_layout)?;
+                <Self as BackendStorage>::gather(src, src_layout, &ids, &ids_layout, rank - 1)
+            }
+            ReduceOp::ArgMin | ReduceOp::Min => {
+                let shader = unary_shader("neg", DType::F32)?;
+                let neg = src.run_unary_like(src_layout, &shader, "candle-wgpu-reduce-neg")?;
+                let neg_layout = Layout::contiguous(src_layout.shape());
+                let ids = neg.run_argmax_last_dim(&neg_layout)?;
+                if op == ReduceOp::ArgMin {
+                    Ok(ids)
+                } else {
+                    <Self as BackendStorage>::gather(src, src_layout, &ids, &ids_layout, rank - 1)
+                }
+            }
+            ReduceOp::Sum => Err(unsupported("reduce extrema")),
+        }
+    }
+
+    fn run_reduce_non_last_dim(&self, op: ReduceOp, layout: &Layout, dim: usize) -> Result<Self> {
+        let rank = layout.dims().len();
+        let perm = (0..rank).filter(|&i| i != dim).chain(std::iter::once(dim));
+        let perm = perm.collect::<Vec<_>>();
+        let perm_shape = perm.iter().map(|&i| layout.dims()[i]).collect::<Vec<_>>();
+        let perm_stride = perm.iter().map(|&i| layout.stride()[i]).collect::<Vec<_>>();
+        let perm_layout = Layout::new(
+            Shape::from(perm_shape.clone()),
+            perm_stride,
+            layout.start_offset(),
+        );
+        let mut permuted = unsafe {
+            self.device
+                .alloc_uninit(&Shape::from(perm_shape.clone()), self.dtype)?
+        };
+        <Self as BackendStorage>::copy_strided_src(self, &mut permuted, 0, &perm_layout)?;
+        let permuted_layout = Layout::contiguous(Shape::from(perm_shape));
+        <Self as BackendStorage>::reduce_op(&permuted, op, &permuted_layout, &[rank - 1])
+    }
+
+    fn run_reduce_multi_dim(
+        &self,
+        op: ReduceOp,
+        layout: &Layout,
+        reduce_dims: &[usize],
+    ) -> Result<Self> {
+        if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
+            return Err(unsupported("reduce multi-dim arg"));
+        }
+        let mut current_shape = layout.dims().to_vec();
+        let mut current_layout = layout.clone();
+        let mut current_storage = None;
+        for &dim in reduce_dims {
+            let src = current_storage.as_ref().unwrap_or(self);
+            let reduced = <Self as BackendStorage>::reduce_op(src, op, &current_layout, &[dim])?;
+            current_shape[dim] = 1;
+            current_layout = Layout::contiguous(Shape::from(current_shape.clone()));
+            current_storage = Some(reduced);
+        }
+        current_storage.ok_or_else(|| unsupported("reduce multi-dim empty"))
+    }
+
     pub(crate) fn argsort_last_dim_f32(
         &self,
         layout: &Layout,
@@ -1294,15 +1403,18 @@ impl WgpuStorage {
         if last_dim == 0 || layout.dims().last().copied() != Some(last_dim) {
             return Err(unsupported("argsort last-dim"));
         }
-        let workgroup_size = next_power_of_two_u32(last_dim, "argsort")?;
-        if workgroup_size > WG_SIZE {
-            return Err(unsupported("argsort last-dim > 256"));
-        }
+        let workgroup_size = next_power_of_two_u32(last_dim.min(WG_SIZE as usize), "argsort")?;
         let (dims, strides) = dims4(layout)?;
         let count = layout.shape().elem_count();
         let nrows = count / last_dim;
         let dst = unsafe { self.device.alloc_uninit(layout.shape(), DType::U32)? };
         let dst_strides = contiguous_strides(dims);
+        let npr = last_dim.div_ceil(workgroup_size as usize);
+        let top_k = if npr == 1 {
+            last_dim.try_into()?
+        } else {
+            workgroup_size
+        };
         let params = ArgsortParams {
             offset_src: layout.start_offset().try_into()?,
             offset_dst: 0,
@@ -1316,8 +1428,8 @@ impl WgpuStorage {
             ne1: dims[1],
             ne2: dims[2],
             ne0: last_dim.try_into()?,
-            top_k: last_dim.try_into()?,
-            npr: 1,
+            top_k,
+            npr: npr.try_into()?,
             nrows: nrows.try_into()?,
         };
         let param_buffer = self
@@ -1350,10 +1462,107 @@ impl WgpuStorage {
             &shader,
             &entries,
             &bindings,
-            nrows.try_into()?,
+            (npr * nrows).try_into()?,
             "candle-wgpu-argsort",
         )?;
-        Ok(dst)
+        if npr == 1 {
+            return Ok(dst);
+        }
+
+        let mut current = dst;
+        let mut scratch = unsafe { self.device.alloc_uninit(layout.shape(), DType::U32)? };
+        let idx_layout = Layout::contiguous(layout.shape());
+        let mut len = workgroup_size as usize;
+        while len < last_dim {
+            let nm = last_dim.div_ceil(2 * len);
+            self.run_argsort_merge_pass(
+                &current,
+                &scratch,
+                layout,
+                &idx_layout,
+                asc,
+                len,
+                nm,
+                nrows,
+            )?;
+            std::mem::swap(&mut current, &mut scratch);
+            len *= 2;
+        }
+        Ok(current)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_argsort_merge_pass(
+        &self,
+        idx_in: &Self,
+        idx_out: &Self,
+        layout: &Layout,
+        idx_layout: &Layout,
+        asc: bool,
+        len: usize,
+        nm: usize,
+        nrows: usize,
+    ) -> Result<()> {
+        let (dims, strides) = dims4(layout)?;
+        let (_, idx_strides) = dims4(idx_layout)?;
+        let params = ArgsortMergeParams {
+            offset_src: layout.start_offset().try_into()?,
+            offset_in: 0,
+            offset_out: 0,
+            stride_src1: strides[1],
+            stride_src2: strides[2],
+            stride_src3: strides[3],
+            stride_idx1: idx_strides[1],
+            stride_idx2: idx_strides[2],
+            stride_idx3: idx_strides[3],
+            stride_out1: idx_strides[1],
+            stride_out2: idx_strides[2],
+            stride_out3: idx_strides[3],
+            ne0: dims[0],
+            ne1: dims[1],
+            ne2: dims[2],
+            top_k: dims[0],
+            len: len.try_into()?,
+            nm: nm.try_into()?,
+            nrows: nrows.try_into()?,
+            _pad0: 0,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-argsort-merge-params"),
+                size: std::mem::size_of::<ArgsortMergeParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &idx_in.buffer),
+            buffer_binding(2, &idx_out.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::argsort_merge_shader(WG_SIZE, asc)
+            .ok_or_else(|| Error::Msg("wgpu shader argsort_merge.wgsl not embedded".into()).bt())?;
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            (nm * nrows).try_into()?,
+            "candle-wgpu-argsort-merge",
+        )?;
+        Ok(())
     }
 
     fn run_cumsum_last_dim(&self, layout: &Layout) -> Result<Self> {
@@ -2453,14 +2662,24 @@ impl BackendStorage for WgpuStorage {
         if rank == 0 {
             return Err(unsupported("reduce scalar"));
         }
-        if reduce_dims != [rank - 1] {
-            return Err(unsupported("reduce non-last-dim"));
+        if reduce_dims.len() > 1 {
+            return self.run_reduce_multi_dim(op, layout, reduce_dims);
         }
-        if op == ReduceOp::ArgMax {
-            return self.run_argmax_last_dim(layout);
+        if reduce_dims.is_empty() {
+            return Err(unsupported("reduce empty dims"));
         }
-        if op != ReduceOp::Sum {
-            return Err(unsupported("reduce"));
+        let dim = reduce_dims[0];
+        if dim >= rank {
+            return Err(unsupported("reduce dim"));
+        }
+        if dim != rank - 1 {
+            return self.run_reduce_non_last_dim(op, layout, dim);
+        }
+        match op {
+            ReduceOp::ArgMax | ReduceOp::ArgMin | ReduceOp::Max | ReduceOp::Min => {
+                return self.run_reduce_extrema_last_dim(layout, op);
+            }
+            ReduceOp::Sum => {}
         }
         let (dims, strides) = dims4(layout)?;
         let mut dst_dims = layout.dims().to_vec();

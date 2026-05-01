@@ -1068,6 +1068,109 @@ impl VulkanStorage {
         self.run_unary_generic_with_params(layout, spirv, 0.0, 0.0)
     }
 
+    fn run_binary_named(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        op: &'static str,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan binary").bt());
+        }
+        if rhs.dtype != self.dtype {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan binary").bt());
+        }
+        self.device
+            .same_device(&rhs.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: rhs.device.location(),
+                    op,
+                }
+                .bt()
+            })?;
+        if lhs_layout.start_offset() != 0 || rhs_layout.start_offset() != 0 {
+            return Err(unsupported("binary offset"));
+        }
+        let (lhs_dims, lhs_strides) = dims4_ggml(lhs_layout)?;
+        let (rhs_dims, rhs_strides) = dims4_ggml(rhs_layout)?;
+        let count = lhs_layout.shape().elem_count();
+        let dst = unsafe { self.device.alloc_uninit(lhs_layout.shape(), self.dtype)? };
+        let params = GgmlBinaryParams {
+            ne: count.try_into()?,
+            ne00: lhs_dims[0],
+            ne01: lhs_dims[1],
+            ne02: lhs_dims[2],
+            ne03: lhs_dims[3],
+            nb00: lhs_strides[0],
+            nb01: lhs_strides[1],
+            nb02: lhs_strides[2],
+            nb03: lhs_strides[3],
+            ne10: rhs_dims[0],
+            ne11: rhs_dims[1],
+            ne12: rhs_dims[2],
+            ne13: rhs_dims[3],
+            nb10: rhs_strides[0],
+            nb11: rhs_strides[1],
+            nb12: rhs_strides[2],
+            nb13: rhs_strides[3],
+            ne20: lhs_dims[0],
+            ne21: lhs_dims[1],
+            ne22: lhs_dims[2],
+            ne23: lhs_dims[3],
+            nb20: 1,
+            nb21: lhs_dims[0],
+            nb22: lhs_dims[0] * lhs_dims[1],
+            nb23: lhs_dims[0] * lhs_dims[1] * lhs_dims[2],
+            misalign_offsets: 0,
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(rhs.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let spirv = binary_spirv(op, self.dtype)?;
+        let workgroups = (count as u32).div_ceil(512);
+        self.device
+            .run_compute(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+        Ok(dst)
+    }
+
+    fn run_binary_min_max_f32(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        op: &'static str,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, op).bt());
+        }
+        if rhs.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, op).bt());
+        }
+
+        let out_layout = Layout::contiguous(lhs_layout.shape());
+        let sum = self.run_binary_named(rhs, lhs_layout, rhs_layout, "add")?;
+        let diff = self.run_binary_named(rhs, lhs_layout, rhs_layout, "sub")?;
+        let (abs_spirv, _) = unary_spirv("abs", DType::F32)?;
+        let abs = diff.run_unary_head(&out_layout, abs_spirv)?;
+        let combined = match op {
+            "maximum" => sum.run_binary_named(&abs, &out_layout, &out_layout, "add")?,
+            "minimum" => sum.run_binary_named(&abs, &out_layout, &out_layout, "sub")?,
+            _ => return Err(unsupported("binary min/max")),
+        };
+        let scale_spirv = candle_vulkan_kernels::spirv("scale_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader scale_f32 not generated".into()).bt())?;
+        combined.run_unary_generic_with_params(&out_layout, scale_spirv, 0.5, 0.0)
+    }
+
     fn run_copy_into(
         &self,
         layout: &Layout,
@@ -1218,6 +1321,93 @@ impl VulkanStorage {
             Some(&[(0, self.device.inner.subgroup_size)]),
         )?;
         Ok(dst)
+    }
+
+    fn run_reduce_extrema_last_dim(&self, layout: &Layout, op: ReduceOp) -> Result<Self> {
+        let mut materialized_storage;
+        let materialized_layout;
+        let src;
+        let src_layout;
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            src = self;
+            src_layout = layout;
+        } else {
+            materialized_storage = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized_storage, 0, layout)?;
+            materialized_layout = Layout::contiguous(layout.shape());
+            src = &materialized_storage;
+            src_layout = &materialized_layout;
+        }
+
+        let rank = src_layout.dims().len();
+        let mut ids_dims = src_layout.dims().to_vec();
+        ids_dims[rank - 1] = 1;
+        let ids_layout = Layout::contiguous(Shape::from(ids_dims));
+
+        match op {
+            ReduceOp::ArgMax => src.run_argmax_last_dim(src_layout),
+            ReduceOp::Max => {
+                let ids = src.run_argmax_last_dim(src_layout)?;
+                <Self as BackendStorage>::gather(src, src_layout, &ids, &ids_layout, rank - 1)
+            }
+            ReduceOp::ArgMin | ReduceOp::Min => {
+                let (spirv, kind) = unary_spirv("neg", DType::F32)?;
+                let neg = match kind {
+                    VulkanUnaryKind::Head => src.run_unary_head(src_layout, spirv)?,
+                    VulkanUnaryKind::Generic => src.run_unary_generic(src_layout, spirv)?,
+                };
+                let neg_layout = Layout::contiguous(src_layout.shape());
+                let ids = neg.run_argmax_last_dim(&neg_layout)?;
+                if op == ReduceOp::ArgMin {
+                    Ok(ids)
+                } else {
+                    <Self as BackendStorage>::gather(src, src_layout, &ids, &ids_layout, rank - 1)
+                }
+            }
+            ReduceOp::Sum => Err(unsupported("reduce extrema")),
+        }
+    }
+
+    fn run_reduce_non_last_dim(&self, op: ReduceOp, layout: &Layout, dim: usize) -> Result<Self> {
+        let rank = layout.dims().len();
+        let perm = (0..rank).filter(|&i| i != dim).chain(std::iter::once(dim));
+        let perm = perm.collect::<Vec<_>>();
+        let perm_shape = perm.iter().map(|&i| layout.dims()[i]).collect::<Vec<_>>();
+        let perm_stride = perm.iter().map(|&i| layout.stride()[i]).collect::<Vec<_>>();
+        let perm_layout = Layout::new(
+            Shape::from(perm_shape.clone()),
+            perm_stride,
+            layout.start_offset(),
+        );
+        let mut permuted = unsafe {
+            self.device
+                .alloc_uninit(&Shape::from(perm_shape.clone()), self.dtype)?
+        };
+        <Self as BackendStorage>::copy_strided_src(self, &mut permuted, 0, &perm_layout)?;
+        let permuted_layout = Layout::contiguous(Shape::from(perm_shape));
+        <Self as BackendStorage>::reduce_op(&permuted, op, &permuted_layout, &[rank - 1])
+    }
+
+    fn run_reduce_multi_dim(
+        &self,
+        op: ReduceOp,
+        layout: &Layout,
+        reduce_dims: &[usize],
+    ) -> Result<Self> {
+        if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
+            return Err(unsupported("reduce multi-dim arg"));
+        }
+        let mut current_shape = layout.dims().to_vec();
+        let mut current_layout = layout.clone();
+        let mut current_storage = None;
+        for &dim in reduce_dims {
+            let src = current_storage.as_ref().unwrap_or(self);
+            let reduced = <Self as BackendStorage>::reduce_op(src, op, &current_layout, &[dim])?;
+            current_shape[dim] = 1;
+            current_layout = Layout::contiguous(Shape::from(current_shape.clone()));
+            current_storage = Some(reduced);
+        }
+        current_storage.ok_or_else(|| unsupported("reduce multi-dim empty"))
     }
 
     pub(crate) fn argsort_last_dim_f32(
@@ -2502,14 +2692,24 @@ impl BackendStorage for VulkanStorage {
         if rank == 0 {
             return Err(unsupported("reduce scalar"));
         }
-        if reduce_dims != [rank - 1] {
-            return Err(unsupported("reduce non-last-dim"));
+        if reduce_dims.len() > 1 {
+            return self.run_reduce_multi_dim(op, layout, reduce_dims);
         }
-        if op == ReduceOp::ArgMax {
-            return self.run_argmax_last_dim(layout);
+        if reduce_dims.is_empty() {
+            return Err(unsupported("reduce empty dims"));
         }
-        if op != ReduceOp::Sum {
-            return Err(unsupported("reduce"));
+        let dim = reduce_dims[0];
+        if dim >= rank {
+            return Err(unsupported("reduce dim"));
+        }
+        if dim != rank - 1 {
+            return self.run_reduce_non_last_dim(op, layout, dim);
+        }
+        match op {
+            ReduceOp::ArgMax | ReduceOp::ArgMin | ReduceOp::Max | ReduceOp::Min => {
+                return self.run_reduce_extrema_last_dim(layout, op);
+            }
+            ReduceOp::Sum => {}
         }
         self.run_sum_rows(layout)
     }
@@ -2547,71 +2747,12 @@ impl BackendStorage for VulkanStorage {
         lhs_layout: &Layout,
         rhs_layout: &Layout,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan binary").bt());
+        match B::NAME {
+            "maximum" | "minimum" => {
+                self.run_binary_min_max_f32(rhs, lhs_layout, rhs_layout, B::NAME)
+            }
+            _ => self.run_binary_named(rhs, lhs_layout, rhs_layout, B::NAME),
         }
-        if rhs.dtype != self.dtype {
-            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan binary").bt());
-        }
-        self.device
-            .same_device(&rhs.device)
-            .then_some(())
-            .ok_or_else(|| {
-                Error::DeviceMismatchBinaryOp {
-                    lhs: self.device.location(),
-                    rhs: rhs.device.location(),
-                    op: B::NAME,
-                }
-                .bt()
-            })?;
-        if lhs_layout.start_offset() != 0 || rhs_layout.start_offset() != 0 {
-            return Err(unsupported("binary offset"));
-        }
-        let (lhs_dims, lhs_strides) = dims4_ggml(lhs_layout)?;
-        let (rhs_dims, rhs_strides) = dims4_ggml(rhs_layout)?;
-        let count = lhs_layout.shape().elem_count();
-        let dst = unsafe { self.device.alloc_uninit(lhs_layout.shape(), self.dtype)? };
-        let params = GgmlBinaryParams {
-            ne: count.try_into()?,
-            ne00: lhs_dims[0],
-            ne01: lhs_dims[1],
-            ne02: lhs_dims[2],
-            ne03: lhs_dims[3],
-            nb00: lhs_strides[0],
-            nb01: lhs_strides[1],
-            nb02: lhs_strides[2],
-            nb03: lhs_strides[3],
-            ne10: rhs_dims[0],
-            ne11: rhs_dims[1],
-            ne12: rhs_dims[2],
-            ne13: rhs_dims[3],
-            nb10: rhs_strides[0],
-            nb11: rhs_strides[1],
-            nb12: rhs_strides[2],
-            nb13: rhs_strides[3],
-            ne20: lhs_dims[0],
-            ne21: lhs_dims[1],
-            ne22: lhs_dims[2],
-            ne23: lhs_dims[3],
-            nb20: 1,
-            nb21: lhs_dims[0],
-            nb22: lhs_dims[0] * lhs_dims[1],
-            nb23: lhs_dims[0] * lhs_dims[1] * lhs_dims[2],
-            misalign_offsets: 0,
-            param1: 0.0,
-            param2: 0.0,
-            param3: 0,
-        };
-        let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(rhs.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
-        ];
-        let spirv = binary_spirv(B::NAME, self.dtype)?;
-        let workgroups = (count as u32).div_ceil(512);
-        self.device
-            .run_compute(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
-        Ok(dst)
     }
     fn where_cond(&self, _: &Layout, _: &Self, _: &Layout, _: &Self, _: &Layout) -> Result<Self> {
         Err(unsupported("where"))

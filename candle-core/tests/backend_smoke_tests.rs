@@ -96,6 +96,7 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     smoke_f32_sum_last_dim(device)?;
     smoke_f32_cumsum(device)?;
     smoke_f32_argmax_last_dim(device)?;
+    smoke_f32_extrema_last_dim(device)?;
     smoke_f32_argsort_last_dim(device)?;
     smoke_f32_index_select(device)?;
     smoke_f32_gather_last_dim(device)?;
@@ -295,6 +296,17 @@ fn smoke_f32_binary_broadcast_and_strided_layout(device: &Device) -> Result<()> 
         transposed.broadcast_add(&row)?.to_vec2::<f32>()?,
         [[11.0, 24.0], [12.0, 25.0], [13.0, 26.0]]
     );
+
+    let lhs = Tensor::from_slice(&[1.0f32, 5.0, -2.0, 4.0], (2, 2), device)?;
+    let rhs = Tensor::from_slice(&[0.0f32, 6.0], (1, 2), device)?;
+    assert_eq!(
+        lhs.broadcast_maximum(&rhs)?.to_vec2::<f32>()?,
+        [[1.0, 6.0], [0.0, 6.0]]
+    );
+    assert_eq!(
+        lhs.broadcast_minimum(&rhs)?.to_vec2::<f32>()?,
+        [[0.0, 5.0], [-2.0, 4.0]]
+    );
     Ok(())
 }
 
@@ -370,6 +382,9 @@ fn smoke_strided_const_set(device: &Device) -> Result<()> {
 fn smoke_f32_sum_last_dim(device: &Device) -> Result<()> {
     let xs = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), device)?;
     assert_eq!(xs.sum_keepdim(1)?.to_vec2::<f32>()?, [[6.0], [15.0]]);
+    assert_eq!(xs.sum_keepdim(0)?.to_vec2::<f32>()?, [[5.0, 7.0, 9.0]]);
+    assert_eq!(xs.sum_keepdim((0, 1))?.to_vec2::<f32>()?, [[21.0]]);
+    assert_eq!(xs.sum_all()?.to_scalar::<f32>()?, 21.0);
 
     let ys = Tensor::from_slice(
         &[
@@ -413,6 +428,7 @@ fn smoke_f32_cumsum(device: &Device) -> Result<()> {
 fn smoke_f32_argmax_last_dim(device: &Device) -> Result<()> {
     let xs = Tensor::from_slice(&[1.0f32, 4.0, 2.0, 9.0, 3.0, 5.0], (2, 3), device)?;
     assert_eq!(xs.argmax_keepdim(1)?.to_vec2::<u32>()?, [[1], [0]]);
+    assert_eq!(xs.argmax_keepdim(0)?.to_vec2::<u32>()?, [[1, 0, 1]]);
 
     let ys = Tensor::from_slice(
         &[1.0f32, 7.0, 3.0, 4.0, 8.0, 5.0, 6.0, 2.0],
@@ -423,6 +439,21 @@ fn smoke_f32_argmax_last_dim(device: &Device) -> Result<()> {
         ys.argmax_keepdim(2)?.to_vec3::<u32>()?,
         [[[1], [1]], [[0], [0]]]
     );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_extrema_last_dim(device: &Device) -> Result<()> {
+    let xs = Tensor::from_slice(&[1.0f32, -3.0, 2.0, 4.0, 0.0, -5.0], (2, 3), device)?;
+    assert_eq!(xs.max_keepdim(1)?.to_vec2::<f32>()?, [[2.0], [4.0]]);
+    assert_eq!(xs.max(1)?.to_vec1::<f32>()?, [2.0, 4.0]);
+    assert_eq!(xs.max_keepdim(0)?.to_vec2::<f32>()?, [[4.0, 0.0, 2.0]]);
+    assert_eq!(xs.min_keepdim(1)?.to_vec2::<f32>()?, [[-3.0], [-5.0]]);
+    assert_eq!(xs.min(1)?.to_vec1::<f32>()?, [-3.0, -5.0]);
+    assert_eq!(xs.min_keepdim(0)?.to_vec2::<f32>()?, [[1.0, -3.0, -5.0]]);
+    assert_eq!(xs.argmin_keepdim(1)?.to_vec2::<u32>()?, [[1], [2]]);
+    assert_eq!(xs.argmin(1)?.to_vec1::<u32>()?, [1, 2]);
+    assert_eq!(xs.argmin_keepdim(0)?.to_vec2::<u32>()?, [[0, 0, 1]]);
     Ok(())
 }
 
@@ -444,6 +475,15 @@ fn smoke_f32_argsort_last_dim(device: &Device) -> Result<()> {
         sorted.to_vec2::<f32>()?,
         [[1.0, 2.0, 3.0], [5.0, 7.0, 10.0]]
     );
+
+    let large_values = (0..300).rev().map(|v| v as f32).collect::<Vec<_>>();
+    let large = Tensor::from_vec(large_values, (1, 300), device)?;
+    let asc = large.arg_sort_last_dim(true)?.to_vec2::<u32>()?;
+    assert_eq!(&asc[0][..5], &[299, 298, 297, 296, 295]);
+    assert_eq!(&asc[0][295..], &[4, 3, 2, 1, 0]);
+    let desc = large.arg_sort_last_dim(false)?.to_vec2::<u32>()?;
+    assert_eq!(&desc[0][..5], &[0, 1, 2, 3, 4]);
+    assert_eq!(&desc[0][295..], &[295, 296, 297, 298, 299]);
     Ok(())
 }
 
