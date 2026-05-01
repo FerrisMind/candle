@@ -383,6 +383,54 @@ fn sigmoid_vulkan() -> Result<()> {
     sigmoid_backend(&device)
 }
 
+#[test]
+#[ignore = "requires a usable wgpu adapter and driver"]
+#[cfg(feature = "wgpu")]
+fn layer_norm_wgpu() -> Result<()> {
+    let device = Device::new_wgpu(0)?;
+    layer_norm_backend(&device)
+}
+
+#[test]
+#[ignore = "requires a usable Vulkan compute device and driver"]
+#[cfg(feature = "vulkan")]
+fn layer_norm_vulkan() -> Result<()> {
+    let device = Device::new_vulkan(0)?;
+    layer_norm_backend(&device)
+}
+
+#[test]
+#[ignore = "requires a usable wgpu adapter and driver"]
+#[cfg(feature = "wgpu")]
+fn rope_wgpu() -> Result<()> {
+    let device = Device::new_wgpu(0)?;
+    rope_backend(&device)
+}
+
+#[test]
+#[ignore = "requires a usable Vulkan compute device and driver"]
+#[cfg(feature = "vulkan")]
+fn rope_vulkan() -> Result<()> {
+    let device = Device::new_vulkan(0)?;
+    rope_backend(&device)
+}
+
+#[test]
+#[ignore = "requires a usable wgpu adapter and driver"]
+#[cfg(feature = "wgpu")]
+fn sdpa_wgpu() -> Result<()> {
+    let device = Device::new_wgpu(0)?;
+    sdpa_backend(&device)
+}
+
+#[test]
+#[ignore = "requires a usable Vulkan compute device and driver"]
+#[cfg(feature = "vulkan")]
+fn sdpa_vulkan() -> Result<()> {
+    let device = Device::new_vulkan(0)?;
+    sdpa_backend(&device)
+}
+
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn softmax_last_dim_backend(device: &Device) -> Result<()> {
     let tensor = Tensor::new(
@@ -428,5 +476,129 @@ fn rms_norm_backend(device: &Device) -> Result<()> {
             [[0.4714, 0.4714, 4.9497], [1.206, 0.603, 3.6181]]
         ]
     );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn layer_norm_backend(device: &Device) -> Result<()> {
+    let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
+    let tensor = Tensor::new(data, device)?;
+    let alpha = Tensor::new(&[1f32, 2f32, 3f32], device)?;
+    let beta = Tensor::new(&[0.5f32, 0f32, -0.2f32], device)?;
+    let fast = candle_nn::ops::layer_norm(&tensor, &alpha, &beta, 1e-5)?;
+    let slow = candle_nn::ops::layer_norm_slow(&tensor, &alpha, &beta, 1e-5)?;
+    let diff = (fast - slow)?.abs()?.sum_all()?.to_vec0::<f32>()?;
+    assert!(diff < 1e-4, "layer_norm backend diff too large: {diff}");
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn rope_backend(device: &Device) -> Result<()> {
+    let src_values = [&[
+        1.0f32, 0.5, -1.0, 2.0, 3.0, -0.5, 0.25, 1.5, //
+        -2.0, 4.0, 1.25, -0.75, 0.0, 2.5, -1.5, 3.5, //
+    ]];
+    let cos_values = [&[
+        1.0f32, 0.5, 0.25, 0.75, //
+        0.9, 0.4, 0.3, 0.8, //
+    ]];
+    let sin_values = [&[
+        0.0f32, 0.2, 0.3, 0.4, //
+        0.1, 0.25, 0.35, 0.45, //
+    ]];
+
+    let src = Tensor::from_slice(src_values[0], (1, 1, 2, 8), device)?;
+    let cos = Tensor::from_slice(cos_values[0], (2, 4), device)?;
+    let sin = Tensor::from_slice(sin_values[0], (2, 4), device)?;
+
+    let cpu = Device::Cpu;
+    let src_cpu = Tensor::from_slice(src_values[0], (1, 1, 2, 8), &cpu)?;
+    let cos_cpu = Tensor::from_slice(cos_values[0], (2, 4), &cpu)?;
+    let sin_cpu = Tensor::from_slice(sin_values[0], (2, 4), &cpu)?;
+
+    let rope_fast = candle_nn::rotary_emb::rope(&src, &cos, &sin)?;
+    let rope_slow = candle_nn::rotary_emb::rope_slow(&src_cpu, &cos_cpu, &sin_cpu)?;
+    let diff = (rope_fast
+        .to_dtype(candle::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?
+        .iter()
+        .zip(rope_slow.flatten_all()?.to_vec1::<f32>()?.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f32>())
+        / rope_fast.elem_count() as f32;
+    assert!(diff < 1e-4, "rope backend diff too large: {diff}");
+
+    let rope_i_fast = candle_nn::rotary_emb::rope_i(&src, &cos, &sin)?;
+    let rope_i_slow = candle_nn::rotary_emb::rope_i_slow(&src_cpu, &cos_cpu, &sin_cpu)?;
+    let diff = (rope_i_fast
+        .to_dtype(candle::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?
+        .iter()
+        .zip(rope_i_slow.flatten_all()?.to_vec1::<f32>()?.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f32>())
+        / rope_i_fast.elem_count() as f32;
+    assert!(diff < 1e-4, "rope_i backend diff too large: {diff}");
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn sdpa_backend(device: &Device) -> Result<()> {
+    let q = Tensor::from_slice(
+        &[
+            0.1f32, 0.2, 0.3, //
+            0.4, 0.5, 0.6, //
+            0.7, 0.1, 0.2, //
+            0.3, 0.4, 0.5, //
+        ],
+        (1, 2, 2, 3),
+        device,
+    )?;
+    let k = Tensor::from_slice(
+        &[
+            0.2f32, 0.1, 0.3, //
+            0.6, 0.4, 0.2, //
+            0.5, 0.7, 0.8, //
+        ],
+        (1, 1, 3, 3),
+        device,
+    )?;
+    let v = Tensor::from_slice(
+        &[
+            1.0f32, 0.0, //
+            0.5, 2.0, //
+            1.5, 1.0, //
+        ],
+        (1, 1, 3, 2),
+        device,
+    )?;
+    let scale = (3f32).sqrt().recip();
+    let fast = candle_nn::ops::sdpa(&q, &k, &v, None, true, scale, 1.0)?;
+
+    let ids = Tensor::from_slice(&[0u32, 0], (2,), device)?;
+    let k_exp = k.index_select(&ids, 1)?;
+    let v_exp = v.index_select(&ids, 1)?;
+    let mut att = q.to_dtype(candle::DType::F32)?.matmul(
+        &k_exp
+            .to_dtype(candle::DType::F32)?
+            .transpose(2, 3)?
+            .contiguous()?,
+    )?;
+    att = (att * scale as f64)?;
+    let mask = Tensor::from_slice(
+        &[0.0f32, 0.0, f32::NEG_INFINITY, 0.0, 0.0, 0.0],
+        (1, 1, 2, 3),
+        device,
+    )?;
+    let probs = candle_nn::ops::softmax_last_dim(&att.broadcast_add(&mask)?)?;
+    let reference = probs.matmul(&v_exp.to_dtype(candle::DType::F32)?)?;
+
+    let diff = (fast.to_dtype(candle::DType::F32)? - reference)?
+        .abs()?
+        .sum_all()?
+        .to_vec0::<f32>()?;
+    assert!(diff < 2e-4, "sdpa backend diff too large: {diff}");
     Ok(())
 }

@@ -962,6 +962,9 @@ pub fn layer_norm(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Resul
             beta.shape()
         )
     }
+    if xs.device().is_wgpu() || xs.device().is_vulkan() {
+        return layer_norm_slow(xs, alpha, beta, eps);
+    }
     xs.apply_op3_no_bwd(alpha, beta, &LayerNorm { eps })
 }
 
@@ -1294,6 +1297,121 @@ impl candle::CustomOp3 for Sdpa {
     }
 }
 
+fn sdpa_causal_mask(q_seq: usize, k_seq: usize, device: &candle::Device) -> Result<Tensor> {
+    let offset = k_seq as isize - q_seq as isize;
+    let mask: Vec<f32> = (0..q_seq)
+        .flat_map(|i| {
+            let i = i as isize;
+            (0..k_seq).map(move |j| {
+                let j = j as isize;
+                if j > i + offset {
+                    f32::NEG_INFINITY
+                } else {
+                    0.0
+                }
+            })
+        })
+        .collect();
+    Tensor::from_vec(mask, (1, 1, q_seq, k_seq), device)
+}
+
+fn sdpa_expand_kv_for_gqa(q_heads: usize, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+    let (b_k, kv_heads_k, kv_seq_k, _k_dim) = k.dims4()?;
+    let (b_v, kv_heads_v, kv_seq_v, _v_dim) = v.dims4()?;
+    if b_k != b_v || kv_heads_k != kv_heads_v || kv_seq_k != kv_seq_v {
+        candle::bail!(
+            "`k` and `v` shapes are incompatible for sdpa: {:?} {:?}",
+            k.shape(),
+            v.shape()
+        );
+    }
+    if q_heads == kv_heads_k {
+        return Ok((k.clone(), v.clone()));
+    }
+    if q_heads % kv_heads_k != 0 {
+        candle::bail!(
+            "query `n_heads` must be a multiple of `n_kv_heads` in sdpa: q_heads={q_heads} kv_heads={kv_heads_k}"
+        );
+    }
+    let repeat = q_heads / kv_heads_k;
+    let ids = (0..q_heads)
+        .map(|h| (h / repeat) as u32)
+        .collect::<Vec<_>>();
+    let ids = Tensor::from_vec(ids, q_heads, k.device())?;
+    let k = k.index_select(&ids, 1)?;
+    let v = v.index_select(&ids, 1)?;
+    Ok((k, v))
+}
+
+fn sdpa_unfused(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    do_causal: bool,
+    scale: f32,
+    softcapping: f32,
+) -> Result<Tensor> {
+    let (b_q, q_heads, q_seq, q_dim) = q.dims4()?;
+    let (b_k, _kv_heads, k_seq, k_dim) = k.dims4()?;
+    let (b_v, _kv_heads_v, v_seq, _v_dim) = v.dims4()?;
+    if b_q != b_k || b_q != b_v {
+        candle::bail!(
+            "`q`, `k`, and `v` batch dims must match: q={:?} k={:?} v={:?}",
+            q.shape(),
+            k.shape(),
+            v.shape()
+        );
+    }
+    if q_dim != k_dim {
+        candle::bail!("`q` and `k` last dims must match");
+    }
+    if k_seq != v_seq {
+        candle::bail!("`k` and `v` sequence dims must match");
+    }
+    if do_causal && k_seq < q_seq {
+        candle::bail!("causal sdpa requires `k_seq >= q_seq` (k_seq={k_seq}, q_seq={q_seq})");
+    }
+
+    if let Some(mask) = mask {
+        if mask.dims() != [b_q, q_heads, q_seq, k_seq] {
+            candle::bail!(
+                "mask shape must be {:?}, got {:?}",
+                [b_q, q_heads, q_seq, k_seq],
+                mask.dims()
+            );
+        }
+    }
+
+    let out_dtype = q.dtype();
+    let compute_dtype = match out_dtype {
+        DType::F16 | DType::BF16 => DType::F32,
+        dt => dt,
+    };
+    let q = q.to_dtype(compute_dtype)?;
+    let k = k.to_dtype(compute_dtype)?;
+    let v = v.to_dtype(compute_dtype)?;
+    let (k, v) = sdpa_expand_kv_for_gqa(q_heads, &k, &v)?;
+
+    let k_t = k.transpose(2, 3)?.contiguous()?;
+    let mut att = q.matmul(&k_t)?;
+    att = (att * scale as f64)?;
+    if softcapping != 1.0 {
+        att = ((att / softcapping as f64)?.tanh()? * softcapping as f64)?;
+    }
+    if do_causal {
+        let causal_mask = sdpa_causal_mask(q_seq, k_seq, q.device())?.to_dtype(compute_dtype)?;
+        att = att.broadcast_add(&causal_mask)?;
+    }
+    if let Some(mask) = mask {
+        let mask = mask.to_dtype(compute_dtype)?;
+        att = att.broadcast_add(&mask)?;
+    }
+
+    let probs = softmax_last_dim(&att.to_dtype(DType::F32)?)?.to_dtype(compute_dtype)?;
+    probs.matmul(&v)?.to_dtype(out_dtype)
+}
+
 /// Scaled dot product attention with a fused kernel.
 ///
 /// Computes softmax(qk^T*scale)v.
@@ -1331,14 +1449,17 @@ pub fn sdpa(
     scale: f32,
     softcapping: f32,
 ) -> Result<Tensor> {
-    q.apply_op3_no_bwd(
-        k,
-        v,
-        &Sdpa {
-            scale,
-            softcapping,
-            mask: mask.cloned(),
-            do_causal,
-        },
-    )
+    if q.device().is_metal() {
+        return q.apply_op3_no_bwd(
+            k,
+            v,
+            &Sdpa {
+                scale,
+                softcapping,
+                mask: mask.cloned(),
+                do_causal,
+            },
+        );
+    }
+    sdpa_unfused(q, k, v, mask, do_causal, scale, softcapping)
 }
