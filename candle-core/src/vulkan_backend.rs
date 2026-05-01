@@ -7,7 +7,7 @@ use gpu_allocator::vulkan::{
 };
 use gpu_allocator::MemoryLocation;
 use std::ffi::CString;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -270,6 +270,7 @@ struct VulkanInner {
     queue_family_index: u32,
     queue: vk::Queue,
     allocator: Mutex<Option<Allocator>>,
+    seed_value: RwLock<u64>,
 }
 
 impl std::fmt::Debug for VulkanInner {
@@ -3040,7 +3041,24 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose1D,
     ) -> Result<Self> {
-        self.run_conv_transpose1d_f32(layout, kernel, kernel_l, params)
+        match self.run_conv_transpose1d_f32(layout, kernel, kernel_l, params) {
+            Ok(out) => Ok(out),
+            Err(err)
+                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
+            {
+                let src_cpu = self.to_cpu_storage()?;
+                let kernel_cpu = kernel.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::conv_transpose1d(
+                    &src_cpu,
+                    layout,
+                    &kernel_cpu,
+                    kernel_l,
+                    params,
+                )?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
     fn conv2d(
         &self,
@@ -3073,7 +3091,24 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self> {
-        self.run_conv_transpose2d_f32(layout, kernel, kernel_l, params)
+        match self.run_conv_transpose2d_f32(layout, kernel, kernel_l, params) {
+            Ok(out) => Ok(out),
+            Err(err)
+                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
+            {
+                let src_cpu = self.to_cpu_storage()?;
+                let kernel_cpu = kernel.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::conv_transpose2d(
+                    &src_cpu,
+                    layout,
+                    &kernel_cpu,
+                    kernel_l,
+                    params,
+                )?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
     fn avg_pool2d(
         &self,
@@ -3522,6 +3557,7 @@ impl BackendDevice for VulkanDevice {
                 queue_family_index,
                 queue,
                 allocator: Mutex::new(Some(allocator)),
+                seed_value: RwLock::new(299_792_458),
             }),
         })
     }
@@ -3603,12 +3639,23 @@ impl BackendDevice for VulkanDevice {
         self.storage_from_cpu_storage(&cpu)
     }
 
-    fn set_seed(&self, _: u64) -> Result<()> {
-        Err(unsupported("set_seed"))
+    fn set_seed(&self, seed: u64) -> Result<()> {
+        let mut guard = self
+            .inner
+            .seed_value
+            .write()
+            .map_err(|_| Error::msg("vulkan seed lock poisoned"))?;
+        *guard = seed;
+        Ok(())
     }
 
     fn get_current_seed(&self) -> Result<u64> {
-        Err(unsupported("get_current_seed"))
+        let guard = self
+            .inner
+            .seed_value
+            .read()
+            .map_err(|_| Error::msg("vulkan seed lock poisoned"))?;
+        Ok(*guard)
     }
 
     fn synchronize(&self) -> Result<()> {

@@ -1,7 +1,7 @@
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, DType, Error, Layout, Result, Shape, WithDType};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 const WG_SIZE: u32 = 256;
 
@@ -383,6 +383,7 @@ struct WgpuInner {
     device: wgpu::Device,
     queue: wgpu::Queue,
     features: wgpu::Features,
+    seed_value: RwLock<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -3513,6 +3514,7 @@ impl BackendDevice for WgpuDevice {
                 device,
                 queue,
                 features: required_features,
+                seed_value: RwLock::new(299_792_458),
             }),
         })
     }
@@ -3598,12 +3600,23 @@ impl BackendDevice for WgpuDevice {
         self.storage_from_cpu_storage(&cpu)
     }
 
-    fn set_seed(&self, _: u64) -> Result<()> {
-        Err(unsupported("set_seed"))
+    fn set_seed(&self, seed: u64) -> Result<()> {
+        let mut guard = self
+            .inner
+            .seed_value
+            .write()
+            .map_err(|_| Error::msg("wgpu seed lock poisoned"))?;
+        *guard = seed;
+        Ok(())
     }
 
     fn get_current_seed(&self) -> Result<u64> {
-        Err(unsupported("get_current_seed"))
+        let guard = self
+            .inner
+            .seed_value
+            .read()
+            .map_err(|_| Error::msg("wgpu seed lock poisoned"))?;
+        Ok(*guard)
     }
 
     fn synchronize(&self) -> Result<()> {
