@@ -740,8 +740,22 @@ impl GgmlType for BlockQ8_1 {
         }
     }
 
-    fn to_float(_xs: &[Self], _ys: &mut [f32]) {
-        unimplemented!("no support for vec-dot on Q8_1")
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        debug_assert_eq!(
+            xs.len() * Self::BLCK_SIZE,
+            ys.len(),
+            "size mismatch {} {} {}",
+            xs.len(),
+            ys.len(),
+            Self::BLCK_SIZE
+        );
+        for (block_idx, block) in xs.iter().enumerate() {
+            let scale = f16::to_f32(block.d);
+            let ys = &mut ys[block_idx * Self::BLCK_SIZE..(block_idx + 1) * Self::BLCK_SIZE];
+            for (dst, &q) in ys.iter_mut().zip(block.qs.iter()) {
+                *dst = scale * q as f32;
+            }
+        }
     }
 }
 

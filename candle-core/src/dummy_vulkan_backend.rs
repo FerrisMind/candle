@@ -8,6 +8,41 @@ pub struct VulkanDevice;
 #[derive(Debug)]
 pub struct VulkanStorage;
 
+impl VulkanStorage {
+    pub(crate) fn quantized_index_select_f32(
+        &self,
+        _: crate::quantized::GgmlDType,
+        _: &Shape,
+        _: &Self,
+        _: &Layout,
+        _: usize,
+    ) -> Result<Self> {
+        Err(Error::NotCompiledWithVulkanSupport)
+    }
+
+    pub(crate) fn quantized_matmul(
+        &self,
+        _: crate::quantized::GgmlDType,
+        _: &Shape,
+        _: &Self,
+        _: &Layout,
+    ) -> Result<(Self, Shape)> {
+        Err(Error::NotCompiledWithVulkanSupport)
+    }
+
+    pub(crate) fn quantized_indexed_moe_f32(
+        &self,
+        _: crate::quantized::GgmlDType,
+        _: &Shape,
+        _: &Self,
+        _: &Layout,
+        _: &Self,
+        _: &Layout,
+    ) -> Result<(Self, Shape)> {
+        Err(Error::NotCompiledWithVulkanSupport)
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum VulkanError {
     #[error("{0}")]

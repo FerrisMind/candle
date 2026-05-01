@@ -1,5 +1,6 @@
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
+use crate::quantized::GgmlDType;
 use crate::{CpuStorage, DType, Error, Layout, Result, Shape, WithDType};
 use ash::vk;
 use gpu_allocator::vulkan::{
@@ -174,6 +175,48 @@ struct VulkanMatmulParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct VulkanMatVecParams {
+    ncols: u32,
+    stride_a: u32,
+    stride_b: u32,
+    stride_d: u32,
+    batch_stride_a: u32,
+    batch_stride_b: u32,
+    batch_stride_d: u32,
+    fusion_flags: u32,
+    base_work_group_y: u32,
+    ne02: u32,
+    ne12: u32,
+    broadcast2: u32,
+    broadcast3: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VulkanMatVecIdParams {
+    ncols: u32,
+    stride_a: u32,
+    stride_b: u32,
+    stride_d: u32,
+    batch_stride_a: u32,
+    batch_stride_b: u32,
+    batch_stride_d: u32,
+    fusion_flags: u32,
+    nei0: u32,
+    ne11: u32,
+    expert_i1: u32,
+    nbi1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VulkanQuantizeQ8_1Params {
+    ne: u32,
+    num_blocks: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct VulkanIm2ColParams {
     dst_addr: [u32; 2],
     batch_offset: u32,
@@ -261,8 +304,11 @@ struct VulkanInner {
     _entry: ash::Entry,
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
+    vendor_id: u32,
+    integer_dot_product: bool,
     subgroup_size: u32,
     max_workgroup_size_log2: u32,
+    max_workgroup_count_x: u32,
     max_workgroup_count_y: u32,
     robust_buffer_access: bool,
     vulkan_memory_model: bool,
@@ -278,8 +324,11 @@ impl std::fmt::Debug for VulkanInner {
         f.debug_struct("VulkanInner")
             .field("ordinal", &self.ordinal)
             .field("physical_device", &self.physical_device)
+            .field("vendor_id", &self.vendor_id)
+            .field("integer_dot_product", &self.integer_dot_product)
             .field("subgroup_size", &self.subgroup_size)
             .field("max_workgroup_size_log2", &self.max_workgroup_size_log2)
+            .field("max_workgroup_count_x", &self.max_workgroup_count_x)
             .field("max_workgroup_count_y", &self.max_workgroup_count_y)
             .field("robust_buffer_access", &self.robust_buffer_access)
             .field("vulkan_memory_model", &self.vulkan_memory_model)
@@ -321,6 +370,172 @@ fn should_cpu_fallback(err: &Error) -> bool {
 
 pub fn shader_source(name: &str) -> Option<&'static str> {
     candle_vulkan_kernels::get(name).map(|module| module.source())
+}
+
+fn vulkan_quantized_stem(dtype: GgmlDType) -> Result<&'static str> {
+    match dtype {
+        GgmlDType::Q4_0 => Ok("q4_0"),
+        GgmlDType::Q4_1 => Ok("q4_1"),
+        GgmlDType::Q5_0 => Ok("q5_0"),
+        GgmlDType::Q5_1 => Ok("q5_1"),
+        GgmlDType::Q8_0 => Ok("q8_0"),
+        GgmlDType::Q8_1 => Ok("q8_1"),
+        GgmlDType::Q2K => Ok("q2_k"),
+        GgmlDType::Q3K => Ok("q3_k"),
+        GgmlDType::Q4K => Ok("q4_k"),
+        GgmlDType::Q5K => Ok("q5_k"),
+        GgmlDType::Q6K => Ok("q6_k"),
+        other => crate::bail!("vulkan backend quantized dtype {other:?} is not supported"),
+    }
+}
+
+fn vulkan_quantized_vec_rows(dtype: GgmlDType) -> Result<u32> {
+    match dtype {
+        GgmlDType::Q8_0 => Ok(1),
+        GgmlDType::Q4_0
+        | GgmlDType::Q4_1
+        | GgmlDType::Q5_0
+        | GgmlDType::Q5_1
+        | GgmlDType::Q8_1
+        | GgmlDType::Q2K
+        | GgmlDType::Q3K
+        | GgmlDType::Q4K
+        | GgmlDType::Q5K
+        | GgmlDType::Q6K => Ok(2),
+        other => crate::bail!("vulkan backend quantized dtype {other:?} is not supported"),
+    }
+}
+
+fn vulkan_supports_q8_1_rhs(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+    )
+}
+
+fn vulkan_is_k_quant(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
+    )
+}
+
+const VULKAN_VENDOR_ID_NVIDIA: u32 = 0x10DE;
+const VULKAN_VENDOR_ID_AMD: u32 = 0x1002;
+const VULKAN_VENDOR_ID_INTEL: u32 = 0x8086;
+
+fn vulkan_should_use_mmvq(device: &VulkanDevice, qdtype: GgmlDType, n: usize, k: usize) -> bool {
+    if matches!(qdtype, GgmlDType::Q3K | GgmlDType::Q6K) {
+        return false;
+    }
+    if n > 1 {
+        return true;
+    }
+    match device.inner.vendor_id {
+        VULKAN_VENDOR_ID_NVIDIA => {
+            if matches!(qdtype, GgmlDType::Q2K) {
+                return true;
+            }
+            if k <= 4096 {
+                return false;
+            }
+            !matches!(qdtype, GgmlDType::Q8_0)
+        }
+        VULKAN_VENDOR_ID_AMD => {
+            if k < 2048 {
+                return false;
+            }
+            !matches!(qdtype, GgmlDType::Q8_0)
+        }
+        VULKAN_VENDOR_ID_INTEL => {
+            if k < 2048 {
+                return false;
+            }
+            !matches!(qdtype, GgmlDType::Q4_0 | GgmlDType::Q5_1)
+        }
+        _ => true,
+    }
+}
+
+fn vulkan_dmmv_rows_per_group(
+    device: &VulkanDevice,
+    qdtype: GgmlDType,
+    q8_1_rhs: bool,
+) -> Result<u32> {
+    let rm_stdq_int = if device.inner.vendor_id == VULKAN_VENDOR_ID_INTEL {
+        2
+    } else {
+        1
+    };
+    let rm_kq_int = 1;
+    let rows = if q8_1_rhs {
+        match qdtype {
+            GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0 => rm_stdq_int,
+            GgmlDType::Q2K => 2 * rm_kq_int,
+            GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => rm_kq_int,
+            other => {
+                crate::bail!("vulkan backend q8_1 rhs rows/group unsupported for {other:?}")
+            }
+        }
+    } else {
+        vulkan_quantized_vec_rows(qdtype)?
+    };
+    Ok(rows)
+}
+
+fn vulkan_q8_1_x4_bytes(elem_count: usize) -> Result<usize> {
+    elem_count
+        .div_ceil(128)
+        .checked_mul(GgmlDType::Q8_1.type_size() * 4)
+        .ok_or_else(|| Error::msg("vulkan q8_1 temp size overflow"))
+}
+
+fn quantize_f32_storage_to_q8_1_x4(
+    device: &VulkanDevice,
+    src: &VulkanStorage,
+    elem_count: usize,
+) -> Result<Arc<VulkanBuffer>> {
+    if src.dtype != DType::F32 {
+        return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan quantize_q8_1").bt());
+    }
+    if elem_count % 4 != 0 {
+        crate::bail!("vulkan quantize_q8_1 expects element count divisible by 4, got {elem_count}")
+    }
+    let num_blocks: u32 = elem_count.div_ceil(128).try_into()?;
+    let out_size = vulkan_q8_1_x4_bytes(elem_count)?;
+    let out = device.create_buffer(out_size, "candle-vulkan-quantize-q8_1-x4")?;
+    let spirv = candle_vulkan_kernels::spirv("quantize_q8_1_x4").ok_or_else(|| {
+        Error::Msg("vulkan shader quantize_q8_1_x4 not generated".into()).bt()
+    })?;
+    let params = VulkanQuantizeQ8_1Params {
+        ne: elem_count.try_into()?,
+        num_blocks,
+    };
+    let workgroups_x = num_blocks.min(device.inner.max_workgroup_count_x.max(1));
+    device.run_compute_specialized(
+        spirv,
+        &[
+            VulkanBinding::Storage(src.buffer.as_ref()),
+            VulkanBinding::Storage(out.as_ref()),
+        ],
+        Some(any_as_bytes(&params)),
+        (workgroups_x, 1, 1),
+        Some(&[(0, 32)]),
+    )?;
+    Ok(out)
 }
 
 fn byte_len(dtype: DType, count: usize, op: &'static str) -> Result<usize> {
@@ -2706,6 +2921,583 @@ impl VulkanStorage {
         drop(input_contiguous);
         Ok(dst)
     }
+
+    pub(crate) fn quantized_index_select_f32(
+        &self,
+        qdtype: GgmlDType,
+        src_shape: &Shape,
+        ids: &Self,
+        ids_l: &Layout,
+        dim: usize,
+    ) -> Result<Self> {
+        if ids.dtype != DType::U32 {
+            return Err(Error::UnsupportedDTypeForOp(
+                ids.dtype,
+                "vulkan quantized index_select ids",
+            )
+            .bt());
+        }
+        if !ids_l.is_contiguous() {
+            return Err(unsupported("quantized index_select ids strided"));
+        }
+        let ids_len = match ids_l.dims() {
+            [ids_len] => *ids_len,
+            _ => return Err(unsupported("quantized index_select ids rank")),
+        };
+        let dims = src_shape.dims();
+        if dim >= dims.len() {
+            crate::bail!("index_select dim {dim} out of range for {src_shape:?}")
+        }
+        let block_size = qdtype.block_size();
+        let right_size: usize = dims[dim + 1..].iter().product();
+        if !right_size.is_multiple_of(block_size) {
+            crate::bail!(
+                "vulkan quantized index_select requires block-aligned rows, got right_size={right_size}, block_size={block_size}"
+            )
+        }
+        let left_size: usize = dims[..dim].iter().product();
+        let src_dim = dims[dim];
+        let mut dst_dims = dims.to_vec();
+        dst_dims[dim] = ids_len;
+        let dst_shape = Shape::from(dst_dims);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let params = GgmlBinaryParams {
+            ne: (left_size * ids_len * right_size).try_into()?,
+            ne00: right_size.try_into()?,
+            ne01: src_dim.try_into()?,
+            ne02: left_size.try_into()?,
+            ne03: 1,
+            nb00: 1,
+            nb01: (right_size / block_size).try_into()?,
+            nb02: (src_dim * right_size / block_size).try_into()?,
+            nb03: (src_dim * right_size * left_size / block_size).try_into()?,
+            ne10: ids_len.try_into()?,
+            ne11: left_size.try_into()?,
+            ne12: 1,
+            ne13: 1,
+            nb10: ids_l.stride()[0].try_into()?,
+            nb11: 0,
+            nb12: 0,
+            nb13: 0,
+            ne20: right_size.try_into()?,
+            ne21: ids_len.try_into()?,
+            ne22: left_size.try_into()?,
+            ne23: 1,
+            nb20: 1,
+            nb21: right_size.try_into()?,
+            nb22: (ids_len * right_size).try_into()?,
+            nb23: (left_size * ids_len * right_size).try_into()?,
+            misalign_offsets: 0,
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(ids.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let spirv_name = format!("get_rows_{}_f32", vulkan_quantized_stem(qdtype)?);
+        let spirv = candle_vulkan_kernels::spirv(&spirv_name).ok_or_else(|| {
+            Error::Msg(format!("vulkan shader {spirv_name} not generated").into()).bt()
+        })?;
+        self.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (
+                right_size.div_ceil(1024).try_into()?,
+                ids_len.try_into()?,
+                left_size.try_into()?,
+            ),
+        )?;
+        Ok(dst)
+    }
+
+    pub(crate) fn quantized_matmul(
+        &self,
+        qdtype: GgmlDType,
+        qshape: &Shape,
+        storage: &Self,
+        layout: &Layout,
+    ) -> Result<(Self, Shape)> {
+        if storage.dtype != DType::F32 && storage.dtype != DType::F16 {
+            return Err(
+                Error::UnsupportedDTypeForOp(storage.dtype, "vulkan quantized matmul").bt(),
+            );
+        }
+        let rank = layout.dims().len();
+        if rank < 2 || rank > 4 {
+            return Err(unsupported("quantized matmul rank"));
+        }
+        let (n, k) = qshape.dims2()?;
+        let input_m = layout.dims()[rank - 2];
+        let last_k = layout.dims()[rank - 1];
+        if last_k != k {
+            crate::bail!("input tensor {layout:?} incompatible with quantized weights {qshape:?}")
+        }
+        if input_m == 1 {
+            return self.quantized_matvec(qdtype, qshape, storage, layout);
+        }
+
+        let mut src_contiguous = None;
+        let (src, src_layout) = if layout.is_contiguous() && layout.start_offset() == 0 {
+            (storage, layout.clone())
+        } else {
+            let mut tmp = unsafe { storage.device.alloc_uninit(layout.shape(), storage.dtype)? };
+            storage.copy_strided_src(&mut tmp, 0, layout)?;
+            src_contiguous = Some(tmp);
+            (
+                src_contiguous.as_ref().unwrap(),
+                Layout::contiguous(layout.shape().clone()),
+            )
+        };
+
+        let src_stride = src_layout.stride();
+        let batch_inner = if rank >= 3 {
+            src_layout.dims()[rank - 3]
+        } else {
+            1
+        };
+        let batch_outer = if rank >= 4 {
+            src_layout.dims()[rank - 4]
+        } else {
+            1
+        };
+        let batch_count = batch_inner * batch_outer;
+        let src_stride_batch_inner = if rank >= 3 {
+            src_stride[rank - 3]
+        } else {
+            input_m * k
+        };
+        let src_elem_count = src_layout.shape().elem_count();
+        let use_q8_1_rhs = src.dtype == DType::F32
+            && self.device.inner.integer_dot_product
+            && vulkan_supports_q8_1_rhs(qdtype)
+            && src_elem_count % 4 == 0;
+
+        let mut dst_dims = src_layout.dims().to_vec();
+        dst_dims.pop();
+        dst_dims.push(n);
+        let dst_shape = Shape::from(dst_dims);
+        let dst = unsafe { storage.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let params = VulkanMatmulParams {
+            m: n.try_into()?,
+            n: input_m.try_into()?,
+            k: k.try_into()?,
+            stride_a: k.try_into()?,
+            stride_b: src_stride[rank - 2].try_into()?,
+            stride_d: n.try_into()?,
+            batch_stride_a: 0,
+            batch_stride_b: src_stride_batch_inner.try_into()?,
+            batch_stride_d: (input_m * n).try_into()?,
+            base_work_group_z: 0,
+            num_batches: batch_count.try_into()?,
+            k_split: k.try_into()?,
+            ne02: 1,
+            ne12: batch_inner.try_into()?,
+            broadcast2: batch_inner.try_into()?,
+            broadcast3: batch_outer.try_into()?,
+            padded_n: input_m.try_into()?,
+        };
+        let q8_1_rhs = if use_q8_1_rhs {
+            Some(quantize_f32_storage_to_q8_1_x4(
+                &self.device,
+                src,
+                src_elem_count,
+            )?)
+        } else {
+            None
+        };
+        let rhs_binding = q8_1_rhs
+            .as_ref()
+            .map(|buffer| buffer.as_ref())
+            .unwrap_or(src.buffer.as_ref());
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(rhs_binding),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let rhs_suffix = if use_q8_1_rhs {
+            "q8_1"
+        } else {
+            match src.dtype {
+                DType::F32 => "f32",
+                DType::F16 => "f16",
+                other => {
+                    return Err(Error::UnsupportedDTypeForOp(
+                        other,
+                        "vulkan quantized matmul",
+                    )
+                    .bt())
+                }
+            }
+        };
+        let spirv_name = format!("matmul_{}_{}", vulkan_quantized_stem(qdtype)?, rhs_suffix);
+        let spirv = candle_vulkan_kernels::spirv(&spirv_name).ok_or_else(|| {
+            Error::Msg(format!("vulkan shader {spirv_name} not generated").into()).bt()
+        })?;
+        let spec = if use_q8_1_rhs {
+            let subgroup = self.device.inner.subgroup_size.max(8);
+            let subgroup32 = self.device.inner.subgroup_size.max(32);
+            let small = input_m <= 32 || n <= 32;
+            if vulkan_is_k_quant(qdtype) && small {
+                [
+                    (0, subgroup32),
+                    (1, 32),
+                    (2, 32),
+                    (4, 32),
+                    (5, 32),
+                    (6, 1),
+                    (7, 2),
+                    (8, 1),
+                    (10, subgroup),
+                ]
+            } else if vulkan_is_k_quant(qdtype) {
+                [
+                    (0, 128),
+                    (1, 64),
+                    (2, 64),
+                    (4, subgroup),
+                    (5, 32),
+                    (6, 1),
+                    (7, 2),
+                    (8, 2),
+                    (10, subgroup),
+                ]
+            } else if small {
+                [
+                    (0, subgroup32),
+                    (1, 32),
+                    (2, 32),
+                    (4, 32),
+                    (5, 32),
+                    (6, 2),
+                    (7, 2),
+                    (8, 1),
+                    (10, subgroup),
+                ]
+            } else {
+                [
+                    (0, 128),
+                    (1, 64),
+                    (2, 64),
+                    (4, subgroup),
+                    (5, 32),
+                    (6, 2),
+                    (7, 2),
+                    (8, 2),
+                    (10, subgroup),
+                ]
+            }
+        } else {
+            [
+                (0, 64),
+                (1, 64),
+                (2, 64),
+                (4, 32),
+                (5, 32),
+                (6, 2),
+                (7, 4),
+                (8, 2),
+                (10, self.device.inner.subgroup_size.max(1)),
+            ]
+        };
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (
+                n.try_into()?,
+                input_m.try_into()?,
+                batch_count.try_into()?,
+            ),
+            Some(&spec),
+        )?;
+        drop(src_contiguous);
+        Ok((dst, dst_shape))
+    }
+
+    fn quantized_matvec(
+        &self,
+        qdtype: GgmlDType,
+        qshape: &Shape,
+        storage: &Self,
+        layout: &Layout,
+    ) -> Result<(Self, Shape)> {
+        let rank = layout.dims().len();
+        let (n, k) = qshape.dims2()?;
+        let input_m = layout.dims()[rank - 2];
+        if input_m != 1 {
+            crate::bail!("vulkan quantized matvec expects input_m == 1, got {input_m}");
+        }
+        let last_k = layout.dims()[rank - 1];
+        if last_k != k {
+            crate::bail!("input tensor {layout:?} incompatible with quantized weights {qshape:?}")
+        }
+
+        let mut src_contiguous = None;
+        let (src, src_layout) = if layout.is_contiguous() && layout.start_offset() == 0 {
+            (storage, layout.clone())
+        } else {
+            let mut tmp = unsafe { storage.device.alloc_uninit(layout.shape(), storage.dtype)? };
+            storage.copy_strided_src(&mut tmp, 0, layout)?;
+            src_contiguous = Some(tmp);
+            (
+                src_contiguous.as_ref().unwrap(),
+                Layout::contiguous(layout.shape().clone()),
+            )
+        };
+
+        let batch_inner = if rank >= 3 {
+            src_layout.dims()[rank - 3]
+        } else {
+            1
+        };
+        let batch_outer = if rank >= 4 {
+            src_layout.dims()[rank - 4]
+        } else {
+            1
+        };
+        let batch_count = batch_inner * batch_outer;
+        let src_elem_count = src_layout.shape().elem_count();
+        let use_q8_1_rhs = src.dtype == DType::F32
+            && self.device.inner.integer_dot_product
+            && vulkan_supports_q8_1_rhs(qdtype)
+            && src_elem_count % 4 == 0;
+        let mut dst_dims = src_layout.dims().to_vec();
+        dst_dims.pop();
+        dst_dims.push(n);
+        let dst_shape = Shape::from(dst_dims);
+        let dst = unsafe { storage.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let params = VulkanMatVecParams {
+            ncols: k.try_into()?,
+            stride_a: k.try_into()?,
+            stride_b: k.try_into()?,
+            stride_d: n.try_into()?,
+            batch_stride_a: qshape.elem_count().try_into()?,
+            batch_stride_b: k.try_into()?,
+            batch_stride_d: n.try_into()?,
+            fusion_flags: 0,
+            base_work_group_y: 0,
+            ne02: 1,
+            ne12: batch_inner.try_into()?,
+            broadcast2: batch_inner.try_into()?,
+            broadcast3: batch_outer.try_into()?,
+        };
+        let q8_1_rhs = if use_q8_1_rhs {
+            Some(quantize_f32_storage_to_q8_1_x4(
+                &self.device,
+                src,
+                src_elem_count,
+            )?)
+        } else {
+            None
+        };
+        let rhs_binding = q8_1_rhs
+            .as_ref()
+            .map(|buffer| buffer.as_ref())
+            .unwrap_or(src.buffer.as_ref());
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(rhs_binding),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let (rhs_suffix, rows_per_group, block_size) = if use_q8_1_rhs {
+            (
+                "q8_1_f32".to_string(),
+                vulkan_dmmv_rows_per_group(&self.device, qdtype, true)?,
+                32,
+            )
+        } else {
+            (
+                match src.dtype {
+                    DType::F32 => "f32_f32".to_string(),
+                    DType::F16 => "f16_f32".to_string(),
+                    other => {
+                        return Err(Error::UnsupportedDTypeForOp(
+                            other,
+                            "vulkan quantized matvec",
+                        )
+                        .bt())
+                    }
+                },
+                vulkan_quantized_vec_rows(qdtype)?,
+                32,
+            )
+        };
+        let spirv_name = format!("mul_mat_vec_{}_{}", vulkan_quantized_stem(qdtype)?, rhs_suffix);
+        let spirv = candle_vulkan_kernels::spirv(&spirv_name).ok_or_else(|| {
+            Error::Msg(format!("vulkan shader {spirv_name} not generated").into()).bt()
+        })?;
+        let spec = [(0, block_size), (1, rows_per_group), (2, 1)];
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (
+                n.div_ceil(rows_per_group as usize).try_into()?,
+                batch_count.try_into()?,
+                1,
+            ),
+            Some(&spec),
+        )?;
+        drop(src_contiguous);
+        Ok((dst, dst_shape))
+    }
+
+    pub(crate) fn quantized_indexed_moe_f32(
+        &self,
+        qdtype: GgmlDType,
+        qshape: &Shape,
+        storage: &Self,
+        layout: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+    ) -> Result<(Self, Shape)> {
+        if storage.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(
+                storage.dtype,
+                "vulkan quantized indexed_moe",
+            )
+            .bt());
+        }
+        if ids.dtype != DType::U32 && ids.dtype != DType::I32 {
+            return Err(Error::UnsupportedDTypeForOp(
+                ids.dtype,
+                "vulkan quantized indexed_moe ids",
+            )
+            .bt());
+        }
+        let (num_experts, n, k) = qshape.dims3()?;
+        let rank = layout.dims().len();
+        if rank != 3 {
+            return Err(unsupported("quantized indexed_moe rank"));
+        }
+        let (batch, input_dim1, input_k) = layout.shape().dims3()?;
+        let (ids_batch, topk) = ids_l.shape().dims2()?;
+        if batch != ids_batch {
+            crate::bail!("indexed_moe_forward batch mismatch: input={batch}, ids={ids_batch}");
+        }
+        if input_k != k {
+            crate::bail!("indexed_moe_forward last dim mismatch: input={input_k}, weight={k}");
+        }
+        if input_dim1 != 1 && input_dim1 != topk {
+            crate::bail!(
+                "indexed_moe_forward expects input dim-1 to be 1 or topk ({topk}), got {input_dim1}"
+            );
+        }
+        let mut src_contiguous = None;
+        let (src, _src_layout) = if layout.is_contiguous() && layout.start_offset() == 0 {
+            (storage, layout.clone())
+        } else {
+            let mut tmp = unsafe { storage.device.alloc_uninit(layout.shape(), storage.dtype)? };
+            storage.copy_strided_src(&mut tmp, 0, layout)?;
+            src_contiguous = Some(tmp);
+            (
+                src_contiguous.as_ref().unwrap(),
+                Layout::contiguous(layout.shape().clone()),
+            )
+        };
+        let mut ids_contiguous = None;
+        let (ids_src, ids_layout) = if ids_l.is_contiguous() && ids_l.start_offset() == 0 {
+            (ids, ids_l.clone())
+        } else {
+            let mut tmp = unsafe { ids.device.alloc_uninit(ids_l.shape(), ids.dtype)? };
+            ids.copy_strided_src(&mut tmp, 0, ids_l)?;
+            ids_contiguous = Some(tmp);
+            (
+                ids_contiguous.as_ref().unwrap(),
+                Layout::contiguous(ids_l.shape().clone()),
+            )
+        };
+        let ids_stride = ids_layout.stride();
+        if ids_stride[1] != 1 {
+            return Err(unsupported("quantized indexed_moe ids inner stride"));
+        }
+        let src_elem_count = layout.shape().elem_count();
+        let use_q8_1_rhs = self.device.inner.integer_dot_product
+            && vulkan_supports_q8_1_rhs(qdtype)
+            && vulkan_should_use_mmvq(&self.device, qdtype, batch, k)
+            && src_elem_count % 4 == 0;
+        let dst_shape = Shape::from((batch, topk, n));
+        let dst = unsafe { storage.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let params = VulkanMatVecIdParams {
+            ncols: k.try_into()?,
+            stride_a: k.try_into()?,
+            stride_b: k.try_into()?,
+            stride_d: n.try_into()?,
+            batch_stride_a: (n * k).try_into()?,
+            batch_stride_b: (input_dim1 * k).try_into()?,
+            batch_stride_d: (topk * n).try_into()?,
+            fusion_flags: 0,
+            nei0: topk.try_into()?,
+            ne11: input_dim1.try_into()?,
+            expert_i1: 0,
+            nbi1: ids_stride[0].try_into()?,
+        };
+        let q8_1_rhs = if use_q8_1_rhs {
+            Some(quantize_f32_storage_to_q8_1_x4(
+                &self.device,
+                src,
+                src_elem_count,
+            )?)
+        } else {
+            None
+        };
+        let rhs_binding = q8_1_rhs
+            .as_ref()
+            .map(|buffer| buffer.as_ref())
+            .unwrap_or(src.buffer.as_ref());
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(rhs_binding),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(ids_src.buffer.as_ref()),
+        ];
+        let (rhs_suffix, rows_per_group, block_size) = if use_q8_1_rhs {
+            (
+                "q8_1_f32".to_string(),
+                vulkan_dmmv_rows_per_group(&self.device, qdtype, true)?,
+                32,
+            )
+        } else {
+            ("f32_f32".to_string(), 1, 32)
+        };
+        let spirv_name = format!(
+            "mul_mat_vec_id_{}_{}",
+            vulkan_quantized_stem(qdtype)?,
+            rhs_suffix
+        );
+        let spirv = candle_vulkan_kernels::spirv(&spirv_name).ok_or_else(|| {
+            Error::Msg(format!("vulkan shader {spirv_name} not generated").into()).bt()
+        })?;
+        let spec = [(0, block_size), (1, rows_per_group), (2, 1)];
+        let groups_x_max = self.device.inner.max_workgroup_count_x.max(1);
+        let groups_x = (n as u32).div_ceil(rows_per_group).min(groups_x_max);
+        let groups_z = (n as u32).div_ceil(groups_x);
+        for expert_i1 in 0..batch {
+            let params = VulkanMatVecIdParams {
+                expert_i1: expert_i1.try_into()?,
+                ..params
+            };
+            self.device.run_compute_specialized(
+                spirv,
+                &bindings,
+                Some(any_as_bytes(&params)),
+                (groups_x, topk.try_into()?, groups_z),
+                Some(&spec),
+            )?;
+        }
+        drop(ids_contiguous);
+        drop(src_contiguous);
+        let _ = num_experts;
+        Ok((dst, dst_shape))
+    }
 }
 
 impl Drop for VulkanBuffer {
@@ -3473,8 +4265,10 @@ impl BackendDevice for VulkanDevice {
             .or_else(|| physical_devices.first())
             .ok_or_else(|| Error::msg("no vulkan physical device found"))?;
         let mut subgroup_properties = vk::PhysicalDeviceSubgroupProperties::default();
-        let mut physical_device_properties =
-            vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup_properties);
+        let mut integer_dot_properties = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
+        let mut physical_device_properties = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut subgroup_properties)
+            .push_next(&mut integer_dot_properties);
         unsafe {
             instance
                 .get_physical_device_properties2(physical_device, &mut physical_device_properties);
@@ -3485,15 +4279,23 @@ impl BackendDevice for VulkanDevice {
             .max_compute_work_group_invocations
             .max(1);
         let max_workgroup_size_log2 = floor_log2_u32(max_workgroup_invocations);
+        let max_workgroup_count_x = physical_device_properties
+            .properties
+            .limits
+            .max_compute_work_group_count[0]
+            .max(1);
         let max_workgroup_count_y = physical_device_properties
             .properties
             .limits
             .max_compute_work_group_count[1]
             .max(1);
+        let vendor_id = physical_device_properties.properties.vendor_id;
         let subgroup_size = subgroup_properties.subgroup_size.max(1);
         let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default();
-        let mut physical_features2 =
-            vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan12_features);
+        let mut integer_dot_features = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+        let mut physical_features2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut vulkan12_features)
+            .push_next(&mut integer_dot_features);
         unsafe {
             instance.get_physical_device_features2(physical_device, &mut physical_features2);
         }
@@ -3512,6 +4314,9 @@ impl BackendDevice for VulkanDevice {
         };
         let robust_buffer_access = physical_features2.features.robust_buffer_access == vk::TRUE;
         let vulkan_memory_model = vulkan12_features.vulkan_memory_model == vk::TRUE;
+        let integer_dot_product = integer_dot_features.shader_integer_dot_product == vk::TRUE
+            && integer_dot_properties.integer_dot_product4x8_bit_packed_signed_accelerated
+                == vk::TRUE;
         let mut enabled_features = vk::PhysicalDeviceFeatures::default();
         if robust_buffer_access {
             enabled_features.robust_buffer_access = vk::TRUE;
@@ -3519,6 +4324,10 @@ impl BackendDevice for VulkanDevice {
         let mut enabled_vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
         if vulkan_memory_model {
             enabled_vulkan12.vulkan_memory_model = vk::TRUE;
+        }
+        let mut enabled_integer_dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+        if integer_dot_product {
+            enabled_integer_dot.shader_integer_dot_product = vk::TRUE;
         }
         let priorities = [1.0f32];
         let queue_info = [vk::DeviceQueueCreateInfo::default()
@@ -3529,6 +4338,9 @@ impl BackendDevice for VulkanDevice {
             .enabled_features(&enabled_features);
         if vulkan_memory_model {
             device_info = device_info.push_next(&mut enabled_vulkan12);
+        }
+        if integer_dot_product {
+            device_info = device_info.push_next(&mut enabled_integer_dot);
         }
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
             .map_err(Error::wrap)?;
@@ -3548,8 +4360,11 @@ impl BackendDevice for VulkanDevice {
                 _entry: entry,
                 instance,
                 physical_device,
+                vendor_id,
+                integer_dot_product,
                 subgroup_size,
                 max_workgroup_size_log2,
+                max_workgroup_count_x,
                 max_workgroup_count_y,
                 robust_buffer_access,
                 vulkan_memory_model,
@@ -3660,6 +4475,71 @@ impl BackendDevice for VulkanDevice {
 
     fn synchronize(&self) -> Result<()> {
         unsafe { self.inner.device.queue_wait_idle(self.inner.queue) }.map_err(Error::wrap)?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "vulkan"))]
+mod tests {
+    use super::*;
+
+    fn exact_q8_1_x4_bytes(xs: &[f32]) -> Vec<u8> {
+        assert_eq!(xs.len() % 128, 0);
+        let mut out = Vec::new();
+        for x4 in xs.chunks_exact(128) {
+            let mut ds = [0u16; 8];
+            let mut qs = [0i32; 32];
+            for block_idx in 0..4 {
+                let block = &x4[block_idx * 32..(block_idx + 1) * 32];
+                let mut amax = 0f32;
+                for &x in block {
+                    amax = amax.max(x.abs());
+                }
+                let d = amax / 127.0;
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                let mut qbytes = [0u8; 32];
+                let mut sum = 0i32;
+                for i in 0..16 {
+                    let q0 = f32::round(block[i] * id) as i8;
+                    let q1 = f32::round(block[i + 16] * id) as i8;
+                    qbytes[i] = q0 as u8;
+                    qbytes[i + 16] = q1 as u8;
+                    sum += q0 as i32 + q1 as i32;
+                }
+                ds[block_idx * 2] = half::f16::from_f32(d).to_bits();
+                ds[block_idx * 2 + 1] = half::f16::from_f32(sum as f32 * d).to_bits();
+                for i in 0..8 {
+                    let base = i * 4;
+                    qs[block_idx * 8 + i] = i32::from_le_bytes([
+                        qbytes[base],
+                        qbytes[base + 1],
+                        qbytes[base + 2],
+                        qbytes[base + 3],
+                    ]);
+                }
+            }
+            for bits in ds {
+                out.extend_from_slice(&bits.to_le_bytes());
+            }
+            for packed in qs {
+                out.extend_from_slice(&packed.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_q8_1_x4_matches_cpu_pack() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let xs = (0..128)
+            .map(|i| (i as f32 - 64.0) / 7.0)
+            .collect::<Vec<_>>();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F32(xs.clone()))?;
+        let packed = quantize_f32_storage_to_q8_1_x4(&device, &src, xs.len())?;
+        let gpu = device.read_buffer(packed.as_ref())?;
+        let cpu = exact_q8_1_x4_bytes(&xs);
+        assert_eq!(gpu, cpu);
         Ok(())
     }
 }

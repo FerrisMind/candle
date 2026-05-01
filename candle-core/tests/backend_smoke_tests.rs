@@ -1,4 +1,8 @@
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+use candle_core::Module;
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use half::f16;
@@ -111,6 +115,7 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     smoke_f32_scatter_add_and_index_add(device)?;
     smoke_f32_extended_unary_ops(device)?;
     smoke_rank5_unary_binary_fallback(device)?;
+    smoke_quantized_paths(device)?;
 
     device.synchronize()?;
     Ok(())
@@ -886,6 +891,332 @@ fn smoke_rank5_unary_binary_fallback(device: &Device) -> Result<()> {
         add.flatten_all()?.to_vec1::<f32>()?,
         [8.0, 19.0, 30.0, 11.0, 22.0, 33.0]
     );
+
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn vulkan_uses_q8_1_rhs(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+    )
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[derive(Clone)]
+struct ExactQ81Block {
+    d: f32,
+    s: f32,
+    qs: [i8; 32],
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn read_f16_le(bytes: &[u8], offset: usize) -> f32 {
+    f16::from_bits(u16::from_le_bytes([bytes[offset], bytes[offset + 1]])).to_f32()
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn quantize_f32_to_exact_q8_1_blocks(xs: &[f32]) -> Vec<ExactQ81Block> {
+    assert_eq!(xs.len() % 32, 0);
+    let mut out = Vec::with_capacity(xs.len() / 32);
+    for block in xs.chunks_exact(32) {
+        let mut amax = 0f32;
+        for &x in block {
+            amax = amax.max(x.abs());
+        }
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let mut qs = [0i8; 32];
+        let mut sum = 0i32;
+        for i in 0..16 {
+            let q0 = f32::round(block[i] * id) as i8;
+            let q1 = f32::round(block[i + 16] * id) as i8;
+            qs[i] = q0;
+            qs[i + 16] = q1;
+            sum += q0 as i32 + q1 as i32;
+        }
+        out.push(ExactQ81Block {
+            d: f16::from_f32(d).to_f32(),
+            s: f16::from_f32(sum as f32 * d).to_f32(),
+            qs,
+        });
+    }
+    out
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn exact_q8_1_legacy_matmul_reference(qweights: &QTensor, lhs: &Tensor) -> Result<Tensor> {
+    let cpu = Device::Cpu;
+    let lhs_vals = lhs.flatten_all()?.to_vec1::<f32>()?;
+    let q8 = quantize_f32_to_exact_q8_1_blocks(&lhs_vals);
+    let (rows, k) = qweights.shape().dims2()?;
+    let dtype = qweights.dtype();
+    let data = qweights.data()?.into_owned();
+    let bytes_per_row = k / dtype.block_size() * dtype.type_size();
+    let mut out = vec![0f32; rows];
+    for row in 0..rows {
+        let row_bytes = &data[row * bytes_per_row..(row + 1) * bytes_per_row];
+        let mut acc = 0f32;
+        match dtype {
+            GgmlDType::Q4_0 => {
+                for (block_idx, block_bytes) in row_bytes.chunks_exact(18).enumerate() {
+                    let d = read_f16_le(block_bytes, 0);
+                    let qb = &q8[block_idx];
+                    let mut qsum = 0i32;
+                    for j in 0..16 {
+                        let packed = block_bytes[2 + j];
+                        qsum += (packed as i32 & 0x0F) * qb.qs[j] as i32;
+                        qsum += (packed as i32 >> 4) * qb.qs[j + 16] as i32;
+                    }
+                    acc += d * (qsum as f32 * qb.d - 8.0 * qb.s);
+                }
+            }
+            GgmlDType::Q4_1 => {
+                for (block_idx, block_bytes) in row_bytes.chunks_exact(20).enumerate() {
+                    let d = read_f16_le(block_bytes, 0);
+                    let m = read_f16_le(block_bytes, 2);
+                    let qb = &q8[block_idx];
+                    let mut qsum = 0i32;
+                    for j in 0..16 {
+                        let packed = block_bytes[4 + j];
+                        qsum += (packed as i32 & 0x0F) * qb.qs[j] as i32;
+                        qsum += (packed as i32 >> 4) * qb.qs[j + 16] as i32;
+                    }
+                    acc += qsum as f32 * d * qb.d + m * qb.s;
+                }
+            }
+            GgmlDType::Q5_0 => {
+                for (block_idx, block_bytes) in row_bytes.chunks_exact(22).enumerate() {
+                    let d = read_f16_le(block_bytes, 0);
+                    let qh = u32::from_le_bytes([
+                        block_bytes[2],
+                        block_bytes[3],
+                        block_bytes[4],
+                        block_bytes[5],
+                    ]);
+                    let qb = &q8[block_idx];
+                    let mut qsum = 0i32;
+                    for j in 0..16 {
+                        let packed = block_bytes[6 + j] as i32;
+                        let x0 = (packed & 0x0F) | ((((qh >> j) << 4) & 0x10) as i32);
+                        let x1 = (packed >> 4) | (((qh >> (j + 12)) & 0x10) as i32);
+                        qsum += x0 * qb.qs[j] as i32;
+                        qsum += x1 * qb.qs[j + 16] as i32;
+                    }
+                    acc += d * (qsum as f32 * qb.d - 16.0 * qb.s);
+                }
+            }
+            GgmlDType::Q5_1 => {
+                for (block_idx, block_bytes) in row_bytes.chunks_exact(24).enumerate() {
+                    let d = read_f16_le(block_bytes, 0);
+                    let m = read_f16_le(block_bytes, 2);
+                    let qh = u32::from_le_bytes([
+                        block_bytes[4],
+                        block_bytes[5],
+                        block_bytes[6],
+                        block_bytes[7],
+                    ]);
+                    let qb = &q8[block_idx];
+                    let mut qsum = 0i32;
+                    for j in 0..16 {
+                        let packed = block_bytes[8 + j] as i32;
+                        let x0 = (packed & 0x0F) | ((((qh >> j) << 4) & 0x10) as i32);
+                        let x1 = (packed >> 4) | (((qh >> (j + 12)) & 0x10) as i32);
+                        qsum += x0 * qb.qs[j] as i32;
+                        qsum += x1 * qb.qs[j + 16] as i32;
+                    }
+                    acc += qsum as f32 * d * qb.d + m * qb.s;
+                }
+            }
+            other => panic!("exact q8_1 legacy matmul ref unsupported for {other:?}"),
+        }
+        out[row] = acc;
+    }
+    Tensor::from_vec(out, (1, rows), &cpu)
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn q8_1_activation_matmul_reference(qweights: &QTensor, lhs: &Tensor) -> Result<Tensor> {
+    if matches!(
+        qweights.dtype(),
+        GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1
+    ) {
+        return exact_q8_1_legacy_matmul_reference(qweights, lhs);
+    }
+    let cpu = Device::Cpu;
+    let lhs_q8_1 = QTensor::quantize(lhs, GgmlDType::Q8_1)?.dequantize(&cpu)?;
+    let weights = qweights.dequantize(&cpu)?;
+    lhs_q8_1.matmul(&weights.t()?)
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn q8_1_activation_indexed_moe_reference(
+    qweights: &QTensor,
+    x: &Tensor,
+    ids: &Tensor,
+) -> Result<Tensor> {
+    let cpu = Device::Cpu;
+    let x_q8_1 = QTensor::quantize(x, GgmlDType::Q8_1)?.dequantize(&cpu)?;
+    let weights = qweights.dequantize(&cpu)?;
+    let (num_experts, n, k) = weights.shape().dims3()?;
+    let (batch, topk) = ids.shape().dims2()?;
+    let x_vals = x_q8_1.to_vec2::<f32>()?;
+    let weight_vals = weights.to_vec3::<f32>()?;
+    let id_vals = ids.to_vec2::<u32>()?;
+    let mut out = vec![0f32; batch * topk * n];
+    for batch_idx in 0..batch {
+        for topk_idx in 0..topk {
+            let expert = id_vals[batch_idx][topk_idx] as usize;
+            assert!(expert < num_experts);
+            let out_base = (batch_idx * topk + topk_idx) * n;
+            for row in 0..n {
+                let mut acc = 0f32;
+                for col in 0..k {
+                    acc += x_vals[batch_idx][col] * weight_vals[expert][row][col];
+                }
+                out[out_base + row] = acc;
+            }
+        }
+    }
+    Tensor::from_vec(out, (batch, topk, n), &cpu)
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_quantized_paths(device: &Device) -> Result<()> {
+    let cpu = Device::Cpu;
+    let qmatmul_dtypes = [
+        GgmlDType::Q4_0,
+        GgmlDType::Q4_1,
+        GgmlDType::Q5_0,
+        GgmlDType::Q5_1,
+        GgmlDType::Q8_0,
+        GgmlDType::Q8_1,
+        GgmlDType::Q2K,
+        GgmlDType::Q3K,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::Q8K,
+    ];
+    let indexed_moe_dtypes = [
+        GgmlDType::Q8_0,
+        GgmlDType::Q8_1,
+        GgmlDType::Q2K,
+        GgmlDType::Q3K,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::Q8K,
+    ];
+
+    let k = 256;
+    let lhs_vals = (0..k).map(|v| v as f32 / 32.0).collect::<Vec<_>>();
+    let rhs_vals = (0..(k * 4))
+        .map(|v| (v as f32 - 384.0) / 64.0)
+        .collect::<Vec<_>>();
+
+    let lhs_cpu = Tensor::from_slice(&lhs_vals, (1, k), &cpu)?;
+    let rhs_cpu = Tensor::from_slice(&rhs_vals, (k, 4), &cpu)?;
+    let lhs = Tensor::from_slice(&lhs_vals, (1, k), device)?;
+    let rhs = Tensor::from_slice(&rhs_vals, (k, 4), device)?;
+    for dtype in qmatmul_dtypes {
+        let q_rhs = QTensor::quantize(&rhs.t()?, dtype)?;
+        assert_eq!(q_rhs.shape().dims(), &[4, k]);
+        assert_eq!(q_rhs.dequantize(device)?.shape().dims(), &[4, k]);
+
+        let q_rhs_cpu = QTensor::quantize(&rhs_cpu.t()?, dtype)?;
+        let expected_mm = if device.is_vulkan() && vulkan_uses_q8_1_rhs(dtype) {
+            q8_1_activation_matmul_reference(&q_rhs_cpu, &lhs_cpu)?
+        } else {
+            QMatMul::from_qtensor(q_rhs_cpu)?.forward(&lhs_cpu)?
+        };
+        let actual_mm = QMatMul::from_qtensor(q_rhs)?.forward(&lhs)?;
+        let rel_tol = match dtype {
+            GgmlDType::Q8_0 | GgmlDType::Q8_1 | GgmlDType::Q8K => 1e-3,
+            GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1 => 2e-3,
+            GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K => 5e-3,
+            _ => 1e-3,
+        };
+        for (row_idx, (actual_row, expected_row)) in actual_mm
+            .to_vec2::<f32>()?
+            .iter()
+            .zip(expected_mm.to_vec2::<f32>()?.iter())
+            .enumerate()
+        {
+            for (col_idx, (actual, expected)) in
+                actual_row.iter().zip(expected_row.iter()).enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() < rel_tol * expected.abs().max(1.0),
+                    "quantized qmatmul mismatch for {dtype:?} at ({row_idx}, {col_idx}): got {actual}, expected {expected}, rel_tol {rel_tol}"
+                );
+            }
+        }
+    }
+
+    let moe_w_vals = (0..(2 * 3 * k))
+        .map(|v| (v as f32 - 3.0 * k as f32) / 128.0)
+        .collect::<Vec<_>>();
+    let moe_x_vals = (0..(2 * k))
+        .map(|v| (v as f32 - k as f32 / 2.0) / 16.0)
+        .collect::<Vec<_>>();
+    let moe_w = Tensor::from_slice(&moe_w_vals, (2, 3, k), device)?;
+    let moe_x = Tensor::from_slice(&moe_x_vals, (2, k), device)?;
+    let moe_ids = Tensor::from_slice(&[0u32, 1, 1, 0], (2, 2), device)?;
+    let moe_w_cpu = Tensor::from_slice(&moe_w_vals, (2, 3, k), &cpu)?;
+    let moe_x_cpu = Tensor::from_slice(&moe_x_vals, (2, k), &cpu)?;
+    let moe_ids_cpu = Tensor::from_slice(&[0u32, 1, 1, 0], (2, 2), &cpu)?;
+    for dtype in indexed_moe_dtypes {
+        let q_moe = QTensor::quantize(&moe_w, dtype)?;
+        let q_moe_cpu = QTensor::quantize(&moe_w_cpu, dtype)?;
+        let expected_moe = if device.is_vulkan() && vulkan_uses_q8_1_rhs(dtype) {
+            q8_1_activation_indexed_moe_reference(&q_moe_cpu, &moe_x_cpu, &moe_ids_cpu)?
+        } else {
+            q_moe_cpu.indexed_moe_forward(&moe_x_cpu, &moe_ids_cpu)?
+        };
+        let actual_moe = q_moe.indexed_moe_forward(&moe_x, &moe_ids)?;
+        let rel_tol = match dtype {
+            GgmlDType::Q8_0 | GgmlDType::Q8_1 | GgmlDType::Q8K => 2e-3,
+            GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K => 8e-3,
+            _ => 2e-3,
+        };
+        for (actual_topk, expected_topk) in actual_moe
+            .to_vec3::<f32>()?
+            .iter()
+            .zip(expected_moe.to_vec3::<f32>()?.iter())
+        {
+            for (topk_idx, (actual_row, expected_row)) in
+                actual_topk.iter().zip(expected_topk.iter()).enumerate()
+            {
+                for (col_idx, (actual, expected)) in
+                    actual_row.iter().zip(expected_row.iter()).enumerate()
+                {
+                    assert!(
+                        (actual - expected).abs() < rel_tol * expected.abs().max(1.0),
+                        "quantized indexed_moe mismatch for {dtype:?} at topk={topk_idx}, col={col_idx}: got {actual}, expected {expected}, rel_tol {rel_tol}"
+                    );
+                }
+            }
+        }
+    }
 
     Ok(())
 }

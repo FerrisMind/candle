@@ -1,5 +1,6 @@
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
+use crate::quantized::GgmlDType;
 use crate::{CpuStorage, DType, Error, Layout, Result, Shape, WithDType};
 use std::sync::{Arc, RwLock};
 
@@ -383,6 +384,7 @@ struct WgpuInner {
     device: wgpu::Device,
     queue: wgpu::Queue,
     features: wgpu::Features,
+    limits: wgpu::Limits,
     seed_value: RwLock<u64>,
 }
 
@@ -583,6 +585,17 @@ impl WgpuDevice {
         workgroups: u32,
         label: &'static str,
     ) -> Result<()> {
+        self.run_compute_xyz(shader, entries, bindings, (workgroups, 1, 1), label)
+    }
+
+    fn run_compute_xyz(
+        &self,
+        shader: &str,
+        entries: &[wgpu::BindGroupLayoutEntry],
+        bindings: &[wgpu::BindGroupEntry<'_>],
+        workgroups: (u32, u32, u32),
+        label: &'static str,
+    ) -> Result<()> {
         let module = self
             .inner
             .device
@@ -635,7 +648,7 @@ impl WgpuDevice {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
         }
         self.inner.queue.submit([encoder.finish()]);
         Ok(())
@@ -667,6 +680,16 @@ fn next_power_of_two_u32(value: usize, op: &'static str) -> Result<u32> {
         .ok_or_else(|| Error::Msg(format!("wgpu backend op {op} dimension overflow").into()).bt())?
         .try_into()
         .map_err(Error::wrap)
+}
+
+fn compute_2d_workgroups(total_wg: u32, max_per_dim: u32) -> (u32, u32) {
+    if total_wg == 0 {
+        return (1, 1);
+    }
+    let max_per_dim = max_per_dim.max(1);
+    let wg_y = std::cmp::max(1, total_wg.div_ceil(max_per_dim));
+    let wg_x = total_wg.div_ceil(wg_y);
+    (wg_x, wg_y)
 }
 
 fn nearest_interp_weights(in_size: usize, out_size: usize) -> Vec<f32> {
@@ -718,6 +741,23 @@ fn wgpu_kernel_dtype(dtype: DType) -> Result<candle_wgpu_kernels::DType> {
         DType::F32 => Ok(candle_wgpu_kernels::DType::F32),
         DType::F16 => Ok(candle_wgpu_kernels::DType::F16),
         _ => Err(Error::UnsupportedDTypeForOp(dtype, "wgpu shader").bt()),
+    }
+}
+
+fn wgpu_quantized_dtype(dtype: GgmlDType) -> Result<candle_wgpu_kernels::QuantizedDType> {
+    match dtype {
+        GgmlDType::Q4_0 => Ok(candle_wgpu_kernels::QuantizedDType::Q4_0),
+        GgmlDType::Q4_1 => Ok(candle_wgpu_kernels::QuantizedDType::Q4_1),
+        GgmlDType::Q5_0 => Ok(candle_wgpu_kernels::QuantizedDType::Q5_0),
+        GgmlDType::Q5_1 => Ok(candle_wgpu_kernels::QuantizedDType::Q5_1),
+        GgmlDType::Q8_0 => Ok(candle_wgpu_kernels::QuantizedDType::Q8_0),
+        GgmlDType::Q8_1 => Ok(candle_wgpu_kernels::QuantizedDType::Q8_1),
+        GgmlDType::Q2K => Ok(candle_wgpu_kernels::QuantizedDType::Q2_K),
+        GgmlDType::Q3K => Ok(candle_wgpu_kernels::QuantizedDType::Q3_K),
+        GgmlDType::Q4K => Ok(candle_wgpu_kernels::QuantizedDType::Q4_K),
+        GgmlDType::Q5K => Ok(candle_wgpu_kernels::QuantizedDType::Q5_K),
+        GgmlDType::Q6K => Ok(candle_wgpu_kernels::QuantizedDType::Q6_K),
+        other => crate::bail!("wgpu backend quantized dtype {other:?} is not supported"),
     }
 }
 
@@ -2589,6 +2629,420 @@ impl WgpuStorage {
         }
         acc.ok_or_else(|| Error::Msg("pool2d empty kernel".into()).bt())
     }
+
+    pub(crate) fn quantized_index_select_f32(
+        &self,
+        qdtype: GgmlDType,
+        src_shape: &Shape,
+        ids: &Self,
+        ids_l: &Layout,
+        dim: usize,
+    ) -> Result<Self> {
+        if !self
+            .device
+            .inner
+            .features
+            .contains(wgpu::Features::SHADER_F16)
+        {
+            return Err(unsupported("quantized index_select requires shader-f16"));
+        }
+        if ids.dtype != DType::U32 {
+            return Err(
+                Error::UnsupportedDTypeForOp(ids.dtype, "wgpu quantized index_select ids").bt(),
+            );
+        }
+        if !ids_l.is_contiguous() {
+            return Err(unsupported("quantized index_select ids strided"));
+        }
+        let ids_len = match ids_l.dims() {
+            [ids_len] => *ids_len,
+            _ => return Err(unsupported("quantized index_select ids rank")),
+        };
+        let dims = src_shape.dims();
+        if dim >= dims.len() {
+            crate::bail!("index_select dim {dim} out of range for {src_shape:?}")
+        }
+        let block_size = qdtype.block_size();
+        let right_size: usize = dims[dim + 1..].iter().product();
+        if !right_size.is_multiple_of(block_size) {
+            crate::bail!(
+                "wgpu quantized index_select requires block-aligned rows, got right_size={right_size}, block_size={block_size}"
+            )
+        }
+        let left_size: usize = dims[..dim].iter().product();
+        let src_dim = dims[dim];
+        let mut dst_dims = dims.to_vec();
+        dst_dims[dim] = ids_len;
+        let dst_shape = Shape::from(dst_dims);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let params = GetRowsParams {
+            offset_src: 0,
+            offset_idx: ids_l.start_offset().try_into()?,
+            offset_dst: 0,
+            stride_src1: (right_size / block_size).try_into()?,
+            stride_src2: (src_dim * right_size / block_size).try_into()?,
+            stride_src3: (src_dim * right_size * left_size / block_size).try_into()?,
+            stride_idx0: ids_l.stride()[0].try_into()?,
+            stride_idx1: 0,
+            stride_idx2: 0,
+            stride_dst1: right_size.try_into()?,
+            stride_dst2: (ids_len * right_size).try_into()?,
+            stride_dst3: (left_size * ids_len * right_size).try_into()?,
+            ne0: right_size.try_into()?,
+            n_rows: ids_len.try_into()?,
+            ne2: left_size.try_into()?,
+            ne3: 1,
+            idx1: 1,
+            idx2: 1,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-quant-get-rows-params"),
+                size: std::mem::size_of::<GetRowsParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &ids.buffer),
+            buffer_binding(2, &dst.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::quantized_get_rows_f32_shader(
+            wgpu_quantized_dtype(qdtype)?,
+            WG_SIZE,
+        )
+        .ok_or_else(|| Error::Msg("wgpu quantized get_rows shader not embedded".into()).bt())?;
+        let rows: u32 = (left_size * ids_len).try_into()?;
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            rows.div_ceil(WG_SIZE),
+            "candle-wgpu-quant-get-rows",
+        )?;
+        Ok(dst)
+    }
+
+    pub(crate) fn quantized_matmul(
+        &self,
+        qdtype: GgmlDType,
+        qshape: &Shape,
+        storage: &Self,
+        layout: &Layout,
+    ) -> Result<(Self, Shape)> {
+        if !self
+            .device
+            .inner
+            .features
+            .contains(wgpu::Features::SHADER_F16)
+        {
+            return Err(unsupported("quantized matmul requires shader-f16"));
+        }
+        if storage.dtype != DType::F32 && storage.dtype != DType::F16 {
+            return Err(Error::UnsupportedDTypeForOp(storage.dtype, "wgpu quantized matmul").bt());
+        }
+        if storage.dtype == DType::F16
+            && !storage
+                .device
+                .inner
+                .features
+                .contains(wgpu::Features::SHADER_F16)
+        {
+            return Err(unsupported("quantized matmul f16"));
+        }
+        let rank = layout.dims().len();
+        if rank < 2 || rank > 4 {
+            return Err(unsupported("quantized matmul rank"));
+        }
+        let (n, k) = qshape.dims2()?;
+        let input_m = layout.dims()[rank - 2];
+        let last_k = layout.dims()[rank - 1];
+        if last_k != k {
+            crate::bail!("input tensor {layout:?} incompatible with quantized weights {qshape:?}")
+        }
+        if input_m == 1 {
+            return self.quantized_matvec(qdtype, qshape, storage, layout);
+        }
+
+        let mut src_contiguous = None;
+        let (src, src_layout) = if layout.is_contiguous() && layout.start_offset() == 0 {
+            (storage, layout.clone())
+        } else {
+            let mut tmp = unsafe { storage.device.alloc_uninit(layout.shape(), storage.dtype)? };
+            storage.copy_strided_src(&mut tmp, 0, layout)?;
+            src_contiguous = Some(tmp);
+            (
+                src_contiguous.as_ref().unwrap(),
+                Layout::contiguous(layout.shape().clone()),
+            )
+        };
+
+        let src_stride = src_layout.stride();
+        let batch_inner = if rank >= 3 {
+            src_layout.dims()[rank - 3]
+        } else {
+            1
+        };
+        let batch_outer = if rank >= 4 {
+            src_layout.dims()[rank - 4]
+        } else {
+            1
+        };
+        let batch_count = batch_inner * batch_outer;
+        let src_stride_batch_inner = if rank >= 3 {
+            src_stride[rank - 3]
+        } else {
+            input_m * k
+        };
+        let src_stride_batch_outer = if rank >= 4 {
+            src_stride[rank - 4]
+        } else {
+            batch_inner * input_m * k
+        };
+
+        let mut dst_dims = src_layout.dims().to_vec();
+        dst_dims.pop();
+        dst_dims.push(n);
+        let dst_shape = Shape::from(dst_dims);
+        let dst = unsafe { storage.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let params = MulMatParams {
+            offset_src0: 0,
+            offset_src1: src_layout.start_offset().try_into()?,
+            offset_dst: 0,
+            m: n.try_into()?,
+            n: input_m.try_into()?,
+            k: k.try_into()?,
+            stride_01: (k / qdtype.block_size()).try_into()?,
+            stride_11: src_stride[rank - 2].try_into()?,
+            stride_02: 0,
+            stride_12: src_stride_batch_inner.try_into()?,
+            stride_03: 0,
+            stride_13: src_stride_batch_outer.try_into()?,
+            bs02: 1,
+            bs03: 1,
+            broadcast2: batch_inner.try_into()?,
+            broadcast3: batch_outer.try_into()?,
+        };
+        let param_buffer = storage
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-quant-matmul-params"),
+                size: std::mem::size_of::<MulMatParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        storage
+            .device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &src.buffer),
+            buffer_binding(2, &dst.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::quantized_matmul_fast_shader(
+            wgpu_quantized_dtype(qdtype)?,
+            wgpu_kernel_dtype(src.dtype)?,
+        )
+        .ok_or_else(|| Error::Msg("wgpu quantized mul_mat_reg_tile shader not embedded".into()).bt())?;
+        let (_, _, wg_size_m, wg_size_n, _) = candle_wgpu_kernels::quantized_matmul_fast_tile_shape();
+        let tile_m_s = 4usize * wg_size_m as usize;
+        let tile_n_s = 4usize * wg_size_n as usize;
+        let total_wg = input_m
+            .div_ceil(tile_n_s)
+            .checked_mul(n.div_ceil(tile_m_s))
+            .and_then(|v| v.checked_mul(batch_count))
+            .ok_or_else(|| Error::Msg("wgpu backend op quantized matmul workgroup overflow".into()).bt())?;
+        let total_wg: u32 = total_wg.try_into()?;
+        let (wg_x, wg_y) = compute_2d_workgroups(
+            total_wg,
+            storage
+                .device
+                .inner
+                .limits
+                .max_compute_workgroups_per_dimension,
+        );
+        storage.device.run_compute_xyz(
+            &shader,
+            &entries,
+            &bindings,
+            (wg_x, wg_y, 1),
+            "candle-wgpu-quant-matmul",
+        )?;
+        drop(src_contiguous);
+        Ok((dst, dst_shape))
+    }
+
+    fn quantized_matvec(
+        &self,
+        qdtype: GgmlDType,
+        qshape: &Shape,
+        storage: &Self,
+        layout: &Layout,
+    ) -> Result<(Self, Shape)> {
+        if !self
+            .device
+            .inner
+            .features
+            .contains(wgpu::Features::SHADER_F16)
+        {
+            return Err(unsupported("quantized matvec requires shader-f16"));
+        }
+        if storage.dtype != DType::F32 && storage.dtype != DType::F16 {
+            return Err(Error::UnsupportedDTypeForOp(storage.dtype, "wgpu quantized matvec").bt());
+        }
+        let rank = layout.dims().len();
+        let (n, k) = qshape.dims2()?;
+        let input_m = layout.dims()[rank - 2];
+        if input_m != 1 {
+            crate::bail!("wgpu quantized matvec expects input_m == 1, got {input_m}");
+        }
+        let last_k = layout.dims()[rank - 1];
+        if last_k != k {
+            crate::bail!("input tensor {layout:?} incompatible with quantized weights {qshape:?}")
+        }
+
+        let mut src_contiguous = None;
+        let (src, src_layout) = if layout.is_contiguous() && layout.start_offset() == 0 {
+            (storage, layout.clone())
+        } else {
+            let mut tmp = unsafe { storage.device.alloc_uninit(layout.shape(), storage.dtype)? };
+            storage.copy_strided_src(&mut tmp, 0, layout)?;
+            src_contiguous = Some(tmp);
+            (
+                src_contiguous.as_ref().unwrap(),
+                Layout::contiguous(layout.shape().clone()),
+            )
+        };
+
+        let src_stride = src_layout.stride();
+        let batch_inner = if rank >= 3 {
+            src_layout.dims()[rank - 3]
+        } else {
+            1
+        };
+        let batch_outer = if rank >= 4 {
+            src_layout.dims()[rank - 4]
+        } else {
+            1
+        };
+        let batch_count = batch_inner * batch_outer;
+        let src_stride_batch_inner = if rank >= 3 {
+            src_stride[rank - 3]
+        } else {
+            input_m * k
+        };
+        let src_stride_batch_outer = if rank >= 4 {
+            src_stride[rank - 4]
+        } else {
+            batch_inner * input_m * k
+        };
+
+        let mut dst_dims = src_layout.dims().to_vec();
+        dst_dims.pop();
+        dst_dims.push(n);
+        let dst_shape = Shape::from(dst_dims);
+        let dst = unsafe { storage.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let params = MulMatParams {
+            offset_src0: 0,
+            offset_src1: src_layout.start_offset().try_into()?,
+            offset_dst: 0,
+            m: n.try_into()?,
+            n: input_m.try_into()?,
+            k: k.try_into()?,
+            stride_01: (k / qdtype.block_size()).try_into()?,
+            stride_11: src_stride[rank - 2].try_into()?,
+            stride_02: 0,
+            stride_12: src_stride_batch_inner.try_into()?,
+            stride_03: 0,
+            stride_13: src_stride_batch_outer.try_into()?,
+            bs02: 1,
+            bs03: 1,
+            broadcast2: batch_inner.try_into()?,
+            broadcast3: batch_outer.try_into()?,
+        };
+        let param_buffer = storage
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-quant-matvec-params"),
+                size: std::mem::size_of::<MulMatParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        storage
+            .device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &src.buffer),
+            buffer_binding(2, &dst.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let qdtype = wgpu_quantized_dtype(qdtype)?;
+        let shader = candle_wgpu_kernels::quantized_matvec_shader(
+            qdtype,
+            wgpu_kernel_dtype(src.dtype)?,
+        )
+        .ok_or_else(|| Error::Msg("wgpu quantized mul_mat_vec shader not embedded".into()).bt())?;
+        let outputs_per_wg =
+            candle_wgpu_kernels::quantized_matvec_outputs_per_wg(qdtype) as usize;
+        let total_wg = n
+            .div_ceil(outputs_per_wg)
+            .checked_mul(batch_count)
+            .ok_or_else(|| Error::Msg("wgpu backend op quantized matvec workgroup overflow".into()).bt())?;
+        let total_wg: u32 = total_wg.try_into()?;
+        let (wg_x, wg_y) = compute_2d_workgroups(
+            total_wg,
+            storage
+                .device
+                .inner
+                .limits
+                .max_compute_workgroups_per_dimension,
+        );
+        storage.device.run_compute_xyz(
+            &shader,
+            &entries,
+            &bindings,
+            (wg_x, wg_y, 1),
+            "candle-wgpu-quant-matvec",
+        )?;
+        drop(src_contiguous);
+        Ok((dst, dst_shape))
+    }
 }
 
 impl BackendStorage for WgpuStorage {
@@ -3501,6 +3955,7 @@ impl BackendDevice for WgpuDevice {
         }))
         .map_err(|e| Error::wrap(e))?;
         let adapter_features = adapter.features();
+        let adapter_limits = adapter.limits();
         let required_features = adapter_features & wgpu::Features::SHADER_F16;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("candle-wgpu"),
@@ -3514,6 +3969,7 @@ impl BackendDevice for WgpuDevice {
                 device,
                 queue,
                 features: required_features,
+                limits: adapter_limits,
                 seed_value: RwLock::new(299_792_458),
             }),
         })

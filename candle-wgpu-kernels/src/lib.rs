@@ -36,6 +36,31 @@ pub enum DType {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub enum QuantizedDType {
+    Q4_0,
+    Q4_1,
+    Q5_0,
+    Q5_1,
+    Q8_0,
+    Q8_1,
+    Q2_K,
+    Q3_K,
+    Q4_K,
+    Q5_K,
+    Q6_K,
+}
+
+const QUANT_MUL_MAT_TILE_M: u32 = 4;
+const QUANT_MUL_MAT_TILE_N: u32 = 4;
+const QUANT_MUL_MAT_WG_SIZE_M: u32 = 8;
+const QUANT_MUL_MAT_WG_SIZE_N: u32 = 8;
+const QUANT_MUL_MAT_REG_TILE_K_QUANT: u32 = 32;
+const QUANT_MUL_MAT_VEC_WG_SIZE: u32 = 256;
+const QUANT_MUL_MAT_VEC_FLOAT_OUTPUTS_PER_WG: u32 = 4;
+const QUANT_MUL_MAT_VEC_LEGACY_Q_OUTPUTS_PER_WG: u32 = 4;
+const QUANT_MUL_MAT_VEC_K_Q_OUTPUTS_PER_WG: u32 = 4;
+
+#[derive(Debug, Clone, Copy)]
 pub enum UnaryOp {
     Abs,
     Ceil,
@@ -263,6 +288,339 @@ pub fn matmul_f32_shader() -> Option<String> {
     Some(preprocess(&source, &defines, &replacements, DType::F32))
 }
 
+fn quantized_shader_config(dtype: QuantizedDType) -> (Vec<String>, &'static str, &'static str) {
+    match dtype {
+        QuantizedDType::Q4_0 => (
+            vec![
+                "Q4_0".to_string(),
+                "BYTE_HELPERS".to_string(),
+                "U32_DEQUANT_HELPERS".to_string(),
+            ],
+            "u32",
+            "32",
+        ),
+        QuantizedDType::Q4_1 => (
+            vec![
+                "Q4_1".to_string(),
+                "Q4_1_T".to_string(),
+                "BYTE_HELPERS".to_string(),
+            ],
+            "q4_1",
+            "32",
+        ),
+        QuantizedDType::Q5_0 => (
+            vec![
+                "Q5_0".to_string(),
+                "BYTE_HELPERS".to_string(),
+                "U32_DEQUANT_HELPERS".to_string(),
+            ],
+            "u32",
+            "32",
+        ),
+        QuantizedDType::Q5_1 => (
+            vec![
+                "Q5_1".to_string(),
+                "Q5_1_T".to_string(),
+                "BYTE_HELPERS".to_string(),
+            ],
+            "q5_1",
+            "32",
+        ),
+        QuantizedDType::Q8_0 => (
+            vec![
+                "Q8_0".to_string(),
+                "BYTE_HELPERS".to_string(),
+                "U32_DEQUANT_HELPERS".to_string(),
+            ],
+            "u32",
+            "32",
+        ),
+        QuantizedDType::Q8_1 => (
+            vec![
+                "Q8_1".to_string(),
+                "Q8_1_T".to_string(),
+                "BYTE_HELPERS".to_string(),
+            ],
+            "q8_1",
+            "32",
+        ),
+        QuantizedDType::Q2_K => (
+            vec![
+                "Q2_K".to_string(),
+                "Q2_K_T".to_string(),
+                "BYTE_HELPERS".to_string(),
+            ],
+            "q2_K",
+            "256",
+        ),
+        QuantizedDType::Q3_K => (
+            vec![
+                "Q3_K".to_string(),
+                "BYTE_HELPERS".to_string(),
+                "U32_DEQUANT_HELPERS".to_string(),
+            ],
+            "u32",
+            "256",
+        ),
+        QuantizedDType::Q4_K => (
+            vec![
+                "Q4_K".to_string(),
+                "Q4_K_T".to_string(),
+                "Q4_K_SCALE_MIN".to_string(),
+                "BYTE_HELPERS".to_string(),
+            ],
+            "q4_K",
+            "256",
+        ),
+        QuantizedDType::Q5_K => (
+            vec![
+                "Q5_K".to_string(),
+                "Q5_K_T".to_string(),
+                "Q5_K_SCALE_MIN".to_string(),
+                "BYTE_HELPERS".to_string(),
+            ],
+            "q5_K",
+            "256",
+        ),
+        QuantizedDType::Q6_K => (
+            vec![
+                "Q6_K".to_string(),
+                "BYTE_HELPERS".to_string(),
+                "U32_DEQUANT_HELPERS".to_string(),
+            ],
+            "u32",
+            "256",
+        ),
+    }
+}
+
+fn quantized_mul_acc_define(dtype: QuantizedDType) -> &'static str {
+    match dtype {
+        QuantizedDType::Q4_0 => "MUL_ACC_Q4_0",
+        QuantizedDType::Q4_1 => "MUL_ACC_Q4_1",
+        QuantizedDType::Q5_0 => "MUL_ACC_Q5_0",
+        QuantizedDType::Q5_1 => "MUL_ACC_Q5_1",
+        QuantizedDType::Q8_0 => "MUL_ACC_Q8_0",
+        QuantizedDType::Q8_1 => "MUL_ACC_Q8_1",
+        QuantizedDType::Q2_K => "MUL_ACC_Q2_K",
+        QuantizedDType::Q3_K => "MUL_ACC_Q3_K",
+        QuantizedDType::Q4_K => "MUL_ACC_Q4_K",
+        QuantizedDType::Q5_K => "MUL_ACC_Q5_K",
+        QuantizedDType::Q6_K => "MUL_ACC_Q6_K",
+    }
+}
+
+pub fn quantized_matvec_outputs_per_wg(dtype: QuantizedDType) -> u32 {
+    match dtype {
+        QuantizedDType::Q2_K
+        | QuantizedDType::Q3_K
+        | QuantizedDType::Q4_K
+        | QuantizedDType::Q5_K
+        | QuantizedDType::Q6_K => QUANT_MUL_MAT_VEC_K_Q_OUTPUTS_PER_WG,
+        _ => QUANT_MUL_MAT_VEC_LEGACY_Q_OUTPUTS_PER_WG,
+    }
+}
+
+pub fn quantized_matvec_workgroup_size() -> u32 {
+    QUANT_MUL_MAT_VEC_WG_SIZE
+}
+
+pub fn quantized_matmul_fast_tile_shape() -> (u32, u32, u32, u32, u32) {
+    (
+        QUANT_MUL_MAT_TILE_M,
+        QUANT_MUL_MAT_TILE_N,
+        QUANT_MUL_MAT_WG_SIZE_M,
+        QUANT_MUL_MAT_WG_SIZE_N,
+        QUANT_MUL_MAT_REG_TILE_K_QUANT,
+    )
+}
+
+pub fn quantized_matmul_shader(dtype: QuantizedDType, rhs_dtype: DType) -> Option<String> {
+    let source = get("mul_mat.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let (mut defines, src0_type, _) = quantized_shader_config(dtype);
+    defines.push("DECLARE_BYTE_LOADERS_SRC0".to_string());
+    let src1_type = match rhs_dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+    };
+    let replacements = vec![
+        ("SRC0_TYPE".to_string(), src0_type.to_string()),
+        ("SRC1_TYPE".to_string(), src1_type.to_string()),
+    ];
+    Some(preprocess(&source, &defines, &replacements, DType::F16))
+}
+
+pub fn quantized_matvec_shader(dtype: QuantizedDType, rhs_dtype: DType) -> Option<String> {
+    let source = get("mul_mat_vec.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let outputs_per_wg = quantized_matvec_outputs_per_wg(dtype);
+    let mut defines = vec![
+        "SCALAR".to_string(),
+        "USE_WORKGROUP_REDUCTION".to_string(),
+        "BYTE_HELPERS".to_string(),
+        "U32_DEQUANT_HELPERS".to_string(),
+        "DECLARE_BYTE_LOADERS_SRC0".to_string(),
+        quantized_mul_acc_define(dtype).to_string(),
+    ];
+    let src1_type = match rhs_dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+    };
+    let replacements = vec![
+        (
+            "WG_SIZE".to_string(),
+            QUANT_MUL_MAT_VEC_WG_SIZE.to_string(),
+        ),
+        ("OUTPUTS_PER_WG".to_string(), outputs_per_wg.to_string()),
+        ("SRC0_TYPE".to_string(), "u32".to_string()),
+        ("SRC1_TYPE".to_string(), src1_type.to_string()),
+        ("SRC0_INNER_TYPE".to_string(), "u32".to_string()),
+        ("SRC1_INNER_TYPE".to_string(), src1_type.to_string()),
+    ];
+    defines.push("WG_SIZE".to_string());
+    defines.push("OUTPUTS_PER_WG".to_string());
+    Some(preprocess(&source, &defines, &replacements, DType::F16))
+}
+
+pub fn quantized_matmul_fast_shader(dtype: QuantizedDType, rhs_dtype: DType) -> Option<String> {
+    let source = get("mul_mat_reg_tile.wgsl")?
+        .source()
+        .replace(
+            "#include \"common_decls.tmpl\"",
+            get("common_decls.tmpl")?.source(),
+        )
+        .replace(
+            "#include \"mul_mat_decls.tmpl\"",
+            get("mul_mat_decls.tmpl")?.source(),
+        );
+    let mut defines = vec![
+        "SCALAR".to_string(),
+        "BYTE_HELPERS".to_string(),
+        "U32_DEQUANT_HELPERS".to_string(),
+        "DECLARE_BYTE_LOADERS_SRC0".to_string(),
+        quantized_mul_acc_define(dtype).to_string(),
+        quantized_mul_mat_id_init_define(dtype).to_string(),
+        "INIT_SRC1_SHMEM_FLOAT".to_string(),
+    ];
+    let src1_type = match rhs_dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+    };
+    let replacements = vec![
+        ("SRC0_TYPE".to_string(), "u32".to_string()),
+        ("SRC1_TYPE".to_string(), src1_type.to_string()),
+        ("DST_TYPE".to_string(), "f32".to_string()),
+        ("SRC0_INNER_TYPE".to_string(), "u32".to_string()),
+        ("SRC1_INNER_TYPE".to_string(), src1_type.to_string()),
+        (
+            "TILE_M".to_string(),
+            format!("{QUANT_MUL_MAT_TILE_M}u"),
+        ),
+        (
+            "TILE_N".to_string(),
+            format!("{QUANT_MUL_MAT_TILE_N}u"),
+        ),
+        (
+            "WORKGROUP_SIZE_M".to_string(),
+            format!("{QUANT_MUL_MAT_WG_SIZE_M}u"),
+        ),
+        (
+            "WORKGROUP_SIZE_N".to_string(),
+            format!("{QUANT_MUL_MAT_WG_SIZE_N}u"),
+        ),
+        (
+            "TILE_K".to_string(),
+            format!("{QUANT_MUL_MAT_REG_TILE_K_QUANT}u"),
+        ),
+    ];
+    defines.push("TILE_M".to_string());
+    defines.push("TILE_N".to_string());
+    defines.push("WORKGROUP_SIZE_M".to_string());
+    defines.push("WORKGROUP_SIZE_N".to_string());
+    defines.push("TILE_K".to_string());
+    Some(preprocess(&source, &defines, &replacements, DType::F16))
+}
+
+pub fn quantized_get_rows_f32_shader(dtype: QuantizedDType, workgroup_size: u32) -> Option<String> {
+    let source = get("get_rows.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let (mut defines, src_type, block_size) = quantized_shader_config(dtype);
+    defines.push("DECLARE_BYTE_LOADERS_SRC".to_string());
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        ("BLOCK_SIZE".to_string(), block_size.to_string()),
+        ("SRC_TYPE".to_string(), src_type.to_string()),
+        ("DST_TYPE".to_string(), "f32".to_string()),
+    ];
+    Some(preprocess(&source, &defines, &replacements, DType::F16))
+}
+
+fn quantized_mul_mat_id_init_define(dtype: QuantizedDType) -> &'static str {
+    match dtype {
+        QuantizedDType::Q4_0 => "INIT_SRC0_SHMEM_Q4_0",
+        QuantizedDType::Q4_1 => "INIT_SRC0_SHMEM_Q4_1",
+        QuantizedDType::Q5_0 => "INIT_SRC0_SHMEM_Q5_0",
+        QuantizedDType::Q5_1 => "INIT_SRC0_SHMEM_Q5_1",
+        QuantizedDType::Q8_0 => "INIT_SRC0_SHMEM_Q8_0",
+        QuantizedDType::Q8_1 => "INIT_SRC0_SHMEM_Q8_1",
+        QuantizedDType::Q2_K => "INIT_SRC0_SHMEM_Q2_K",
+        QuantizedDType::Q3_K => "INIT_SRC0_SHMEM_Q3_K",
+        QuantizedDType::Q4_K => "INIT_SRC0_SHMEM_Q4_K",
+        QuantizedDType::Q5_K => "INIT_SRC0_SHMEM_Q5_K",
+        QuantizedDType::Q6_K => "INIT_SRC0_SHMEM_Q6_K",
+    }
+}
+
+pub fn quantized_mul_mat_id_gather_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("mul_mat_id_gather.wgsl")?.source();
+    let defines = Vec::new();
+    let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
+pub fn quantized_mul_mat_id_shader(dtype: QuantizedDType, rhs_dtype: DType) -> Option<String> {
+    let source = get("mul_mat_id.wgsl")?
+        .source()
+        .replace(
+            "#include \"common_decls.tmpl\"",
+            get("common_decls.tmpl")?.source(),
+        )
+        .replace(
+            "#include \"mul_mat_decls.tmpl\"",
+            get("mul_mat_decls.tmpl")?.source(),
+        );
+    let defines = vec![
+        "MUL_MAT_ID".to_string(),
+        "SCALAR".to_string(),
+        "BYTE_HELPERS".to_string(),
+        "DECLARE_BYTE_LOADERS_SRC0".to_string(),
+        "INIT_SRC1_SHMEM_FLOAT".to_string(),
+        "U32_DEQUANT_HELPERS".to_string(),
+        quantized_mul_mat_id_init_define(dtype).to_string(),
+    ];
+    let src1_type = match rhs_dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+    };
+    let replacements = vec![
+        ("SRC0_TYPE".to_string(), "u32".to_string()),
+        ("SRC1_TYPE".to_string(), src1_type.to_string()),
+        ("TILE_M".to_string(), "4u".to_string()),
+        ("TILE_N".to_string(), "4u".to_string()),
+        ("TILE_K".to_string(), "32u".to_string()),
+        ("WORKGROUP_SIZE_M".to_string(), "8u".to_string()),
+        ("WORKGROUP_SIZE_N".to_string(), "8u".to_string()),
+    ];
+    Some(preprocess(&source, &defines, &replacements, DType::F16))
+}
+
 pub fn conv2d_f32_shader(workgroup_size: u32) -> Option<String> {
     let source = get("conv2d.wgsl")?.source().replace(
         "#include \"common_decls.tmpl\"",
@@ -364,7 +722,7 @@ fn preprocess(
             }
             continue;
         }
-        if trimmed == "#else" {
+        if trimmed == "#else" || trimmed.starts_with("#else ") {
             if let Some(top) = stack.last_mut() {
                 let cond = top.parent_active && !top.branch_taken;
                 top.this_active = cond;
@@ -372,7 +730,7 @@ fn preprocess(
             }
             continue;
         }
-        if trimmed == "#endif" {
+        if trimmed == "#endif" || trimmed.starts_with("#endif ") {
             stack.pop();
             continue;
         }
@@ -395,8 +753,15 @@ fn preprocess(
             continue;
         }
         let mut expanded = line.to_string();
-        for (name, value) in &local_replacements {
-            expanded = replace_token(&expanded, name, value);
+        for _ in 0..8 {
+            let mut next = expanded.clone();
+            for (name, value) in &local_replacements {
+                next = replace_token(&next, name, value);
+            }
+            if next == expanded {
+                break;
+            }
+            expanded = next;
         }
         out.push_str(&expanded);
         out.push('\n');

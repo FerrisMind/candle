@@ -1,5 +1,6 @@
 use crate::{
-    backend::BackendStorage, CpuStorage, DType, Device, Result, Shape, Storage, Tensor, D,
+    backend::{BackendDevice, BackendStorage},
+    CpuStorage, DType, Device, Result, Shape, Storage, Tensor, D,
 };
 use k_quants::*;
 use std::borrow::Cow;
@@ -56,9 +57,511 @@ fn as_t_slice<T>(data: Cow<'_, [u8]>) -> &[T] {
     unsafe { std::slice::from_raw_parts(ptr as *const T, data.len() / size) }
 }
 
+fn is_backend_not_implemented_msg(msg: &str, backend: &str) -> bool {
+    let backend_rank_limit = msg.contains(backend) && msg.contains("supports up to rank-4 tensors");
+    let backend_overflow = msg.contains(backend)
+        && (msg.contains("dimension overflow")
+            || msg.contains("tmp overflow")
+            || msg.contains("workgroup overflow"));
+    (msg.contains(backend) && msg.contains("backend op") && msg.contains("not implemented"))
+        || msg.contains(&format!("no {backend} implementation for"))
+        || (msg.contains(backend) && msg.contains("shader") && msg.contains("not generated"))
+        || (msg.contains("backend op") && msg.contains("not implemented"))
+        || backend_rank_limit
+        || backend_overflow
+}
+
+fn should_quantized_backend_fallback(err: &crate::Error, backend: &str) -> bool {
+    match err {
+        crate::Error::UnsupportedDTypeForOp(..) => true,
+        crate::Error::Msg(msg) => is_backend_not_implemented_msg(msg, backend),
+        crate::Error::WithBacktrace { inner, .. }
+        | crate::Error::WithPath { inner, .. }
+        | crate::Error::Context { inner, .. } => should_quantized_backend_fallback(inner, backend),
+        _ => false,
+    }
+}
+
+fn cpu_storage_to_f32_vec(storage: &crate::CpuStorage) -> Result<Vec<f32>> {
+    match storage.dtype() {
+        DType::F32 => Ok(storage.as_slice::<f32>()?.to_vec()),
+        DType::F16 => Ok(storage
+            .as_slice::<f16>()?
+            .iter()
+            .map(|v| v.to_f32())
+            .collect()),
+        DType::BF16 => Ok(storage
+            .as_slice::<bf16>()?
+            .iter()
+            .map(|v| v.to_f32())
+            .collect()),
+        dtype => crate::bail!("expected f32/f16/bf16 cpu storage, got {dtype:?}"),
+    }
+}
+
 pub struct QTensor {
     storage: QStorage,
     shape: Shape,
+}
+
+struct QWgpuStorage {
+    dtype: GgmlDType,
+    len_bytes: usize,
+    storage: crate::WgpuStorage,
+}
+
+impl QWgpuStorage {
+    fn from_bytes(
+        device: &crate::WgpuDevice,
+        dtype: GgmlDType,
+        data: Cow<'_, [u8]>,
+    ) -> Result<Self> {
+        let raw = data.into_owned();
+        let len_bytes = raw.len();
+        let mut padded = raw;
+        padded.resize(len_bytes + 4, 0);
+        let storage = device.storage_from_cpu_storage(&crate::CpuStorage::U8(padded))?;
+        Ok(Self {
+            dtype,
+            len_bytes,
+            storage,
+        })
+    }
+
+    fn zeros(device: &crate::WgpuDevice, elem_count: usize, dtype: GgmlDType) -> Result<Self> {
+        let len_bytes = elem_count.div_ceil(dtype.block_size()) * dtype.type_size();
+        let padded = vec![0u8; len_bytes + 4];
+        let storage = device.storage_from_cpu_storage(&crate::CpuStorage::U8(padded))?;
+        Ok(Self {
+            dtype,
+            len_bytes,
+            storage,
+        })
+    }
+
+    fn device(&self) -> &crate::WgpuDevice {
+        self.storage.device()
+    }
+
+    fn data(&self) -> Result<Vec<u8>> {
+        let bytes = self.storage.to_cpu_storage()?;
+        let mut bytes = bytes.as_slice::<u8>()?.to_vec();
+        bytes.truncate(self.len_bytes);
+        Ok(bytes)
+    }
+
+    fn to_cpu_quantized(&self) -> Result<Box<dyn QuantizedType>> {
+        Ok(self.dtype.from_data(Cow::Owned(self.data()?)))
+    }
+
+    fn quantize_from_cpu(
+        &mut self,
+        src: &crate::CpuStorage,
+        imatrix: Option<(&[f32], usize)>,
+    ) -> Result<()> {
+        let src_len = src.as_slice::<f32>()?.len();
+        let mut qcpu = crate::Device::Cpu.qzeros(src_len, self.dtype)?;
+        match (&mut qcpu, imatrix) {
+            (QStorage::Cpu(storage), None) => storage.from_float(src.as_slice::<f32>()?),
+            (QStorage::Cpu(storage), Some((weights, n_per_row))) => {
+                storage.from_float_imatrix(src.as_slice::<f32>()?, weights, n_per_row)
+            }
+            _ => unreachable!(),
+        }
+        let data = qcpu.data()?.into_owned();
+        self.len_bytes = data.len();
+        let mut padded = data;
+        padded.resize(self.len_bytes + 4, 0);
+        self.storage = self
+            .device()
+            .storage_from_cpu_storage(&crate::CpuStorage::U8(padded))?;
+        Ok(())
+    }
+
+    fn quantize(&mut self, src: &crate::WgpuStorage) -> Result<()> {
+        let src = src.to_cpu_storage()?;
+        self.quantize_from_cpu(&src, None)
+    }
+
+    fn quantize_imatrix(
+        &mut self,
+        src: &crate::WgpuStorage,
+        imatrix_weights: &[f32],
+        n_per_row: usize,
+    ) -> Result<()> {
+        let src = src.to_cpu_storage()?;
+        self.quantize_from_cpu(&src, Some((imatrix_weights, n_per_row)))
+    }
+
+    fn quantize_onto(&mut self, src: &crate::CpuStorage) -> Result<()> {
+        self.quantize_from_cpu(src, None)
+    }
+
+    fn quantize_imatrix_onto(
+        &mut self,
+        src: &crate::CpuStorage,
+        imatrix_weights: &[f32],
+        n_per_row: usize,
+    ) -> Result<()> {
+        self.quantize_from_cpu(src, Some((imatrix_weights, n_per_row)))
+    }
+
+    fn dequantize(&self, elem_count: usize) -> Result<crate::WgpuStorage> {
+        let cpu = self.to_cpu_quantized()?.dequantize(elem_count)?;
+        self.device().storage_from_cpu_storage(&cpu)
+    }
+
+    fn fwd_cpu_fallback(
+        &self,
+        self_shape: &Shape,
+        storage: &crate::WgpuStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::WgpuStorage, Shape)> {
+        let src_cpu = if layout.is_contiguous() && layout.start_offset() == 0 {
+            storage.to_cpu_storage()?
+        } else {
+            let mut tmp = unsafe { storage.device().alloc_uninit(layout.shape(), storage.dtype())? };
+            storage.copy_strided_src(&mut tmp, 0, layout)?;
+            tmp.to_cpu_storage()?
+        };
+        let src_shape = layout.shape();
+        let (n, k) = self_shape.dims2()?;
+        if src_shape.rank() < 2 {
+            crate::bail!("input tensor has only one dimension {layout:?}")
+        }
+        let mut dst_shape = src_shape.dims().to_vec();
+        let last_k = dst_shape.pop().unwrap();
+        if last_k != k {
+            crate::bail!("input tensor {layout:?} incompatible with {self_shape:?}")
+        }
+        dst_shape.push(n);
+        let dst_shape = Shape::from(dst_shape);
+        let lhs = cpu_storage_to_f32_vec(&src_cpu)?;
+        let mut dst = vec![0f32; dst_shape.elem_count()];
+        self.to_cpu_quantized()?
+            .matmul_t((dst_shape.elem_count() / n, k, n), &lhs, &mut dst)?;
+        let storage = self
+            .device()
+            .storage_from_cpu_storage(&crate::CpuStorage::F32(dst))?;
+        Ok((storage, dst_shape))
+    }
+
+    fn index_select_f32_cpu_fallback(
+        &self,
+        self_shape: &Shape,
+        ids: &crate::WgpuStorage,
+        ids_l: &crate::Layout,
+        dim: usize,
+    ) -> Result<crate::WgpuStorage> {
+        let ids_cpu = if ids_l.is_contiguous() && ids_l.start_offset() == 0 {
+            ids.to_cpu_storage()?
+        } else {
+            let mut tmp = unsafe { ids.device().alloc_uninit(ids_l.shape(), ids.dtype())? };
+            ids.copy_strided_src(&mut tmp, 0, ids_l)?;
+            tmp.to_cpu_storage()?
+        };
+        let ids = ids_cpu.as_slice::<u32>()?;
+        let src = cpu_storage_to_f32_vec(&self.to_cpu_quantized()?.dequantize(self_shape.elem_count())?)?;
+        let dims = self_shape.dims();
+        if dim >= dims.len() {
+            crate::bail!("index_select dim {dim} out of range for {self_shape:?}")
+        }
+        let left_size: usize = dims[..dim].iter().product();
+        let src_dim = dims[dim];
+        let right_size: usize = dims[dim + 1..].iter().product();
+        let mut dst_dims = dims.to_vec();
+        dst_dims[dim] = ids.len();
+        let mut dst = vec![0f32; dst_dims.iter().product()];
+        for left_idx in 0..left_size {
+            let src_left_base = left_idx * src_dim * right_size;
+            let dst_left_base = left_idx * ids.len() * right_size;
+            for (dst_row, &src_row) in ids.iter().enumerate() {
+                let src_row = src_row as usize;
+                if src_row >= src_dim {
+                    crate::bail!("index_select id {src_row} out of range for dim size {src_dim}")
+                }
+                let src_offset = src_left_base + src_row * right_size;
+                let dst_offset = dst_left_base + dst_row * right_size;
+                dst[dst_offset..dst_offset + right_size]
+                    .copy_from_slice(&src[src_offset..src_offset + right_size]);
+            }
+        }
+        self.device()
+            .storage_from_cpu_storage(&crate::CpuStorage::F32(dst))
+    }
+
+    fn fwd(
+        &self,
+        self_shape: &Shape,
+        storage: &crate::WgpuStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::WgpuStorage, Shape)> {
+        match self
+            .storage
+            .quantized_matmul(self.dtype, self_shape, storage, layout)
+        {
+            Ok(out) => Ok(out),
+            Err(err) if should_quantized_backend_fallback(&err, "wgpu") => {
+                self.fwd_cpu_fallback(self_shape, storage, layout)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn index_select_f32(
+        &self,
+        self_shape: &Shape,
+        ids: &crate::WgpuStorage,
+        ids_l: &crate::Layout,
+        dim: usize,
+    ) -> Result<crate::WgpuStorage> {
+        match self
+            .storage
+            .quantized_index_select_f32(self.dtype, self_shape, ids, ids_l, dim)
+        {
+            Ok(out) => Ok(out),
+            Err(err) if should_quantized_backend_fallback(&err, "wgpu") => {
+                self.index_select_f32_cpu_fallback(self_shape, ids, ids_l, dim)
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+struct QVulkanStorage {
+    dtype: GgmlDType,
+    len_bytes: usize,
+    storage: crate::VulkanStorage,
+}
+
+impl QVulkanStorage {
+    fn from_bytes(
+        device: &crate::VulkanDevice,
+        dtype: GgmlDType,
+        data: Cow<'_, [u8]>,
+    ) -> Result<Self> {
+        let raw = data.into_owned();
+        let len_bytes = raw.len();
+        let mut padded = raw;
+        padded.resize(len_bytes + 4, 0);
+        let storage = device.storage_from_cpu_storage(&crate::CpuStorage::U8(padded))?;
+        Ok(Self {
+            dtype,
+            len_bytes,
+            storage,
+        })
+    }
+
+    fn zeros(device: &crate::VulkanDevice, elem_count: usize, dtype: GgmlDType) -> Result<Self> {
+        let len_bytes = elem_count.div_ceil(dtype.block_size()) * dtype.type_size();
+        let padded = vec![0u8; len_bytes + 4];
+        let storage = device.storage_from_cpu_storage(&crate::CpuStorage::U8(padded))?;
+        Ok(Self {
+            dtype,
+            len_bytes,
+            storage,
+        })
+    }
+
+    fn device(&self) -> &crate::VulkanDevice {
+        self.storage.device()
+    }
+
+    fn data(&self) -> Result<Vec<u8>> {
+        let bytes = self.storage.to_cpu_storage()?;
+        let mut bytes = bytes.as_slice::<u8>()?.to_vec();
+        bytes.truncate(self.len_bytes);
+        Ok(bytes)
+    }
+
+    fn to_cpu_quantized(&self) -> Result<Box<dyn QuantizedType>> {
+        Ok(self.dtype.from_data(Cow::Owned(self.data()?)))
+    }
+
+    fn quantize_from_cpu(
+        &mut self,
+        src: &crate::CpuStorage,
+        imatrix: Option<(&[f32], usize)>,
+    ) -> Result<()> {
+        let src_len = src.as_slice::<f32>()?.len();
+        let mut qcpu = crate::Device::Cpu.qzeros(src_len, self.dtype)?;
+        match (&mut qcpu, imatrix) {
+            (QStorage::Cpu(storage), None) => storage.from_float(src.as_slice::<f32>()?),
+            (QStorage::Cpu(storage), Some((weights, n_per_row))) => {
+                storage.from_float_imatrix(src.as_slice::<f32>()?, weights, n_per_row)
+            }
+            _ => unreachable!(),
+        }
+        let data = qcpu.data()?.into_owned();
+        self.len_bytes = data.len();
+        let mut padded = data;
+        padded.resize(self.len_bytes + 4, 0);
+        self.storage = self
+            .device()
+            .storage_from_cpu_storage(&crate::CpuStorage::U8(padded))?;
+        Ok(())
+    }
+
+    fn quantize(&mut self, src: &crate::VulkanStorage) -> Result<()> {
+        let src = src.to_cpu_storage()?;
+        self.quantize_from_cpu(&src, None)
+    }
+
+    fn quantize_imatrix(
+        &mut self,
+        src: &crate::VulkanStorage,
+        imatrix_weights: &[f32],
+        n_per_row: usize,
+    ) -> Result<()> {
+        let src = src.to_cpu_storage()?;
+        self.quantize_from_cpu(&src, Some((imatrix_weights, n_per_row)))
+    }
+
+    fn quantize_onto(&mut self, src: &crate::CpuStorage) -> Result<()> {
+        self.quantize_from_cpu(src, None)
+    }
+
+    fn quantize_imatrix_onto(
+        &mut self,
+        src: &crate::CpuStorage,
+        imatrix_weights: &[f32],
+        n_per_row: usize,
+    ) -> Result<()> {
+        self.quantize_from_cpu(src, Some((imatrix_weights, n_per_row)))
+    }
+
+    fn dequantize(&self, elem_count: usize) -> Result<crate::VulkanStorage> {
+        let cpu = self.to_cpu_quantized()?.dequantize(elem_count)?;
+        self.device().storage_from_cpu_storage(&cpu)
+    }
+
+    fn fwd_cpu_fallback(
+        &self,
+        self_shape: &Shape,
+        storage: &crate::VulkanStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::VulkanStorage, Shape)> {
+        let src_cpu = if layout.is_contiguous() && layout.start_offset() == 0 {
+            storage.to_cpu_storage()?
+        } else {
+            let mut tmp = unsafe { storage.device().alloc_uninit(layout.shape(), storage.dtype())? };
+            storage.copy_strided_src(&mut tmp, 0, layout)?;
+            tmp.to_cpu_storage()?
+        };
+        let src_shape = layout.shape();
+        let (n, k) = self_shape.dims2()?;
+        if src_shape.rank() < 2 {
+            crate::bail!("input tensor has only one dimension {layout:?}")
+        }
+        let mut dst_shape = src_shape.dims().to_vec();
+        let last_k = dst_shape.pop().unwrap();
+        if last_k != k {
+            crate::bail!("input tensor {layout:?} incompatible with {self_shape:?}")
+        }
+        dst_shape.push(n);
+        let dst_shape = Shape::from(dst_shape);
+        let lhs = cpu_storage_to_f32_vec(&src_cpu)?;
+        let mut dst = vec![0f32; dst_shape.elem_count()];
+        self.to_cpu_quantized()?
+            .matmul_t((dst_shape.elem_count() / n, k, n), &lhs, &mut dst)?;
+        let storage = self
+            .device()
+            .storage_from_cpu_storage(&crate::CpuStorage::F32(dst))?;
+        Ok((storage, dst_shape))
+    }
+
+    fn index_select_f32_cpu_fallback(
+        &self,
+        self_shape: &Shape,
+        ids: &crate::VulkanStorage,
+        ids_l: &crate::Layout,
+        dim: usize,
+    ) -> Result<crate::VulkanStorage> {
+        let ids_cpu = if ids_l.is_contiguous() && ids_l.start_offset() == 0 {
+            ids.to_cpu_storage()?
+        } else {
+            let mut tmp = unsafe { ids.device().alloc_uninit(ids_l.shape(), ids.dtype())? };
+            ids.copy_strided_src(&mut tmp, 0, ids_l)?;
+            tmp.to_cpu_storage()?
+        };
+        let ids = ids_cpu.as_slice::<u32>()?;
+        let src = cpu_storage_to_f32_vec(&self.to_cpu_quantized()?.dequantize(self_shape.elem_count())?)?;
+        let dims = self_shape.dims();
+        if dim >= dims.len() {
+            crate::bail!("index_select dim {dim} out of range for {self_shape:?}")
+        }
+        let left_size: usize = dims[..dim].iter().product();
+        let src_dim = dims[dim];
+        let right_size: usize = dims[dim + 1..].iter().product();
+        let mut dst_dims = dims.to_vec();
+        dst_dims[dim] = ids.len();
+        let mut dst = vec![0f32; dst_dims.iter().product()];
+        for left_idx in 0..left_size {
+            let src_left_base = left_idx * src_dim * right_size;
+            let dst_left_base = left_idx * ids.len() * right_size;
+            for (dst_row, &src_row) in ids.iter().enumerate() {
+                let src_row = src_row as usize;
+                if src_row >= src_dim {
+                    crate::bail!("index_select id {src_row} out of range for dim size {src_dim}")
+                }
+                let src_offset = src_left_base + src_row * right_size;
+                let dst_offset = dst_left_base + dst_row * right_size;
+                dst[dst_offset..dst_offset + right_size]
+                    .copy_from_slice(&src[src_offset..src_offset + right_size]);
+            }
+        }
+        self.device()
+            .storage_from_cpu_storage(&crate::CpuStorage::F32(dst))
+    }
+
+    fn fwd(
+        &self,
+        self_shape: &Shape,
+        storage: &crate::VulkanStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::VulkanStorage, Shape)> {
+        match self
+            .storage
+            .quantized_matmul(self.dtype, self_shape, storage, layout)
+        {
+            Ok(out) => Ok(out),
+            Err(err) if should_quantized_backend_fallback(&err, "vulkan") => {
+                self.fwd_cpu_fallback(self_shape, storage, layout)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn index_select_f32(
+        &self,
+        self_shape: &Shape,
+        ids: &crate::VulkanStorage,
+        ids_l: &crate::Layout,
+        dim: usize,
+    ) -> Result<crate::VulkanStorage> {
+        match self
+            .storage
+            .quantized_index_select_f32(self.dtype, self_shape, ids, ids_l, dim)
+        {
+            Ok(out) => Ok(out),
+            Err(err) if should_quantized_backend_fallback(&err, "vulkan") => {
+                self.index_select_f32_cpu_fallback(self_shape, ids, ids_l, dim)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn indexed_moe_forward_f32(
+        &self,
+        self_shape: &Shape,
+        input: &crate::VulkanStorage,
+        input_l: &crate::Layout,
+        ids: &crate::VulkanStorage,
+        ids_l: &crate::Layout,
+    ) -> Result<(crate::VulkanStorage, Shape)> {
+        self.storage
+            .quantized_indexed_moe_f32(self.dtype, self_shape, input, input_l, ids, ids_l)
+    }
 }
 
 impl Device {
@@ -76,15 +579,20 @@ impl Device {
                 let storage = cuda::QCudaStorage::zeros(cuda, elem_count, dtype)?;
                 Ok(QStorage::Cuda(storage))
             }
-            Device::Wgpu(_) | Device::Vulkan(_) => {
-                crate::bail!("quantized tensors are not implemented for wgpu/vulkan backends")
-            }
+            Device::Wgpu(wgpu) => Ok(QStorage::Wgpu(QWgpuStorage::zeros(
+                wgpu, elem_count, dtype,
+            )?)),
+            Device::Vulkan(vulkan) => Ok(QStorage::Vulkan(QVulkanStorage::zeros(
+                vulkan, elem_count, dtype,
+            )?)),
         }
     }
 }
 
 pub enum QStorage {
     Cpu(Box<dyn QuantizedType>),
+    Wgpu(QWgpuStorage),
+    Vulkan(QVulkanStorage),
     Metal(metal::QMetalStorage),
     Cuda(cuda::QCudaStorage),
 }
@@ -127,15 +635,16 @@ impl QStorage {
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
             },
-            Device::Wgpu(_) | Device::Vulkan(_) => {
-                crate::bail!("quantized tensors are not implemented for wgpu/vulkan backends")
-            }
+            Device::Wgpu(d) => Ok(Self::Wgpu(QWgpuStorage::from_bytes(d, dtype, data)?)),
+            Device::Vulkan(d) => Ok(Self::Vulkan(QVulkanStorage::from_bytes(d, dtype, data)?)),
         }
     }
 
     fn block_size(&self) -> usize {
         match self {
             QStorage::Cpu(storage) => storage.block_size(),
+            QStorage::Wgpu(storage) => storage.dtype.block_size(),
+            QStorage::Vulkan(storage) => storage.dtype.block_size(),
             QStorage::Metal(storage) => storage.dtype().block_size(),
             QStorage::Cuda(storage) => storage.dtype().block_size(),
         }
@@ -144,6 +653,8 @@ impl QStorage {
     fn dtype(&self) -> GgmlDType {
         match self {
             QStorage::Cpu(storage) => storage.dtype(),
+            QStorage::Wgpu(storage) => storage.dtype,
+            QStorage::Vulkan(storage) => storage.dtype,
             QStorage::Metal(storage) => storage.dtype(),
             QStorage::Cuda(storage) => storage.dtype(),
         }
@@ -152,6 +663,8 @@ impl QStorage {
     fn device(&self) -> Device {
         match self {
             QStorage::Cpu(_storage) => Device::Cpu,
+            QStorage::Wgpu(storage) => Device::Wgpu(storage.device().clone()),
+            QStorage::Vulkan(storage) => Device::Vulkan(storage.device().clone()),
             QStorage::Metal(storage) => Device::Metal(storage.device().clone()),
             QStorage::Cuda(storage) => Device::Cuda(storage.device().clone()),
         }
@@ -160,6 +673,8 @@ impl QStorage {
     fn size_in_bytes(&self) -> usize {
         match self {
             QStorage::Cpu(storage) => storage.storage_size_in_bytes(),
+            QStorage::Wgpu(storage) => storage.len_bytes,
+            QStorage::Vulkan(storage) => storage.len_bytes,
             QStorage::Metal(storage) => storage.storage_size_in_bytes(),
             QStorage::Cuda(storage) => storage.storage_size_in_bytes(),
         }
@@ -170,6 +685,8 @@ impl QStorage {
             (QStorage::Cpu(storage), Storage::Cpu(src)) => {
                 storage.from_float(src.as_slice::<f32>()?);
             }
+            (QStorage::Wgpu(storage), Storage::Wgpu(src)) => storage.quantize(src)?,
+            (QStorage::Vulkan(storage), Storage::Vulkan(src)) => storage.quantize(src)?,
             (QStorage::Metal(storage), Storage::Metal(src)) => storage.quantize(src)?,
             (QStorage::Cuda(storage), Storage::Cuda(src)) => storage.quantize(src)?,
             _ => crate::bail!("Invalid quantize storage locations do not match"),
@@ -187,6 +704,12 @@ impl QStorage {
             (QStorage::Cpu(storage), Storage::Cpu(src)) => {
                 storage.from_float_imatrix(src.as_slice::<f32>()?, imatrix_weights, n_per_row);
             }
+            (QStorage::Wgpu(storage), Storage::Wgpu(src)) => {
+                storage.quantize_imatrix(src, imatrix_weights, n_per_row)?
+            }
+            (QStorage::Vulkan(storage), Storage::Vulkan(src)) => {
+                storage.quantize_imatrix(src, imatrix_weights, n_per_row)?
+            }
             (QStorage::Metal(storage), Storage::Metal(src)) => {
                 storage.quantize_imatrix(src, imatrix_weights, n_per_row)?
             }
@@ -203,6 +726,8 @@ impl QStorage {
             (QStorage::Cpu(storage), Storage::Cpu(src)) => {
                 storage.from_float(src.as_slice::<f32>()?);
             }
+            (QStorage::Wgpu(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
+            (QStorage::Vulkan(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
             (QStorage::Metal(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
             (QStorage::Cuda(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
             _ => crate::bail!("Invalid quantize source storage locations: not on cpu"),
@@ -220,6 +745,12 @@ impl QStorage {
             (QStorage::Cpu(storage), Storage::Cpu(src)) => {
                 storage.from_float_imatrix(src.as_slice::<f32>()?, imatrix_weights, n_per_row);
             }
+            (QStorage::Wgpu(storage), Storage::Cpu(src)) => {
+                storage.quantize_imatrix_onto(src, imatrix_weights, n_per_row)?
+            }
+            (QStorage::Vulkan(storage), Storage::Cpu(src)) => {
+                storage.quantize_imatrix_onto(src, imatrix_weights, n_per_row)?
+            }
             (QStorage::Metal(storage), Storage::Cpu(src)) => {
                 storage.quantize_imatrix_onto(src, imatrix_weights, n_per_row)?
             }
@@ -234,6 +765,8 @@ impl QStorage {
     fn dequantize(&self, elem_count: usize) -> Result<Storage> {
         match self {
             QStorage::Cpu(storage) => Ok(Storage::Cpu(storage.dequantize(elem_count)?)),
+            QStorage::Wgpu(storage) => Ok(Storage::Wgpu(storage.dequantize(elem_count)?)),
+            QStorage::Vulkan(storage) => Ok(Storage::Vulkan(storage.dequantize(elem_count)?)),
             QStorage::Metal(storage) => Ok(Storage::Metal(storage.dequantize(elem_count)?)),
             QStorage::Cuda(storage) => Ok(Storage::Cuda(storage.dequantize(elem_count)?)),
         }
@@ -247,6 +780,8 @@ impl QStorage {
                 let data = unsafe { std::slice::from_raw_parts(data_ptr, size_in_bytes) };
                 Ok(Cow::from(data))
             }
+            QStorage::Wgpu(storage) => Ok(Cow::Owned(storage.data()?)),
+            QStorage::Vulkan(storage) => Ok(Cow::Owned(storage.data()?)),
             QStorage::Cuda(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::Metal(storage) => Ok(Cow::from(storage.data()?)),
         }
@@ -255,7 +790,7 @@ impl QStorage {
     pub fn device_ptr(&self) -> Result<*const u8> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr(),
-            QStorage::Metal(_) | QStorage::Cpu(_) => {
+            QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::Wgpu(_) | QStorage::Vulkan(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -484,6 +1019,64 @@ fn check_shape(shape: &Shape, block_size: usize) -> Result<()> {
     Ok(())
 }
 
+fn indexed_moe_forward_dense(weights: &Tensor, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
+    let (num_experts, n, k) = weights.dims3()?;
+    let (batch, input_dim1, input_k, x3) = match x.rank() {
+        2 => {
+            let (batch, k) = x.dims2()?;
+            (batch, 1, k, x.unsqueeze(1)?)
+        }
+        3 => {
+            let (batch, slots, k) = x.dims3()?;
+            (batch, slots, k, x.clone())
+        }
+        rank => crate::bail!("indexed_moe_forward expects rank-2/3 input, got rank {rank}"),
+    };
+    let (ids_batch, topk) = ids.dims2()?;
+    if batch != ids_batch {
+        crate::bail!("indexed_moe_forward batch mismatch: input={batch}, ids={ids_batch}");
+    }
+    if input_k != k {
+        crate::bail!("indexed_moe_forward last dim mismatch: input={input_k}, weight={k}");
+    }
+    if input_dim1 != 1 && input_dim1 != topk {
+        crate::bail!(
+            "indexed_moe_forward expects input dim-1 to be 1 or topk ({topk}), got {input_dim1}"
+        );
+    }
+    let ids = if ids.dtype() == DType::U32 {
+        ids.clone()
+    } else {
+        ids.to_dtype(DType::U32)?
+    };
+    let max_id = ids.max_all()?.to_scalar::<u32>()? as usize;
+    if max_id >= num_experts {
+        crate::bail!("indexed_moe_forward id {max_id} out of range for {num_experts} experts");
+    }
+    let weights = if weights.dtype() == x3.dtype() {
+        weights.clone()
+    } else {
+        weights.to_dtype(x3.dtype())?
+    };
+    let selected = weights
+        .index_select(&ids.flatten_all()?, 0)?
+        .reshape((batch * topk, n, k))?;
+    let rows = if input_dim1 == topk {
+        x3
+    } else {
+        x3.broadcast_as((batch, topk, k))?
+    };
+    let out = rows
+        .reshape((batch * topk, 1, k))?
+        .matmul(&selected.transpose(1, 2)?)?
+        .reshape((batch, topk, n))?;
+    if out.dtype() == x.dtype() {
+        Ok(out)
+    } else {
+        out.to_dtype(x.dtype())
+    }
+}
+
 impl QTensor {
     pub fn new<S: Into<Shape>>(storage: QStorage, shape: S) -> Result<Self> {
         let shape = shape.into();
@@ -664,6 +1257,144 @@ impl QTensor {
         self.storage.data()
     }
 
+    fn index_select_rows0_f32(&self, ids: &Tensor) -> Result<Tensor> {
+        if ids.rank() != 1 {
+            crate::bail!(
+                "quantized index_select expects rank-1 ids, got {:?}",
+                ids.shape()
+            );
+        }
+        let device = self.device();
+        let ids = ids.to_dtype(DType::U32)?.to_device(&device)?;
+        let ids_len = ids.dim(0)?;
+        let mut out_dims = self.shape.dims().to_vec();
+        out_dims[0] = ids_len;
+        let out_shape = Shape::from(out_dims);
+        let ids_storage = ids.storage();
+        let out = match (&self.storage, &*ids_storage) {
+            (QStorage::Wgpu(storage), Storage::Wgpu(ids_storage)) => {
+                let out = storage.index_select_f32(&self.shape, ids_storage, ids.layout(), 0)?;
+                Ok(crate::tensor::from_storage(
+                    Storage::Wgpu(out),
+                    out_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                ))
+            }
+            (QStorage::Vulkan(storage), Storage::Vulkan(ids_storage)) => {
+                let out = storage.index_select_f32(&self.shape, ids_storage, ids.layout(), 0)?;
+                Ok(crate::tensor::from_storage(
+                    Storage::Vulkan(out),
+                    out_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                ))
+            }
+            _ => {
+                let weights = self.dequantize(&device)?;
+                weights.index_select(&ids, 0)
+            }
+        };
+        drop(ids_storage);
+        out
+    }
+
+    fn indexed_moe_forward_quantized_gpu(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        let (num_experts, n, k) = self.shape.dims3()?;
+        let output_dtype = x.dtype();
+        let output_device = x.device().clone();
+        let device = self.device();
+        let x = x.to_device(&device)?;
+        let ids = ids.to_dtype(DType::U32)?.to_device(&device)?;
+        let (batch, input_dim1, input_k, x3) = match x.rank() {
+            2 => {
+                let (batch, k) = x.dims2()?;
+                (batch, 1, k, x.unsqueeze(1)?)
+            }
+            3 => {
+                let (batch, slots, k) = x.dims3()?;
+                (batch, slots, k, x.clone())
+            }
+            rank => crate::bail!("indexed_moe_forward expects rank-2/3 input, got rank {rank}"),
+        };
+        let (ids_batch, topk) = ids.dims2()?;
+        if batch != ids_batch {
+            crate::bail!("indexed_moe_forward batch mismatch: input={batch}, ids={ids_batch}");
+        }
+        if input_k != k {
+            crate::bail!("indexed_moe_forward last dim mismatch: input={input_k}, weight={k}");
+        }
+        if input_dim1 != 1 && input_dim1 != topk {
+            crate::bail!(
+                "indexed_moe_forward expects input dim-1 to be 1 or topk ({topk}), got {input_dim1}"
+            );
+        }
+        let flat_ids = ids.flatten_all()?;
+        let max_id = flat_ids.to_vec1::<u32>()?.into_iter().max().unwrap_or(0) as usize;
+        if max_id >= num_experts {
+            crate::bail!("indexed_moe_forward id {max_id} out of range for {num_experts} experts");
+        }
+        let x3_f32 = if x3.dtype() == DType::F32 {
+            x3.clone()
+        } else {
+            x3.to_dtype(DType::F32)?
+        };
+        if let (
+            QStorage::Vulkan(storage),
+            Storage::Vulkan(x_storage),
+            Storage::Vulkan(ids_storage),
+        ) = (&self.storage, &*x3_f32.storage(), &*ids.storage())
+        {
+            match storage.indexed_moe_forward_f32(
+                &self.shape,
+                x_storage,
+                x3_f32.layout(),
+                ids_storage,
+                ids.layout(),
+            ) {
+                Ok((storage, out_shape)) => {
+                    let out = crate::tensor::from_storage(
+                        Storage::Vulkan(storage),
+                        out_shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    );
+                    let out = if out.dtype() == output_dtype {
+                        out
+                    } else {
+                        out.to_dtype(output_dtype)?
+                    };
+                    return out.to_device(&output_device);
+                }
+                Err(err) if should_quantized_backend_fallback(&err, "vulkan") => {}
+                Err(err) => return Err(err),
+            }
+        }
+        let selected = self
+            .index_select_rows0_f32(&flat_ids)?
+            .reshape((batch * topk, n, k))?;
+        let rows = if input_dim1 == topk {
+            x3
+        } else {
+            x3.broadcast_as((batch, topk, k))?
+        };
+        let rows = if rows.dtype() == DType::F32 {
+            rows
+        } else {
+            rows.to_dtype(DType::F32)?
+        };
+        let out = rows
+            .reshape((batch * topk, 1, k))?
+            .matmul(&selected.transpose(1, 2)?)?
+            .reshape((batch, topk, n))?;
+        let out = if out.dtype() == output_dtype {
+            out
+        } else {
+            out.to_dtype(output_dtype)?
+        };
+        out.to_device(&output_device)
+    }
+
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         match &self.storage {
             QStorage::Cuda(s) => match (&*x.storage(), &*ids.storage()) {
@@ -683,11 +1414,16 @@ impl QTensor {
                     ))
                 }
                 _ => {
-                    panic!("Non-cuda indexed_moe_forward is not implemented!");
+                    let weights = self.dequantize(x.device())?;
+                    indexed_moe_forward_dense(&weights, x, ids)
                 }
             },
+            QStorage::Wgpu(_) | QStorage::Vulkan(_) => {
+                self.indexed_moe_forward_quantized_gpu(x, ids)
+            }
             _ => {
-                panic!("indexed_moe_forward is not implemented in this platform!");
+                let weights = self.dequantize(x.device())?;
+                indexed_moe_forward_dense(&weights, x, ids)
             }
         }
     }
@@ -695,7 +1431,7 @@ impl QTensor {
     pub fn device_ptr(&self) -> Result<*const u8> {
         match &self.storage {
             QStorage::Cuda(storage) => storage.device_ptr(),
-            QStorage::Metal(_) | QStorage::Cpu(_) => {
+            QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::Wgpu(_) | QStorage::Vulkan(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -775,9 +1511,7 @@ impl QMatMul {
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         match self {
             Self::QTensor(t) => t.indexed_moe_forward(x, ids),
-            _ => {
-                panic!("Not implemented!")
-            }
+            Self::Tensor(w) | Self::TensorF16(w) => indexed_moe_forward_dense(w, x, ids),
         }
     }
 }
@@ -808,12 +1542,7 @@ impl crate::CustomOp1 for QTensor {
         }
         dst_shape.push(n);
         let dst_shape = Shape::from(dst_shape);
-        #[allow(clippy::infallible_destructuring_match)]
-        let self_storage = match &self.storage {
-            QStorage::Cpu(storage) => storage,
-            QStorage::Metal(_) | QStorage::Cuda(_) => crate::bail!("Invalid storage"),
-        };
-        match storage.dtype() {
+        let run = |self_storage: &dyn QuantizedType| match storage.dtype() {
             DType::F32 => {
                 let slice = storage.as_slice::<f32>()?;
                 let slice =
@@ -824,7 +1553,7 @@ impl crate::CustomOp1 for QTensor {
                     slice,
                     &mut dst_storage,
                 )?;
-                Ok((crate::CpuStorage::F32(dst_storage), dst_shape))
+                Ok((crate::CpuStorage::F32(dst_storage), dst_shape.clone()))
             }
             DType::F16 => {
                 let slice = storage.as_slice::<f16>()?;
@@ -836,9 +1565,21 @@ impl crate::CustomOp1 for QTensor {
                     slice,
                     &mut dst_storage,
                 )?;
-                Ok((crate::CpuStorage::F16(dst_storage), dst_shape))
+                Ok((crate::CpuStorage::F16(dst_storage), dst_shape.clone()))
             }
             _ => crate::bail!("Expected f32/f16"),
+        };
+        match &self.storage {
+            QStorage::Cpu(storage) => run(storage.as_ref()),
+            QStorage::Wgpu(storage) => {
+                let cpu_storage = storage.to_cpu_quantized()?;
+                run(cpu_storage.as_ref())
+            }
+            QStorage::Vulkan(storage) => {
+                let cpu_storage = storage.to_cpu_quantized()?;
+                run(cpu_storage.as_ref())
+            }
+            QStorage::Metal(_) | QStorage::Cuda(_) => crate::bail!("Invalid storage"),
         }
     }
 
@@ -862,6 +1603,30 @@ impl crate::CustomOp1 for QTensor {
         let self_storage = match &self.storage {
             QStorage::Cuda(cuda) => cuda,
             _ => unreachable!("Cannot call cuda matmul on non cuda QTensor"),
+        };
+        self_storage.fwd(&self.shape, storage, layout)
+    }
+
+    fn wgpu_fwd(
+        &self,
+        storage: &crate::WgpuStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::WgpuStorage, Shape)> {
+        let self_storage = match &self.storage {
+            QStorage::Wgpu(wgpu) => wgpu,
+            _ => unreachable!("Cannot call wgpu matmul on non wgpu QTensor"),
+        };
+        self_storage.fwd(&self.shape, storage, layout)
+    }
+
+    fn vulkan_fwd(
+        &self,
+        storage: &crate::VulkanStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::VulkanStorage, Shape)> {
+        let self_storage = match &self.storage {
+            QStorage::Vulkan(vulkan) => vulkan,
+            _ => unreachable!("Cannot call vulkan matmul on non vulkan QTensor"),
         };
         self_storage.fwd(&self.shape, storage, layout)
     }
