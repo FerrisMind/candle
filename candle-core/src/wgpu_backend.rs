@@ -104,6 +104,26 @@ struct ArgMaxParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct ArgsortParams {
+    offset_src: u32,
+    offset_dst: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    stride_dst1: u32,
+    stride_dst2: u32,
+    stride_dst3: u32,
+    src_ne0: u32,
+    ne1: u32,
+    ne2: u32,
+    ne0: u32,
+    top_k: u32,
+    npr: u32,
+    nrows: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct CumsumParams {
     offset_src: u32,
     offset_dst: u32,
@@ -602,6 +622,14 @@ fn dims4(layout: &Layout) -> Result<([u32; 4], [u32; 4])> {
 
 fn contiguous_strides(dims: [u32; 4]) -> [u32; 4] {
     [1, dims[0], dims[0] * dims[1], dims[0] * dims[1] * dims[2]]
+}
+
+fn next_power_of_two_u32(value: usize, op: &'static str) -> Result<u32> {
+    value
+        .checked_next_power_of_two()
+        .ok_or_else(|| Error::Msg(format!("wgpu backend op {op} dimension overflow").into()).bt())?
+        .try_into()
+        .map_err(Error::wrap)
 }
 
 fn nearest_interp_weights(in_size: usize, out_size: usize) -> Vec<f32> {
@@ -1251,6 +1279,83 @@ impl WgpuStorage {
         Ok(dst)
     }
 
+    pub(crate) fn argsort_last_dim_f32(
+        &self,
+        layout: &Layout,
+        asc: bool,
+        last_dim: usize,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu argsort").bt());
+        }
+        if !layout.is_contiguous() {
+            return Err(unsupported("argsort strided"));
+        }
+        if last_dim == 0 || layout.dims().last().copied() != Some(last_dim) {
+            return Err(unsupported("argsort last-dim"));
+        }
+        let workgroup_size = next_power_of_two_u32(last_dim, "argsort")?;
+        if workgroup_size > WG_SIZE {
+            return Err(unsupported("argsort last-dim > 256"));
+        }
+        let (dims, strides) = dims4(layout)?;
+        let count = layout.shape().elem_count();
+        let nrows = count / last_dim;
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), DType::U32)? };
+        let dst_strides = contiguous_strides(dims);
+        let params = ArgsortParams {
+            offset_src: layout.start_offset().try_into()?,
+            offset_dst: 0,
+            stride_src1: strides[1],
+            stride_src2: strides[2],
+            stride_src3: strides[3],
+            stride_dst1: dst_strides[1],
+            stride_dst2: dst_strides[2],
+            stride_dst3: dst_strides[3],
+            src_ne0: last_dim.try_into()?,
+            ne1: dims[1],
+            ne2: dims[2],
+            ne0: last_dim.try_into()?,
+            top_k: last_dim.try_into()?,
+            npr: 1,
+            nrows: nrows.try_into()?,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-argsort-params"),
+                size: std::mem::size_of::<ArgsortParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::argsort_shader(workgroup_size, asc)
+            .ok_or_else(|| Error::Msg("wgpu shader argsort.wgsl not embedded".into()).bt())?;
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            nrows.try_into()?,
+            "candle-wgpu-argsort",
+        )?;
+        Ok(dst)
+    }
+
     fn run_cumsum_last_dim(&self, layout: &Layout) -> Result<Self> {
         if self.dtype != DType::F32 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu cumsum").bt());
@@ -1564,6 +1669,176 @@ impl WgpuStorage {
         )?;
         debug_assert_eq!(dst.count, dst_el);
         Ok(dst)
+    }
+
+    fn run_gather_last_dim_f32(&self, ids: &Self, src_l: &Layout, ids_l: &Layout) -> Result<Self> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu gather").bt());
+        }
+        if ids.dtype != DType::U32 {
+            return Err(Error::UnsupportedDTypeForOp(ids.dtype, "wgpu gather ids").bt());
+        }
+        if !src_l.is_contiguous() {
+            return Err(unsupported("gather strided src"));
+        }
+        if !ids_l.is_contiguous() {
+            return Err(unsupported("gather strided ids"));
+        }
+        let rank = src_l.dims().len();
+        if rank == 0 || ids_l.dims().len() != rank {
+            return Err(unsupported("gather rank"));
+        }
+        let ids_dim = ids_l.dims()[rank - 1];
+        let left_size: usize = ids_l.dims()[..rank - 1].iter().product();
+        let src_dim = src_l.dims()[rank - 1];
+        let dst_shape = ids_l.shape().clone();
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
+        let params = GetRowsParams {
+            offset_src: src_l.start_offset().try_into()?,
+            offset_idx: ids_l.start_offset().try_into()?,
+            offset_dst: 0,
+            stride_src1: 1,
+            stride_src2: src_dim.try_into()?,
+            stride_src3: (src_dim * left_size).try_into()?,
+            stride_idx0: 1,
+            stride_idx1: ids_dim.try_into()?,
+            stride_idx2: 0,
+            stride_dst1: 1,
+            stride_dst2: ids_dim.try_into()?,
+            stride_dst3: (ids_dim * left_size).try_into()?,
+            ne0: 1,
+            n_rows: ids_dim.try_into()?,
+            ne2: left_size.try_into()?,
+            ne3: 1,
+            idx1: left_size.try_into()?,
+            idx2: 1,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-gather-params"),
+                size: std::mem::size_of::<GetRowsParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &ids.buffer),
+            buffer_binding(2, &dst.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::get_rows_f32_shader(WG_SIZE)
+            .ok_or_else(|| Error::Msg("wgpu shader get_rows.wgsl not embedded".into()).bt())?;
+        let rows: u32 = (left_size * ids_dim).try_into()?;
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            rows.div_ceil(WG_SIZE),
+            "candle-wgpu-gather",
+        )?;
+        Ok(dst)
+    }
+
+    fn run_scatter_set_last_dim_f32(
+        &mut self,
+        dst_l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+    ) -> Result<()> {
+        if self.dtype != DType::F32 || src.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu scatter_set").bt());
+        }
+        if ids.dtype != DType::U32 {
+            return Err(Error::UnsupportedDTypeForOp(ids.dtype, "wgpu scatter_set ids").bt());
+        }
+        if !dst_l.is_contiguous() {
+            return Err(unsupported("scatter_set strided dst"));
+        }
+        if !src_l.is_contiguous() {
+            return Err(unsupported("scatter_set strided src"));
+        }
+        if !ids_l.is_contiguous() {
+            return Err(unsupported("scatter_set strided ids"));
+        }
+        let rank = dst_l.dims().len();
+        if rank == 0 || ids_l.dims().len() != rank || src_l.dims().len() != rank {
+            return Err(unsupported("scatter_set rank"));
+        }
+        let ids_dim = ids_l.dims()[rank - 1];
+        let left_size: usize = ids_l.dims()[..rank - 1].iter().product();
+        let dst_dim = dst_l.dims()[rank - 1];
+        let params = GetRowsParams {
+            offset_src: src_l.start_offset().try_into()?,
+            offset_idx: ids_l.start_offset().try_into()?,
+            offset_dst: dst_l.start_offset().try_into()?,
+            stride_src1: 1,
+            stride_src2: ids_dim.try_into()?,
+            stride_src3: (ids_dim * left_size).try_into()?,
+            stride_idx0: 1,
+            stride_idx1: ids_dim.try_into()?,
+            stride_idx2: 0,
+            stride_dst1: 1,
+            stride_dst2: dst_dim.try_into()?,
+            stride_dst3: (dst_dim * left_size).try_into()?,
+            ne0: 1,
+            n_rows: ids_dim.try_into()?,
+            ne2: left_size.try_into()?,
+            ne3: 1,
+            idx1: left_size.try_into()?,
+            idx2: 1,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-scatter-set-params"),
+                size: std::mem::size_of::<GetRowsParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &src.buffer),
+            buffer_binding(1, &ids.buffer),
+            buffer_binding(2, &self.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::set_rows_f32_shader(WG_SIZE)
+            .ok_or_else(|| Error::Msg("wgpu shader set_rows.wgsl not embedded".into()).bt())?;
+        let rows: u32 = (left_size * ids_dim).try_into()?;
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            rows.div_ceil(WG_SIZE),
+            "candle-wgpu-scatter-set",
+        )?;
+        Ok(())
     }
 
     fn run_matmul_f32(
@@ -2467,19 +2742,25 @@ impl BackendStorage for WgpuStorage {
             bilinear_interp_weights(w, out_w, align_corners, scale_w),
         )
     }
-    fn gather(&self, _: &Layout, _: &Self, _: &Layout, _: usize) -> Result<Self> {
-        Err(unsupported("gather"))
+    fn gather(&self, src_l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
+        if dim + 1 != src_l.dims().len() {
+            return Err(unsupported("gather non-last-dim"));
+        }
+        self.run_gather_last_dim_f32(ids, src_l, ids_l)
     }
     fn scatter_set(
         &mut self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: usize,
+        dst_l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
     ) -> Result<()> {
-        Err(unsupported("scatter_set"))
+        if dim + 1 != dst_l.dims().len() {
+            return Err(unsupported("scatter_set non-last-dim"));
+        }
+        self.run_scatter_set_last_dim_f32(dst_l, ids, ids_l, src, src_l)
     }
     fn scatter_add_set(
         &mut self,

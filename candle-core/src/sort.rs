@@ -240,6 +240,26 @@ impl crate::CustomOp1 for ArgSort {
         let dst = crate::MetalStorage::new(dst, device.clone(), el, DType::U32);
         Ok((dst, layout.shape().clone()))
     }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        storage: &crate::WgpuStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::WgpuStorage, crate::Shape)> {
+        let dst = storage.argsort_last_dim_f32(layout, self.asc, self.last_dim)?;
+        Ok((dst, layout.shape().clone()))
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        storage: &crate::VulkanStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::VulkanStorage, crate::Shape)> {
+        let dst = storage.argsort_last_dim_f32(layout, self.asc, self.last_dim)?;
+        Ok((dst, layout.shape().clone()))
+    }
 }
 
 #[allow(unused)]

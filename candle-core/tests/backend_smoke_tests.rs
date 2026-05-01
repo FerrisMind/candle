@@ -63,6 +63,7 @@ fn backend_smoke_vulkan_f32_upload_unary_binary_roundtrip() -> Result<()> {
 
     smoke_f32_upload_unary_binary_roundtrip(&device)?;
     smoke_i32_to_f32_dtype_conversion(&device)?;
+    smoke_f32_conv_transpose_vulkan(&device)?;
     Ok(())
 }
 
@@ -95,7 +96,10 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     smoke_f32_sum_last_dim(device)?;
     smoke_f32_cumsum(device)?;
     smoke_f32_argmax_last_dim(device)?;
+    smoke_f32_argsort_last_dim(device)?;
     smoke_f32_index_select(device)?;
+    smoke_f32_gather_last_dim(device)?;
+    smoke_f32_scatter_set_last_dim(device)?;
     smoke_f32_matmul(device)?;
     smoke_f32_conv1d(device)?;
     smoke_f32_conv2d(device)?;
@@ -423,6 +427,27 @@ fn smoke_f32_argmax_last_dim(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_argsort_last_dim(device: &Device) -> Result<()> {
+    let xs = Tensor::from_slice(&[3.0f32, 1.0, 2.0, 10.0, 5.0, 7.0], (2, 3), device)?;
+    assert_eq!(
+        xs.arg_sort_last_dim(true)?.to_vec2::<u32>()?,
+        [[1, 2, 0], [1, 2, 0]]
+    );
+    assert_eq!(
+        xs.arg_sort_last_dim(false)?.to_vec2::<u32>()?,
+        [[0, 2, 1], [0, 2, 1]]
+    );
+
+    let (sorted, idx) = xs.sort_last_dim(true)?;
+    assert_eq!(idx.to_vec2::<u32>()?, [[1, 2, 0], [1, 2, 0]]);
+    assert_eq!(
+        sorted.to_vec2::<f32>()?,
+        [[1.0, 2.0, 3.0], [5.0, 7.0, 10.0]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_f32_index_select(device: &Device) -> Result<()> {
     let xs = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 10.0, 20.0, 30.0], (2, 3), device)?;
     let ids = Tensor::from_slice(&[1u32, 0], (2,), device)?;
@@ -443,6 +468,51 @@ fn smoke_f32_index_select(device: &Device) -> Result<()> {
     assert_eq!(
         ys.index_select(&ids, 1)?.to_vec3::<f32>()?,
         [[[3.0, 4.0], [1.0, 2.0]], [[30.0, 40.0], [10.0, 20.0]]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_gather_last_dim(device: &Device) -> Result<()> {
+    let xs = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 10.0, 20.0, 30.0], (2, 3), device)?;
+    let ids = Tensor::from_slice(&[2u32, 0, 1, 1], (2, 2), device)?;
+    assert_eq!(
+        xs.gather(&ids, 1)?.to_vec2::<f32>()?,
+        [[3.0, 1.0], [20.0, 20.0]]
+    );
+
+    let ys = Tensor::from_slice(
+        &[1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0],
+        (2, 2, 2),
+        device,
+    )?;
+    let ids = Tensor::from_slice(&[1u32, 0, 0, 1, 1, 1, 0, 0], (2, 2, 2), device)?;
+    assert_eq!(
+        ys.gather(&ids, 2)?.to_vec3::<f32>()?,
+        [[[2.0, 1.0], [3.0, 4.0]], [[20.0, 20.0], [30.0, 30.0]]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_scatter_set_last_dim(device: &Device) -> Result<()> {
+    let base = Tensor::from_slice(
+        &[1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0],
+        (2, 4),
+        device,
+    )?;
+    let ids = Tensor::from_slice(&[2u32, 0, 1, 3], (2, 2), device)?;
+    let src = Tensor::from_slice(&[30.0f32, 10.0, 200.0, 400.0], (2, 2), device)?;
+    assert_eq!(
+        base.scatter(&ids, &src, 1)?.to_vec2::<f32>()?,
+        [[10.0, 2.0, 30.0, 4.0], [10.0, 200.0, 30.0, 400.0]]
+    );
+
+    let dst = Tensor::zeros((2, 4), DType::F32, device)?;
+    dst.scatter_set(&ids, &src, 1)?;
+    assert_eq!(
+        dst.to_vec2::<f32>()?,
+        [[10.0, 0.0, 30.0, 0.0], [0.0, 200.0, 0.0, 400.0]]
     );
     Ok(())
 }
@@ -511,6 +581,44 @@ fn smoke_f32_conv2d(device: &Device) -> Result<()> {
 
     let padded = input.conv2d(&kernel, 1, 1, 1, 1)?;
     assert_eq!(padded.dims(), &[1, 1, 4, 4]);
+    Ok(())
+}
+
+#[cfg(feature = "vulkan")]
+fn smoke_f32_conv_transpose_vulkan(device: &Device) -> Result<()> {
+    let input = Tensor::from_slice(&[1.0f32, 2.0, 3.0], (1, 1, 3), device)?;
+    let kernel = Tensor::from_slice(&[1.0f32, 0.0, 1.0], (1, 1, 3), device)?;
+    assert_eq!(
+        input
+            .conv_transpose1d(&kernel, 1, 0, 1, 1, 1)?
+            .to_vec3::<f32>()?,
+        [[[2.0, 4.0, 2.0]]]
+    );
+
+    let stride_kernel = Tensor::from_slice(&[1.0f32, 1.0], (1, 1, 2), device)?;
+    assert_eq!(
+        input
+            .conv_transpose1d(&stride_kernel, 0, 0, 2, 1, 1)?
+            .to_vec3::<f32>()?,
+        [[[1.0, 1.0, 2.0, 2.0, 3.0, 3.0]]]
+    );
+
+    let image = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, 1, 2, 2), device)?;
+    let kernel_2d = Tensor::from_slice(&[1.0f32, 1.0, 1.0, 1.0], (1, 1, 2, 2), device)?;
+    assert_eq!(
+        image
+            .conv_transpose2d(&kernel_2d, 0, 0, 1, 1)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        [1.0, 3.0, 2.0, 4.0, 10.0, 6.0, 3.0, 7.0, 4.0]
+    );
+    assert_eq!(
+        image
+            .conv_transpose2d(&kernel_2d, 0, 0, 2, 1)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        [1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 3.0, 3.0, 4.0, 4.0]
+    );
     Ok(())
 }
 
