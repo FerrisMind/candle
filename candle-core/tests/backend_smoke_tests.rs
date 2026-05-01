@@ -3,7 +3,7 @@ use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use candle_core::Module;
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
-use candle_core::{DType, Device, IndexOp, Result, Tensor};
+use candle_core::{DType, Device, IndexOp, Result, Shape, Tensor};
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use half::f16;
 
@@ -67,6 +67,66 @@ fn backend_smoke_vulkan_f32_upload_unary_binary_roundtrip() -> Result<()> {
 
     smoke_f32_upload_unary_binary_roundtrip(&device)?;
     smoke_i32_to_f32_dtype_conversion(&device)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a usable Vulkan compute device and driver"]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_quantized_paths_only() -> Result<()> {
+    let device = Device::new_vulkan(0)?;
+    assert!(device.is_vulkan());
+
+    smoke_quantized_paths(&device)?;
+    device.synchronize()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a usable Vulkan compute device and driver"]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_q8_1_qmatmul_regression() -> Result<()> {
+    let cpu = Device::Cpu;
+    let vk = Device::new_vulkan(0)?;
+    let k = 256;
+    let lhs_vals = (0..k).map(|v| v as f32 / 32.0).collect::<Vec<_>>();
+    let rhs_vals = (0..(k * 4))
+        .map(|v| (v as f32 - 384.0) / 64.0)
+        .collect::<Vec<_>>();
+
+    let lhs_cpu = Tensor::from_slice(&lhs_vals, (1, k), &cpu)?;
+    let rhs_cpu = Tensor::from_slice(&rhs_vals, (k, 4), &cpu)?;
+    let lhs_vk = Tensor::from_slice(&lhs_vals, (1, k), &vk)?;
+    let rhs_vk = Tensor::from_slice(&rhs_vals, (k, 4), &vk)?;
+
+    let q_cpu = QTensor::quantize(&rhs_cpu.t()?, GgmlDType::Q8_1)?;
+    let q_vk = QTensor::quantize(&rhs_vk.t()?, GgmlDType::Q8_1)?;
+
+    assert_eq!(q_cpu.data()?.as_ref(), q_vk.data()?.as_ref());
+    assert_eq!(q_vk.dequantize(&vk)?.shape().dims(), &[4, k]);
+
+    let expected_qmm = QMatMul::from_qtensor(q_cpu)?;
+    let actual_qmm = QMatMul::from_qtensor(q_vk)?;
+    assert!(matches!(expected_qmm, QMatMul::QTensor(_)));
+    assert!(matches!(actual_qmm, QMatMul::QTensor(_)));
+
+    let expected = expected_qmm.forward(&lhs_cpu)?;
+    let actual = actual_qmm.forward(&lhs_vk)?;
+
+    for (row_idx, (actual_row, expected_row)) in actual
+        .to_vec2::<f32>()?
+        .iter()
+        .zip(expected.to_vec2::<f32>()?.iter())
+        .enumerate()
+    {
+        for (col_idx, (actual, expected)) in actual_row.iter().zip(expected_row.iter()).enumerate()
+        {
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "integration q8_1 qmatmul mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -896,8 +956,12 @@ fn smoke_rank5_unary_binary_fallback(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
-fn vulkan_uses_q8_1_rhs(dtype: GgmlDType) -> bool {
-    matches!(
+fn vulkan_uses_q8_1_rhs(device: &Device, dtype: GgmlDType, n: usize, k: usize) -> bool {
+    const VULKAN_VENDOR_ID_NVIDIA: u32 = 0x10DE;
+    const VULKAN_VENDOR_ID_AMD: u32 = 0x1002;
+    const VULKAN_VENDOR_ID_INTEL: u32 = 0x8086;
+
+    let supported = matches!(
         dtype,
         GgmlDType::Q4_0
             | GgmlDType::Q4_1
@@ -909,7 +973,44 @@ fn vulkan_uses_q8_1_rhs(dtype: GgmlDType) -> bool {
             | GgmlDType::Q4K
             | GgmlDType::Q5K
             | GgmlDType::Q6K
-    )
+    );
+    if !supported {
+        return false;
+    }
+    if matches!(dtype, GgmlDType::Q3K | GgmlDType::Q6K) {
+        return false;
+    }
+    if n > 1 {
+        return true;
+    }
+    let vendor_id = device
+        .as_vulkan_device()
+        .map(|device| device.vendor_id())
+        .unwrap_or_default();
+    match vendor_id {
+        VULKAN_VENDOR_ID_NVIDIA => {
+            if matches!(dtype, GgmlDType::Q2K) {
+                return true;
+            }
+            if k <= 4096 {
+                return false;
+            }
+            !matches!(dtype, GgmlDType::Q8_0)
+        }
+        VULKAN_VENDOR_ID_AMD => {
+            if k < 2048 {
+                return false;
+            }
+            !matches!(dtype, GgmlDType::Q8_0)
+        }
+        VULKAN_VENDOR_ID_INTEL => {
+            if k < 2048 {
+                return false;
+            }
+            !matches!(dtype, GgmlDType::Q4_0 | GgmlDType::Q5_1)
+        }
+        _ => true,
+    }
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
@@ -1060,6 +1161,97 @@ fn q8_1_activation_matmul_reference(qweights: &QTensor, lhs: &Tensor) -> Result<
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn q8_1_activation_matmul_reference_general(qweights: &QTensor, lhs: &Tensor) -> Result<Tensor> {
+    let cpu = Device::Cpu;
+    let lhs_q8_1 = QTensor::quantize(lhs, GgmlDType::Q8_1)?.dequantize(&cpu)?;
+    let weights = qweights.dequantize(&cpu)?;
+    let (n, k) = qweights.shape().dims2()?;
+    let lhs_dims = lhs_q8_1.dims().to_vec();
+    let lhs_rows = lhs_dims.iter().product::<usize>() / k;
+    let lhs_2d = lhs_q8_1.reshape((lhs_rows, k))?;
+    let out_2d = lhs_2d.matmul(&weights.t()?)?;
+    let mut out_dims = lhs_dims;
+    *out_dims.last_mut().unwrap() = n;
+    out_2d.reshape(Shape::from(out_dims))
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn quantized_rel_tol(dtype: GgmlDType) -> f32 {
+    match dtype {
+        GgmlDType::Q8_0 | GgmlDType::Q8_1 | GgmlDType::Q8K => 1e-3,
+        GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1 => 2e-3,
+        GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => 5e-3,
+        _ => 1e-3,
+    }
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn assert_quantized_close(
+    actual: &Tensor,
+    expected: &Tensor,
+    dtype: GgmlDType,
+    case: &str,
+) -> Result<()> {
+    assert_eq!(
+        actual.dims(),
+        expected.dims(),
+        "{case} shape mismatch for {dtype:?}"
+    );
+    let actual_vals = actual.flatten_all()?.to_vec1::<f32>()?;
+    let expected_vals = expected.flatten_all()?.to_vec1::<f32>()?;
+    let rel_tol = quantized_rel_tol(dtype);
+    let mut max_rel = 0f32;
+    let mut mse_diff = 0f64;
+    let mut mse_ref = 0f64;
+    let mut first_bad = None;
+    for (idx, (actual, expected)) in actual_vals.iter().zip(expected_vals.iter()).enumerate() {
+        let rel = (actual - expected).abs() / expected.abs().max(1.0);
+        max_rel = max_rel.max(rel);
+        let diff = (*actual as f64) - (*expected as f64);
+        mse_diff += diff * diff;
+        mse_ref += (*expected as f64) * (*expected as f64);
+        if rel >= rel_tol && first_bad.is_none() {
+            first_bad = Some((idx, *actual, *expected));
+        }
+    }
+    let nmse = if mse_ref > 0.0 {
+        mse_diff / mse_ref
+    } else {
+        0.0
+    };
+    if case != "matvec" && nmse <= 5e-4 {
+        return Ok(());
+    }
+    if let Some((idx, actual, expected)) = first_bad {
+        panic!(
+            "{case} quantized matmul mismatch for {dtype:?} at linear idx {idx}: got {actual}, expected {expected}, rel_tol {rel_tol}, max_rel {max_rel}, nmse {nmse}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn expected_quantized_matmul(
+    device: &Device,
+    rhs_cpu: &Tensor,
+    lhs_cpu: &Tensor,
+    dtype: GgmlDType,
+) -> Result<Tensor> {
+    let q_rhs_cpu = QTensor::quantize(&rhs_cpu.t()?, dtype)?;
+    let lhs_m = lhs_cpu.dims()[lhs_cpu.rank() - 2];
+    let lhs_k = lhs_cpu.dims()[lhs_cpu.rank() - 1];
+    if device.is_vulkan() && vulkan_uses_q8_1_rhs(device, dtype, lhs_m, lhs_k) {
+        if lhs_m == 1 {
+            q8_1_activation_matmul_reference(&q_rhs_cpu, lhs_cpu)
+        } else {
+            q8_1_activation_matmul_reference_general(&q_rhs_cpu, lhs_cpu)
+        }
+    } else {
+        QMatMul::from_qtensor(q_rhs_cpu)?.forward(lhs_cpu)
+    }
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn q8_1_activation_indexed_moe_reference(
     qweights: &QTensor,
     x: &Tensor,
@@ -1070,7 +1262,23 @@ fn q8_1_activation_indexed_moe_reference(
     let weights = qweights.dequantize(&cpu)?;
     let (num_experts, n, k) = weights.shape().dims3()?;
     let (batch, topk) = ids.shape().dims2()?;
-    let x_vals = x_q8_1.to_vec2::<f32>()?;
+    let (input_dim1, x_vals) = match x_q8_1.rank() {
+        2 => {
+            let (xb, xk) = x_q8_1.dims2()?;
+            assert_eq!(xb, batch);
+            assert_eq!(xk, k);
+            let x2 = x_q8_1.to_vec2::<f32>()?;
+            let x3 = x2.into_iter().map(|row| vec![row]).collect::<Vec<_>>();
+            (1, x3)
+        }
+        3 => {
+            let (xb, xtopk, xk) = x_q8_1.dims3()?;
+            assert_eq!(xb, batch);
+            assert_eq!(xk, k);
+            (xtopk, x_q8_1.to_vec3::<f32>()?)
+        }
+        rank => panic!("q8_1 indexed moe reference expects rank-2/3 input, got rank {rank}"),
+    };
     let weight_vals = weights.to_vec3::<f32>()?;
     let id_vals = ids.to_vec2::<u32>()?;
     let mut out = vec![0f32; batch * topk * n];
@@ -1078,11 +1286,12 @@ fn q8_1_activation_indexed_moe_reference(
         for topk_idx in 0..topk {
             let expert = id_vals[batch_idx][topk_idx] as usize;
             assert!(expert < num_experts);
+            let input_slot = if input_dim1 == topk { topk_idx } else { 0 };
             let out_base = (batch_idx * topk + topk_idx) * n;
             for row in 0..n {
                 let mut acc = 0f32;
                 for col in 0..k {
-                    acc += x_vals[batch_idx][col] * weight_vals[expert][row][col];
+                    acc += x_vals[batch_idx][input_slot][col] * weight_vals[expert][row][col];
                 }
                 out[out_base + row] = acc;
             }
@@ -1129,43 +1338,35 @@ fn smoke_quantized_paths(device: &Device) -> Result<()> {
     let rhs_cpu = Tensor::from_slice(&rhs_vals, (k, 4), &cpu)?;
     let lhs = Tensor::from_slice(&lhs_vals, (1, k), device)?;
     let rhs = Tensor::from_slice(&rhs_vals, (k, 4), device)?;
+    let lhs_multi_vals = (0..(3 * k))
+        .map(|v| (v as f32 - 1.5 * k as f32) / 48.0)
+        .collect::<Vec<_>>();
+    let lhs_multi_cpu = Tensor::from_slice(&lhs_multi_vals, (3, k), &cpu)?;
+    let lhs_multi = Tensor::from_slice(&lhs_multi_vals, (3, k), device)?;
+    let lhs_batched_vals = (0..(2 * 3 * k))
+        .map(|v| (v as f32 - 3.0 * k as f32) / 96.0)
+        .collect::<Vec<_>>();
+    let lhs_batched_cpu = Tensor::from_slice(&lhs_batched_vals, (2, 3, k), &cpu)?;
+    let lhs_batched = Tensor::from_slice(&lhs_batched_vals, (2, 3, k), device)?;
     for dtype in qmatmul_dtypes {
         let q_rhs = QTensor::quantize(&rhs.t()?, dtype)?;
         assert_eq!(q_rhs.shape().dims(), &[4, k]);
         assert_eq!(q_rhs.dequantize(device)?.shape().dims(), &[4, k]);
 
-        let q_rhs_cpu = QTensor::quantize(&rhs_cpu.t()?, dtype)?;
-        let expected_mm = if device.is_vulkan() && vulkan_uses_q8_1_rhs(dtype) {
-            q8_1_activation_matmul_reference(&q_rhs_cpu, &lhs_cpu)?
-        } else {
-            QMatMul::from_qtensor(q_rhs_cpu)?.forward(&lhs_cpu)?
-        };
-        let actual_mm = QMatMul::from_qtensor(q_rhs)?.forward(&lhs)?;
-        let rel_tol = match dtype {
-            GgmlDType::Q8_0 | GgmlDType::Q8_1 | GgmlDType::Q8K => 1e-3,
-            GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1 => 2e-3,
-            GgmlDType::Q2K
-            | GgmlDType::Q3K
-            | GgmlDType::Q4K
-            | GgmlDType::Q5K
-            | GgmlDType::Q6K => 5e-3,
-            _ => 1e-3,
-        };
-        for (row_idx, (actual_row, expected_row)) in actual_mm
-            .to_vec2::<f32>()?
-            .iter()
-            .zip(expected_mm.to_vec2::<f32>()?.iter())
-            .enumerate()
-        {
-            for (col_idx, (actual, expected)) in
-                actual_row.iter().zip(expected_row.iter()).enumerate()
-            {
-                assert!(
-                    (actual - expected).abs() < rel_tol * expected.abs().max(1.0),
-                    "quantized qmatmul mismatch for {dtype:?} at ({row_idx}, {col_idx}): got {actual}, expected {expected}, rel_tol {rel_tol}"
-                );
-            }
-        }
+        let qmm = QMatMul::from_qtensor(q_rhs)?;
+
+        let expected_mm = expected_quantized_matmul(device, &rhs_cpu, &lhs_cpu, dtype)?;
+        let actual_mm = qmm.forward(&lhs)?;
+        assert_quantized_close(&actual_mm, &expected_mm, dtype, "matvec")?;
+
+        let expected_multi = expected_quantized_matmul(device, &rhs_cpu, &lhs_multi_cpu, dtype)?;
+        let actual_multi = qmm.forward(&lhs_multi)?;
+        assert_quantized_close(&actual_multi, &expected_multi, dtype, "matmul-2d")?;
+
+        let expected_batched =
+            expected_quantized_matmul(device, &rhs_cpu, &lhs_batched_cpu, dtype)?;
+        let actual_batched = qmm.forward(&lhs_batched)?;
+        assert_quantized_close(&actual_batched, &expected_batched, dtype, "matmul-3d")?;
     }
 
     let moe_w_vals = (0..(2 * 3 * k))
@@ -1180,10 +1381,17 @@ fn smoke_quantized_paths(device: &Device) -> Result<()> {
     let moe_w_cpu = Tensor::from_slice(&moe_w_vals, (2, 3, k), &cpu)?;
     let moe_x_cpu = Tensor::from_slice(&moe_x_vals, (2, k), &cpu)?;
     let moe_ids_cpu = Tensor::from_slice(&[0u32, 1, 1, 0], (2, 2), &cpu)?;
+    let moe_x3_vals = (0..(2 * 2 * k))
+        .map(|v| (v as f32 - k as f32) / 24.0)
+        .collect::<Vec<_>>();
+    let moe_x3 = Tensor::from_slice(&moe_x3_vals, (2, 2, k), device)?;
+    let moe_x3_cpu = Tensor::from_slice(&moe_x3_vals, (2, 2, k), &cpu)?;
     for dtype in indexed_moe_dtypes {
         let q_moe = QTensor::quantize(&moe_w, dtype)?;
         let q_moe_cpu = QTensor::quantize(&moe_w_cpu, dtype)?;
-        let expected_moe = if device.is_vulkan() && vulkan_uses_q8_1_rhs(dtype) {
+        let expected_moe = if device.is_vulkan()
+            && vulkan_uses_q8_1_rhs(device, dtype, moe_ids_cpu.dims()[0], k)
+        {
             q8_1_activation_indexed_moe_reference(&q_moe_cpu, &moe_x_cpu, &moe_ids_cpu)?
         } else {
             q_moe_cpu.indexed_moe_forward(&moe_x_cpu, &moe_ids_cpu)?
@@ -1191,11 +1399,9 @@ fn smoke_quantized_paths(device: &Device) -> Result<()> {
         let actual_moe = q_moe.indexed_moe_forward(&moe_x, &moe_ids)?;
         let rel_tol = match dtype {
             GgmlDType::Q8_0 | GgmlDType::Q8_1 | GgmlDType::Q8K => 2e-3,
-            GgmlDType::Q2K
-            | GgmlDType::Q3K
-            | GgmlDType::Q4K
-            | GgmlDType::Q5K
-            | GgmlDType::Q6K => 8e-3,
+            GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => {
+                8e-3
+            }
             _ => 2e-3,
         };
         for (actual_topk, expected_topk) in actual_moe
@@ -1212,6 +1418,33 @@ fn smoke_quantized_paths(device: &Device) -> Result<()> {
                     assert!(
                         (actual - expected).abs() < rel_tol * expected.abs().max(1.0),
                         "quantized indexed_moe mismatch for {dtype:?} at topk={topk_idx}, col={col_idx}: got {actual}, expected {expected}, rel_tol {rel_tol}"
+                    );
+                }
+            }
+        }
+
+        let expected_moe_x3 = if device.is_vulkan()
+            && vulkan_uses_q8_1_rhs(device, dtype, moe_ids_cpu.dims()[0], k)
+        {
+            q8_1_activation_indexed_moe_reference(&q_moe_cpu, &moe_x3_cpu, &moe_ids_cpu)?
+        } else {
+            q_moe_cpu.indexed_moe_forward(&moe_x3_cpu, &moe_ids_cpu)?
+        };
+        let actual_moe_x3 = q_moe.indexed_moe_forward(&moe_x3, &moe_ids)?;
+        for (actual_topk, expected_topk) in actual_moe_x3
+            .to_vec3::<f32>()?
+            .iter()
+            .zip(expected_moe_x3.to_vec3::<f32>()?.iter())
+        {
+            for (topk_idx, (actual_row, expected_row)) in
+                actual_topk.iter().zip(expected_topk.iter()).enumerate()
+            {
+                for (col_idx, (actual, expected)) in
+                    actual_row.iter().zip(expected_row.iter()).enumerate()
+                {
+                    assert!(
+                        (actual - expected).abs() < rel_tol * expected.abs().max(1.0),
+                        "quantized indexed_moe rank3 mismatch for {dtype:?} at topk={topk_idx}, col={col_idx}: got {actual}, expected {expected}, rel_tol {rel_tol}"
                     );
                 }
             }

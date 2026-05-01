@@ -306,6 +306,7 @@ struct VulkanInner {
     physical_device: vk::PhysicalDevice,
     vendor_id: u32,
     integer_dot_product: bool,
+    subgroup_arithmetic: bool,
     subgroup_size: u32,
     max_workgroup_size_log2: u32,
     max_workgroup_count_x: u32,
@@ -326,6 +327,7 @@ impl std::fmt::Debug for VulkanInner {
             .field("physical_device", &self.physical_device)
             .field("vendor_id", &self.vendor_id)
             .field("integer_dot_product", &self.integer_dot_product)
+            .field("subgroup_arithmetic", &self.subgroup_arithmetic)
             .field("subgroup_size", &self.subgroup_size)
             .field("max_workgroup_size_log2", &self.max_workgroup_size_log2)
             .field("max_workgroup_count_x", &self.max_workgroup_count_x)
@@ -433,6 +435,12 @@ const VULKAN_VENDOR_ID_NVIDIA: u32 = 0x10DE;
 const VULKAN_VENDOR_ID_AMD: u32 = 0x1002;
 const VULKAN_VENDOR_ID_INTEL: u32 = 0x8086;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VulkanDmmvWorkgroup {
+    Subgroup,
+    Large,
+}
+
 fn vulkan_should_use_mmvq(device: &VulkanDevice, qdtype: GgmlDType, n: usize, k: usize) -> bool {
     if matches!(qdtype, GgmlDType::Q3K | GgmlDType::Q6K) {
         return false;
@@ -463,6 +471,74 @@ fn vulkan_should_use_mmvq(device: &VulkanDevice, qdtype: GgmlDType, n: usize, k:
             !matches!(qdtype, GgmlDType::Q4_0 | GgmlDType::Q5_1)
         }
         _ => true,
+    }
+}
+
+fn vulkan_use_subgroups(device: &VulkanDevice) -> bool {
+    device.inner.subgroup_arithmetic
+}
+
+fn vulkan_supports_quantized_matvec_weight(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+    )
+}
+
+fn vulkan_dmmv_workgroup(
+    device: &VulkanDevice,
+    qdtype: GgmlDType,
+    m: usize,
+    k: usize,
+    q8_1_rhs: bool,
+) -> VulkanDmmvWorkgroup {
+    let mut workgroup = VulkanDmmvWorkgroup::Subgroup;
+    if matches!(
+        device.inner.vendor_id,
+        VULKAN_VENDOR_ID_NVIDIA | VULKAN_VENDOR_ID_INTEL
+    ) {
+        if qdtype == GgmlDType::Q6K {
+            if m < 4096 && k >= 1024 {
+                workgroup = VulkanDmmvWorkgroup::Large;
+            }
+        } else if m <= 8192 && k >= 1024 {
+            workgroup = VulkanDmmvWorkgroup::Large;
+        }
+    }
+    if q8_1_rhs && device.inner.vendor_id == VULKAN_VENDOR_ID_INTEL {
+        workgroup = VulkanDmmvWorkgroup::Subgroup;
+    }
+    workgroup
+}
+
+fn vulkan_dmmv_shader_name(
+    device: &VulkanDevice,
+    base_name: String,
+    workgroup: VulkanDmmvWorkgroup,
+) -> String {
+    if !vulkan_use_subgroups(device) {
+        return base_name;
+    }
+    match workgroup {
+        VulkanDmmvWorkgroup::Subgroup => format!("{base_name}_subgroup"),
+        VulkanDmmvWorkgroup::Large => format!("{base_name}_subgroup_no_shmem"),
+    }
+}
+
+fn vulkan_dmmv_block_size(device: &VulkanDevice, workgroup: VulkanDmmvWorkgroup) -> u32 {
+    let subgroup = device.inner.subgroup_size.max(1);
+    match workgroup {
+        VulkanDmmvWorkgroup::Subgroup => subgroup,
+        VulkanDmmvWorkgroup::Large => subgroup.saturating_mul(4),
     }
 }
 
@@ -517,9 +593,8 @@ fn quantize_f32_storage_to_q8_1_x4(
     let num_blocks: u32 = elem_count.div_ceil(128).try_into()?;
     let out_size = vulkan_q8_1_x4_bytes(elem_count)?;
     let out = device.create_buffer(out_size, "candle-vulkan-quantize-q8_1-x4")?;
-    let spirv = candle_vulkan_kernels::spirv("quantize_q8_1_x4").ok_or_else(|| {
-        Error::Msg("vulkan shader quantize_q8_1_x4 not generated".into()).bt()
-    })?;
+    let spirv = candle_vulkan_kernels::spirv("quantize_q8_1_x4")
+        .ok_or_else(|| Error::Msg("vulkan shader quantize_q8_1_x4 not generated".into()).bt())?;
     let params = VulkanQuantizeQ8_1Params {
         ne: elem_count.try_into()?,
         num_blocks,
@@ -649,6 +724,10 @@ impl VulkanDevice {
     pub fn transfer_to_device(&self, storage: &VulkanStorage) -> Result<VulkanStorage> {
         let cpu = storage.to_cpu_storage()?;
         self.storage_from_cpu_storage(&cpu)
+    }
+
+    pub fn vendor_id(&self) -> u32 {
+        self.inner.vendor_id
     }
 
     fn create_buffer(&self, size: usize, name: &'static str) -> Result<Arc<VulkanBuffer>> {
@@ -3036,7 +3115,31 @@ impl VulkanStorage {
         if last_k != k {
             crate::bail!("input tensor {layout:?} incompatible with quantized weights {qshape:?}")
         }
-        if input_m == 1 {
+        let mut dst_dims = layout.dims().to_vec();
+        dst_dims.pop();
+        dst_dims.push(n);
+        let dst_shape = Shape::from(dst_dims);
+        if rank > 2 {
+            let mut src_contiguous = None;
+            let (src, _src_layout) = if layout.is_contiguous() && layout.start_offset() == 0 {
+                (storage, layout.clone())
+            } else {
+                let mut tmp =
+                    unsafe { storage.device.alloc_uninit(layout.shape(), storage.dtype)? };
+                storage.copy_strided_src(&mut tmp, 0, layout)?;
+                src_contiguous = Some(tmp);
+                (
+                    src_contiguous.as_ref().unwrap(),
+                    Layout::contiguous(layout.shape().clone()),
+                )
+            };
+            let flat_m = layout.shape().elem_count() / k;
+            let flat_layout = Layout::contiguous(Shape::from((flat_m, k)));
+            let (dst, _) = self.quantized_matmul(qdtype, qshape, src, &flat_layout)?;
+            drop(src_contiguous);
+            return Ok((dst, dst_shape));
+        }
+        if input_m == 1 && vulkan_supports_quantized_matvec_weight(qdtype) {
             return self.quantized_matvec(qdtype, qshape, storage, layout);
         }
 
@@ -3076,10 +3179,6 @@ impl VulkanStorage {
             && vulkan_supports_q8_1_rhs(qdtype)
             && src_elem_count % 4 == 0;
 
-        let mut dst_dims = src_layout.dims().to_vec();
-        dst_dims.pop();
-        dst_dims.push(n);
-        let dst_shape = Shape::from(dst_dims);
         let dst = unsafe { storage.device.alloc_uninit(&dst_shape, DType::F32)? };
         let params = VulkanMatmulParams {
             m: n.try_into()?,
@@ -3125,11 +3224,7 @@ impl VulkanStorage {
                 DType::F32 => "f32",
                 DType::F16 => "f16",
                 other => {
-                    return Err(Error::UnsupportedDTypeForOp(
-                        other,
-                        "vulkan quantized matmul",
-                    )
-                    .bt())
+                    return Err(Error::UnsupportedDTypeForOp(other, "vulkan quantized matmul").bt())
                 }
             }
         };
@@ -3207,11 +3302,7 @@ impl VulkanStorage {
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
-            (
-                n.try_into()?,
-                input_m.try_into()?,
-                batch_count.try_into()?,
-            ),
+            (n.try_into()?, input_m.try_into()?, batch_count.try_into()?),
             Some(&spec),
         )?;
         drop(src_contiguous);
@@ -3264,6 +3355,7 @@ impl VulkanStorage {
         let use_q8_1_rhs = src.dtype == DType::F32
             && self.device.inner.integer_dot_product
             && vulkan_supports_q8_1_rhs(qdtype)
+            && vulkan_should_use_mmvq(&self.device, qdtype, input_m, k)
             && src_elem_count % 4 == 0;
         let mut dst_dims = src_layout.dims().to_vec();
         dst_dims.pop();
@@ -3305,30 +3397,42 @@ impl VulkanStorage {
             VulkanBinding::Storage(dst.buffer.as_ref()),
             VulkanBinding::Storage(dst.buffer.as_ref()),
         ];
-        let (rhs_suffix, rows_per_group, block_size) = if use_q8_1_rhs {
+        let dmmv_workgroup = vulkan_dmmv_workgroup(&self.device, qdtype, n, k, use_q8_1_rhs);
+        let (spirv_name, rows_per_group, block_size) = if use_q8_1_rhs {
             (
-                "q8_1_f32".to_string(),
+                vulkan_dmmv_shader_name(
+                    &self.device,
+                    format!("mul_mat_vec_{}_q8_1_f32", vulkan_quantized_stem(qdtype)?),
+                    dmmv_workgroup,
+                ),
                 vulkan_dmmv_rows_per_group(&self.device, qdtype, true)?,
-                32,
+                vulkan_dmmv_block_size(&self.device, dmmv_workgroup),
             )
         } else {
             (
-                match src.dtype {
-                    DType::F32 => "f32_f32".to_string(),
-                    DType::F16 => "f16_f32".to_string(),
-                    other => {
-                        return Err(Error::UnsupportedDTypeForOp(
-                            other,
-                            "vulkan quantized matvec",
-                        )
-                        .bt())
-                    }
-                },
+                vulkan_dmmv_shader_name(
+                    &self.device,
+                    format!(
+                        "mul_mat_vec_{}_{}",
+                        vulkan_quantized_stem(qdtype)?,
+                        match src.dtype {
+                            DType::F32 => "f32_f32",
+                            DType::F16 => "f16_f32",
+                            other => {
+                                return Err(Error::UnsupportedDTypeForOp(
+                                    other,
+                                    "vulkan quantized matvec",
+                                )
+                                .bt());
+                            }
+                        }
+                    ),
+                    dmmv_workgroup,
+                ),
                 vulkan_quantized_vec_rows(qdtype)?,
-                32,
+                vulkan_dmmv_block_size(&self.device, dmmv_workgroup),
             )
         };
-        let spirv_name = format!("mul_mat_vec_{}_{}", vulkan_quantized_stem(qdtype)?, rhs_suffix);
         let spirv = candle_vulkan_kernels::spirv(&spirv_name).ok_or_else(|| {
             Error::Msg(format!("vulkan shader {spirv_name} not generated").into()).bt()
         })?;
@@ -3388,6 +3492,9 @@ impl VulkanStorage {
             crate::bail!(
                 "indexed_moe_forward expects input dim-1 to be 1 or topk ({topk}), got {input_dim1}"
             );
+        }
+        if !vulkan_supports_quantized_matvec_weight(qdtype) {
+            return Err(unsupported("quantized indexed_moe dtype"));
         }
         let mut src_contiguous = None;
         let (src, _src_layout) = if layout.is_contiguous() && layout.start_offset() == 0 {
@@ -3459,20 +3566,28 @@ impl VulkanStorage {
             VulkanBinding::Storage(dst.buffer.as_ref()),
             VulkanBinding::Storage(ids_src.buffer.as_ref()),
         ];
-        let (rhs_suffix, rows_per_group, block_size) = if use_q8_1_rhs {
+        let dmmv_workgroup = vulkan_dmmv_workgroup(&self.device, qdtype, n, k, use_q8_1_rhs);
+        let (spirv_name, rows_per_group, block_size) = if use_q8_1_rhs {
             (
-                "q8_1_f32".to_string(),
+                vulkan_dmmv_shader_name(
+                    &self.device,
+                    format!("mul_mat_vec_id_{}_q8_1_f32", vulkan_quantized_stem(qdtype)?),
+                    dmmv_workgroup,
+                ),
                 vulkan_dmmv_rows_per_group(&self.device, qdtype, true)?,
-                32,
+                vulkan_dmmv_block_size(&self.device, dmmv_workgroup),
             )
         } else {
-            ("f32_f32".to_string(), 1, 32)
+            (
+                vulkan_dmmv_shader_name(
+                    &self.device,
+                    format!("mul_mat_vec_id_{}_f32", vulkan_quantized_stem(qdtype)?),
+                    dmmv_workgroup,
+                ),
+                vulkan_quantized_vec_rows(qdtype)?,
+                vulkan_dmmv_block_size(&self.device, dmmv_workgroup),
+            )
         };
-        let spirv_name = format!(
-            "mul_mat_vec_id_{}_{}",
-            vulkan_quantized_stem(qdtype)?,
-            rhs_suffix
-        );
         let spirv = candle_vulkan_kernels::spirv(&spirv_name).ok_or_else(|| {
             Error::Msg(format!("vulkan shader {spirv_name} not generated").into()).bt()
         })?;
@@ -4265,7 +4380,8 @@ impl BackendDevice for VulkanDevice {
             .or_else(|| physical_devices.first())
             .ok_or_else(|| Error::msg("no vulkan physical device found"))?;
         let mut subgroup_properties = vk::PhysicalDeviceSubgroupProperties::default();
-        let mut integer_dot_properties = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
+        let mut integer_dot_properties =
+            vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
         let mut physical_device_properties = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut subgroup_properties)
             .push_next(&mut integer_dot_properties);
@@ -4290,6 +4406,12 @@ impl BackendDevice for VulkanDevice {
             .max_compute_work_group_count[1]
             .max(1);
         let vendor_id = physical_device_properties.properties.vendor_id;
+        let subgroup_arithmetic = subgroup_properties
+            .supported_operations
+            .contains(vk::SubgroupFeatureFlags::ARITHMETIC)
+            && subgroup_properties
+                .supported_stages
+                .contains(vk::ShaderStageFlags::COMPUTE);
         let subgroup_size = subgroup_properties.subgroup_size.max(1);
         let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default();
         let mut integer_dot_features = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
@@ -4362,6 +4484,7 @@ impl BackendDevice for VulkanDevice {
                 physical_device,
                 vendor_id,
                 integer_dot_product,
+                subgroup_arithmetic,
                 subgroup_size,
                 max_workgroup_size_log2,
                 max_workgroup_count_x,
@@ -4482,6 +4605,7 @@ impl BackendDevice for VulkanDevice {
 #[cfg(all(test, feature = "vulkan"))]
 mod tests {
     use super::*;
+    use crate::Module;
 
     fn exact_q8_1_x4_bytes(xs: &[f32]) -> Vec<u8> {
         assert_eq!(xs.len() % 128, 0);
@@ -4540,6 +4664,245 @@ mod tests {
         let gpu = device.read_buffer(packed.as_ref())?;
         let cpu = exact_q8_1_x4_bytes(&xs);
         assert_eq!(gpu, cpu);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_q8_1_qmatmul_matches_cpu_reference() -> Result<()> {
+        let cpu = crate::Device::Cpu;
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let k = 256;
+        let lhs_vals = (0..k).map(|v| v as f32 / 32.0).collect::<Vec<_>>();
+        let rhs_vals = (0..(k * 4))
+            .map(|v| (v as f32 - 384.0) / 64.0)
+            .collect::<Vec<_>>();
+
+        let lhs_cpu = crate::Tensor::from_slice(&lhs_vals, (1, k), &cpu)?;
+        let rhs_cpu = crate::Tensor::from_slice(&rhs_vals, (k, 4), &cpu)?;
+        let lhs_vk = crate::Tensor::from_slice(&lhs_vals, (1, k), &vk)?;
+        let rhs_vk = crate::Tensor::from_slice(&rhs_vals, (k, 4), &vk)?;
+
+        let q_cpu = crate::quantized::QTensor::quantize(&rhs_cpu.t()?, GgmlDType::Q8_1)?;
+        let q_vk = crate::quantized::QTensor::quantize(&rhs_vk.t()?, GgmlDType::Q8_1)?;
+        let q_vk_direct = crate::quantized::QTensor::quantize(&rhs_vk.t()?, GgmlDType::Q8_1)?;
+
+        assert_eq!(q_cpu.data()?.as_ref(), q_vk.data()?.as_ref());
+        assert_eq!(q_vk.dequantize(&vk)?.shape().dims(), &[4, k]);
+
+        let expected_qmm = crate::quantized::QMatMul::from_qtensor(q_cpu)?;
+        let actual_qmm = crate::quantized::QMatMul::from_qtensor(q_vk)?;
+        assert!(matches!(
+            expected_qmm,
+            crate::quantized::QMatMul::QTensor(_)
+        ));
+        assert!(matches!(actual_qmm, crate::quantized::QMatMul::QTensor(_)));
+
+        let expected = expected_qmm.forward(&lhs_cpu)?.to_vec2::<f32>()?;
+        let lhs_vk_storage = lhs_vk.storage();
+        let direct = match &*lhs_vk_storage {
+            crate::Storage::Vulkan(storage) => {
+                let (out, shape) = <crate::quantized::QTensor as crate::CustomOp1>::vulkan_fwd(
+                    &q_vk_direct,
+                    storage,
+                    lhs_vk.layout(),
+                )?;
+                crate::tensor::from_storage(
+                    crate::Storage::Vulkan(out),
+                    shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                )
+            }
+            other => panic!("expected Vulkan storage, got {other:?}"),
+        };
+        drop(lhs_vk_storage);
+        let direct = direct.to_vec2::<f32>()?;
+        assert_eq!(direct.len(), expected.len());
+        for (row_idx, (direct_row, expected_row)) in direct.iter().zip(expected.iter()).enumerate()
+        {
+            for (col_idx, (actual, expected)) in
+                direct_row.iter().zip(expected_row.iter()).enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 1e-6,
+                    "direct q8_1 vulkan_fwd mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}"
+                );
+            }
+        }
+        let actual = actual_qmm.forward(&lhs_vk)?.to_vec2::<f32>()?;
+
+        assert_eq!(actual.len(), expected.len());
+        for (row_idx, (actual_row, expected_row)) in actual.iter().zip(expected.iter()).enumerate()
+        {
+            for (col_idx, (actual, expected)) in
+                actual_row.iter().zip(expected_row.iter()).enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 1e-6,
+                    "q8_1 qmatmul mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_q8_1_qmatmul_matches_cpu_reference_no_warmup() -> Result<()> {
+        let cpu = crate::Device::Cpu;
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let k = 256;
+        let lhs_vals = (0..k).map(|v| v as f32 / 32.0).collect::<Vec<_>>();
+        let rhs_vals = (0..(k * 4))
+            .map(|v| (v as f32 - 384.0) / 64.0)
+            .collect::<Vec<_>>();
+
+        let lhs_cpu = crate::Tensor::from_slice(&lhs_vals, (1, k), &cpu)?;
+        let rhs_cpu = crate::Tensor::from_slice(&rhs_vals, (k, 4), &cpu)?;
+        let lhs_vk = crate::Tensor::from_slice(&lhs_vals, (1, k), &vk)?;
+        let rhs_vk = crate::Tensor::from_slice(&rhs_vals, (k, 4), &vk)?;
+
+        let q_cpu = crate::quantized::QTensor::quantize(&rhs_cpu.t()?, GgmlDType::Q8_1)?;
+        let q_vk = crate::quantized::QTensor::quantize(&rhs_vk.t()?, GgmlDType::Q8_1)?;
+
+        let expected_qmm = crate::quantized::QMatMul::from_qtensor(q_cpu)?;
+        let actual_qmm = crate::quantized::QMatMul::from_qtensor(q_vk)?;
+        assert!(matches!(
+            expected_qmm,
+            crate::quantized::QMatMul::QTensor(_)
+        ));
+        assert!(matches!(actual_qmm, crate::quantized::QMatMul::QTensor(_)));
+
+        let expected = expected_qmm.forward(&lhs_cpu)?.to_vec2::<f32>()?;
+        let actual = actual_qmm.forward(&lhs_vk)?.to_vec2::<f32>()?;
+
+        assert_eq!(actual.len(), expected.len());
+        for (row_idx, (actual_row, expected_row)) in actual.iter().zip(expected.iter()).enumerate()
+        {
+            for (col_idx, (actual, expected)) in
+                actual_row.iter().zip(expected_row.iter()).enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 1e-6,
+                    "q8_1 qmatmul no-warmup mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_q8_0_indexed_moe_runtime_profile() -> Result<()> {
+        let cpu = crate::Device::Cpu;
+        let vk_dev = VulkanDevice::new(0)?;
+        let vk = crate::Device::Vulkan(vk_dev.clone());
+        let k = 256;
+        let batch = 2;
+        let topk = 2;
+
+        let moe_w_vals = (0..(2 * 3 * k))
+            .map(|v| (v as f32 - 3.0 * k as f32) / 128.0)
+            .collect::<Vec<_>>();
+        let moe_x_vals = (0..(batch * k))
+            .map(|v| (v as f32 - k as f32 / 2.0) / 16.0)
+            .collect::<Vec<_>>();
+
+        let moe_w_cpu = crate::Tensor::from_slice(&moe_w_vals, (2, 3, k), &cpu)?;
+        let moe_x_cpu = crate::Tensor::from_slice(&moe_x_vals, (batch, k), &cpu)?;
+        let moe_ids_cpu = crate::Tensor::from_slice(&[0u32, 1, 1, 0], (batch, topk), &cpu)?;
+        let q_moe_cpu = crate::quantized::QTensor::quantize(&moe_w_cpu, GgmlDType::Q8_0)?;
+
+        let plain_expected = q_moe_cpu.indexed_moe_forward(&moe_x_cpu, &moe_ids_cpu)?;
+        let x_q8_1 =
+            crate::quantized::QTensor::quantize(&moe_x_cpu, GgmlDType::Q8_1)?.dequantize(&cpu)?;
+        let q8_1_expected = {
+            let weights = q_moe_cpu.dequantize(&cpu)?;
+            let weight_vals = weights.to_vec3::<f32>()?;
+            let x_vals = x_q8_1.to_vec2::<f32>()?;
+            let id_vals = moe_ids_cpu.to_vec2::<u32>()?;
+            let mut out = vec![0f32; batch * topk * 3];
+            for batch_idx in 0..batch {
+                for topk_idx in 0..topk {
+                    let expert = id_vals[batch_idx][topk_idx] as usize;
+                    let out_base = (batch_idx * topk + topk_idx) * 3;
+                    for row in 0..3 {
+                        let mut acc = 0f32;
+                        for col in 0..k {
+                            acc += x_vals[batch_idx][col] * weight_vals[expert][row][col];
+                        }
+                        out[out_base + row] = acc;
+                    }
+                }
+            }
+            crate::Tensor::from_vec(out, (batch, topk, 3), &cpu)?
+        };
+
+        let moe_w_vk = crate::Tensor::from_slice(&moe_w_vals, (2, 3, k), &vk)?;
+        let moe_x_vk = crate::Tensor::from_slice(&moe_x_vals, (batch, k), &vk)?;
+        let moe_ids_vk = crate::Tensor::from_slice(&[0u32, 1, 1, 0], (batch, topk), &vk)?;
+        let q_moe_vk = crate::quantized::QTensor::quantize(&moe_w_vk, GgmlDType::Q8_0)?;
+        let actual = q_moe_vk.indexed_moe_forward(&moe_x_vk, &moe_ids_vk)?;
+
+        let use_q8_1_rhs = vk_dev.inner.integer_dot_product
+            && vulkan_supports_q8_1_rhs(GgmlDType::Q8_0)
+            && vulkan_should_use_mmvq(&vk_dev, GgmlDType::Q8_0, batch, k)
+            && (batch * k) % 4 == 0;
+
+        eprintln!(
+            "vendor_id={:#x} integer_dot={} use_q8_1_rhs={}",
+            vk_dev.inner.vendor_id, vk_dev.inner.integer_dot_product, use_q8_1_rhs
+        );
+
+        let actual = actual.to_vec3::<f32>()?;
+        let plain_expected = plain_expected.to_vec3::<f32>()?;
+        let q8_1_expected = q8_1_expected.to_vec3::<f32>()?;
+        eprintln!(
+            "actual[0][0][0]={:.6} plain[0][0][0]={:.6} q8_1[0][0][0]={:.6}",
+            actual[0][0][0], plain_expected[0][0][0], q8_1_expected[0][0][0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn q8_1_from_data_roundtrip_matches_cpu_quantized() -> Result<()> {
+        let cpu = crate::Device::Cpu;
+        let k = 256;
+        let lhs_vals = (0..k).map(|v| v as f32 / 32.0).collect::<Vec<_>>();
+        let rhs_vals = (0..(k * 4))
+            .map(|v| (v as f32 - 384.0) / 64.0)
+            .collect::<Vec<_>>();
+
+        let lhs = crate::Tensor::from_slice(&lhs_vals, (1, k), &cpu)?;
+        let rhs = crate::Tensor::from_slice(&rhs_vals, (k, 4), &cpu)?;
+        let q = crate::quantized::QTensor::quantize(&rhs.t()?, GgmlDType::Q8_1)?;
+        let bytes = q.data()?.into_owned();
+        let reparsed = GgmlDType::Q8_1.from_data(std::borrow::Cow::Owned(bytes));
+
+        let expected = crate::quantized::QMatMul::from_qtensor(q)?.forward(&lhs)?;
+        let lhs = lhs.to_vec2::<f32>()?;
+        let lhs_row = &lhs[0];
+        let mut dst = vec![0f32; 4];
+        reparsed.matmul_t((1, k, 4), lhs_row, &mut dst)?;
+        let actual = crate::Tensor::from_vec(dst, (1, 4), &cpu)?;
+
+        for (row_idx, (actual_row, expected_row)) in actual
+            .to_vec2::<f32>()?
+            .iter()
+            .zip(expected.to_vec2::<f32>()?.iter())
+            .enumerate()
+        {
+            for (col_idx, (actual, expected)) in
+                actual_row.iter().zip(expected_row.iter()).enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 1e-6,
+                    "q8_1 from_data mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}"
+                );
+            }
+        }
         Ok(())
     }
 }

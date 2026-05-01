@@ -472,10 +472,7 @@ pub fn quantized_matvec_shader(dtype: QuantizedDType, rhs_dtype: DType) -> Optio
         DType::F16 => "f16",
     };
     let replacements = vec![
-        (
-            "WG_SIZE".to_string(),
-            QUANT_MUL_MAT_VEC_WG_SIZE.to_string(),
-        ),
+        ("WG_SIZE".to_string(), QUANT_MUL_MAT_VEC_WG_SIZE.to_string()),
         ("OUTPUTS_PER_WG".to_string(), outputs_per_wg.to_string()),
         ("SRC0_TYPE".to_string(), "u32".to_string()),
         ("SRC1_TYPE".to_string(), src1_type.to_string()),
@@ -517,14 +514,8 @@ pub fn quantized_matmul_fast_shader(dtype: QuantizedDType, rhs_dtype: DType) -> 
         ("DST_TYPE".to_string(), "f32".to_string()),
         ("SRC0_INNER_TYPE".to_string(), "u32".to_string()),
         ("SRC1_INNER_TYPE".to_string(), src1_type.to_string()),
-        (
-            "TILE_M".to_string(),
-            format!("{QUANT_MUL_MAT_TILE_M}u"),
-        ),
-        (
-            "TILE_N".to_string(),
-            format!("{QUANT_MUL_MAT_TILE_N}u"),
-        ),
+        ("TILE_M".to_string(), format!("{QUANT_MUL_MAT_TILE_M}u")),
+        ("TILE_N".to_string(), format!("{QUANT_MUL_MAT_TILE_N}u")),
         (
             "WORKGROUP_SIZE_M".to_string(),
             format!("{QUANT_MUL_MAT_WG_SIZE_M}u"),

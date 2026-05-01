@@ -37,6 +37,8 @@ fn collect(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) -> std::io:
 fn main() -> std::io::Result<()> {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=src/shaders");
+    println!("cargo::rerun-if-env-changed=GLSLC");
+    println!("cargo::rerun-if-env-changed=CXX");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let shaders_dir = manifest_dir.join("src/shaders");
@@ -63,12 +65,21 @@ fn main() -> std::io::Result<()> {
 
 fn generate_spirv_with_ggml_generator(shaders_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
     let glslc = env::var("GLSLC").unwrap_or_else(|_| "glslc".to_string());
+    let integer_dot_support = glslc_supports_feature(
+        &glslc,
+        &shaders_dir.join("feature-tests").join("integer_dot.comp"),
+        &out_dir.join("feature-test-integer-dot.spv"),
+    );
     let generator = out_dir.join(if cfg!(windows) {
         "vulkan-shaders-gen.exe"
     } else {
         "vulkan-shaders-gen"
     });
-    compile_generator(&shaders_dir.join("vulkan-shaders-gen.cpp"), &generator)?;
+    compile_generator(
+        &shaders_dir.join("vulkan-shaders-gen.cpp"),
+        &generator,
+        integer_dot_support,
+    )?;
 
     let spv_dir = out_dir.join("spv");
     fs::create_dir_all(&spv_dir)?;
@@ -124,7 +135,23 @@ fn generate_spirv_with_ggml_generator(shaders_dir: &Path, out_dir: &Path) -> std
     Ok(())
 }
 
-fn compile_generator(source: &Path, output: &Path) -> std::io::Result<()> {
+fn glslc_supports_feature(glslc: &str, source: &Path, output: &Path) -> bool {
+    match Command::new(glslc)
+        .arg(source)
+        .arg("-o")
+        .arg(output)
+        .output()
+    {
+        Ok(result) if result.status.success() => true,
+        _ => false,
+    }
+}
+
+fn compile_generator(
+    source: &Path,
+    output: &Path,
+    integer_dot_support: bool,
+) -> std::io::Result<()> {
     let mut compilers = Vec::new();
     if let Ok(cxx) = env::var("CXX") {
         compilers.push(cxx);
@@ -143,6 +170,9 @@ fn compile_generator(source: &Path, output: &Path) -> std::io::Result<()> {
     for compiler in compilers {
         let mut cmd = Command::new(&compiler);
         cmd.arg("-std=c++17").arg(source).arg("-o").arg(output);
+        if integer_dot_support {
+            cmd.arg("-DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT");
+        }
         match cmd.output() {
             Ok(output_result) if output_result.status.success() => return Ok(()),
             Ok(output_result) => errors.push(format!(

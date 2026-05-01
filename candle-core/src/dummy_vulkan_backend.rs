@@ -5,6 +5,12 @@ use crate::{CpuStorage, DType, Error, Layout, Result, Shape};
 #[derive(Debug, Clone)]
 pub struct VulkanDevice;
 
+impl VulkanDevice {
+    pub fn vendor_id(&self) -> u32 {
+        0
+    }
+}
+
 #[derive(Debug)]
 pub struct VulkanStorage;
 

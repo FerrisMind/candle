@@ -2774,6 +2774,30 @@ impl WgpuStorage {
         if last_k != k {
             crate::bail!("input tensor {layout:?} incompatible with quantized weights {qshape:?}")
         }
+        let mut dst_dims = layout.dims().to_vec();
+        dst_dims.pop();
+        dst_dims.push(n);
+        let dst_shape = Shape::from(dst_dims);
+        if rank > 2 {
+            let mut src_contiguous = None;
+            let (src, _src_layout) = if layout.is_contiguous() && layout.start_offset() == 0 {
+                (storage, layout.clone())
+            } else {
+                let mut tmp =
+                    unsafe { storage.device.alloc_uninit(layout.shape(), storage.dtype)? };
+                storage.copy_strided_src(&mut tmp, 0, layout)?;
+                src_contiguous = Some(tmp);
+                (
+                    src_contiguous.as_ref().unwrap(),
+                    Layout::contiguous(layout.shape().clone()),
+                )
+            };
+            let flat_m = layout.shape().elem_count() / k;
+            let flat_layout = Layout::contiguous(Shape::from((flat_m, k)));
+            let (dst, _) = self.quantized_matmul(qdtype, qshape, src, &flat_layout)?;
+            drop(src_contiguous);
+            return Ok((dst, dst_shape));
+        }
         if input_m == 1 {
             return self.quantized_matvec(qdtype, qshape, storage, layout);
         }
@@ -2814,10 +2838,6 @@ impl WgpuStorage {
             batch_inner * input_m * k
         };
 
-        let mut dst_dims = src_layout.dims().to_vec();
-        dst_dims.pop();
-        dst_dims.push(n);
-        let dst_shape = Shape::from(dst_dims);
         let dst = unsafe { storage.device.alloc_uninit(&dst_shape, DType::F32)? };
         let params = MulMatParams {
             offset_src0: 0,
@@ -2868,15 +2888,20 @@ impl WgpuStorage {
             wgpu_quantized_dtype(qdtype)?,
             wgpu_kernel_dtype(src.dtype)?,
         )
-        .ok_or_else(|| Error::Msg("wgpu quantized mul_mat_reg_tile shader not embedded".into()).bt())?;
-        let (_, _, wg_size_m, wg_size_n, _) = candle_wgpu_kernels::quantized_matmul_fast_tile_shape();
+        .ok_or_else(|| {
+            Error::Msg("wgpu quantized mul_mat_reg_tile shader not embedded".into()).bt()
+        })?;
+        let (_, _, wg_size_m, wg_size_n, _) =
+            candle_wgpu_kernels::quantized_matmul_fast_tile_shape();
         let tile_m_s = 4usize * wg_size_m as usize;
         let tile_n_s = 4usize * wg_size_n as usize;
         let total_wg = input_m
             .div_ceil(tile_n_s)
             .checked_mul(n.div_ceil(tile_m_s))
             .and_then(|v| v.checked_mul(batch_count))
-            .ok_or_else(|| Error::Msg("wgpu backend op quantized matmul workgroup overflow".into()).bt())?;
+            .ok_or_else(|| {
+                Error::Msg("wgpu backend op quantized matmul workgroup overflow".into()).bt()
+            })?;
         let total_wg: u32 = total_wg.try_into()?;
         let (wg_x, wg_y) = compute_2d_workgroups(
             total_wg,
@@ -3013,17 +3038,18 @@ impl WgpuStorage {
             buffer_binding(3, &param_buffer),
         ];
         let qdtype = wgpu_quantized_dtype(qdtype)?;
-        let shader = candle_wgpu_kernels::quantized_matvec_shader(
-            qdtype,
-            wgpu_kernel_dtype(src.dtype)?,
-        )
-        .ok_or_else(|| Error::Msg("wgpu quantized mul_mat_vec shader not embedded".into()).bt())?;
-        let outputs_per_wg =
-            candle_wgpu_kernels::quantized_matvec_outputs_per_wg(qdtype) as usize;
+        let shader =
+            candle_wgpu_kernels::quantized_matvec_shader(qdtype, wgpu_kernel_dtype(src.dtype)?)
+                .ok_or_else(|| {
+                    Error::Msg("wgpu quantized mul_mat_vec shader not embedded".into()).bt()
+                })?;
+        let outputs_per_wg = candle_wgpu_kernels::quantized_matvec_outputs_per_wg(qdtype) as usize;
         let total_wg = n
             .div_ceil(outputs_per_wg)
             .checked_mul(batch_count)
-            .ok_or_else(|| Error::Msg("wgpu backend op quantized matvec workgroup overflow".into()).bt())?;
+            .ok_or_else(|| {
+                Error::Msg("wgpu backend op quantized matvec workgroup overflow".into()).bt()
+            })?;
         let total_wg: u32 = total_wg.try_into()?;
         let (wg_x, wg_y) = compute_2d_workgroups(
             total_wg,
