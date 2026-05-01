@@ -8,10 +8,17 @@ use crate::{
 use crate::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
 
 fn is_backend_not_implemented_msg(msg: &str, backend: &str) -> bool {
+    let backend_rank_limit = msg.contains(backend) && msg.contains("supports up to rank-4 tensors");
+    let backend_overflow = msg.contains(backend)
+        && (msg.contains("dimension overflow")
+            || msg.contains("tmp overflow")
+            || msg.contains("workgroup overflow"));
     (msg.contains(backend) && msg.contains("backend op") && msg.contains("not implemented"))
         || msg.contains(&format!("no {backend} implementation for"))
         || (msg.contains(backend) && msg.contains("shader") && msg.contains("not generated"))
         || (msg.contains("backend op") && msg.contains("not implemented"))
+        || backend_rank_limit
+        || backend_overflow
 }
 
 fn is_backend_not_implemented(err: &Error, backend: &str) -> bool {
