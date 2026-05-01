@@ -34,6 +34,9 @@ struct VulkanArgsortParams {
     inner_end: u32,
 }
 
+const VULKAN_ARGSORT_NUM_PIPELINES: u32 = 11;
+const VULKAN_ARGSORT_WG_UNROLL_FACTOR: u32 = 2;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GgmlBinaryParams {
@@ -259,7 +262,10 @@ struct VulkanInner {
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
     subgroup_size: u32,
+    max_workgroup_size_log2: u32,
+    max_workgroup_count_y: u32,
     robust_buffer_access: bool,
+    vulkan_memory_model: bool,
     device: ash::Device,
     queue_family_index: u32,
     queue: vk::Queue,
@@ -272,7 +278,10 @@ impl std::fmt::Debug for VulkanInner {
             .field("ordinal", &self.ordinal)
             .field("physical_device", &self.physical_device)
             .field("subgroup_size", &self.subgroup_size)
+            .field("max_workgroup_size_log2", &self.max_workgroup_size_log2)
+            .field("max_workgroup_count_y", &self.max_workgroup_count_y)
             .field("robust_buffer_access", &self.robust_buffer_access)
+            .field("vulkan_memory_model", &self.vulkan_memory_model)
             .field("queue_family_index", &self.queue_family_index)
             .finish_non_exhaustive()
     }
@@ -296,6 +305,17 @@ pub struct VulkanStorage {
 
 fn unsupported(op: &'static str) -> Error {
     Error::Msg(format!("vulkan backend op {op} not implemented").into()).bt()
+}
+
+fn should_cpu_fallback(err: &Error) -> bool {
+    match err {
+        Error::UnsupportedDTypeForOp(..) => true,
+        Error::Msg(msg) => msg.contains("vulkan backend op") && msg.contains("not implemented"),
+        Error::Context { inner, .. }
+        | Error::WithPath { inner, .. }
+        | Error::WithBacktrace { inner, .. } => should_cpu_fallback(inner),
+        _ => false,
+    }
 }
 
 pub fn shader_source(name: &str) -> Option<&'static str> {
@@ -829,6 +849,10 @@ fn next_power_of_two_u32(value: usize, op: &'static str) -> Result<u32> {
         })?
         .try_into()
         .map_err(Error::wrap)
+}
+
+fn floor_log2_u32(value: u32) -> u32 {
+    u32::BITS - 1 - value.leading_zeros()
 }
 
 fn nearest_interp_weights(in_size: usize, out_size: usize) -> Vec<f32> {
@@ -1426,9 +1450,6 @@ impl VulkanStorage {
             return Err(unsupported("argsort last-dim"));
         }
         let ncols_padded = next_power_of_two_u32(last_dim, "argsort")?;
-        if ncols_padded > 1024 {
-            return Err(unsupported("argsort last-dim > 1024"));
-        }
         if ncols_padded != last_dim as u32 && !self.device.inner.robust_buffer_access {
             return Err(unsupported(
                 "argsort non-power-of-two without robust buffers",
@@ -1436,34 +1457,140 @@ impl VulkanStorage {
         }
         let count = layout.shape().elem_count();
         let nrows = count / last_dim;
+        let nrows_u32: u32 = nrows.try_into()?;
+        if nrows_u32 == 0 {
+            return Err(unsupported("argsort empty rows"));
+        }
+        let workgroups_y = nrows_u32
+            .min(self.device.inner.max_workgroup_count_y)
+            .max(1);
         let dst = unsafe { self.device.alloc_uninit(layout.shape(), DType::U32)? };
         let ncols_padded_log2 = ncols_padded.trailing_zeros();
-        let params = VulkanArgsortParams {
+        let pipeline_idx = ncols_padded_log2.min(VULKAN_ARGSORT_NUM_PIPELINES - 1);
+        let use_small = ncols_padded_log2 <= self.device.inner.max_workgroup_size_log2;
+        if !use_small && !self.device.inner.vulkan_memory_model {
+            return Err(unsupported("argsort large requires vulkan memory model"));
+        }
+        let base_params = VulkanArgsortParams {
             ncols: last_dim.try_into()?,
             ncols_padded,
             ncols_padded_log2,
-            nrows: nrows.try_into()?,
+            nrows: nrows_u32,
             order: if asc { 0 } else { 1 },
             outer_start: 0,
             outer_end: 0,
             inner_start: 0,
             inner_end: 0,
         };
+
+        if use_small {
+            let bindings = [
+                VulkanBinding::Storage(self.buffer.as_ref()),
+                VulkanBinding::Storage(dst.buffer.as_ref()),
+                VulkanBinding::Storage(dst.buffer.as_ref()),
+            ];
+            let spirv = candle_vulkan_kernels::spirv("argsort_f32")
+                .ok_or_else(|| Error::Msg("vulkan shader argsort_f32 not generated".into()).bt())?;
+            self.device.run_compute_specialized(
+                spirv,
+                &bindings,
+                Some(any_as_bytes(&base_params)),
+                (1, workgroups_y, 1),
+                Some(&[(0, ncols_padded), (1, ncols_padded_log2)]),
+            )?;
+            return Ok(dst);
+        }
+
+        let tmp_count = (ncols_padded as usize)
+            .checked_mul(nrows)
+            .and_then(|v| v.checked_mul(2))
+            .ok_or_else(|| Error::Msg("vulkan backend op argsort tmp overflow".into()).bt())?;
+        let tmp_size = byte_len(DType::I32, tmp_count, "vulkan argsort tmp")?;
+        let tmp = self
+            .device
+            .create_buffer(tmp_size, "candle-vulkan-argsort-large-tmp")?;
+        self.run_argsort_large_pass(
+            self.buffer.as_ref(),
+            tmp.as_ref(),
+            dst.buffer.as_ref(),
+            base_params,
+            workgroups_y,
+            pipeline_idx,
+            0,
+            ncols_padded_log2.min(self.device.inner.max_workgroup_size_log2),
+            0,
+            100,
+        )?;
+        for outer in self.device.inner.max_workgroup_size_log2..ncols_padded_log2 {
+            let mut inner = 0;
+            while inner <= outer {
+                let inner_start = inner;
+                let (pass_idx, inner_end) = if outer - inner_start < pipeline_idx {
+                    inner = outer + 1;
+                    (pipeline_idx, 100)
+                } else {
+                    inner += 1;
+                    (pipeline_idx.saturating_sub(2), inner_start + 1)
+                };
+                self.run_argsort_large_pass(
+                    self.buffer.as_ref(),
+                    tmp.as_ref(),
+                    dst.buffer.as_ref(),
+                    base_params,
+                    workgroups_y,
+                    pass_idx,
+                    outer,
+                    outer + 1,
+                    inner_start,
+                    inner_end,
+                )?;
+            }
+        }
+        Ok(dst)
+    }
+
+    fn run_argsort_large_pass(
+        &self,
+        src: &VulkanBuffer,
+        tmp: &VulkanBuffer,
+        dst: &VulkanBuffer,
+        base_params: VulkanArgsortParams,
+        workgroups_y: u32,
+        pass_idx: u32,
+        outer_start: u32,
+        outer_end: u32,
+        inner_start: u32,
+        inner_end: u32,
+    ) -> Result<()> {
+        let block_size = 1u32 << pass_idx.min(self.device.inner.max_workgroup_size_log2);
+        let elems_per_wg = block_size
+            .checked_mul(VULKAN_ARGSORT_WG_UNROLL_FACTOR)
+            .ok_or_else(|| {
+                Error::Msg("vulkan backend op argsort workgroup overflow".into()).bt()
+            })?;
+        let workgroups_x = base_params.ncols_padded.div_ceil(elems_per_wg).max(1);
+        let params = VulkanArgsortParams {
+            outer_start,
+            outer_end,
+            inner_start,
+            inner_end,
+            ..base_params
+        };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(src),
+            VulkanBinding::Storage(tmp),
+            VulkanBinding::Storage(dst),
         ];
-        let spirv = candle_vulkan_kernels::spirv("argsort_f32")
-            .ok_or_else(|| Error::Msg("vulkan shader argsort_f32 not generated".into()).bt())?;
+        let spirv = candle_vulkan_kernels::spirv("argsort_large_f32").ok_or_else(|| {
+            Error::Msg("vulkan shader argsort_large_f32 not generated".into()).bt()
+        })?;
         self.device.run_compute_specialized(
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
-            (1, nrows.try_into()?, 1),
-            Some(&[(0, ncols_padded), (1, ncols_padded_log2)]),
-        )?;
-        Ok(dst)
+            (workgroups_x, workgroups_y, 1),
+            Some(&[(0, block_size), (1, VULKAN_ARGSORT_WG_UNROLL_FACTOR)]),
+        )
     }
 
     fn run_cumsum_last_dim(&self, layout: &Layout) -> Result<Self> {
@@ -2619,7 +2746,9 @@ impl BackendStorage for VulkanStorage {
             || layout.start_offset() != 0
             || layout.shape().elem_count() != self.count
         {
-            return Err(unsupported("try_clone_strided"));
+            let cpu = self.to_cpu_storage()?;
+            let out_cpu = <CpuStorage as BackendStorage>::try_clone(&cpu, layout)?;
+            return self.device.storage_from_cpu_storage(&out_cpu);
         }
         let bytes = self.device.read_buffer(&self.buffer)?;
         let buffer = self
@@ -2649,30 +2778,61 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
-        if self.dtype != DType::F32 {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan affine").bt());
+        let gpu = || -> Result<Self> {
+            if self.dtype != DType::F32 {
+                return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan affine").bt());
+            }
+            if !layout.is_contiguous() || layout.start_offset() != 0 {
+                return Err(unsupported("affine strided"));
+            }
+            let spirv = candle_vulkan_kernels::spirv("scale_f32")
+                .ok_or_else(|| Error::Msg("vulkan shader scale_f32 not generated".into()).bt())?;
+            self.run_unary_generic_with_params(layout, spirv, mul as f32, add as f32)
+        };
+        match gpu() {
+            Ok(out) => Ok(out),
+            Err(err)
+                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
+            {
+                let src_cpu = self.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::affine(&src_cpu, layout, mul, add)?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
         }
-        if !layout.is_contiguous() || layout.start_offset() != 0 {
-            return Err(unsupported("affine strided"));
-        }
-        let spirv = candle_vulkan_kernels::spirv("scale_f32")
-            .ok_or_else(|| Error::Msg("vulkan shader scale_f32 not generated".into()).bt())?;
-        self.run_unary_generic_with_params(layout, spirv, mul as f32, add as f32)
     }
     fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
-        if self.dtype != DType::F32 {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan powf").bt());
+        let gpu = || -> Result<Self> {
+            if self.dtype != DType::F32 {
+                return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan powf").bt());
+            }
+            let spirv = candle_vulkan_kernels::spirv("powf_f32")
+                .ok_or_else(|| Error::Msg("vulkan shader powf_f32 not generated".into()).bt())?;
+            self.run_unary_generic_with_params(layout, spirv, e as f32, 0.0)
+        };
+        match gpu() {
+            Ok(out) => Ok(out),
+            Err(err)
+                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
+            {
+                let src_cpu = self.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::powf(&src_cpu, layout, e)?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
         }
-        let spirv = candle_vulkan_kernels::spirv("powf_f32")
-            .ok_or_else(|| Error::Msg("vulkan shader powf_f32 not generated".into()).bt())?;
-        self.run_unary_generic_with_params(layout, spirv, e as f32, 0.0)
     }
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
+        let cpu_fallback = || -> Result<Self> {
+            let src_cpu = self.to_cpu_storage()?;
+            let out_cpu = <CpuStorage as BackendStorage>::elu(&src_cpu, layout, alpha)?;
+            self.device.storage_from_cpu_storage(&out_cpu)
+        };
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan elu").bt());
+            return cpu_fallback();
         }
         if alpha != 1.0 {
-            return Err(unsupported("elu alpha"));
+            return cpu_fallback();
         }
         let suffix = match self.dtype {
             DType::F32 => "f32",
@@ -2682,63 +2842,130 @@ impl BackendStorage for VulkanStorage {
         let name = format!("elu_{suffix}");
         let spirv = candle_vulkan_kernels::spirv(&name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated").into()).bt())?;
-        self.run_unary_head(layout, spirv)
+        match self.run_unary_head(layout, spirv) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+            Err(err) => Err(err),
+        }
     }
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
+        let cpu_fallback = || -> Result<Self> {
+            let src_cpu = self.to_cpu_storage()?;
+            let out_cpu =
+                <CpuStorage as BackendStorage>::reduce_op(&src_cpu, op, layout, reduce_dims)?;
+            self.device.storage_from_cpu_storage(&out_cpu)
+        };
         if self.dtype != DType::F32 {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan reduce").bt());
+            return cpu_fallback();
         }
         let rank = layout.dims().len();
         if rank == 0 {
-            return Err(unsupported("reduce scalar"));
+            return cpu_fallback();
         }
         if reduce_dims.len() > 1 {
-            return self.run_reduce_multi_dim(op, layout, reduce_dims);
+            return match self.run_reduce_multi_dim(op, layout, reduce_dims) {
+                Ok(out) => Ok(out),
+                Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+                Err(err) => Err(err),
+            };
         }
         if reduce_dims.is_empty() {
-            return Err(unsupported("reduce empty dims"));
+            return cpu_fallback();
         }
         let dim = reduce_dims[0];
         if dim >= rank {
-            return Err(unsupported("reduce dim"));
+            return cpu_fallback();
         }
         if dim != rank - 1 {
-            return self.run_reduce_non_last_dim(op, layout, dim);
+            return match self.run_reduce_non_last_dim(op, layout, dim) {
+                Ok(out) => Ok(out),
+                Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+                Err(err) => Err(err),
+            };
         }
         match op {
             ReduceOp::ArgMax | ReduceOp::ArgMin | ReduceOp::Max | ReduceOp::Min => {
-                return self.run_reduce_extrema_last_dim(layout, op);
+                return match self.run_reduce_extrema_last_dim(layout, op) {
+                    Ok(out) => Ok(out),
+                    Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+                    Err(err) => Err(err),
+                };
             }
             ReduceOp::Sum => {}
         }
-        self.run_sum_rows(layout)
+        match self.run_sum_rows(layout) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+            Err(err) => Err(err),
+        }
     }
     fn cumsum_last_dim(&self, layout: &Layout) -> Result<Self> {
-        self.run_cumsum_last_dim(layout)
+        match self.run_cumsum_last_dim(layout) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => {
+                let src_cpu = self.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::cumsum_last_dim(&src_cpu, layout)?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
     fn clamp(&self, layout: &Layout, min: f32, max: f32) -> Result<Self> {
-        if self.dtype != DType::F32 {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan clamp").bt());
+        let gpu = || -> Result<Self> {
+            if self.dtype != DType::F32 {
+                return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan clamp").bt());
+            }
+            let spirv = candle_vulkan_kernels::spirv("clamp_f32")
+                .ok_or_else(|| Error::Msg("vulkan shader clamp_f32 not generated".into()).bt())?;
+            self.run_unary_generic_with_params(layout, spirv, min, max)
+        };
+        match gpu() {
+            Ok(out) => Ok(out),
+            Err(err)
+                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
+            {
+                let src_cpu = self.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::clamp(&src_cpu, layout, min, max)?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
         }
-        let spirv = candle_vulkan_kernels::spirv("clamp_f32")
-            .ok_or_else(|| Error::Msg("vulkan shader clamp_f32 not generated".into()).bt())?;
-        self.run_unary_generic_with_params(layout, spirv, min, max)
     }
-    fn cmp(&self, _: CmpOp, _: &Self, _: &Layout, _: &Layout) -> Result<Self> {
-        Err(unsupported("cmp"))
+    fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        let lhs_cpu = self.to_cpu_storage()?;
+        let rhs_cpu = rhs.to_cpu_storage()?;
+        let out_cpu = <CpuStorage as BackendStorage>::cmp(&lhs_cpu, op, &rhs_cpu, lhs_l, rhs_l)?;
+        self.device.storage_from_cpu_storage(&out_cpu)
     }
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
         let spirv = copy_spirv(self.dtype, dtype)?;
-        self.run_unary_generic_with_params_dtype(layout, spirv, 0.0, 0.0, dtype)
+        match self.run_unary_generic_with_params_dtype(layout, spirv, 0.0, 0.0, dtype) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => {
+                let src_cpu = self.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::to_dtype(&src_cpu, layout, dtype)?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+        let cpu_fallback = || -> Result<Self> {
+            let src_cpu = self.to_cpu_storage()?;
+            let out_cpu = <CpuStorage as BackendStorage>::unary_impl::<B>(&src_cpu, layout)?;
+            self.device.storage_from_cpu_storage(&out_cpu)
+        };
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan unary").bt());
+            return cpu_fallback();
         }
         let (spirv, kind) = unary_spirv(B::NAME, self.dtype)?;
-        match kind {
+        match match kind {
             VulkanUnaryKind::Head => self.run_unary_head(layout, spirv),
             VulkanUnaryKind::Generic => self.run_unary_generic(layout, spirv),
+        } {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+            Err(err) => Err(err),
         }
     }
     fn binary_impl<B: BinaryOpT>(
@@ -2747,15 +2974,40 @@ impl BackendStorage for VulkanStorage {
         lhs_layout: &Layout,
         rhs_layout: &Layout,
     ) -> Result<Self> {
-        match B::NAME {
+        let cpu_fallback = || -> Result<Self> {
+            let lhs_cpu = self.to_cpu_storage()?;
+            let rhs_cpu = rhs.to_cpu_storage()?;
+            let out_cpu = <CpuStorage as BackendStorage>::binary_impl::<B>(
+                &lhs_cpu, &rhs_cpu, lhs_layout, rhs_layout,
+            )?;
+            self.device.storage_from_cpu_storage(&out_cpu)
+        };
+        match match B::NAME {
             "maximum" | "minimum" => {
                 self.run_binary_min_max_f32(rhs, lhs_layout, rhs_layout, B::NAME)
             }
             _ => self.run_binary_named(rhs, lhs_layout, rhs_layout, B::NAME),
+        } {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+            Err(err) => Err(err),
         }
     }
-    fn where_cond(&self, _: &Layout, _: &Self, _: &Layout, _: &Self, _: &Layout) -> Result<Self> {
-        Err(unsupported("where"))
+    fn where_cond(
+        &self,
+        layout: &Layout,
+        t: &Self,
+        t_l: &Layout,
+        f: &Self,
+        f_l: &Layout,
+    ) -> Result<Self> {
+        let cond_cpu = self.to_cpu_storage()?;
+        let t_cpu = t.to_cpu_storage()?;
+        let f_cpu = f.to_cpu_storage()?;
+        let out_cpu = <CpuStorage as BackendStorage>::where_cond(
+            &cond_cpu, layout, &t_cpu, t_l, &f_cpu, f_l,
+        )?;
+        self.device.storage_from_cpu_storage(&out_cpu)
     }
     fn conv1d(
         &self,
@@ -2764,7 +3016,22 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
-        self.run_conv1d_f32(layout, kernel, kernel_l, params)
+        match self.run_conv1d_f32(layout, kernel, kernel_l, params) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => {
+                let src_cpu = self.to_cpu_storage()?;
+                let kernel_cpu = kernel.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::conv1d(
+                    &src_cpu,
+                    layout,
+                    &kernel_cpu,
+                    kernel_l,
+                    params,
+                )?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
     fn conv_transpose1d(
         &self,
@@ -2782,7 +3049,22 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        self.run_conv2d_f32(layout, kernel, kernel_l, params)
+        match self.run_conv2d_f32(layout, kernel, kernel_l, params) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => {
+                let src_cpu = self.to_cpu_storage()?;
+                let kernel_cpu = kernel.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::conv2d(
+                    &src_cpu,
+                    layout,
+                    &kernel_cpu,
+                    kernel_l,
+                    params,
+                )?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
     fn conv_transpose2d(
         &self,
@@ -2799,7 +3081,20 @@ impl BackendStorage for VulkanStorage {
         kernel_size: (usize, usize),
         stride: (usize, usize),
     ) -> Result<Self> {
-        self.run_pool2d_f32(layout, kernel_size, stride, false)
+        match self.run_pool2d_f32(layout, kernel_size, stride, false) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => {
+                let src_cpu = self.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::avg_pool2d(
+                    &src_cpu,
+                    layout,
+                    kernel_size,
+                    stride,
+                )?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
     fn max_pool2d(
         &self,
@@ -2807,20 +3102,52 @@ impl BackendStorage for VulkanStorage {
         kernel_size: (usize, usize),
         stride: (usize, usize),
     ) -> Result<Self> {
-        self.run_pool2d_f32(layout, kernel_size, stride, true)
+        match self.run_pool2d_f32(layout, kernel_size, stride, true) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => {
+                let src_cpu = self.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::max_pool2d(
+                    &src_cpu,
+                    layout,
+                    kernel_size,
+                    stride,
+                )?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
     fn upsample_nearest1d(&self, layout: &Layout, out_l: usize) -> Result<Self> {
-        self.run_upsample_nearest1d_f32(layout, out_l)
+        match self.run_upsample_nearest1d_f32(layout, out_l) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => {
+                let src_cpu = self.to_cpu_storage()?;
+                let out_cpu =
+                    <CpuStorage as BackendStorage>::upsample_nearest1d(&src_cpu, layout, out_l)?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
     fn upsample_nearest2d(&self, layout: &Layout, out_h: usize, out_w: usize) -> Result<Self> {
         let (_, _, h, w) = layout.shape().dims4()?;
-        self.run_upsample2d_f32(
+        match self.run_upsample2d_f32(
             layout,
             out_h,
             out_w,
             nearest_interp_weights(h, out_h),
             nearest_interp_weights(w, out_w),
-        )
+        ) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => {
+                let src_cpu = self.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::upsample_nearest2d(
+                    &src_cpu, layout, out_h, out_w,
+                )?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
     fn upsample_bilinear2d(
         &self,
@@ -2832,19 +3159,43 @@ impl BackendStorage for VulkanStorage {
         scale_w: Option<f64>,
     ) -> Result<Self> {
         let (_, _, h, w) = layout.shape().dims4()?;
-        self.run_upsample2d_f32(
+        match self.run_upsample2d_f32(
             layout,
             out_h,
             out_w,
             bilinear_interp_weights(h, out_h, align_corners, scale_h),
             bilinear_interp_weights(w, out_w, align_corners, scale_w),
-        )
+        ) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => {
+                let src_cpu = self.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::upsample_bilinear2d(
+                    &src_cpu,
+                    layout,
+                    out_h,
+                    out_w,
+                    align_corners,
+                    scale_h,
+                    scale_w,
+                )?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
     fn gather(&self, src_l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
-        if dim + 1 != src_l.dims().len() {
-            return Err(unsupported("gather non-last-dim"));
+        if dim + 1 == src_l.dims().len() {
+            match self.run_gather_last_dim_f32(ids, src_l, ids_l) {
+                Ok(out) => return Ok(out),
+                Err(err) if should_cpu_fallback(&err) => {}
+                Err(err) => return Err(err),
+            }
         }
-        self.run_gather_last_dim_f32(ids, src_l, ids_l)
+        let src_cpu = self.to_cpu_storage()?;
+        let ids_cpu = ids.to_cpu_storage()?;
+        let out_cpu =
+            <CpuStorage as BackendStorage>::gather(&src_cpu, src_l, &ids_cpu, ids_l, dim)?;
+        self.device.storage_from_cpu_storage(&out_cpu)
     }
     fn scatter_set(
         &mut self,
@@ -2855,35 +3206,82 @@ impl BackendStorage for VulkanStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<()> {
-        if dim + 1 != dst_l.dims().len() {
-            return Err(unsupported("scatter_set non-last-dim"));
+        if dim + 1 == dst_l.dims().len() {
+            match self.run_scatter_set_last_dim_f32(dst_l, ids, ids_l, src, src_l) {
+                Ok(()) => return Ok(()),
+                Err(err) if should_cpu_fallback(&err) => {}
+                Err(err) => return Err(err),
+            }
         }
-        self.run_scatter_set_last_dim_f32(dst_l, ids, ids_l, src, src_l)
+        let mut dst_cpu = self.to_cpu_storage()?;
+        let ids_cpu = ids.to_cpu_storage()?;
+        let src_cpu = src.to_cpu_storage()?;
+        <CpuStorage as BackendStorage>::scatter_set(
+            &mut dst_cpu,
+            dst_l,
+            &ids_cpu,
+            ids_l,
+            &src_cpu,
+            src_l,
+            dim,
+        )?;
+        *self = self.device.storage_from_cpu_storage(&dst_cpu)?;
+        Ok(())
     }
     fn scatter_add_set(
         &mut self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: usize,
+        dst_l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
     ) -> Result<()> {
-        Err(unsupported("scatter_add"))
+        let mut dst_cpu = self.to_cpu_storage()?;
+        let ids_cpu = ids.to_cpu_storage()?;
+        let src_cpu = src.to_cpu_storage()?;
+        <CpuStorage as BackendStorage>::scatter_add_set(
+            &mut dst_cpu,
+            dst_l,
+            &ids_cpu,
+            ids_l,
+            &src_cpu,
+            src_l,
+            dim,
+        )?;
+        *self = self.device.storage_from_cpu_storage(&dst_cpu)?;
+        Ok(())
     }
     fn index_select(&self, ids: &Self, src_l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
-        self.run_index_select_f32(ids, src_l, ids_l, dim)
+        match self.run_index_select_f32(ids, src_l, ids_l, dim) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => {
+                let src_cpu = self.to_cpu_storage()?;
+                let ids_cpu = ids.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::index_select(
+                    &src_cpu, &ids_cpu, src_l, ids_l, dim,
+                )?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
     fn index_add(
         &self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: &Self,
-        _: &Layout,
-        _: usize,
+        dst_l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
     ) -> Result<Self> {
-        Err(unsupported("index_add"))
+        let dst_cpu = self.to_cpu_storage()?;
+        let ids_cpu = ids.to_cpu_storage()?;
+        let src_cpu = src.to_cpu_storage()?;
+        let out_cpu = <CpuStorage as BackendStorage>::index_add(
+            &dst_cpu, dst_l, &ids_cpu, ids_l, &src_cpu, src_l, dim,
+        )?;
+        self.device.storage_from_cpu_storage(&out_cpu)
     }
     fn matmul(
         &self,
@@ -2892,7 +3290,17 @@ impl BackendStorage for VulkanStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        self.run_matmul_f32(rhs, bmnk, lhs_l, rhs_l)
+        match self.run_matmul_f32(rhs, bmnk, lhs_l, rhs_l) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => {
+                let lhs_cpu = self.to_cpu_storage()?;
+                let rhs_cpu = rhs.to_cpu_storage()?;
+                let out_cpu =
+                    <CpuStorage as BackendStorage>::matmul(&lhs_cpu, &rhs_cpu, bmnk, lhs_l, rhs_l)?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
@@ -2907,9 +3315,35 @@ impl BackendStorage for VulkanStorage {
             match self.dtype {
                 DType::F32 | DType::F16 => {
                     let spirv = copy_spirv(self.dtype, self.dtype)?;
-                    return self.run_copy_into(src_l, dst, dst_offset, spirv);
+                    match self.run_copy_into(src_l, dst, dst_offset, spirv) {
+                        Ok(()) => return Ok(()),
+                        Err(err) if should_cpu_fallback(&err) => {
+                            let src_cpu = self.to_cpu_storage()?;
+                            let mut dst_cpu = dst.to_cpu_storage()?;
+                            <CpuStorage as BackendStorage>::copy_strided_src(
+                                &src_cpu,
+                                &mut dst_cpu,
+                                dst_offset,
+                                src_l,
+                            )?;
+                            *dst = dst.device.storage_from_cpu_storage(&dst_cpu)?;
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    }
                 }
-                _ => return Err(unsupported("copy_strided_src_non_contiguous")),
+                _ => {
+                    let src_cpu = self.to_cpu_storage()?;
+                    let mut dst_cpu = dst.to_cpu_storage()?;
+                    <CpuStorage as BackendStorage>::copy_strided_src(
+                        &src_cpu,
+                        &mut dst_cpu,
+                        dst_offset,
+                        src_l,
+                    )?;
+                    *dst = dst.device.storage_from_cpu_storage(&dst_cpu)?;
+                    return Ok(());
+                }
             }
         }
         let elem_size = self.dtype.size_in_bytes();
@@ -2961,9 +3395,15 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn const_set(&mut self, scalar: crate::scalar::Scalar, layout: &Layout) -> Result<()> {
-        let (start, end) = layout
-            .contiguous_offsets()
-            .ok_or_else(|| unsupported("const_set_non_contiguous"))?;
+        let (start, end) = match layout.contiguous_offsets() {
+            Some(v) => v,
+            None => {
+                let mut cpu = self.to_cpu_storage()?;
+                <CpuStorage as BackendStorage>::const_set(&mut cpu, scalar, layout)?;
+                *self = self.device.storage_from_cpu_storage(&cpu)?;
+                return Ok(());
+            }
+        };
         let scalar = scalar_bytes(scalar, self.dtype, "vulkan const_set")?;
         let mut bytes = self.device.read_buffer(&self.buffer)?;
         let start = start * scalar.len();
@@ -3004,7 +3444,24 @@ impl BackendDevice for VulkanDevice {
             instance
                 .get_physical_device_properties2(physical_device, &mut physical_device_properties);
         }
+        let max_workgroup_invocations = physical_device_properties
+            .properties
+            .limits
+            .max_compute_work_group_invocations
+            .max(1);
+        let max_workgroup_size_log2 = floor_log2_u32(max_workgroup_invocations);
+        let max_workgroup_count_y = physical_device_properties
+            .properties
+            .limits
+            .max_compute_work_group_count[1]
+            .max(1);
         let subgroup_size = subgroup_properties.subgroup_size.max(1);
+        let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default();
+        let mut physical_features2 =
+            vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan12_features);
+        unsafe {
+            instance.get_physical_device_features2(physical_device, &mut physical_features2);
+        }
         let queue_family_index = unsafe {
             instance
                 .get_physical_device_queue_family_properties(physical_device)
@@ -3018,19 +3475,26 @@ impl BackendDevice for VulkanDevice {
                 })
                 .ok_or_else(|| Error::msg("no vulkan compute queue family found"))?
         };
-        let physical_features = unsafe { instance.get_physical_device_features(physical_device) };
-        let robust_buffer_access = physical_features.robust_buffer_access == vk::TRUE;
+        let robust_buffer_access = physical_features2.features.robust_buffer_access == vk::TRUE;
+        let vulkan_memory_model = vulkan12_features.vulkan_memory_model == vk::TRUE;
         let mut enabled_features = vk::PhysicalDeviceFeatures::default();
         if robust_buffer_access {
             enabled_features.robust_buffer_access = vk::TRUE;
+        }
+        let mut enabled_vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
+        if vulkan_memory_model {
+            enabled_vulkan12.vulkan_memory_model = vk::TRUE;
         }
         let priorities = [1.0f32];
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&priorities)];
-        let device_info = vk::DeviceCreateInfo::default()
+        let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_features(&enabled_features);
+        if vulkan_memory_model {
+            device_info = device_info.push_next(&mut enabled_vulkan12);
+        }
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
             .map_err(Error::wrap)?;
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
@@ -3050,7 +3514,10 @@ impl BackendDevice for VulkanDevice {
                 instance,
                 physical_device,
                 subgroup_size,
+                max_workgroup_size_log2,
+                max_workgroup_count_y,
                 robust_buffer_access,
+                vulkan_memory_model,
                 device,
                 queue_family_index,
                 queue,
@@ -3114,12 +3581,26 @@ impl BackendDevice for VulkanDevice {
         self.storage_from_cpu_storage(&storage)
     }
 
-    fn rand_uniform(&self, _: &Shape, _: DType, _: f64, _: f64) -> Result<Self::Storage> {
-        Err(unsupported("rand_uniform"))
+    fn rand_uniform(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        min: f64,
+        max: f64,
+    ) -> Result<Self::Storage> {
+        let cpu = crate::cpu_backend::CpuDevice.rand_uniform(shape, dtype, min, max)?;
+        self.storage_from_cpu_storage(&cpu)
     }
 
-    fn rand_normal(&self, _: &Shape, _: DType, _: f64, _: f64) -> Result<Self::Storage> {
-        Err(unsupported("rand_normal"))
+    fn rand_normal(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        mean: f64,
+        std: f64,
+    ) -> Result<Self::Storage> {
+        let cpu = crate::cpu_backend::CpuDevice.rand_normal(shape, dtype, mean, std)?;
+        self.storage_from_cpu_storage(&cpu)
     }
 
     fn set_seed(&self, _: u64) -> Result<()> {

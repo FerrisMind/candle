@@ -63,7 +63,6 @@ fn backend_smoke_vulkan_f32_upload_unary_binary_roundtrip() -> Result<()> {
 
     smoke_f32_upload_unary_binary_roundtrip(&device)?;
     smoke_i32_to_f32_dtype_conversion(&device)?;
-    smoke_f32_conv_transpose_vulkan(&device)?;
     Ok(())
 }
 
@@ -104,8 +103,11 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     smoke_f32_matmul(device)?;
     smoke_f32_conv1d(device)?;
     smoke_f32_conv2d(device)?;
+    smoke_f32_conv_transpose(device)?;
     smoke_f32_upsample(device)?;
     smoke_f32_pool2d(device)?;
+    smoke_f32_cmp_where(device)?;
+    smoke_f32_scatter_add_and_index_add(device)?;
     smoke_f32_extended_unary_ops(device)?;
 
     device.synchronize()?;
@@ -484,6 +486,17 @@ fn smoke_f32_argsort_last_dim(device: &Device) -> Result<()> {
     let desc = large.arg_sort_last_dim(false)?.to_vec2::<u32>()?;
     assert_eq!(&desc[0][..5], &[0, 1, 2, 3, 4]);
     assert_eq!(&desc[0][295..], &[295, 296, 297, 298, 299]);
+
+    if device.is_vulkan() {
+        let vulkan_large_values = (0..1100).rev().map(|v| v as f32).collect::<Vec<_>>();
+        let vulkan_large = Tensor::from_vec(vulkan_large_values, (1, 1100), device)?;
+        let asc = vulkan_large.arg_sort_last_dim(true)?.to_vec2::<u32>()?;
+        assert_eq!(&asc[0][..5], &[1099, 1098, 1097, 1096, 1095]);
+        assert_eq!(&asc[0][1095..], &[4, 3, 2, 1, 0]);
+        let desc = vulkan_large.arg_sort_last_dim(false)?.to_vec2::<u32>()?;
+        assert_eq!(&desc[0][..5], &[0, 1, 2, 3, 4]);
+        assert_eq!(&desc[0][1095..], &[1095, 1096, 1097, 1098, 1099]);
+    }
     Ok(())
 }
 
@@ -624,8 +637,8 @@ fn smoke_f32_conv2d(device: &Device) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "vulkan")]
-fn smoke_f32_conv_transpose_vulkan(device: &Device) -> Result<()> {
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_conv_transpose(device: &Device) -> Result<()> {
     let input = Tensor::from_slice(&[1.0f32, 2.0, 3.0], (1, 1, 3), device)?;
     let kernel = Tensor::from_slice(&[1.0f32, 0.0, 1.0], (1, 1, 3), device)?;
     assert_eq!(
@@ -658,6 +671,43 @@ fn smoke_f32_conv_transpose_vulkan(device: &Device) -> Result<()> {
             .flatten_all()?
             .to_vec1::<f32>()?,
         [1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 3.0, 3.0, 4.0, 4.0]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_cmp_where(device: &Device) -> Result<()> {
+    let lhs = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (2, 2), device)?;
+    let rhs = Tensor::from_slice(&[1.0f32, 0.0, 3.0, 5.0], (2, 2), device)?;
+    assert_eq!(lhs.eq(&rhs)?.to_vec2::<u8>()?, [[1, 0], [1, 0]]);
+    assert_eq!(lhs.gt(&rhs)?.to_vec2::<u8>()?, [[0, 1], [0, 0]]);
+
+    let cond = Tensor::from_slice(&[1u8, 0, 1, 0], (2, 2), device)?;
+    let on_true = Tensor::from_slice(&[10.0f32, 20.0, 30.0, 40.0], (2, 2), device)?;
+    let on_false = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (2, 2), device)?;
+    assert_eq!(
+        cond.where_cond(&on_true, &on_false)?.to_vec2::<f32>()?,
+        [[10.0, 2.0], [30.0, 4.0]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_scatter_add_and_index_add(device: &Device) -> Result<()> {
+    let dst = Tensor::zeros((1, 5), DType::F32, device)?;
+    let ids = Tensor::from_slice(&[1u32, 1, 3], (1, 3), device)?;
+    let src = Tensor::from_slice(&[1.0f32, 2.5, 4.0], (1, 3), device)?;
+    assert_eq!(
+        dst.scatter_add(&ids, &src, 1)?.to_vec2::<f32>()?,
+        [[0.0, 3.5, 0.0, 4.0, 0.0]]
+    );
+
+    let base = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), device)?;
+    let row_ids = Tensor::from_slice(&[1u32, 0], (2,), device)?;
+    let add_rows = Tensor::from_slice(&[10.0f32, 10.0, 10.0, 1.0, 1.0, 1.0], (2, 3), device)?;
+    assert_eq!(
+        base.index_add(&row_ids, &add_rows, 0)?.to_vec2::<f32>()?,
+        [[2.0, 3.0, 4.0], [14.0, 15.0, 16.0]]
     );
     Ok(())
 }
