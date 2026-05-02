@@ -555,6 +555,62 @@ pub fn rope_slow(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     x.broadcast_mul(&cos)? + rotate_half(x)?.broadcast_mul(&sin)?
 }
 
+#[derive(Debug, Clone)]
+struct RotaryEmbGgml {
+    n_dims: usize,
+    freq_base: f32,
+}
+
+impl candle::CustomOp2 for RotaryEmbGgml {
+    fn name(&self) -> &'static str {
+        "rotary-emb-ggml"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("ggml rope has no cpu impl")
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        s1: &candle::WgpuStorage,
+        l1: &Layout,
+        s2: &candle::WgpuStorage,
+        l2: &Layout,
+    ) -> Result<(candle::WgpuStorage, Shape)> {
+        let storage = s1.ggml_rope(l1, s2, l2, self.n_dims, self.freq_base)?;
+        Ok((storage, l1.shape().clone()))
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        s1: &candle::VulkanStorage,
+        l1: &Layout,
+        s2: &candle::VulkanStorage,
+        l2: &Layout,
+    ) -> Result<(candle::VulkanStorage, Shape)> {
+        let storage = s1.ggml_rope(l1, s2, l2, self.n_dims, self.freq_base)?;
+        Ok((storage, l1.shape().clone()))
+    }
+}
+
+pub fn rope_ggml(xs: &Tensor, positions: &Tensor, n_dims: usize, freq_base: f32) -> Result<Tensor> {
+    if !xs.is_contiguous() {
+        candle::bail!("xs has to be contiguous in rope_ggml")
+    }
+    if !positions.is_contiguous() {
+        candle::bail!("positions has to be contiguous in rope_ggml")
+    }
+    xs.apply_op2_no_bwd(positions, &RotaryEmbGgml { n_dims, freq_base })
+}
+
 /// T (seqlen)/H (num-heads)/D (head-dim) contiguous variant of rope embeddings.
 #[derive(Debug, Clone)]
 struct RotaryEmbThd;

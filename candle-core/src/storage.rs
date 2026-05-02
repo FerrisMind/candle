@@ -33,11 +33,19 @@ fn is_backend_not_implemented(err: &Error, backend: &str) -> bool {
 }
 
 fn should_wgpu_cpu_fallback(err: &Error) -> bool {
-    is_backend_not_implemented(err, "wgpu")
+    let fallback = is_backend_not_implemented(err, "wgpu");
+    if fallback && std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
+        eprintln!("[candle][wgpu][cpu-fallback] {err:?}");
+    }
+    fallback
 }
 
 fn should_vulkan_cpu_fallback(err: &Error) -> bool {
-    is_backend_not_implemented(err, "vulkan")
+    let fallback = is_backend_not_implemented(err, "vulkan");
+    if fallback && std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
+        eprintln!("[candle][vulkan][cpu-fallback] {err:?}");
+    }
+    fallback
 }
 
 // We do not want to implement Clone on Storage as cloning may fail because of
@@ -432,6 +440,10 @@ impl Storage {
     }
 
     pub(crate) fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+        let dtype = match self {
+            Self::Wgpu(_) | Self::Vulkan(_) if dtype == DType::BF16 => DType::F16,
+            _ => dtype,
+        };
         match self {
             Storage::Cpu(storage) => {
                 let storage = storage.to_dtype(layout, dtype)?;

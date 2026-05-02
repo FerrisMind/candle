@@ -7,7 +7,8 @@ use gpu_allocator::vulkan::{
     Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc,
 };
 use gpu_allocator::MemoryLocation;
-use std::ffi::CString;
+use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex, RwLock};
 
 #[repr(C)]
@@ -37,6 +38,7 @@ struct VulkanArgsortParams {
 
 const VULKAN_ARGSORT_NUM_PIPELINES: u32 = 11;
 const VULKAN_ARGSORT_WG_UNROLL_FACTOR: u32 = 2;
+const VULKAN_MUL_MAT_VEC_MAX_COLS: usize = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -149,6 +151,34 @@ struct GgmlSoftmaxParams {
     n_head_log2: u32,
     nrows_x: u32,
     has_sinks: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VulkanRopeParams {
+    rope_mode: u32,
+    nrows: u32,
+    n_dims: u32,
+    freq_scale: f32,
+    freq_base: f32,
+    ext_factor: f32,
+    attn_factor: f32,
+    corr_dims: [f32; 2],
+    theta_scale: f32,
+    has_ff: u32,
+    sections: [i32; 4],
+    is_imrope: u32,
+    is_back: u32,
+    set_rows_stride: u32,
+    ne00: u32,
+    ne01: u32,
+    ne02: u32,
+    nb01: u32,
+    nb02: u32,
+    nb03: u32,
+    nb11: u32,
+    nb12: u32,
+    nb13: u32,
 }
 
 #[repr(C)]
@@ -308,6 +338,10 @@ struct VulkanInner {
     integer_dot_product: bool,
     subgroup_arithmetic: bool,
     subgroup_size: u32,
+    subgroup_size_control: bool,
+    compute_full_subgroups: bool,
+    subgroup_min_size: u32,
+    subgroup_max_size: u32,
     max_workgroup_size_log2: u32,
     max_workgroup_count_x: u32,
     max_workgroup_count_y: u32,
@@ -318,6 +352,38 @@ struct VulkanInner {
     queue: vk::Queue,
     allocator: Mutex<Option<Allocator>>,
     seed_value: RwLock<u64>,
+    pipeline_cache: Mutex<HashMap<VulkanPipelineCacheKey, Arc<VulkanCachedPipeline>>>,
+    pending_submissions: Mutex<Vec<VulkanPendingSubmission>>,
+    deferred_buffer_frees: Mutex<Vec<VulkanDeferredBuffer>>,
+}
+
+struct VulkanPendingSubmission {
+    fence: vk::Fence,
+    command_pool: vk::CommandPool,
+    descriptor_pool: vk::DescriptorPool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VulkanPipelineCacheKey {
+    shader_ptr: usize,
+    shader_len: usize,
+    binding_count: usize,
+    push_constant_len: u32,
+    specialization_u32: Vec<(u32, u32)>,
+    require_full_subgroups: bool,
+    required_subgroup_size: Option<u32>,
+}
+
+struct VulkanCachedPipeline {
+    shader: vk::ShaderModule,
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+}
+
+struct VulkanDeferredBuffer {
+    buffer: vk::Buffer,
+    allocation: Allocation,
 }
 
 impl std::fmt::Debug for VulkanInner {
@@ -329,6 +395,10 @@ impl std::fmt::Debug for VulkanInner {
             .field("integer_dot_product", &self.integer_dot_product)
             .field("subgroup_arithmetic", &self.subgroup_arithmetic)
             .field("subgroup_size", &self.subgroup_size)
+            .field("subgroup_size_control", &self.subgroup_size_control)
+            .field("compute_full_subgroups", &self.compute_full_subgroups)
+            .field("subgroup_min_size", &self.subgroup_min_size)
+            .field("subgroup_max_size", &self.subgroup_max_size)
             .field("max_workgroup_size_log2", &self.max_workgroup_size_log2)
             .field("max_workgroup_count_x", &self.max_workgroup_count_x)
             .field("max_workgroup_count_y", &self.max_workgroup_count_y)
@@ -478,6 +548,33 @@ fn vulkan_use_subgroups(device: &VulkanDevice) -> bool {
     device.inner.subgroup_arithmetic
 }
 
+fn vulkan_has_subgroup_min_16(device: &VulkanDevice) -> bool {
+    device.inner.subgroup_size_control
+        && device.inner.subgroup_min_size <= 16
+        && device.inner.subgroup_max_size >= 16
+}
+
+fn vulkan_dmmv_subgroup_size(device: &VulkanDevice) -> u32 {
+    if device.inner.vendor_id == VULKAN_VENDOR_ID_INTEL && vulkan_has_subgroup_min_16(device) {
+        16
+    } else {
+        device.inner.subgroup_size.max(1)
+    }
+}
+
+fn vulkan_dmmv_subgroup_size16(device: &VulkanDevice) -> u32 {
+    vulkan_dmmv_subgroup_size(device).max(16)
+}
+
+fn vulkan_dmmv_use_subgroups(device: &VulkanDevice, qdtype: GgmlDType) -> bool {
+    let use_subgroups = vulkan_use_subgroups(device);
+    if vulkan_is_k_quant(qdtype) {
+        use_subgroups && vulkan_has_subgroup_min_16(device)
+    } else {
+        use_subgroups
+    }
+}
+
 fn vulkan_supports_quantized_matvec_weight(dtype: GgmlDType) -> bool {
     matches!(
         dtype,
@@ -522,10 +619,11 @@ fn vulkan_dmmv_workgroup(
 
 fn vulkan_dmmv_shader_name(
     device: &VulkanDevice,
+    qdtype: GgmlDType,
     base_name: String,
     workgroup: VulkanDmmvWorkgroup,
 ) -> String {
-    if !vulkan_use_subgroups(device) {
+    if !vulkan_dmmv_use_subgroups(device, qdtype) {
         return base_name;
     }
     match workgroup {
@@ -534,8 +632,16 @@ fn vulkan_dmmv_shader_name(
     }
 }
 
-fn vulkan_dmmv_block_size(device: &VulkanDevice, workgroup: VulkanDmmvWorkgroup) -> u32 {
-    let subgroup = device.inner.subgroup_size.max(1);
+fn vulkan_dmmv_block_size(
+    device: &VulkanDevice,
+    qdtype: GgmlDType,
+    workgroup: VulkanDmmvWorkgroup,
+) -> u32 {
+    let subgroup = if vulkan_is_k_quant(qdtype) {
+        vulkan_dmmv_subgroup_size16(device)
+    } else {
+        vulkan_dmmv_subgroup_size(device)
+    };
     match workgroup {
         VulkanDmmvWorkgroup::Subgroup => subgroup,
         VulkanDmmvWorkgroup::Large => subgroup.saturating_mul(4),
@@ -774,6 +880,99 @@ impl VulkanDevice {
         }))
     }
 
+    fn destroy_submission(&self, submission: VulkanPendingSubmission) {
+        unsafe {
+            self.inner.device.destroy_fence(submission.fence, None);
+            self.inner
+                .device
+                .destroy_command_pool(submission.command_pool, None);
+            self.inner
+                .device
+                .destroy_descriptor_pool(submission.descriptor_pool, None);
+        }
+    }
+
+    fn destroy_deferred_buffers(&self) -> Result<()> {
+        let deferred = {
+            let mut deferred = self
+                .inner
+                .deferred_buffer_frees
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            std::mem::take(&mut *deferred)
+        };
+        if deferred.is_empty() {
+            return Ok(());
+        }
+        let mut allocator = self
+            .inner
+            .allocator
+            .lock()
+            .map_err(|e| Error::wrap(e.to_string()))?;
+        let allocator = allocator
+            .as_mut()
+            .ok_or_else(|| Error::msg("vulkan allocator already dropped"))?;
+        for deferred in deferred {
+            unsafe {
+                self.inner.device.destroy_buffer(deferred.buffer, None);
+            }
+            allocator.free(deferred.allocation).map_err(Error::wrap)?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_pending_submissions(&self, wait: bool) -> Result<()> {
+        let ready = {
+            let mut pending = self
+                .inner
+                .pending_submissions
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            let mut ready = Vec::new();
+            let mut idx = 0;
+            while idx < pending.len() {
+                let is_ready = if wait {
+                    true
+                } else {
+                    unsafe { self.inner.device.get_fence_status(pending[idx].fence) }
+                        .map_err(Error::wrap)?
+                };
+                if is_ready {
+                    ready.push(pending.swap_remove(idx));
+                } else {
+                    idx += 1;
+                }
+            }
+            ready
+        };
+        for submission in ready {
+            if wait {
+                unsafe {
+                    self.inner
+                        .device
+                        .wait_for_fences(std::slice::from_ref(&submission.fence), true, u64::MAX)
+                        .map_err(Error::wrap)?;
+                }
+            }
+            self.destroy_submission(submission);
+        }
+        let pending_empty = self
+            .inner
+            .pending_submissions
+            .lock()
+            .map_err(|e| Error::wrap(e.to_string()))?
+            .is_empty();
+        if pending_empty {
+            self.destroy_deferred_buffers()?;
+        }
+        Ok(())
+    }
+
+    fn synchronize_pending(&self) -> Result<()> {
+        unsafe { self.inner.device.queue_wait_idle(self.inner.queue) }.map_err(Error::wrap)?;
+        self.cleanup_pending_submissions(true)
+    }
+
     fn write_buffer(&self, buffer: &VulkanBuffer, bytes: &[u8]) -> Result<()> {
         if bytes.len() > buffer.size {
             crate::bail!("vulkan write larger than buffer")
@@ -811,6 +1010,7 @@ impl VulkanDevice {
     }
 
     fn read_buffer(&self, buffer: &VulkanBuffer) -> Result<Vec<u8>> {
+        self.synchronize_pending()?;
         let allocation = buffer
             .allocation
             .lock()
@@ -860,7 +1060,15 @@ impl VulkanDevice {
         push_constants: Option<&[u8]>,
         workgroups: (u32, u32, u32),
     ) -> Result<()> {
-        self.run_compute_specialized(spirv, bindings, push_constants, workgroups, None)
+        self.run_compute_specialized_with_options(
+            spirv,
+            bindings,
+            push_constants,
+            workgroups,
+            None,
+            false,
+            None,
+        )
     }
 
     fn run_compute_specialized(
@@ -871,99 +1079,169 @@ impl VulkanDevice {
         workgroups: (u32, u32, u32),
         specialization_u32: Option<&[(u32, u32)]>,
     ) -> Result<()> {
+        self.run_compute_specialized_with_options(
+            spirv,
+            bindings,
+            push_constants,
+            workgroups,
+            specialization_u32,
+            false,
+            None,
+        )
+    }
+
+    fn run_compute_specialized_with_options(
+        &self,
+        spirv: &[u32],
+        bindings: &[VulkanBinding<'_>],
+        push_constants: Option<&[u8]>,
+        workgroups: (u32, u32, u32),
+        specialization_u32: Option<&[(u32, u32)]>,
+        require_full_subgroups: bool,
+        required_subgroup_size: Option<u32>,
+    ) -> Result<()> {
         unsafe {
-            let shader_info = vk::ShaderModuleCreateInfo::default().code(spirv);
-            let shader = self
-                .inner
-                .device
-                .create_shader_module(&shader_info, None)
-                .map_err(Error::wrap)?;
-            let result = self.run_compute_with_shader(
-                shader,
+            self.run_compute_with_shader(
+                spirv,
                 bindings,
                 push_constants,
                 workgroups,
                 specialization_u32,
-            );
-            self.inner.device.destroy_shader_module(shader, None);
-            result
+                require_full_subgroups,
+                required_subgroup_size,
+            )
         }
     }
 
     unsafe fn run_compute_with_shader(
         &self,
-        shader: vk::ShaderModule,
+        spirv: &[u32],
         bindings: &[VulkanBinding<'_>],
         push_constants: Option<&[u8]>,
         workgroups: (u32, u32, u32),
         specialization_u32: Option<&[(u32, u32)]>,
+        require_full_subgroups: bool,
+        required_subgroup_size: Option<u32>,
     ) -> Result<()> {
-        let layout_bindings = bindings
-            .iter()
-            .enumerate()
-            .map(|(binding, entry)| {
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(binding as u32)
-                    .descriptor_type(entry.descriptor_type())
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            })
-            .collect::<Vec<_>>();
-        let set_layout_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&layout_bindings);
-        let set_layout = self
-            .inner
-            .device
-            .create_descriptor_set_layout(&set_layout_info, None)
-            .map_err(Error::wrap)?;
-        let push_constant_ranges = push_constants
-            .map(|bytes| {
-                vec![vk::PushConstantRange::default()
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                    .offset(0)
-                    .size(bytes.len() as u32)]
-            })
-            .unwrap_or_default();
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&set_layout))
-            .push_constant_ranges(&push_constant_ranges);
-        let pipeline_layout = self
-            .inner
-            .device
-            .create_pipeline_layout(&pipeline_layout_info, None)
-            .map_err(Error::wrap)?;
-        let entry = CString::new("main").map_err(Error::wrap)?;
-        let mut spec_entries = Vec::new();
-        let mut spec_data = Vec::new();
-        let spec_info;
-        let mut stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(shader)
-            .name(&entry);
-        if let Some(specialization_u32) = specialization_u32 {
-            for (idx, &(constant_id, value)) in specialization_u32.iter().enumerate() {
-                spec_entries.push(
-                    vk::SpecializationMapEntry::default()
-                        .constant_id(constant_id)
-                        .offset((idx * std::mem::size_of::<u32>()) as u32)
-                        .size(std::mem::size_of::<u32>()),
-                );
-                spec_data.extend_from_slice(&value.to_ne_bytes());
+        self.cleanup_pending_submissions(false)?;
+        let cache_key = VulkanPipelineCacheKey {
+            shader_ptr: spirv.as_ptr() as usize,
+            shader_len: spirv.len(),
+            binding_count: bindings.len(),
+            push_constant_len: push_constants.map(|bytes| bytes.len() as u32).unwrap_or(0),
+            specialization_u32: specialization_u32
+                .map(|specs| specs.to_vec())
+                .unwrap_or_default(),
+            require_full_subgroups,
+            required_subgroup_size,
+        };
+        let cached = {
+            let mut cache = self
+                .inner
+                .pipeline_cache
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            if let Some(cached) = cache.get(&cache_key) {
+                cached.clone()
+            } else {
+                let shader_info = vk::ShaderModuleCreateInfo::default().code(spirv);
+                let shader = self
+                    .inner
+                    .device
+                    .create_shader_module(&shader_info, None)
+                    .map_err(Error::wrap)?;
+                let layout_bindings = bindings
+                    .iter()
+                    .enumerate()
+                    .map(|(binding, entry)| {
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(binding as u32)
+                            .descriptor_type(entry.descriptor_type())
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                    })
+                    .collect::<Vec<_>>();
+                let set_layout_info =
+                    vk::DescriptorSetLayoutCreateInfo::default().bindings(&layout_bindings);
+                let descriptor_set_layout = self
+                    .inner
+                    .device
+                    .create_descriptor_set_layout(&set_layout_info, None)
+                    .map_err(Error::wrap)?;
+                let push_constant_ranges = push_constants
+                    .map(|bytes| {
+                        vec![vk::PushConstantRange::default()
+                            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                            .offset(0)
+                            .size(bytes.len() as u32)]
+                    })
+                    .unwrap_or_default();
+                let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(std::slice::from_ref(&descriptor_set_layout))
+                    .push_constant_ranges(&push_constant_ranges);
+                let pipeline_layout = self
+                    .inner
+                    .device
+                    .create_pipeline_layout(&pipeline_layout_info, None)
+                    .map_err(Error::wrap)?;
+                let entry = CString::new("main").map_err(Error::wrap)?;
+                let mut spec_entries = Vec::new();
+                let mut spec_data = Vec::new();
+                let spec_info;
+                let mut stage_flags = vk::PipelineShaderStageCreateFlags::empty();
+                if require_full_subgroups && self.inner.compute_full_subgroups {
+                    stage_flags |= vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS_EXT;
+                }
+                let mut stage = vk::PipelineShaderStageCreateInfo::default()
+                    .flags(stage_flags)
+                    .stage(vk::ShaderStageFlags::COMPUTE)
+                    .module(shader)
+                    .name(&entry);
+                if let Some(specialization_u32) = specialization_u32 {
+                    for (idx, &(constant_id, value)) in specialization_u32.iter().enumerate() {
+                        spec_entries.push(
+                            vk::SpecializationMapEntry::default()
+                                .constant_id(constant_id)
+                                .offset((idx * std::mem::size_of::<u32>()) as u32)
+                                .size(std::mem::size_of::<u32>()),
+                        );
+                        spec_data.extend_from_slice(&value.to_ne_bytes());
+                    }
+                    spec_info = vk::SpecializationInfo::default()
+                        .map_entries(&spec_entries)
+                        .data(&spec_data);
+                    stage = stage.specialization_info(&spec_info);
+                }
+                let mut required_subgroup_info;
+                if let Some(required_subgroup_size) = required_subgroup_size {
+                    if self.inner.subgroup_size_control
+                        && self.inner.subgroup_min_size <= required_subgroup_size
+                        && required_subgroup_size <= self.inner.subgroup_max_size
+                    {
+                        required_subgroup_info =
+                            vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+                                .required_subgroup_size(required_subgroup_size);
+                        stage = stage.push_next(&mut required_subgroup_info);
+                    }
+                }
+                let pipeline_info = vk::ComputePipelineCreateInfo::default()
+                    .stage(stage)
+                    .layout(pipeline_layout);
+                let pipelines = self
+                    .inner
+                    .device
+                    .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                    .map_err(|(_, e)| Error::wrap(e))?;
+                let cached = Arc::new(VulkanCachedPipeline {
+                    shader,
+                    pipeline: pipelines[0],
+                    pipeline_layout,
+                    descriptor_set_layout,
+                });
+                cache.insert(cache_key, cached.clone());
+                cached
             }
-            spec_info = vk::SpecializationInfo::default()
-                .map_entries(&spec_entries)
-                .data(&spec_data);
-            stage = stage.specialization_info(&spec_info);
-        }
-        let pipeline_info = vk::ComputePipelineCreateInfo::default()
-            .stage(stage)
-            .layout(pipeline_layout);
-        let pipelines = self
-            .inner
-            .device
-            .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-            .map_err(|(_, e)| Error::wrap(e))?;
-        let pipeline = pipelines[0];
+        };
 
         let mut storage_count = 0;
         for binding in bindings {
@@ -989,7 +1267,7 @@ impl VulkanDevice {
             .map_err(Error::wrap)?;
         let set_alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
-            .set_layouts(std::slice::from_ref(&set_layout));
+            .set_layouts(std::slice::from_ref(&cached.descriptor_set_layout));
         let descriptor_set = self
             .inner
             .device
@@ -1042,12 +1320,12 @@ impl VulkanDevice {
         self.inner.device.cmd_bind_pipeline(
             command_buffer,
             vk::PipelineBindPoint::COMPUTE,
-            pipeline,
+            cached.pipeline,
         );
         self.inner.device.cmd_bind_descriptor_sets(
             command_buffer,
             vk::PipelineBindPoint::COMPUTE,
-            pipeline_layout,
+            cached.pipeline_layout,
             0,
             std::slice::from_ref(&descriptor_set),
             &[],
@@ -1055,7 +1333,7 @@ impl VulkanDevice {
         if let Some(bytes) = push_constants {
             self.inner.device.cmd_push_constants(
                 command_buffer,
-                pipeline_layout,
+                cached.pipeline_layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
                 bytes,
@@ -1080,21 +1358,14 @@ impl VulkanDevice {
             .queue_submit(self.inner.queue, std::slice::from_ref(&submit_info), fence)
             .map_err(Error::wrap)?;
         self.inner
-            .device
-            .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)
-            .map_err(Error::wrap)?;
-        self.inner.device.destroy_fence(fence, None);
-        self.inner.device.destroy_command_pool(command_pool, None);
-        self.inner
-            .device
-            .destroy_descriptor_pool(descriptor_pool, None);
-        self.inner.device.destroy_pipeline(pipeline, None);
-        self.inner
-            .device
-            .destroy_pipeline_layout(pipeline_layout, None);
-        self.inner
-            .device
-            .destroy_descriptor_set_layout(set_layout, None);
+            .pending_submissions
+            .lock()
+            .map_err(|e| Error::wrap(e.to_string()))?
+            .push(VulkanPendingSubmission {
+                fence,
+                command_pool,
+                descriptor_pool,
+            });
         Ok(())
     }
 }
@@ -1134,6 +1405,17 @@ fn dims4_ggml(layout: &Layout) -> Result<([u32; 4], [u32; 4])> {
 
 fn contiguous_strides_ggml(dims: [u32; 4]) -> [u32; 4] {
     [1, dims[0], dims[0] * dims[1], dims[0] * dims[1] * dims[2]]
+}
+
+fn ggml_linear_workgroups(count: usize) -> Result<(u32, u32, u32)> {
+    let count: u32 = count.try_into()?;
+    Ok(if count > 262_144 {
+        (1, 512, count.div_ceil(262_144))
+    } else if count > 512 {
+        (1, count.div_ceil(512), 1)
+    } else {
+        (1, 1, 1)
+    })
 }
 
 fn next_power_of_two_u32(value: usize, op: &'static str) -> Result<u32> {
@@ -1273,16 +1555,99 @@ fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
         (DType::F32, DType::F32) => "cpy_f32_f32",
         (DType::F32, DType::I32) => "cpy_f32_i32",
         (DType::I32, DType::F32) => "cpy_i32_f32",
+        (DType::U32, DType::F32) => "cpy_u32_f32",
         (DType::F32, DType::F16) => "cpy_f32_f16",
         (DType::F16, DType::F32) => "cpy_f16_f32",
         (DType::F16, DType::F16) => "cpy_f16_f16",
-        _ => return Err(unsupported("to_dtype")),
+        _ => {
+            return Err(Error::Msg(
+                format!("vulkan backend op to_dtype {src:?}->{dst:?} not implemented").into(),
+            )
+            .bt())
+        }
     };
     candle_vulkan_kernels::spirv(name)
         .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated").into()).bt())
 }
 
 impl VulkanStorage {
+    fn run_bf16_to_dtype_via_get_rows(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+        if self.dtype != DType::BF16 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan to_dtype").bt());
+        }
+        if dtype != DType::F16 && dtype != DType::F32 {
+            return Err(unsupported("to_dtype bf16"));
+        }
+        if !layout.is_contiguous() || layout.start_offset() != 0 {
+            return Err(unsupported("to_dtype bf16 strided"));
+        }
+
+        let elem_count = layout.shape().elem_count();
+        let cols = layout.dims().last().copied().unwrap_or(1).max(1);
+        let rows = elem_count.div_ceil(cols);
+        let rows_u32: u32 = rows.try_into()?;
+        let cols_u32: u32 = cols.try_into()?;
+
+        let ids = CpuStorage::U32((0..rows_u32).collect());
+        let ids = self.device.storage_from_cpu_storage(&ids)?;
+        let ids_layout = Layout::contiguous(Shape::from(rows));
+        let src_layout = Layout::contiguous(Shape::from((rows, cols)));
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), dtype)? };
+        let params = GgmlBinaryParams {
+            ne: (rows * cols).try_into()?,
+            ne00: cols_u32,
+            ne01: rows_u32,
+            ne02: 1,
+            ne03: 1,
+            nb00: 1,
+            nb01: cols_u32,
+            nb02: 0,
+            nb03: 0,
+            ne10: rows_u32,
+            ne11: 1,
+            ne12: 1,
+            ne13: 1,
+            nb10: 1,
+            nb11: 0,
+            nb12: 0,
+            nb13: 0,
+            ne20: cols_u32,
+            ne21: rows_u32,
+            ne22: 1,
+            ne23: 1,
+            nb20: 1,
+            nb21: cols_u32,
+            nb22: 0,
+            nb23: 0,
+            misalign_offsets: 0,
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(ids.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+        ];
+        let spirv_name = match dtype {
+            DType::F16 => "get_rows_bf16",
+            DType::F32 => "get_rows_bf16_f32",
+            _ => unreachable!(),
+        };
+        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
+            Error::Msg(format!("vulkan shader {spirv_name} not generated").into()).bt()
+        })?;
+        self.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (cols_u32.div_ceil(512), rows_u32, 1),
+        )?;
+        let _ = ids_layout;
+        let _ = src_layout;
+        Ok(dst)
+    }
+
     fn run_unary_head(&self, layout: &Layout, spirv: &[u32]) -> Result<Self> {
         if !layout.is_contiguous() || layout.start_offset() != 0 {
             return Err(unsupported("unary strided"));
@@ -1301,9 +1666,9 @@ impl VulkanStorage {
             VulkanBinding::Storage(self.buffer.as_ref()),
             VulkanBinding::Storage(dst.buffer.as_ref()),
         ];
-        let workgroups = (count as u32).div_ceil(512);
+        let workgroups = ggml_linear_workgroups(count)?;
         self.device
-            .run_compute(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
         Ok(dst)
     }
 
@@ -1377,9 +1742,9 @@ impl VulkanStorage {
             VulkanBinding::Storage(self.buffer.as_ref()),
             VulkanBinding::Storage(dst.buffer.as_ref()),
         ];
-        let workgroups = (count as u32).div_ceil(512);
+        let workgroups = ggml_linear_workgroups(count)?;
         self.device
-            .run_compute(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
         Ok(dst)
     }
 
@@ -1455,9 +1820,9 @@ impl VulkanStorage {
             VulkanBinding::Storage(dst.buffer.as_ref()),
         ];
         let spirv = binary_spirv(op, self.dtype)?;
-        let workgroups = (count as u32).div_ceil(512);
+        let workgroups = ggml_linear_workgroups(count)?;
         self.device
-            .run_compute(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
         Ok(dst)
     }
 
@@ -1548,9 +1913,9 @@ impl VulkanStorage {
             VulkanBinding::Storage(self.buffer.as_ref()),
             VulkanBinding::Storage(dst.buffer.as_ref()),
         ];
-        let workgroups = (count as u32).div_ceil(512);
+        let workgroups = ggml_linear_workgroups(count)?;
         self.device
-            .run_compute(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
         Ok(())
     }
 
@@ -1935,11 +2300,17 @@ impl VulkanStorage {
     }
 
     pub fn softmax_last_dim(&self, layout: &Layout) -> Result<Self> {
-        if self.dtype != DType::F32 {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan softmax").bt());
-        }
         if !layout.is_contiguous() || layout.start_offset() != 0 {
             return Err(unsupported("softmax strided"));
+        }
+        if self.dtype == DType::F16 {
+            let src_f32 = self.to_dtype(layout, DType::F32)?;
+            let src_f32_layout = Layout::contiguous(layout.shape().clone());
+            let out_f32 = src_f32.softmax_last_dim(&src_f32_layout)?;
+            return out_f32.to_dtype(&src_f32_layout, DType::F16);
+        }
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan softmax").bt());
         }
         let rank = layout.dims().len();
         if rank == 0 {
@@ -1986,6 +2357,85 @@ impl VulkanStorage {
         Ok(dst)
     }
 
+    pub fn ggml_rope(
+        &self,
+        layout: &Layout,
+        pos: &Self,
+        pos_layout: &Layout,
+        n_dims: usize,
+        freq_base: f32,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan rope").bt());
+        }
+        if pos.dtype != DType::I32 {
+            return Err(Error::UnsupportedDTypeForOp(pos.dtype, "vulkan rope positions").bt());
+        }
+        if !layout.is_contiguous() || layout.start_offset() != 0 {
+            return Err(unsupported("rope strided"));
+        }
+        if !pos_layout.is_contiguous() || pos_layout.start_offset() != 0 {
+            return Err(unsupported("rope positions strided"));
+        }
+        let (dims, strides) = dims4_ggml(layout)?;
+        let count = layout.shape().elem_count();
+        let rows = count / layout.dims().last().copied().unwrap_or(1).max(1);
+        let rows_u32: u32 = rows.try_into()?;
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        let dst_strides = contiguous_strides_ggml(dims);
+        let theta_scale = freq_base.powf(-2.0 / n_dims as f32);
+        let params = VulkanRopeParams {
+            rope_mode: 0,
+            nrows: rows_u32,
+            n_dims: n_dims.try_into()?,
+            freq_scale: 1.0,
+            freq_base,
+            ext_factor: 0.0,
+            attn_factor: 1.0,
+            corr_dims: [0.0, 0.0],
+            theta_scale,
+            has_ff: 0,
+            sections: [0, 0, 0, 0],
+            is_imrope: 0,
+            is_back: 0,
+            set_rows_stride: 0,
+            ne00: dims[0],
+            ne01: dims[1],
+            ne02: dims[2],
+            nb01: strides[1],
+            nb02: strides[2],
+            nb03: strides[3],
+            nb11: dst_strides[1],
+            nb12: dst_strides[2],
+            nb13: dst_strides[3],
+        };
+        let bindings = [
+            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(pos.buffer.as_ref()),
+            VulkanBinding::Storage(pos.buffer.as_ref()),
+            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(pos.buffer.as_ref()),
+        ];
+        let spirv_name = match self.dtype {
+            DType::F32 => "rope_norm_f32",
+            DType::F16 => "rope_norm_f16",
+            _ => unreachable!(),
+        };
+        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
+            Error::Msg(format!("vulkan shader {spirv_name} not generated").into()).bt()
+        })?;
+        let wg_y = ((n_dims / 2) as u32).div_ceil(256).max(1);
+        let groups_x = rows_u32.min(32768);
+        let groups_z = rows_u32.div_ceil(32768).max(1);
+        self.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (groups_x, wg_y, groups_z),
+        )?;
+        Ok(dst)
+    }
+
     pub fn rms_norm(
         &self,
         layout: &Layout,
@@ -1993,6 +2443,17 @@ impl VulkanStorage {
         alpha_layout: &Layout,
         eps: f32,
     ) -> Result<Self> {
+        if self.dtype == DType::F16 || alpha.dtype == DType::F16 {
+            if self.dtype != DType::F16 || alpha.dtype != DType::F16 {
+                return Err(unsupported("rms_norm mixed dtype"));
+            }
+            let src_f32 = self.to_dtype(layout, DType::F32)?;
+            let alpha_f32 = alpha.to_dtype(alpha_layout, DType::F32)?;
+            let src_f32_layout = Layout::contiguous(layout.shape().clone());
+            let alpha_f32_layout = Layout::contiguous(alpha_layout.shape().clone());
+            let out_f32 = src_f32.rms_norm(&src_f32_layout, &alpha_f32, &alpha_f32_layout, eps)?;
+            return out_f32.to_dtype(&src_f32_layout, DType::F16);
+        }
         if self.dtype != DType::F32 || alpha.dtype != DType::F32 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan rms_norm").bt());
         }
@@ -2075,7 +2536,7 @@ impl VulkanStorage {
         ids_l: &Layout,
         dim: usize,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan index_select").bt());
         }
         if ids.dtype != DType::U32 {
@@ -2135,8 +2596,13 @@ impl VulkanStorage {
             VulkanBinding::Storage(ids.buffer.as_ref()),
             VulkanBinding::Storage(dst.buffer.as_ref()),
         ];
-        let spirv = candle_vulkan_kernels::spirv("get_rows_f32_f32").ok_or_else(|| {
-            Error::Msg("vulkan shader get_rows_f32_f32 not generated".into()).bt()
+        let spirv_name = match self.dtype {
+            DType::F32 => "get_rows_f32_f32",
+            DType::F16 => "get_rows_f16",
+            _ => unreachable!(),
+        };
+        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
+            Error::Msg(format!("vulkan shader {spirv_name} not generated").into()).bt()
         })?;
         self.device.run_compute_3d(
             spirv,
@@ -2152,7 +2618,7 @@ impl VulkanStorage {
     }
 
     fn run_gather_last_dim_f32(&self, ids: &Self, src_l: &Layout, ids_l: &Layout) -> Result<Self> {
-        if self.dtype != DType::F32 {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan gather").bt());
         }
         if ids.dtype != DType::U32 {
@@ -2213,8 +2679,13 @@ impl VulkanStorage {
             VulkanBinding::Storage(ids.buffer.as_ref()),
             VulkanBinding::Storage(dst.buffer.as_ref()),
         ];
-        let spirv = candle_vulkan_kernels::spirv("get_rows_f32_f32").ok_or_else(|| {
-            Error::Msg("vulkan shader get_rows_f32_f32 not generated".into()).bt()
+        let spirv_name = match self.dtype {
+            DType::F32 => "get_rows_f32_f32",
+            DType::F16 => "get_rows_f16",
+            _ => unreachable!(),
+        };
+        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
+            Error::Msg(format!("vulkan shader {spirv_name} not generated").into()).bt()
         })?;
         self.device.run_compute_3d(
             spirv,
@@ -2233,8 +2704,23 @@ impl VulkanStorage {
         src: &Self,
         src_l: &Layout,
     ) -> Result<()> {
-        if self.dtype != DType::F32 || src.dtype != DType::F32 {
+        if (self.dtype != DType::F32 && self.dtype != DType::F16) || self.dtype != src.dtype {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_set").bt());
+        }
+        if self.dtype == DType::F16 {
+            let mut dst_f32 = self.to_dtype(dst_l, DType::F32)?;
+            let src_f32 = src.to_dtype(src_l, DType::F32)?;
+            let dst_f32_layout = Layout::contiguous(dst_l.shape().clone());
+            let src_f32_layout = Layout::contiguous(src_l.shape().clone());
+            dst_f32.run_scatter_set_last_dim_f32(
+                &dst_f32_layout,
+                ids,
+                ids_l,
+                &src_f32,
+                &src_f32_layout,
+            )?;
+            *self = dst_f32.to_dtype(&dst_f32_layout, DType::F16)?;
+            return Ok(());
         }
         if ids.dtype != DType::U32 {
             return Err(Error::UnsupportedDTypeForOp(ids.dtype, "vulkan scatter_set ids").bt());
@@ -2319,7 +2805,10 @@ impl VulkanStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 || rhs.dtype != DType::F32 {
+        if self.dtype != rhs.dtype {
+            return Err(unsupported("matmul mixed dtype"));
+        }
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan matmul").bt());
         }
         let rank = lhs_l.dims().len();
@@ -2344,12 +2833,82 @@ impl VulkanStorage {
         };
 
         let rhs_t_src_layout = rhs_l.transpose(rank - 2, rank - 1)?;
-        let rhs_t_shape = rhs_t_src_layout.shape().clone();
-        let mut rhs_t = unsafe { rhs.device.alloc_uninit(&rhs_t_shape, rhs.dtype)? };
-        rhs.copy_strided_src(&mut rhs_t, 0, &rhs_t_src_layout)?;
+        let rhs_t_contiguous =
+            if rhs_t_src_layout.is_contiguous() && rhs_t_src_layout.start_offset() == 0 {
+                None
+            } else {
+                let rhs_t_shape = rhs_t_src_layout.shape().clone();
+                let mut tmp = unsafe { rhs.device.alloc_uninit(&rhs_t_shape, rhs.dtype)? };
+                rhs.copy_strided_src(&mut tmp, 0, &rhs_t_src_layout)?;
+                Some(tmp)
+            };
+        let (rhs_t, rhs_t_layout) = if let Some(rhs_t_contiguous) = rhs_t_contiguous.as_ref() {
+            (
+                rhs_t_contiguous,
+                Layout::contiguous(rhs_t_src_layout.shape().clone()),
+            )
+        } else {
+            (rhs, rhs_t_src_layout.clone())
+        };
 
         let lhs_stride = lhs_layout.stride();
-        let rhs_t_stride = rhs_t_shape.stride_contiguous();
+        let dst_shape = Shape::from(vec![b, m, n]);
+        if rank == 2 && self.dtype == DType::F32 && m <= VULKAN_MUL_MAT_VEC_MAX_COLS {
+            let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+            let params = VulkanMatVecParams {
+                ncols: k.try_into()?,
+                stride_a: k.try_into()?,
+                stride_b: lhs_stride[rank - 2].try_into()?,
+                stride_d: n.try_into()?,
+                batch_stride_a: 0,
+                batch_stride_b: k.try_into()?,
+                batch_stride_d: n.try_into()?,
+                fusion_flags: 0,
+                base_work_group_y: 0,
+                ne02: 1,
+                ne12: 1,
+                broadcast2: 1,
+                broadcast3: 1,
+            };
+            let bindings = [
+                VulkanBinding::Storage(rhs_t.buffer.as_ref()),
+                VulkanBinding::Storage(lhs.buffer.as_ref()),
+                VulkanBinding::Storage(dst.buffer.as_ref()),
+                VulkanBinding::Storage(dst.buffer.as_ref()),
+                VulkanBinding::Storage(dst.buffer.as_ref()),
+            ];
+            let dmmv_workgroup = vulkan_dmmv_workgroup(&self.device, GgmlDType::F32, n, k, false);
+            let spirv_name = vulkan_dmmv_shader_name(
+                &self.device,
+                GgmlDType::F32,
+                "mul_mat_vec_f32_f32_f32".to_string(),
+                dmmv_workgroup,
+            );
+            let spirv = candle_vulkan_kernels::spirv(&spirv_name).ok_or_else(|| {
+                Error::Msg(format!("vulkan shader {spirv_name} not generated").into()).bt()
+            })?;
+            let block_size = vulkan_dmmv_block_size(&self.device, GgmlDType::F32, dmmv_workgroup);
+            let rows_per_group = 1u32;
+            let spec = [(0, block_size), (1, rows_per_group), (2, m.try_into()?)];
+            let use_dmmv_subgroups = vulkan_dmmv_use_subgroups(&self.device, GgmlDType::F32);
+            let required_subgroup_size = if use_dmmv_subgroups {
+                Some(vulkan_dmmv_subgroup_size(&self.device))
+            } else {
+                None
+            };
+            self.device.run_compute_specialized_with_options(
+                spirv,
+                &bindings,
+                Some(any_as_bytes(&params)),
+                (n.div_ceil(rows_per_group as usize).try_into()?, 1, 1),
+                Some(&spec),
+                use_dmmv_subgroups,
+                required_subgroup_size,
+            )?;
+            drop(lhs_contiguous);
+            return Ok(dst);
+        }
+        let rhs_t_stride = rhs_t_layout.stride();
         let bs02 = if rank >= 3 {
             lhs_layout.dims()[rank - 3]
         } else {
@@ -2366,7 +2925,6 @@ impl VulkanStorage {
             n * k
         };
 
-        let dst_shape = Shape::from(vec![b, m, n]);
         let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
         let params = VulkanMatmulParams {
             m: n.try_into()?,
@@ -2392,8 +2950,14 @@ impl VulkanStorage {
             VulkanBinding::Storage(lhs.buffer.as_ref()),
             VulkanBinding::Storage(dst.buffer.as_ref()),
         ];
-        let spirv = candle_vulkan_kernels::spirv("matmul_f32_f32")
-            .ok_or_else(|| Error::Msg("vulkan shader matmul_f32_f32 not generated".into()).bt())?;
+        let spirv_name = match self.dtype {
+            DType::F32 => "matmul_f32_f32",
+            DType::F16 => "matmul_f16",
+            _ => unreachable!(),
+        };
+        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
+            Error::Msg(format!("vulkan shader {spirv_name} not generated").into()).bt()
+        })?;
         let spec = [
             (0, 64),
             (1, 64),
@@ -3139,7 +3703,10 @@ impl VulkanStorage {
             drop(src_contiguous);
             return Ok((dst, dst_shape));
         }
-        if input_m == 1 && vulkan_supports_quantized_matvec_weight(qdtype) {
+        if input_m <= VULKAN_MUL_MAT_VEC_MAX_COLS
+            && rank == 2
+            && vulkan_supports_quantized_matvec_weight(qdtype)
+        {
             return self.quantized_matvec(qdtype, qshape, storage, layout);
         }
 
@@ -3319,8 +3886,10 @@ impl VulkanStorage {
         let rank = layout.dims().len();
         let (n, k) = qshape.dims2()?;
         let input_m = layout.dims()[rank - 2];
-        if input_m != 1 {
-            crate::bail!("vulkan quantized matvec expects input_m == 1, got {input_m}");
+        if input_m == 0 || input_m > VULKAN_MUL_MAT_VEC_MAX_COLS {
+            crate::bail!(
+                "vulkan quantized matvec expects 1 <= input_m <= {VULKAN_MUL_MAT_VEC_MAX_COLS}, got {input_m}"
+            );
         }
         let last_k = layout.dims()[rank - 1];
         if last_k != k {
@@ -3350,7 +3919,18 @@ impl VulkanStorage {
         } else {
             1
         };
-        let batch_count = batch_inner * batch_outer;
+        if input_m > 1 && rank != 2 {
+            crate::bail!(
+                "vulkan quantized matvec multi-column expects rank-2 input, got rank {rank}"
+            );
+        }
+        let batch_n = input_m > 1;
+        let batch_count = if batch_n {
+            input_m
+        } else {
+            batch_inner * batch_outer
+        };
+        let dispatch_y = if batch_n { 1 } else { batch_count };
         let src_elem_count = src_layout.shape().elem_count();
         let use_q8_1_rhs = src.dtype == DType::F32
             && self.device.inner.integer_dot_product
@@ -3367,15 +3947,19 @@ impl VulkanStorage {
             stride_a: k.try_into()?,
             stride_b: k.try_into()?,
             stride_d: n.try_into()?,
-            batch_stride_a: qshape.elem_count().try_into()?,
+            batch_stride_a: if batch_n {
+                0
+            } else {
+                qshape.elem_count().try_into()?
+            },
             batch_stride_b: k.try_into()?,
             batch_stride_d: n.try_into()?,
             fusion_flags: 0,
             base_work_group_y: 0,
             ne02: 1,
-            ne12: batch_inner.try_into()?,
-            broadcast2: batch_inner.try_into()?,
-            broadcast3: batch_outer.try_into()?,
+            ne12: if batch_n { 1 } else { batch_inner.try_into()? },
+            broadcast2: if batch_n { 1 } else { batch_inner.try_into()? },
+            broadcast3: if batch_n { 1 } else { batch_outer.try_into()? },
         };
         let q8_1_rhs = if use_q8_1_rhs {
             Some(quantize_f32_storage_to_q8_1_x4(
@@ -3402,16 +3986,18 @@ impl VulkanStorage {
             (
                 vulkan_dmmv_shader_name(
                     &self.device,
+                    qdtype,
                     format!("mul_mat_vec_{}_q8_1_f32", vulkan_quantized_stem(qdtype)?),
                     dmmv_workgroup,
                 ),
                 vulkan_dmmv_rows_per_group(&self.device, qdtype, true)?,
-                vulkan_dmmv_block_size(&self.device, dmmv_workgroup),
+                vulkan_dmmv_block_size(&self.device, qdtype, dmmv_workgroup),
             )
         } else {
             (
                 vulkan_dmmv_shader_name(
                     &self.device,
+                    qdtype,
                     format!(
                         "mul_mat_vec_{}_{}",
                         vulkan_quantized_stem(qdtype)?,
@@ -3430,23 +4016,39 @@ impl VulkanStorage {
                     dmmv_workgroup,
                 ),
                 vulkan_quantized_vec_rows(qdtype)?,
-                vulkan_dmmv_block_size(&self.device, dmmv_workgroup),
+                vulkan_dmmv_block_size(&self.device, qdtype, dmmv_workgroup),
             )
         };
         let spirv = candle_vulkan_kernels::spirv(&spirv_name).ok_or_else(|| {
             Error::Msg(format!("vulkan shader {spirv_name} not generated").into()).bt()
         })?;
-        let spec = [(0, block_size), (1, rows_per_group), (2, 1)];
-        self.device.run_compute_specialized(
+        let spec = [
+            (0, block_size),
+            (1, rows_per_group),
+            (2, input_m.try_into()?),
+        ];
+        let use_dmmv_subgroups = vulkan_dmmv_use_subgroups(&self.device, qdtype);
+        let required_subgroup_size = if use_dmmv_subgroups {
+            Some(if vulkan_is_k_quant(qdtype) {
+                vulkan_dmmv_subgroup_size16(&self.device)
+            } else {
+                vulkan_dmmv_subgroup_size(&self.device)
+            })
+        } else {
+            None
+        };
+        self.device.run_compute_specialized_with_options(
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
             (
                 n.div_ceil(rows_per_group as usize).try_into()?,
-                batch_count.try_into()?,
+                dispatch_y.try_into()?,
                 1,
             ),
             Some(&spec),
+            use_dmmv_subgroups,
+            required_subgroup_size,
         )?;
         drop(src_contiguous);
         Ok((dst, dst_shape))
@@ -3571,21 +4173,23 @@ impl VulkanStorage {
             (
                 vulkan_dmmv_shader_name(
                     &self.device,
+                    qdtype,
                     format!("mul_mat_vec_id_{}_q8_1_f32", vulkan_quantized_stem(qdtype)?),
                     dmmv_workgroup,
                 ),
                 vulkan_dmmv_rows_per_group(&self.device, qdtype, true)?,
-                vulkan_dmmv_block_size(&self.device, dmmv_workgroup),
+                vulkan_dmmv_block_size(&self.device, qdtype, dmmv_workgroup),
             )
         } else {
             (
                 vulkan_dmmv_shader_name(
                     &self.device,
+                    qdtype,
                     format!("mul_mat_vec_id_{}_f32", vulkan_quantized_stem(qdtype)?),
                     dmmv_workgroup,
                 ),
                 vulkan_quantized_vec_rows(qdtype)?,
-                vulkan_dmmv_block_size(&self.device, dmmv_workgroup),
+                vulkan_dmmv_block_size(&self.device, qdtype, dmmv_workgroup),
             )
         };
         let spirv = candle_vulkan_kernels::spirv(&spirv_name).ok_or_else(|| {
@@ -3595,17 +4199,29 @@ impl VulkanStorage {
         let groups_x_max = self.device.inner.max_workgroup_count_x.max(1);
         let groups_x = (n as u32).div_ceil(rows_per_group).min(groups_x_max);
         let groups_z = (n as u32).div_ceil(groups_x);
+        let use_dmmv_subgroups = vulkan_dmmv_use_subgroups(&self.device, qdtype);
+        let required_subgroup_size = if use_dmmv_subgroups {
+            Some(if vulkan_is_k_quant(qdtype) {
+                vulkan_dmmv_subgroup_size16(&self.device)
+            } else {
+                vulkan_dmmv_subgroup_size(&self.device)
+            })
+        } else {
+            None
+        };
         for expert_i1 in 0..batch {
             let params = VulkanMatVecIdParams {
                 expert_i1: expert_i1.try_into()?,
                 ..params
             };
-            self.device.run_compute_specialized(
+            self.device.run_compute_specialized_with_options(
                 spirv,
                 &bindings,
                 Some(any_as_bytes(&params)),
                 (groups_x, topk.try_into()?, groups_z),
                 Some(&spec),
+                use_dmmv_subgroups,
+                required_subgroup_size,
             )?;
         }
         drop(ids_contiguous);
@@ -3617,16 +4233,13 @@ impl VulkanStorage {
 
 impl Drop for VulkanBuffer {
     fn drop(&mut self) {
-        unsafe {
-            let _ = self.device.inner.device.device_wait_idle();
-            self.device.inner.device.destroy_buffer(self.buffer, None);
-            if let Ok(mut allocation) = self.allocation.lock() {
-                if let Some(allocation) = allocation.take() {
-                    if let Ok(mut allocator) = self.device.inner.allocator.lock() {
-                        if let Some(allocator) = allocator.as_mut() {
-                            let _ = allocator.free(allocation);
-                        }
-                    }
+        if let Ok(mut allocation) = self.allocation.lock() {
+            if let Some(allocation) = allocation.take() {
+                if let Ok(mut deferred) = self.device.inner.deferred_buffer_frees.lock() {
+                    deferred.push(VulkanDeferredBuffer {
+                        buffer: self.buffer,
+                        allocation,
+                    });
                 }
             }
         }
@@ -3637,6 +4250,35 @@ impl Drop for VulkanInner {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Ok(mut pending) = self.pending_submissions.lock() {
+                for submission in pending.drain(..) {
+                    self.device.destroy_fence(submission.fence, None);
+                    self.device
+                        .destroy_command_pool(submission.command_pool, None);
+                    self.device
+                        .destroy_descriptor_pool(submission.descriptor_pool, None);
+                }
+            }
+            if let Ok(mut cache) = self.pipeline_cache.lock() {
+                for (_, cached) in cache.drain() {
+                    self.device.destroy_pipeline(cached.pipeline, None);
+                    self.device
+                        .destroy_pipeline_layout(cached.pipeline_layout, None);
+                    self.device
+                        .destroy_descriptor_set_layout(cached.descriptor_set_layout, None);
+                    self.device.destroy_shader_module(cached.shader, None);
+                }
+            }
+            if let Ok(mut deferred) = self.deferred_buffer_frees.lock() {
+                if let Ok(mut allocator) = self.allocator.lock() {
+                    if let Some(allocator) = allocator.as_mut() {
+                        for deferred in deferred.drain(..) {
+                            self.device.destroy_buffer(deferred.buffer, None);
+                            let _ = allocator.free(deferred.allocation);
+                        }
+                    }
+                }
+            }
             if let Ok(mut allocator) = self.allocator.lock() {
                 let _ = allocator.take();
             }
@@ -3846,6 +4488,18 @@ impl BackendStorage for VulkanStorage {
         self.device.storage_from_cpu_storage(&out_cpu)
     }
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+        if self.dtype == DType::BF16 && (dtype == DType::F16 || dtype == DType::F32) {
+            return match self.run_bf16_to_dtype_via_get_rows(layout, dtype) {
+                Ok(out) => Ok(out),
+                Err(err) if should_cpu_fallback(&err) => {
+                    let src_cpu = self.to_cpu_storage()?;
+                    let out_cpu =
+                        <CpuStorage as BackendStorage>::to_dtype(&src_cpu, layout, dtype)?;
+                    self.device.storage_from_cpu_storage(&out_cpu)
+                }
+                Err(err) => Err(err),
+            };
+        }
         let spirv = copy_spirv(self.dtype, dtype)?;
         match self.run_unary_generic_with_params_dtype(layout, spirv, 0.0, 0.0, dtype) {
             Ok(out) => Ok(out),
@@ -4364,6 +5018,8 @@ impl BackendDevice for VulkanDevice {
     fn new(ordinal: usize) -> Result<Self> {
         let entry = unsafe { ash::Entry::load() }.map_err(Error::wrap)?;
         let app_name = CString::new("candle-vulkan").map_err(Error::wrap)?;
+        let subgroup_size_control_ext =
+            unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_EXT_subgroup_size_control\0") };
         let app_info = vk::ApplicationInfo::default()
             .application_name(&app_name)
             .application_version(0)
@@ -4379,11 +5035,22 @@ impl BackendDevice for VulkanDevice {
             .get(ordinal)
             .or_else(|| physical_devices.first())
             .ok_or_else(|| Error::msg("no vulkan physical device found"))?;
+        let device_extensions = unsafe {
+            instance
+                .enumerate_device_extension_properties(physical_device)
+                .map_err(Error::wrap)?
+        };
+        let has_subgroup_size_control_ext = device_extensions.iter().any(|ext| unsafe {
+            CStr::from_ptr(ext.extension_name.as_ptr()) == subgroup_size_control_ext
+        });
         let mut subgroup_properties = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut subgroup_size_control_properties =
+            vk::PhysicalDeviceSubgroupSizeControlPropertiesEXT::default();
         let mut integer_dot_properties =
             vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
         let mut physical_device_properties = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut subgroup_properties)
+            .push_next(&mut subgroup_size_control_properties)
             .push_next(&mut integer_dot_properties);
         unsafe {
             instance
@@ -4415,8 +5082,11 @@ impl BackendDevice for VulkanDevice {
         let subgroup_size = subgroup_properties.subgroup_size.max(1);
         let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default();
         let mut integer_dot_features = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+        let mut subgroup_size_control_features =
+            vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT::default();
         let mut physical_features2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut vulkan12_features)
+            .push_next(&mut subgroup_size_control_features)
             .push_next(&mut integer_dot_features);
         unsafe {
             instance.get_physical_device_features2(physical_device, &mut physical_features2);
@@ -4439,6 +5109,12 @@ impl BackendDevice for VulkanDevice {
         let integer_dot_product = integer_dot_features.shader_integer_dot_product == vk::TRUE
             && integer_dot_properties.integer_dot_product4x8_bit_packed_signed_accelerated
                 == vk::TRUE;
+        let subgroup_size_control = has_subgroup_size_control_ext
+            && subgroup_size_control_features.subgroup_size_control == vk::TRUE;
+        let compute_full_subgroups = subgroup_size_control
+            && subgroup_size_control_features.compute_full_subgroups == vk::TRUE;
+        let subgroup_min_size = subgroup_size_control_properties.min_subgroup_size.max(1);
+        let subgroup_max_size = subgroup_size_control_properties.max_subgroup_size.max(1);
         let mut enabled_features = vk::PhysicalDeviceFeatures::default();
         if robust_buffer_access {
             enabled_features.robust_buffer_access = vk::TRUE;
@@ -4451,15 +5127,31 @@ impl BackendDevice for VulkanDevice {
         if integer_dot_product {
             enabled_integer_dot.shader_integer_dot_product = vk::TRUE;
         }
+        let mut enabled_subgroup_size_control =
+            vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT::default();
+        if subgroup_size_control {
+            enabled_subgroup_size_control.subgroup_size_control = vk::TRUE;
+            if compute_full_subgroups {
+                enabled_subgroup_size_control.compute_full_subgroups = vk::TRUE;
+            }
+        }
         let priorities = [1.0f32];
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&priorities)];
+        let mut enabled_extension_names = Vec::new();
+        if has_subgroup_size_control_ext {
+            enabled_extension_names.push(subgroup_size_control_ext.as_ptr());
+        }
         let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
-            .enabled_features(&enabled_features);
+            .enabled_features(&enabled_features)
+            .enabled_extension_names(&enabled_extension_names);
         if vulkan_memory_model {
             device_info = device_info.push_next(&mut enabled_vulkan12);
+        }
+        if subgroup_size_control {
+            device_info = device_info.push_next(&mut enabled_subgroup_size_control);
         }
         if integer_dot_product {
             device_info = device_info.push_next(&mut enabled_integer_dot);
@@ -4486,6 +5178,10 @@ impl BackendDevice for VulkanDevice {
                 integer_dot_product,
                 subgroup_arithmetic,
                 subgroup_size,
+                subgroup_size_control,
+                compute_full_subgroups,
+                subgroup_min_size,
+                subgroup_max_size,
                 max_workgroup_size_log2,
                 max_workgroup_count_x,
                 max_workgroup_count_y,
@@ -4496,6 +5192,9 @@ impl BackendDevice for VulkanDevice {
                 queue,
                 allocator: Mutex::new(Some(allocator)),
                 seed_value: RwLock::new(299_792_458),
+                pipeline_cache: Mutex::new(HashMap::new()),
+                pending_submissions: Mutex::new(Vec::new()),
+                deferred_buffer_frees: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -4540,6 +5239,19 @@ impl BackendDevice for VulkanDevice {
     }
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
+        let normalized_storage;
+        let storage = match storage {
+            CpuStorage::BF16(values) => {
+                normalized_storage = CpuStorage::F16(
+                    values
+                        .iter()
+                        .map(|value| half::f16::from_f32(value.to_f32()))
+                        .collect(),
+                );
+                &normalized_storage
+            }
+            _ => storage,
+        };
         let (dtype, count, bytes) = cpu_storage_to_bytes(storage)?;
         let buffer = self.create_buffer(bytes.len(), "candle-vulkan-upload")?;
         self.write_buffer(&buffer, &bytes)?;
@@ -4597,8 +5309,7 @@ impl BackendDevice for VulkanDevice {
     }
 
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.inner.device.queue_wait_idle(self.inner.queue) }.map_err(Error::wrap)?;
-        Ok(())
+        self.synchronize_pending()
     }
 }
 

@@ -185,6 +185,7 @@ impl Tensor {
     ) -> Result<Self> {
         let none = BackpropOp::none();
         let shape = shape.into();
+        let dtype = device.normalize_dtype_for_device(dtype);
         let mut storage = unsafe { device.alloc_uninit(&shape, dtype)? };
         let layout = Layout::contiguous(shape.clone());
         storage.const_set(crate::scalar::Scalar::one(dtype), &layout)?;
@@ -444,9 +445,15 @@ impl Tensor {
     ) -> Result<Self> {
         let none = BackpropOp::none();
         let shape = shape.into();
-        let mut storage = unsafe { device.alloc_uninit(&shape, D::DTYPE)? };
+        let dtype = device.normalize_dtype_for_device(D::DTYPE);
+        let mut storage = unsafe { device.alloc_uninit(&shape, dtype)? };
         let layout = Layout::contiguous(shape.clone());
-        storage.const_set(value.to_scalar(), &layout)?;
+        let scalar = if dtype == DType::F16 && D::DTYPE == DType::BF16 {
+            crate::scalar::Scalar::F16(half::f16::from_f32(value.to_f64() as f32))
+        } else {
+            value.to_scalar()
+        };
+        storage.const_set(scalar, &layout)?;
         Ok(from_storage(storage, shape, none, false))
     }
 
@@ -1683,6 +1690,27 @@ impl Tensor {
     pub fn scatter<D: Dim>(&self, indexes: &Self, source: &Self, dim: D) -> Result<Self> {
         let dim = dim.to_index(self.shape(), "scatter")?;
         self.scatter_checks(indexes, source, dim)?;
+        let rank = self.rank();
+        let use_gpu_comp = rank > 0
+            && dim + 1 != rank
+            && (self.device().is_wgpu() || self.device().is_vulkan())
+            && matches!(self.dtype(), DType::F32 | DType::F16)
+            && self.dtype() == source.dtype()
+            && indexes.dtype() == DType::U32;
+        if use_gpu_comp {
+            let mut perm = (0..rank).filter(|&idx| idx != dim).collect::<Vec<_>>();
+            perm.push(dim);
+            let mut inv_perm = vec![0usize; rank];
+            for (idx, &src_dim) in perm.iter().enumerate() {
+                inv_perm[src_dim] = idx;
+            }
+            let self_p = self.permute(perm.clone())?.contiguous()?;
+            let indexes_p = indexes.permute(perm.clone())?.contiguous()?;
+            let source_p = source.permute(perm.clone())?.contiguous()?;
+            return self_p
+                .scatter(&indexes_p, &source_p, rank - 1)?
+                .permute(inv_perm);
+        }
         let shape = self.shape();
         let mut storage = unsafe { self.device().alloc_uninit(shape, self.dtype())? };
         self.storage()
@@ -1891,6 +1919,7 @@ impl Tensor {
     /// dimension `dim` by the values in `indexes`.
     pub fn gather<D: Dim>(&self, indexes: &Self, dim: D) -> Result<Self> {
         let dim = dim.to_index(self.shape(), "gather")?;
+        let rank = self.rank();
 
         let self_dims = self.dims();
         let indexes_dims = indexes.dims();
@@ -1913,6 +1942,22 @@ impl Tensor {
                 rhs: indexes.shape().clone(),
             }
             .bt())?
+        }
+        let use_gpu_comp = rank > 0
+            && dim + 1 != rank
+            && (self.device().is_wgpu() || self.device().is_vulkan())
+            && matches!(self.dtype(), DType::F32 | DType::F16)
+            && indexes.dtype() == DType::U32;
+        if use_gpu_comp {
+            let mut perm = (0..rank).filter(|&idx| idx != dim).collect::<Vec<_>>();
+            perm.push(dim);
+            let mut inv_perm = vec![0usize; rank];
+            for (idx, &src_dim) in perm.iter().enumerate() {
+                inv_perm[src_dim] = idx;
+            }
+            let self_p = self.permute(perm.clone())?.contiguous()?;
+            let indexes_p = indexes.permute(perm.clone())?.contiguous()?;
+            return self_p.gather(&indexes_p, rank - 1)?.permute(inv_perm);
         }
         let storage =
             self.storage()
@@ -2496,6 +2541,7 @@ impl Tensor {
     /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn to_dtype(&self, dtype: DType) -> Result<Self> {
+        let dtype = self.device().normalize_dtype_for_device(dtype);
         if self.dtype() == dtype {
             Ok(self.clone())
         } else {

@@ -9,6 +9,14 @@ use safetensors::{slice::IndexOp, tensor::SafeTensors};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+fn normalize_dtype_for_device(dtype: DType, dev: &Device) -> DType {
+    if dtype == DType::BF16 && (dev.is_wgpu() || dev.is_vulkan()) {
+        DType::F16
+    } else {
+        dtype
+    }
+}
+
 /// A structure used to retrieve variables, these variables can either come from storage or be
 /// generated via some form of initialization.
 ///
@@ -107,6 +115,7 @@ impl Backend for Box<dyn SimpleBackend + '_> {
 
 impl<B: Backend> VarBuilderArgs<'_, B> {
     pub fn new_with_args(backend: B, dtype: DType, dev: &Device) -> Self {
+        let dtype = normalize_dtype_for_device(dtype, dev);
         let data = TensorData {
             backend: Arc::new(backend),
             device: dev.clone(),
@@ -175,6 +184,7 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
 
     /// Clone the VarBuilder tweaking its dtype
     pub fn to_dtype(&self, dtype: DType) -> Self {
+        let dtype = normalize_dtype_for_device(dtype, &self.data.device);
         Self {
             data: self.data.clone(),
             path: self.path.clone(),
@@ -222,6 +232,7 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
     /// Retrieve the tensor associated with the given name & dtype at the current path.
     pub fn get_unchecked_dtype(&self, name: &str, dtype: DType) -> Result<Tensor> {
         let name = self.path(name);
+        let dtype = normalize_dtype_for_device(dtype, &self.data.device);
         self.data
             .backend
             .get_unchecked(&name, dtype, &self.data.device)
@@ -236,6 +247,7 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
         dtype: DType,
     ) -> Result<Tensor> {
         let path = self.path(name);
+        let dtype = normalize_dtype_for_device(dtype, &self.data.device);
         self.data
             .backend
             .get(s.into(), &path, hints, dtype, &self.data.device)
@@ -243,18 +255,21 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
 
     /// Set the device of the VarBuilder.
     pub fn set_device(self, device: Device) -> Self {
+        let dtype = normalize_dtype_for_device(self.data.dtype, &device);
         Self {
             data: Arc::new(TensorData {
                 backend: self.data.backend.clone(),
-                dtype: self.data.dtype,
+                dtype,
                 device,
             }),
+            dtype,
             ..self
         }
     }
 
     /// Set the dtype of the VarBuilder.
     pub fn set_dtype(self, dtype: DType) -> Self {
+        let dtype = normalize_dtype_for_device(dtype, &self.data.device);
         Self {
             data: Arc::new(TensorData {
                 backend: self.data.backend.clone(),
@@ -599,6 +614,7 @@ impl<'a> VarBuilder<'a> {
         dtype: DType,
         device: Device,
     ) -> Self {
+        let dtype = normalize_dtype_for_device(dtype, &device);
         let data = TensorData {
             backend: Arc::new(backend),
             device,

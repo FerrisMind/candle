@@ -5,7 +5,7 @@ use candle_core::Module;
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use candle_core::{DType, Device, IndexOp, Result, Shape, Tensor};
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
-use half::f16;
+use half::{bf16, f16};
 
 #[test]
 #[cfg(feature = "wgpu")]
@@ -146,6 +146,7 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     let ys = Tensor::from_slice(&[10.0f32, 20.0, 30.0, 40.0], (2, 2), device)?;
     assert_eq!((&xs + &ys)?.to_vec2::<f32>()?, [[8.0, 19.0], [30.0, 43.0]]);
 
+    smoke_f32_large_linear_elementwise(device)?;
     smoke_non_f32_upload_download(device)?;
     smoke_f32_to_i32_dtype_conversion(device)?;
     smoke_f32_f16_dtype_conversion(device)?;
@@ -178,6 +179,32 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     smoke_quantized_paths(device)?;
 
     device.synchronize()?;
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_large_linear_elementwise(device: &Device) -> Result<()> {
+    let values = (0..4096)
+        .map(|idx| idx as f32 / 128.0 - 8.0)
+        .collect::<Vec<_>>();
+    let xs = Tensor::from_slice(&values, (1, 4, 1024), device)?;
+    let zeros = Tensor::zeros((1, 4, 1024), DType::F32, device)?;
+    assert_close_vec(
+        &xs.add(&zeros)?.flatten_all()?.to_vec1::<f32>()?,
+        &values,
+        1e-4,
+        "large linear add",
+    );
+    let expected_affine = values
+        .iter()
+        .map(|value| value * 0.5 + 1.25)
+        .collect::<Vec<_>>();
+    assert_close_vec(
+        &xs.affine(0.5, 1.25)?.flatten_all()?.to_vec1::<f32>()?,
+        &expected_affine,
+        1e-4,
+        "large linear affine",
+    );
     Ok(())
 }
 
@@ -226,6 +253,44 @@ fn smoke_non_f32_upload_download(device: &Device) -> Result<()> {
         [
             [f16::from_f32(0.0), f16::from_f32(0.0)],
             [f16::from_f32(0.0), f16::from_f32(0.0)]
+        ]
+    );
+
+    let bf16s = Tensor::from_slice(
+        &[
+            bf16::from_f32(0.5),
+            bf16::from_f32(1.5),
+            bf16::from_f32(-2.0),
+            bf16::from_f32(4.0),
+        ],
+        (2, 2),
+        device,
+    )?;
+    assert_eq!(bf16s.dtype(), DType::F16);
+    assert_eq!(
+        bf16s.to_vec2::<f16>()?,
+        [
+            [f16::from_f32(0.5), f16::from_f32(1.5)],
+            [f16::from_f32(-2.0), f16::from_f32(4.0)]
+        ]
+    );
+    let bf16_zeros = Tensor::zeros((2, 2), DType::BF16, device)?;
+    assert_eq!(bf16_zeros.dtype(), DType::F16);
+    assert_eq!(
+        bf16_zeros.to_vec2::<f16>()?,
+        [
+            [f16::from_f32(0.0), f16::from_f32(0.0)],
+            [f16::from_f32(0.0), f16::from_f32(0.0)]
+        ]
+    );
+    let f32_to_bf16 =
+        Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (2, 2), device)?.to_dtype(DType::BF16)?;
+    assert_eq!(f32_to_bf16.dtype(), DType::F16);
+    assert_eq!(
+        f32_to_bf16.to_vec2::<f16>()?,
+        [
+            [f16::from_f32(1.0), f16::from_f32(2.0)],
+            [f16::from_f32(3.0), f16::from_f32(4.0)]
         ]
     );
     Ok(())
@@ -601,6 +666,26 @@ fn smoke_f32_gather_last_dim(device: &Device) -> Result<()> {
         [[3.0, 1.0], [20.0, 20.0]]
     );
 
+    let xs_f16 = Tensor::from_slice(
+        &[
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+            f16::from_f32(3.0),
+            f16::from_f32(10.0),
+            f16::from_f32(20.0),
+            f16::from_f32(30.0),
+        ],
+        (2, 3),
+        device,
+    )?;
+    assert_eq!(
+        xs_f16.gather(&ids, 1)?.to_vec2::<f16>()?,
+        [
+            [f16::from_f32(3.0), f16::from_f32(1.0)],
+            [f16::from_f32(20.0), f16::from_f32(20.0)]
+        ]
+    );
+
     let ys = Tensor::from_slice(
         &[1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0],
         (2, 2, 2),
@@ -634,6 +719,36 @@ fn smoke_f32_scatter_set_last_dim(device: &Device) -> Result<()> {
         dst.to_vec2::<f32>()?,
         [[10.0, 0.0, 30.0, 0.0], [0.0, 200.0, 0.0, 400.0]]
     );
+
+    let dst_f16 = Tensor::zeros((2, 4), DType::F16, device)?;
+    let src_f16 = Tensor::from_slice(
+        &[
+            f16::from_f32(30.0),
+            f16::from_f32(10.0),
+            f16::from_f32(200.0),
+            f16::from_f32(400.0),
+        ],
+        (2, 2),
+        device,
+    )?;
+    dst_f16.scatter_set(&ids, &src_f16, 1)?;
+    assert_eq!(
+        dst_f16.to_vec2::<f16>()?,
+        [
+            [
+                f16::from_f32(10.0),
+                f16::from_f32(0.0),
+                f16::from_f32(30.0),
+                f16::from_f32(0.0)
+            ],
+            [
+                f16::from_f32(0.0),
+                f16::from_f32(200.0),
+                f16::from_f32(0.0),
+                f16::from_f32(400.0)
+            ]
+        ]
+    );
     Ok(())
 }
 
@@ -656,6 +771,45 @@ fn smoke_f32_gather_scatter_non_last_dim(device: &Device) -> Result<()> {
     assert_eq!(
         base.scatter(&ids, &src, 0)?.to_vec2::<f32>()?,
         expected_scatter
+    );
+
+    let xs_f16 = Tensor::from_slice(
+        &[
+            f16::from_f32(1.0),
+            f16::from_f32(10.0),
+            f16::from_f32(2.0),
+            f16::from_f32(20.0),
+            f16::from_f32(3.0),
+            f16::from_f32(30.0),
+        ],
+        (3, 2),
+        device,
+    )?;
+    let src_f16 = Tensor::from_slice(
+        &[
+            f16::from_f32(7.0),
+            f16::from_f32(70.0),
+            f16::from_f32(8.0),
+            f16::from_f32(80.0),
+        ],
+        (2, 2),
+        device,
+    )?;
+    assert_eq!(
+        xs_f16.gather(&ids, 0)?.to_vec2::<f16>()?,
+        [
+            [f16::from_f32(1.0), f16::from_f32(20.0)],
+            [f16::from_f32(3.0), f16::from_f32(10.0)]
+        ]
+    );
+    let base_f16 = Tensor::zeros((3, 2), DType::F16, device)?;
+    assert_eq!(
+        base_f16.scatter(&ids, &src_f16, 0)?.to_vec2::<f16>()?,
+        [
+            [f16::from_f32(7.0), f16::from_f32(80.0)],
+            [f16::from_f32(0.0), f16::from_f32(70.0)],
+            [f16::from_f32(8.0), f16::from_f32(0.0)]
+        ]
     );
     Ok(())
 }
@@ -1452,6 +1606,17 @@ fn smoke_quantized_paths(device: &Device) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn assert_close_vec(actual: &[f32], expected: &[f32], tol: f32, label: &str) {
+    assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
+    for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (actual - expected).abs() <= tol,
+            "{label}: mismatch at idx {idx}: got {actual}, expected {expected}, tol {tol}"
+        );
+    }
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]

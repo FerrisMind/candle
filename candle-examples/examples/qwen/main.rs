@@ -375,6 +375,7 @@ fn main() -> Result<()> {
         Some("f32") => DType::F32,
         Some(dtype) => anyhow::bail!("Unsupported dtype {dtype}"),
         None if device.is_cuda() || device.is_metal() => DType::BF16,
+        None if device.is_wgpu() || device.is_vulkan() => DType::F16,
         None => DType::F32,
     };
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };

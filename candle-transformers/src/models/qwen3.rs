@@ -36,10 +36,17 @@ pub struct Config {
 pub(crate) struct Qwen3RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
+    head_dim: usize,
+    rope_theta: f32,
 }
 
 impl Qwen3RotaryEmbedding {
     pub(crate) fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
+        let rope_dev = if dev.is_wgpu() || dev.is_vulkan() {
+            &Device::Cpu
+        } else {
+            dev
+        };
         let dim = cfg.head_dim;
         let max_seq_len = cfg.max_position_embeddings;
         let inv_freq: Vec<_> = (0..dim)
@@ -47,25 +54,44 @@ impl Qwen3RotaryEmbedding {
             .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(DType::F32)?;
-        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
+        let inv_freq =
+            Tensor::from_vec(inv_freq, (1, inv_freq_len), rope_dev)?.to_dtype(DType::F32)?;
+        let t = Tensor::arange(0u32, max_seq_len as u32, rope_dev)?
             .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
         Ok(Self {
             sin: freqs.sin()?.to_dtype(dtype)?,
             cos: freqs.cos()?.to_dtype(dtype)?,
+            head_dim: cfg.head_dim,
+            rope_theta: cfg.rope_theta as f32,
         })
     }
 
     /// Apply RoPE (q, k shape: B x H x L x D)
     pub(crate) fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
-        let (_, _, seq_len, _) = q.dims4()?;
-        let cos = self.cos.narrow(0, offset, seq_len)?;
-        let sin = self.sin.narrow(0, offset, seq_len)?;
-        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
-        Ok((q_embed, k_embed))
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        if q.device().is_wgpu() || q.device().is_vulkan() {
+            let (_, _, seq_len, _) = q.dims4()?;
+            let positions = Tensor::from_vec(
+                (offset..offset + seq_len).map(|v| v as i32).collect(),
+                seq_len,
+                q.device(),
+            )?;
+            let q_embed =
+                candle_nn::rotary_emb::rope_ggml(&q, &positions, self.head_dim, self.rope_theta)?;
+            let k_embed =
+                candle_nn::rotary_emb::rope_ggml(&k, &positions, self.head_dim, self.rope_theta)?;
+            Ok((q_embed, k_embed))
+        } else {
+            let (_, _, seq_len, _) = q.dims4()?;
+            let cos = self.cos.narrow(0, offset, seq_len)?;
+            let sin = self.sin.narrow(0, offset, seq_len)?;
+            let q_embed = candle_nn::rotary_emb::rope(&q, &cos, &sin)?;
+            let k_embed = candle_nn::rotary_emb::rope(&k, &cos, &sin)?;
+            Ok((q_embed, k_embed))
+        }
     }
 }
 
@@ -339,18 +365,21 @@ impl Qwen3Attention {
         b: usize,
         l: usize,
     ) -> Result<Tensor> {
-        // GQA repeat_kv
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
         let k = repeat_kv(k.clone(), self.num_kv_groups)?.contiguous()?;
         let v = repeat_kv(v.clone(), self.num_kv_groups)?.contiguous()?;
-
-        // Attention score
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
         if let Some(m) = attn_mask {
-            scores = scores.broadcast_add(m)?;
-        }
+            let scores_dtype = scores.dtype();
+            let mask = if m.dtype() != scores_dtype {
+                m.to_dtype(scores_dtype)?
+            } else {
+                m.clone()
+            };
+            scores = scores.broadcast_add(&mask)?;
+        };
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?; // (B, H, L, D)
+        let ctx = probs.matmul(&v)?;
 
         // Output proj
         ctx.transpose(1, 2)?

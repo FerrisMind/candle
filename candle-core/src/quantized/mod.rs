@@ -41,20 +41,23 @@ use half::{bf16, f16};
 
 pub use k_quants::GgmlType;
 
-fn as_t_slice<T>(data: Cow<'_, [u8]>) -> &[T] {
+fn decode_t_vec<T>(data: &[u8]) -> Vec<T> {
     let size = std::mem::size_of::<T>();
+    assert!(size > 0, "zero-sized quantized types are not supported");
     assert_eq!(
         data.len() % size,
         0,
         "Data length must be a multiple of T's size"
     );
-    let ptr = data.as_ptr();
-    assert_eq!(
-        (ptr as usize) % std::mem::align_of::<T>(),
-        0,
-        "Data pointer must be aligned to T's alignment"
-    );
-    unsafe { std::slice::from_raw_parts(ptr as *const T, data.len() / size) }
+    let mut out = Vec::with_capacity(data.len() / size);
+    let mut ptr = data.as_ptr();
+    for _ in 0..(data.len() / size) {
+        // Quantized blocks are serialized as packed bytes. Reconstruct them into aligned Rust
+        // values without assuming that the input byte pointer is aligned.
+        out.push(unsafe { std::ptr::read_unaligned(ptr as *const T) });
+        ptr = unsafe { ptr.add(size) };
+    }
+    out
 }
 
 fn is_backend_not_implemented_msg(msg: &str, backend: &str) -> bool {
@@ -80,6 +83,22 @@ fn should_quantized_backend_fallback(err: &crate::Error, backend: &str) -> bool 
         | crate::Error::Context { inner, .. } => should_quantized_backend_fallback(inner, backend),
         _ => false,
     }
+}
+
+fn load_quantized_metal_from_bytes<T: k_quants::GgmlType + Send + Sync + 'static>(
+    device: &crate::MetalDevice,
+    data: &[u8],
+) -> Result<QStorage> {
+    let values = decode_t_vec::<T>(data);
+    metal::load_quantized(device, &values)
+}
+
+fn load_quantized_cuda_from_bytes<T: k_quants::GgmlType + Send + Sync + 'static>(
+    device: &crate::CudaDevice,
+    data: &[u8],
+) -> Result<QStorage> {
+    let values = decode_t_vec::<T>(data);
+    cuda::load_quantized(device, &values)
 }
 
 fn wgpu_quantized_weight_requires_cpu_fallback(dtype: GgmlDType) -> bool {
@@ -713,38 +732,38 @@ impl QStorage {
         match device {
             Device::Cpu => Ok(Self::Cpu(dtype.from_data(data))),
             Device::Metal(d) => match dtype {
-                GgmlDType::F32 => metal::load_quantized(d, as_t_slice::<f32>(data)),
-                GgmlDType::F16 => metal::load_quantized(d, as_t_slice::<f16>(data)),
-                GgmlDType::Q4_0 => metal::load_quantized(d, as_t_slice::<BlockQ4_0>(data)),
-                GgmlDType::Q4_1 => metal::load_quantized(d, as_t_slice::<BlockQ4_1>(data)),
-                GgmlDType::Q5_0 => metal::load_quantized(d, as_t_slice::<BlockQ5_0>(data)),
-                GgmlDType::Q5_1 => metal::load_quantized(d, as_t_slice::<BlockQ5_1>(data)),
-                GgmlDType::Q8_0 => metal::load_quantized(d, as_t_slice::<BlockQ8_0>(data)),
-                GgmlDType::Q8_1 => metal::load_quantized(d, as_t_slice::<BlockQ8_1>(data)),
-                GgmlDType::Q2K => metal::load_quantized(d, as_t_slice::<BlockQ2K>(data)),
-                GgmlDType::Q3K => metal::load_quantized(d, as_t_slice::<BlockQ3K>(data)),
-                GgmlDType::Q4K => metal::load_quantized(d, as_t_slice::<BlockQ4K>(data)),
-                GgmlDType::Q5K => metal::load_quantized(d, as_t_slice::<BlockQ5K>(data)),
-                GgmlDType::Q6K => metal::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
-                GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
-                GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
+                GgmlDType::F32 => load_quantized_metal_from_bytes::<f32>(d, data.as_ref()),
+                GgmlDType::F16 => load_quantized_metal_from_bytes::<f16>(d, data.as_ref()),
+                GgmlDType::Q4_0 => load_quantized_metal_from_bytes::<BlockQ4_0>(d, data.as_ref()),
+                GgmlDType::Q4_1 => load_quantized_metal_from_bytes::<BlockQ4_1>(d, data.as_ref()),
+                GgmlDType::Q5_0 => load_quantized_metal_from_bytes::<BlockQ5_0>(d, data.as_ref()),
+                GgmlDType::Q5_1 => load_quantized_metal_from_bytes::<BlockQ5_1>(d, data.as_ref()),
+                GgmlDType::Q8_0 => load_quantized_metal_from_bytes::<BlockQ8_0>(d, data.as_ref()),
+                GgmlDType::Q8_1 => load_quantized_metal_from_bytes::<BlockQ8_1>(d, data.as_ref()),
+                GgmlDType::Q2K => load_quantized_metal_from_bytes::<BlockQ2K>(d, data.as_ref()),
+                GgmlDType::Q3K => load_quantized_metal_from_bytes::<BlockQ3K>(d, data.as_ref()),
+                GgmlDType::Q4K => load_quantized_metal_from_bytes::<BlockQ4K>(d, data.as_ref()),
+                GgmlDType::Q5K => load_quantized_metal_from_bytes::<BlockQ5K>(d, data.as_ref()),
+                GgmlDType::Q6K => load_quantized_metal_from_bytes::<BlockQ6K>(d, data.as_ref()),
+                GgmlDType::Q8K => load_quantized_metal_from_bytes::<BlockQ8K>(d, data.as_ref()),
+                GgmlDType::BF16 => load_quantized_metal_from_bytes::<bf16>(d, data.as_ref()),
             },
             Device::Cuda(d) => match dtype {
-                GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
-                GgmlDType::F16 => cuda::load_quantized(d, as_t_slice::<f16>(data)),
-                GgmlDType::Q4_0 => cuda::load_quantized(d, as_t_slice::<BlockQ4_0>(data)),
-                GgmlDType::Q4_1 => cuda::load_quantized(d, as_t_slice::<BlockQ4_1>(data)),
-                GgmlDType::Q5_0 => cuda::load_quantized(d, as_t_slice::<BlockQ5_0>(data)),
-                GgmlDType::Q5_1 => cuda::load_quantized(d, as_t_slice::<BlockQ5_1>(data)),
-                GgmlDType::Q8_0 => cuda::load_quantized(d, as_t_slice::<BlockQ8_0>(data)),
-                GgmlDType::Q8_1 => cuda::load_quantized(d, as_t_slice::<BlockQ8_1>(data)),
-                GgmlDType::Q2K => cuda::load_quantized(d, as_t_slice::<BlockQ2K>(data)),
-                GgmlDType::Q3K => cuda::load_quantized(d, as_t_slice::<BlockQ3K>(data)),
-                GgmlDType::Q4K => cuda::load_quantized(d, as_t_slice::<BlockQ4K>(data)),
-                GgmlDType::Q5K => cuda::load_quantized(d, as_t_slice::<BlockQ5K>(data)),
-                GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
-                GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
-                GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
+                GgmlDType::F32 => load_quantized_cuda_from_bytes::<f32>(d, data.as_ref()),
+                GgmlDType::F16 => load_quantized_cuda_from_bytes::<f16>(d, data.as_ref()),
+                GgmlDType::Q4_0 => load_quantized_cuda_from_bytes::<BlockQ4_0>(d, data.as_ref()),
+                GgmlDType::Q4_1 => load_quantized_cuda_from_bytes::<BlockQ4_1>(d, data.as_ref()),
+                GgmlDType::Q5_0 => load_quantized_cuda_from_bytes::<BlockQ5_0>(d, data.as_ref()),
+                GgmlDType::Q5_1 => load_quantized_cuda_from_bytes::<BlockQ5_1>(d, data.as_ref()),
+                GgmlDType::Q8_0 => load_quantized_cuda_from_bytes::<BlockQ8_0>(d, data.as_ref()),
+                GgmlDType::Q8_1 => load_quantized_cuda_from_bytes::<BlockQ8_1>(d, data.as_ref()),
+                GgmlDType::Q2K => load_quantized_cuda_from_bytes::<BlockQ2K>(d, data.as_ref()),
+                GgmlDType::Q3K => load_quantized_cuda_from_bytes::<BlockQ3K>(d, data.as_ref()),
+                GgmlDType::Q4K => load_quantized_cuda_from_bytes::<BlockQ4K>(d, data.as_ref()),
+                GgmlDType::Q5K => load_quantized_cuda_from_bytes::<BlockQ5K>(d, data.as_ref()),
+                GgmlDType::Q6K => load_quantized_cuda_from_bytes::<BlockQ6K>(d, data.as_ref()),
+                GgmlDType::Q8K => load_quantized_cuda_from_bytes::<BlockQ8K>(d, data.as_ref()),
+                GgmlDType::BF16 => load_quantized_cuda_from_bytes::<bf16>(d, data.as_ref()),
             },
             Device::Wgpu(d) => Ok(Self::Wgpu(QWgpuStorage::from_bytes(d, dtype, data)?)),
             Device::Vulkan(d) => Ok(Self::Vulkan(QVulkanStorage::from_bytes(d, dtype, data)?)),
@@ -995,21 +1014,21 @@ impl GgmlDType {
 
     pub fn from_data(&self, data: Cow<'_, [u8]>) -> Box<dyn QuantizedType> {
         match self {
-            Self::F32 => Box::new(as_t_slice::<f32>(data).to_vec()),
-            Self::F16 => Box::new(as_t_slice::<f16>(data).to_vec()),
-            Self::Q4_0 => Box::new(as_t_slice::<BlockQ4_0>(data).to_vec()),
-            Self::Q4_1 => Box::new(as_t_slice::<BlockQ4_1>(data).to_vec()),
-            Self::Q5_0 => Box::new(as_t_slice::<BlockQ5_0>(data).to_vec()),
-            Self::Q5_1 => Box::new(as_t_slice::<BlockQ5_1>(data).to_vec()),
-            Self::Q8_0 => Box::new(as_t_slice::<BlockQ8_0>(data).to_vec()),
+            Self::F32 => Box::new(decode_t_vec::<f32>(data.as_ref())),
+            Self::F16 => Box::new(decode_t_vec::<f16>(data.as_ref())),
+            Self::Q4_0 => Box::new(decode_t_vec::<BlockQ4_0>(data.as_ref())),
+            Self::Q4_1 => Box::new(decode_t_vec::<BlockQ4_1>(data.as_ref())),
+            Self::Q5_0 => Box::new(decode_t_vec::<BlockQ5_0>(data.as_ref())),
+            Self::Q5_1 => Box::new(decode_t_vec::<BlockQ5_1>(data.as_ref())),
+            Self::Q8_0 => Box::new(decode_t_vec::<BlockQ8_0>(data.as_ref())),
             Self::Q8_1 => Box::new(decode_block_q8_1_data(data.as_ref())),
-            Self::Q2K => Box::new(as_t_slice::<BlockQ2K>(data).to_vec()),
-            Self::Q3K => Box::new(as_t_slice::<BlockQ3K>(data).to_vec()),
-            Self::Q4K => Box::new(as_t_slice::<BlockQ4K>(data).to_vec()),
-            Self::Q5K => Box::new(as_t_slice::<BlockQ5K>(data).to_vec()),
-            Self::Q6K => Box::new(as_t_slice::<BlockQ6K>(data).to_vec()),
+            Self::Q2K => Box::new(decode_t_vec::<BlockQ2K>(data.as_ref())),
+            Self::Q3K => Box::new(decode_t_vec::<BlockQ3K>(data.as_ref())),
+            Self::Q4K => Box::new(decode_t_vec::<BlockQ4K>(data.as_ref())),
+            Self::Q5K => Box::new(decode_t_vec::<BlockQ5K>(data.as_ref())),
+            Self::Q6K => Box::new(decode_t_vec::<BlockQ6K>(data.as_ref())),
             Self::Q8K => Box::new(decode_block_q8k_data(data.as_ref())),
-            Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
+            Self::BF16 => Box::new(decode_t_vec::<bf16>(data.as_ref())),
         }
     }
 
@@ -1799,5 +1818,26 @@ impl crate::Module for QMatMul {
                 xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_data_accepts_misaligned_quantized_bytes() -> Result<()> {
+        let zeros = GgmlDType::Q4_0.cpu_zeros(k_quants::QK4_0);
+        let bytes =
+            unsafe { std::slice::from_raw_parts(zeros.as_ptr(), zeros.storage_size_in_bytes()) };
+        let mut misaligned = vec![0x7f];
+        misaligned.extend_from_slice(bytes);
+        let reparsed = GgmlDType::Q4_0.from_data(Cow::Borrowed(&misaligned[1..]));
+        let dequantized = reparsed
+            .dequantize(k_quants::QK4_0)?
+            .as_slice::<f32>()?
+            .to_vec();
+        assert_eq!(dequantized, vec![0.0; k_quants::QK4_0]);
+        Ok(())
     }
 }

@@ -1,6 +1,7 @@
 use crate::backend::BackendDevice;
 use crate::cpu_backend::CpuDevice;
 use crate::{CpuStorage, DType, Result, Shape, Storage, WithDType};
+use half::f16;
 
 /// A `DeviceLocation` represents a physical device whereas multiple `Device`
 /// can live on the same location (typically for cuda devices).
@@ -235,6 +236,28 @@ impl<S: WithDType> NdArray for Vec<Vec<Vec<Vec<S>>>> {
 }
 
 impl Device {
+    pub(crate) fn normalize_dtype_for_device(&self, dtype: DType) -> DType {
+        if dtype == DType::BF16 && matches!(self, Self::Wgpu(_) | Self::Vulkan(_)) {
+            DType::F16
+        } else {
+            dtype
+        }
+    }
+
+    pub(crate) fn normalize_cpu_storage_for_device(&self, storage: CpuStorage) -> CpuStorage {
+        match storage {
+            CpuStorage::BF16(values) if matches!(self, Self::Wgpu(_) | Self::Vulkan(_)) => {
+                CpuStorage::F16(
+                    values
+                        .into_iter()
+                        .map(|value| f16::from_f32(value.to_f32()))
+                        .collect(),
+                )
+            }
+            storage => storage,
+        }
+    }
+
     pub fn new_cuda(ordinal: usize) -> Result<Self> {
         Ok(Self::Cuda(crate::CudaDevice::new(ordinal)?))
     }
@@ -411,6 +434,7 @@ impl Device {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Storage> {
+        let dtype = self.normalize_dtype_for_device(dtype);
         match self {
             Device::Cpu => {
                 let storage = CpuDevice.rand_uniform(shape, dtype, lo, up)?;
@@ -457,6 +481,7 @@ impl Device {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Storage> {
+        let dtype = self.normalize_dtype_for_device(dtype);
         match self {
             Device::Cpu => {
                 let storage = CpuDevice.rand_normal(shape, dtype, mean, std)?;
@@ -497,6 +522,7 @@ impl Device {
     }
 
     pub(crate) fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Storage> {
+        let dtype = self.normalize_dtype_for_device(dtype);
         match self {
             Device::Cpu => {
                 let storage = CpuDevice.zeros_impl(shape, dtype)?;
@@ -522,6 +548,7 @@ impl Device {
     }
 
     pub(crate) unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Storage> {
+        let dtype = self.normalize_dtype_for_device(dtype);
         match self {
             Device::Cpu => {
                 let storage = CpuDevice.alloc_uninit(shape, dtype)?;
@@ -547,6 +574,18 @@ impl Device {
     }
 
     pub(crate) fn storage_from_slice<D: WithDType>(&self, data: &[D]) -> Result<Storage> {
+        if D::DTYPE == DType::BF16 && matches!(self, Device::Wgpu(_) | Device::Vulkan(_)) {
+            let storage = self.normalize_cpu_storage_for_device(D::to_cpu_storage(data));
+            return match self {
+                Device::Wgpu(device) => Ok(Storage::Wgpu(
+                    device.storage_from_cpu_storage_owned(storage)?,
+                )),
+                Device::Vulkan(device) => Ok(Storage::Vulkan(
+                    device.storage_from_cpu_storage_owned(storage)?,
+                )),
+                _ => unreachable!(),
+            };
+        }
         match self {
             Device::Cpu => Ok(Storage::Cpu(data.to_cpu_storage())),
             Device::Cuda(device) => {
@@ -582,12 +621,12 @@ impl Device {
                 Ok(Storage::Metal(storage))
             }
             Device::Wgpu(device) => {
-                let storage = array.to_cpu_storage();
+                let storage = self.normalize_cpu_storage_for_device(array.to_cpu_storage());
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::Wgpu(storage))
             }
             Device::Vulkan(device) => {
-                let storage = array.to_cpu_storage();
+                let storage = self.normalize_cpu_storage_for_device(array.to_cpu_storage());
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::Vulkan(storage))
             }
@@ -608,12 +647,12 @@ impl Device {
                 Ok(Storage::Metal(storage))
             }
             Device::Wgpu(device) => {
-                let storage = S::to_cpu_storage_owned(data);
+                let storage = self.normalize_cpu_storage_for_device(S::to_cpu_storage_owned(data));
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::Wgpu(storage))
             }
             Device::Vulkan(device) => {
-                let storage = S::to_cpu_storage_owned(data);
+                let storage = self.normalize_cpu_storage_for_device(S::to_cpu_storage_owned(data));
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::Vulkan(storage))
             }

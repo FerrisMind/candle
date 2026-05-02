@@ -50,10 +50,15 @@ pub enum QuantizedDType {
     Q6_K,
 }
 
-const QUANT_MUL_MAT_TILE_M: u32 = 4;
-const QUANT_MUL_MAT_TILE_N: u32 = 4;
-const QUANT_MUL_MAT_WG_SIZE_M: u32 = 8;
-const QUANT_MUL_MAT_WG_SIZE_N: u32 = 8;
+const MUL_MAT_TILE_M: u32 = 4;
+const MUL_MAT_TILE_N: u32 = 4;
+const MUL_MAT_WG_SIZE_M: u32 = 8;
+const MUL_MAT_WG_SIZE_N: u32 = 8;
+const MUL_MAT_REG_TILE_K_FLOAT: u32 = 8;
+const QUANT_MUL_MAT_TILE_M: u32 = MUL_MAT_TILE_M;
+const QUANT_MUL_MAT_TILE_N: u32 = MUL_MAT_TILE_N;
+const QUANT_MUL_MAT_WG_SIZE_M: u32 = MUL_MAT_WG_SIZE_M;
+const QUANT_MUL_MAT_WG_SIZE_N: u32 = MUL_MAT_WG_SIZE_N;
 const QUANT_MUL_MAT_REG_TILE_K_QUANT: u32 = 32;
 const QUANT_MUL_MAT_VEC_WG_SIZE: u32 = 256;
 const QUANT_MUL_MAT_VEC_FLOAT_OUTPUTS_PER_WG: u32 = 4;
@@ -186,6 +191,23 @@ pub fn argmax_shader(workgroup_size: u32) -> Option<String> {
     Some(preprocess(source, &defines, &replacements, DType::F32))
 }
 
+pub fn rope_shader(dtype: DType, workgroup_size: u32) -> Option<String> {
+    let source = get("rope.wgsl")?.source();
+    let mut defines = vec!["WG_SIZE".to_string()];
+    let mut replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    match dtype {
+        DType::F32 => {
+            defines.push("TYPE_F32".to_string());
+            replacements.push(("DataType".to_string(), "f32".to_string()));
+        }
+        DType::F16 => {
+            defines.push("TYPE_F16".to_string());
+            replacements.push(("DataType".to_string(), "f16".to_string()));
+        }
+    }
+    Some(preprocess(source, &defines, &replacements, dtype))
+}
+
 pub fn argsort_shader(workgroup_size: u32, asc: bool) -> Option<String> {
     let source = get("argsort.wgsl")?.source();
     let mut defines = vec!["WG_SIZE".to_string()];
@@ -262,6 +284,21 @@ pub fn get_rows_f32_shader(workgroup_size: u32) -> Option<String> {
     Some(preprocess(&source, &defines, &replacements, DType::F32))
 }
 
+pub fn get_rows_f16_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("get_rows.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let defines = vec!["F16".to_string()];
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        ("BLOCK_SIZE".to_string(), "1".to_string()),
+        ("SRC_TYPE".to_string(), "f16".to_string()),
+        ("DST_TYPE".to_string(), "f32".to_string()),
+    ];
+    Some(preprocess(&source, &defines, &replacements, DType::F16))
+}
+
 pub fn set_rows_f32_shader(workgroup_size: u32) -> Option<String> {
     let source = get("set_rows.wgsl")?.source();
     let defines = vec!["DST_F32".to_string()];
@@ -275,6 +312,19 @@ pub fn set_rows_f32_shader(workgroup_size: u32) -> Option<String> {
     Some(preprocess(source, &defines, &replacements, DType::F32))
 }
 
+pub fn set_rows_f16_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("set_rows.wgsl")?.source();
+    let defines = Vec::new();
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        ("SRC_TYPE".to_string(), "f16".to_string()),
+        ("DST_INNER_TYPE".to_string(), "f16".to_string()),
+        ("DST_TYPE".to_string(), "f16".to_string()),
+        ("VEC_SIZE".to_string(), "1".to_string()),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F16))
+}
+
 pub fn matmul_f32_shader() -> Option<String> {
     let source = get("mul_mat.wgsl")?.source().replace(
         "#include \"common_decls.tmpl\"",
@@ -286,6 +336,128 @@ pub fn matmul_f32_shader() -> Option<String> {
         ("SRC1_TYPE".to_string(), "f32".to_string()),
     ];
     Some(preprocess(&source, &defines, &replacements, DType::F32))
+}
+
+pub fn matmul_f16_shader() -> Option<String> {
+    let source = get("mul_mat.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let defines = vec!["FLOAT".to_string()];
+    let replacements = vec![
+        ("SRC0_TYPE".to_string(), "f16".to_string()),
+        ("SRC1_TYPE".to_string(), "f16".to_string()),
+    ];
+    Some(preprocess(&source, &defines, &replacements, DType::F16))
+}
+
+pub fn matmul_fast_tile_shape() -> (u32, u32, u32, u32, u32) {
+    (
+        MUL_MAT_TILE_M,
+        MUL_MAT_TILE_N,
+        MUL_MAT_WG_SIZE_M,
+        MUL_MAT_WG_SIZE_N,
+        MUL_MAT_REG_TILE_K_FLOAT,
+    )
+}
+
+pub fn matmul_fast_shader(dtype: DType, vectorized: bool) -> Option<String> {
+    let source = get("mul_mat_reg_tile.wgsl")?
+        .source()
+        .replace(
+            "#include \"common_decls.tmpl\"",
+            get("common_decls.tmpl")?.source(),
+        )
+        .replace(
+            "#include \"mul_mat_decls.tmpl\"",
+            get("mul_mat_decls.tmpl")?.source(),
+        );
+    let inner_type = match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+    };
+    let mut defines = vec![
+        if vectorized {
+            "VEC".to_string()
+        } else {
+            "SCALAR".to_string()
+        },
+        "INIT_SRC0_SHMEM_FLOAT".to_string(),
+        "INIT_SRC1_SHMEM_FLOAT".to_string(),
+        "TILE_M".to_string(),
+        "TILE_N".to_string(),
+        "WORKGROUP_SIZE_M".to_string(),
+        "WORKGROUP_SIZE_N".to_string(),
+        "TILE_K".to_string(),
+    ];
+    let replacements = vec![
+        ("SRC0_INNER_TYPE".to_string(), inner_type.to_string()),
+        ("SRC1_INNER_TYPE".to_string(), inner_type.to_string()),
+        ("TILE_M".to_string(), format!("{MUL_MAT_TILE_M}u")),
+        ("TILE_N".to_string(), format!("{MUL_MAT_TILE_N}u")),
+        (
+            "WORKGROUP_SIZE_M".to_string(),
+            format!("{MUL_MAT_WG_SIZE_M}u"),
+        ),
+        (
+            "WORKGROUP_SIZE_N".to_string(),
+            format!("{MUL_MAT_WG_SIZE_N}u"),
+        ),
+        ("TILE_K".to_string(), format!("{MUL_MAT_REG_TILE_K_FLOAT}u")),
+    ];
+    defines.push("TILE_M".to_string());
+    defines.push("TILE_N".to_string());
+    defines.push("WORKGROUP_SIZE_M".to_string());
+    defines.push("WORKGROUP_SIZE_N".to_string());
+    defines.push("TILE_K".to_string());
+    Some(preprocess(&source, &defines, &replacements, DType::F16))
+}
+
+pub fn matvec_outputs_per_wg() -> u32 {
+    QUANT_MUL_MAT_VEC_FLOAT_OUTPUTS_PER_WG
+}
+
+pub fn matvec_workgroup_size() -> u32 {
+    QUANT_MUL_MAT_VEC_WG_SIZE
+}
+
+pub fn matvec_shader(dtype: DType, vectorized: bool, use_subgroups: bool) -> Option<String> {
+    let source = get("mul_mat_vec.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let inner_type = match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+    };
+    let mut defines = vec![
+        if vectorized {
+            "VEC".to_string()
+        } else {
+            "SCALAR".to_string()
+        },
+        if use_subgroups {
+            "USE_SUBGROUP_REDUCTION".to_string()
+        } else {
+            "USE_WORKGROUP_REDUCTION".to_string()
+        },
+        "MUL_ACC_FLOAT".to_string(),
+        "WG_SIZE".to_string(),
+        "OUTPUTS_PER_WG".to_string(),
+    ];
+    let replacements = vec![
+        ("WG_SIZE".to_string(), QUANT_MUL_MAT_VEC_WG_SIZE.to_string()),
+        (
+            "OUTPUTS_PER_WG".to_string(),
+            QUANT_MUL_MAT_VEC_FLOAT_OUTPUTS_PER_WG.to_string(),
+        ),
+        ("SRC0_INNER_TYPE".to_string(), inner_type.to_string()),
+        ("SRC1_INNER_TYPE".to_string(), inner_type.to_string()),
+    ];
+    if !matches!(dtype, DType::F16) {
+        defines.retain(|define| define != "USE_SUBGROUP_REDUCTION");
+    }
+    Some(preprocess(&source, &defines, &replacements, dtype))
 }
 
 fn quantized_shader_config(dtype: QuantizedDType) -> (Vec<String>, &'static str, &'static str) {
