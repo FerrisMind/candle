@@ -50,7 +50,28 @@ impl LogitsProcessor {
     }
 
     fn sample_multinomial(&mut self, prs: &Vec<f32>) -> Result<u32> {
-        let distr = rand::distr::weighted::WeightedIndex::new(prs).map_err(Error::wrap)?;
+        let mut prs = prs.clone();
+        for p in &mut prs {
+            if !p.is_finite() || *p < 0.0 {
+                *p = 0.0;
+            }
+        }
+        let sum: f32 = prs.iter().sum();
+        if !sum.is_finite() || sum <= 0.0 {
+            let mut best_i = 0usize;
+            let mut best_v = f32::NEG_INFINITY;
+            for (i, &p) in prs.iter().enumerate() {
+                if p > best_v {
+                    best_v = p;
+                    best_i = i;
+                }
+            }
+            return Ok(best_i as u32);
+        }
+        for p in &mut prs {
+            *p /= sum;
+        }
+        let distr = rand::distr::weighted::WeightedIndex::new(&prs).map_err(Error::wrap)?;
         let next_token = distr.sample(&mut self.rng) as u32;
         Ok(next_token)
     }

@@ -2364,6 +2364,7 @@ impl VulkanStorage {
         pos_layout: &Layout,
         n_dims: usize,
         freq_base: f32,
+        mode: u32,
     ) -> Result<Self> {
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan rope").bt());
@@ -2385,7 +2386,7 @@ impl VulkanStorage {
         let dst_strides = contiguous_strides_ggml(dims);
         let theta_scale = freq_base.powf(-2.0 / n_dims as f32);
         let params = VulkanRopeParams {
-            rope_mode: 0,
+            rope_mode: mode,
             nrows: rows_u32,
             n_dims: n_dims.try_into()?,
             freq_scale: 1.0,
@@ -2818,6 +2819,17 @@ impl VulkanStorage {
         if b != lhs_l.dims()[..rank - 2].iter().product::<usize>() {
             return Err(unsupported("matmul batch"));
         }
+        if self.dtype == DType::F16 {
+            // Keep f16 storage compatibility while executing numerically stable f32 matmul.
+            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
+            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
+            let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
+            let rhs_f32_l = Layout::contiguous(rhs_l.shape().clone());
+            let out_f32 =
+                lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
+            let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
+            return out_f32.to_dtype(&out_l, DType::F16);
+        }
 
         let mut lhs_contiguous = None;
         let (lhs, lhs_layout) = if lhs_l.is_contiguous() && lhs_l.start_offset() == 0 {
@@ -2952,7 +2964,6 @@ impl VulkanStorage {
         ];
         let spirv_name = match self.dtype {
             DType::F32 => "matmul_f32_f32",
-            DType::F16 => "matmul_f16",
             _ => unreachable!(),
         };
         let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {

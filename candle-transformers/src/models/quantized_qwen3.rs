@@ -106,36 +106,30 @@ impl RotaryEmbedding {
         rope_theta: f64,
         dev: &Device,
     ) -> Result<Self> {
-        let rope_dev = if dev.is_wgpu() || dev.is_vulkan() {
-            &Device::Cpu
-        } else {
-            dev
-        };
         let dim = head_dim;
         let max_seq_len = max_position_embeddings;
-        let inv_freq: Vec<_> = (0..dim)
+        let inv_freq: Vec<f32> = (0..dim)
             .step_by(2)
             .map(|i| 1f32 / rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
-        let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), rope_dev)?.to_dtype(dtype)?;
-        let t = Tensor::arange(0u32, max_seq_len as u32, rope_dev)?
-            .to_dtype(dtype)?
-            .reshape((max_seq_len, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
-        let sin_t = freqs.sin()?;
-        let cos_t = freqs.cos()?;
-        let cos_f32 = cos_t
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        let sin_f32 = sin_t
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
+        let half_dim = inv_freq.len();
+        let mut sin_f32 = Vec::with_capacity(max_seq_len * half_dim);
+        let mut cos_f32 = Vec::with_capacity(max_seq_len * half_dim);
+        for pos in 0..max_seq_len {
+            let p = pos as f32;
+            for &f in &inv_freq {
+                let v = p * f;
+                sin_f32.push(v.sin());
+                cos_f32.push(v.cos());
+            }
+        }
+        let sin =
+            Tensor::from_vec(sin_f32.clone(), (max_seq_len, half_dim), dev)?.to_dtype(dtype)?;
+        let cos =
+            Tensor::from_vec(cos_f32.clone(), (max_seq_len, half_dim), dev)?.to_dtype(dtype)?;
         Ok(Self {
-            sin: sin_t,
-            cos: cos_t,
+            sin,
+            cos,
             cos_f32,
             sin_f32,
             half_d: dim / 2,
@@ -149,16 +143,34 @@ impl RotaryEmbedding {
         let q = q.contiguous()?;
         let k = k.contiguous()?;
         if q.device().is_wgpu() || q.device().is_vulkan() {
+            // ggml rope shaders expect positions on i2 and GPT-NeoX pairing.
+            const GGML_ROPE_TYPE_NEOX: u32 = 2;
             let (_, _, seq_len, _) = q.dims4()?;
             let positions = Tensor::from_vec(
                 (offset..offset + seq_len).map(|v| v as i32).collect(),
                 seq_len,
                 q.device(),
             )?;
-            let q_embed =
-                candle_nn::rotary_emb::rope_ggml(&q, &positions, self.head_dim, self.rope_theta)?;
-            let k_embed =
-                candle_nn::rotary_emb::rope_ggml(&k, &positions, self.head_dim, self.rope_theta)?;
+            let q_ggml = q.transpose(1, 2)?.contiguous()?;
+            let k_ggml = k.transpose(1, 2)?.contiguous()?;
+            let q_embed = candle_nn::rotary_emb::rope_ggml(
+                &q_ggml,
+                &positions,
+                self.head_dim,
+                self.rope_theta,
+                GGML_ROPE_TYPE_NEOX,
+            )?
+            .transpose(1, 2)?
+            .contiguous()?;
+            let k_embed = candle_nn::rotary_emb::rope_ggml(
+                &k_ggml,
+                &positions,
+                self.head_dim,
+                self.rope_theta,
+                GGML_ROPE_TYPE_NEOX,
+            )?
+            .transpose(1, 2)?
+            .contiguous()?;
             Ok((q_embed, k_embed))
         } else {
             let (_, _, seq_len, _) = q.dims4()?;

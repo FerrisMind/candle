@@ -1335,55 +1335,105 @@ impl WgpuStorage {
         dst_offset: usize,
         shader: &str,
     ) -> Result<()> {
+        let count = layout.shape().elem_count();
+        if count == 0 {
+            return Ok(());
+        }
+
+        let max_workgroups = self
+            .device
+            .inner
+            .limits
+            .max_compute_workgroups_per_dimension as usize;
+        let max_elems_per_dispatch = max_workgroups * WG_SIZE as usize;
+        let chunk_linear = count > max_elems_per_dispatch && layout.is_contiguous();
+
         let (src_dims, src_strides) = dims4(layout)?;
         let dst_strides = contiguous_strides(src_dims);
-        let count = layout.shape().elem_count();
-        let params = CopyParams {
-            ne: count.try_into()?,
-            offset_src: layout.start_offset().try_into()?,
-            offset_dst: dst_offset.try_into()?,
-            stride_src0: src_strides[0],
-            stride_src1: src_strides[1],
-            stride_src2: src_strides[2],
-            stride_src3: src_strides[3],
-            stride_dst0: dst_strides[0],
-            stride_dst1: dst_strides[1],
-            stride_dst2: dst_strides[2],
-            stride_dst3: dst_strides[3],
-            src_ne0: src_dims[0],
-            src_ne1: src_dims[1],
-            src_ne2: src_dims[2],
-            dst_ne0: src_dims[0],
-            dst_ne1: src_dims[1],
-            dst_ne2: src_dims[2],
-        };
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-copy-params"),
-                size: std::mem::size_of::<CopyParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
             uniform_entry(2),
         ];
-        let bindings = [
-            buffer_binding(0, &self.buffer),
-            buffer_binding(1, &dst.buffer),
-            buffer_binding(2, &param_buffer),
-        ];
-        let workgroups = (count as u32).div_ceil(WG_SIZE);
-        self.device
-            .run_compute(shader, &entries, &bindings, workgroups, "candle-wgpu-copy")?;
+
+        let mut processed = 0usize;
+        while processed < count {
+            let chunk = if chunk_linear {
+                (count - processed).min(max_elems_per_dispatch)
+            } else {
+                if count > max_elems_per_dispatch {
+                    return Err(unsupported("copy too large for non-contiguous layout"));
+                }
+                count - processed
+            };
+            let params = if chunk_linear {
+                CopyParams {
+                    ne: chunk.try_into()?,
+                    offset_src: (layout.start_offset() + processed).try_into()?,
+                    offset_dst: (dst_offset + processed).try_into()?,
+                    stride_src0: 1,
+                    stride_src1: 0,
+                    stride_src2: 0,
+                    stride_src3: 0,
+                    stride_dst0: 1,
+                    stride_dst1: 0,
+                    stride_dst2: 0,
+                    stride_dst3: 0,
+                    src_ne0: chunk.try_into()?,
+                    src_ne1: 1,
+                    src_ne2: 1,
+                    dst_ne0: chunk.try_into()?,
+                    dst_ne1: 1,
+                    dst_ne2: 1,
+                }
+            } else {
+                CopyParams {
+                    ne: count.try_into()?,
+                    offset_src: layout.start_offset().try_into()?,
+                    offset_dst: dst_offset.try_into()?,
+                    stride_src0: src_strides[0],
+                    stride_src1: src_strides[1],
+                    stride_src2: src_strides[2],
+                    stride_src3: src_strides[3],
+                    stride_dst0: dst_strides[0],
+                    stride_dst1: dst_strides[1],
+                    stride_dst2: dst_strides[2],
+                    stride_dst3: dst_strides[3],
+                    src_ne0: src_dims[0],
+                    src_ne1: src_dims[1],
+                    src_ne2: src_dims[2],
+                    dst_ne0: src_dims[0],
+                    dst_ne1: src_dims[1],
+                    dst_ne2: src_dims[2],
+                }
+            };
+            let param_buffer = self
+                .device
+                .inner
+                .device
+                .create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("candle-wgpu-copy-params"),
+                    size: std::mem::size_of::<CopyParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            self.device
+                .inner
+                .queue
+                .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+            let bindings = [
+                buffer_binding(0, &self.buffer),
+                buffer_binding(1, &dst.buffer),
+                buffer_binding(2, &param_buffer),
+            ];
+            let workgroups: u32 = chunk.try_into().map(|v: u32| v.div_ceil(WG_SIZE))?;
+            self.device
+                .run_compute(shader, &entries, &bindings, workgroups, "candle-wgpu-copy")?;
+            processed += chunk;
+            if !chunk_linear {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -1846,6 +1896,7 @@ impl WgpuStorage {
         pos_layout: &Layout,
         n_dims: usize,
         freq_base: f32,
+        mode: u32,
     ) -> Result<Self> {
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu rope").bt());
@@ -1886,7 +1937,7 @@ impl WgpuStorage {
             ne1: dims[1],
             ne2: dims[2],
             n_dims: n_dims.try_into()?,
-            mode: 0,
+            mode,
             theta_scale,
             attn_factor: 1.0,
             freq_scale: 1.0,
@@ -2386,21 +2437,24 @@ impl WgpuStorage {
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu matmul").bt());
         }
-        if self.dtype == DType::F16
-            && !self
-                .device
-                .inner
-                .features
-                .contains(wgpu::Features::SHADER_F16)
-        {
-            return Err(unsupported("matmul f16"));
-        }
         let rank = lhs_l.dims().len();
         if rank != rhs_l.dims().len() || rank < 2 || rank > 4 {
             return Err(unsupported("matmul rank"));
         }
         if b != lhs_l.dims()[..rank - 2].iter().product::<usize>() {
             return Err(unsupported("matmul batch"));
+        }
+        if self.dtype == DType::F16 {
+            // Keep f16 storage compatibility while executing numerically stable f32 matmul.
+            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
+            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
+            let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
+            let rhs_f32_l = Layout::contiguous(rhs_l.shape().clone());
+            let out_f32 =
+                lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
+            let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
+            let copy = copy_shader(DType::F32, DType::F16)?;
+            return out_f32.run_copy_to_dtype(&out_l, DType::F16, &copy);
         }
 
         let mut lhs_contiguous = None;
@@ -2469,7 +2523,6 @@ impl WgpuStorage {
         };
 
         let dst_shape = Shape::from(vec![b, m, n]);
-        let dst_layout = Layout::contiguous(dst_shape.clone());
         let tmp_dtype = if self.dtype == DType::F16 {
             DType::F32
         } else {
@@ -2535,12 +2588,7 @@ impl WgpuStorage {
             "candle-wgpu-matmul",
         )?;
         drop(lhs_contiguous);
-        if self.dtype == DType::F16 {
-            let copy = copy_shader(DType::F32, DType::F16)?;
-            dst.run_copy_to_dtype(&dst_layout, DType::F16, &copy)
-        } else {
-            Ok(dst)
-        }
+        Ok(dst)
     }
 
     fn run_conv1d_f32(
