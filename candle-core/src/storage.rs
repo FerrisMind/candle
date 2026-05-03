@@ -44,7 +44,8 @@ fn should_wgpu_cpu_fallback(err: &Error) -> bool {
 }
 
 fn should_vulkan_cpu_fallback(err: &Error) -> bool {
-    let fallback = is_backend_not_implemented(err, "vulkan");
+    let fallback = is_backend_not_implemented(err, "vulkan")
+        || matches!(err, Error::UnsupportedDTypeForOp(..));
     if fallback {
         let count = VULKAN_CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         if std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
@@ -1650,6 +1651,13 @@ impl Storage {
             (Self::Vulkan(src), Self::Vulkan(dst)) => {
                 match src.copy_strided_src(dst, dst_offset, src_l) {
                     Ok(()) => Ok(()),
+                    Err(err) if should_vulkan_cpu_fallback(&err) => {
+                        let cpu_src = src.to_cpu_storage()?;
+                        let mut cpu_dst = dst.to_cpu_storage()?;
+                        cpu_src.copy_strided_src(&mut cpu_dst, dst_offset, src_l)?;
+                        *dst = dst.device().storage_from_cpu_storage(&cpu_dst)?;
+                        Ok(())
+                    }
                     Err(err) => Err(err),
                 }
             }
@@ -1697,6 +1705,13 @@ impl Storage {
             (Self::Vulkan(src), Self::Vulkan(dst)) => {
                 match src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o) {
                     Ok(()) => Ok(()),
+                    Err(err) if should_vulkan_cpu_fallback(&err) => {
+                        let cpu_src = src.to_cpu_storage()?;
+                        let mut cpu_dst = dst.to_cpu_storage()?;
+                        cpu_src.copy2d(&mut cpu_dst, d1, d2, src_s, dst_s, src_o, dst_o)?;
+                        *dst = dst.device().storage_from_cpu_storage(&cpu_dst)?;
+                        Ok(())
+                    }
                     Err(err) => Err(err),
                 }
             }

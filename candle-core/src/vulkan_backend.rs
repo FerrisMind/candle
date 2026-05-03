@@ -10,6 +10,7 @@ use gpu_allocator::MemoryLocation;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex, RwLock};
+use tracing::trace_span;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -345,9 +346,11 @@ struct VulkanInner {
     max_workgroup_size_log2: u32,
     max_workgroup_count_x: u32,
     max_workgroup_count_y: u32,
+    max_push_constants_size: u32,
     robust_buffer_access: bool,
     vulkan_memory_model: bool,
     device: ash::Device,
+    driver_pipeline_cache: vk::PipelineCache,
     queue_family_index: u32,
     queue: vk::Queue,
     transfer_queue_family_index: Option<u32>,
@@ -404,6 +407,7 @@ impl std::fmt::Debug for VulkanInner {
             .field("max_workgroup_size_log2", &self.max_workgroup_size_log2)
             .field("max_workgroup_count_x", &self.max_workgroup_count_x)
             .field("max_workgroup_count_y", &self.max_workgroup_count_y)
+            .field("max_push_constants_size", &self.max_push_constants_size)
             .field("robust_buffer_access", &self.robust_buffer_access)
             .field("vulkan_memory_model", &self.vulkan_memory_model)
             .field("queue_family_index", &self.queue_family_index)
@@ -833,6 +837,17 @@ fn scalar_bytes(scalar: crate::scalar::Scalar, dtype: DType, op: &'static str) -
 }
 
 impl VulkanDevice {
+    fn copy_queue_and_family(&self) -> (vk::Queue, u32) {
+        if let (Some(queue), Some(family)) = (
+            self.inner.transfer_queue,
+            self.inner.transfer_queue_family_index,
+        ) {
+            (queue, family)
+        } else {
+            (self.inner.queue, self.inner.queue_family_index)
+        }
+    }
+
     pub fn transfer_to_device(&self, storage: &VulkanStorage) -> Result<VulkanStorage> {
         let cpu = storage.to_cpu_storage()?;
         self.storage_from_cpu_storage(&cpu)
@@ -849,30 +864,65 @@ impl VulkanDevice {
         usage: vk::BufferUsageFlags,
         location: MemoryLocation,
     ) -> Result<Arc<VulkanBuffer>> {
-        let info = vk::BufferCreateInfo::default()
+        self.cleanup_pending_submissions(false)?;
+        let mut info = vk::BufferCreateInfo::default()
             .size(size as u64)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            .usage(usage);
+        let queue_family_indices: Option<[u32; 2]> = self
+            .inner
+            .transfer_queue_family_index
+            .filter(|family| *family != self.inner.queue_family_index)
+            .map(|transfer_family| [self.inner.queue_family_index, transfer_family]);
+        if let Some(queue_family_indices) = queue_family_indices.as_ref() {
+            info = info
+                .sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(queue_family_indices);
+        } else {
+            info = info.sharing_mode(vk::SharingMode::EXCLUSIVE);
+        }
         let buffer =
             unsafe { self.inner.device.create_buffer(&info, None) }.map_err(Error::wrap)?;
         let requirements = unsafe { self.inner.device.get_buffer_memory_requirements(buffer) };
-        let mut allocator = self
-            .inner
-            .allocator
-            .lock()
-            .map_err(|e| Error::wrap(e.to_string()))?;
-        let allocator = allocator
-            .as_mut()
-            .ok_or_else(|| Error::msg("vulkan allocator already dropped"))?;
-        let allocation = allocator
-            .allocate(&AllocationCreateDesc {
-                name,
-                requirements,
-                location,
-                linear: true,
-                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
-            })
-            .map_err(Error::wrap)?;
+        let allocate_once = || -> Result<Allocation> {
+            let mut allocator = self
+                .inner
+                .allocator
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            let allocator = allocator
+                .as_mut()
+                .ok_or_else(|| Error::msg("vulkan allocator already dropped"))?;
+            allocator
+                .allocate(&AllocationCreateDesc {
+                    name,
+                    requirements,
+                    location,
+                    linear: true,
+                    allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+                })
+                .map_err(Error::wrap)
+        };
+
+        let allocation = match allocate_once() {
+            Ok(allocation) => allocation,
+            Err(first_err) => {
+                // Long-running async submit bursts can temporarily retain GPU allocations
+                // until fences are observed. Synchronize once and retry allocation.
+                self.synchronize_pending()?;
+                match allocate_once() {
+                    Ok(allocation) => allocation,
+                    Err(second_err) => {
+                        unsafe {
+                            self.inner.device.destroy_buffer(buffer, None);
+                        }
+                        return Err(Error::Msg(format!(
+                            "vulkan allocation retry failed after synchronize: first={first_err}, second={second_err}"
+                        ))
+                        .bt());
+                    }
+                }
+            }
+        };
         unsafe {
             self.inner
                 .device
@@ -984,6 +1034,7 @@ impl VulkanDevice {
         };
         for submission in ready {
             if wait {
+                let _wait_span = trace_span!("vulkan.submit.wait_fence").entered();
                 unsafe {
                     self.inner
                         .device
@@ -1006,6 +1057,9 @@ impl VulkanDevice {
     }
 
     fn synchronize_pending(&self) -> Result<()> {
+        let _wait_span =
+            trace_span!("vulkan.submit.wait_idle", wait_transfer = self.inner.transfer_queue.is_some())
+                .entered();
         unsafe { self.inner.device.queue_wait_idle(self.inner.queue) }.map_err(Error::wrap)?;
         if let Some(transfer_queue) = self.inner.transfer_queue {
             unsafe { self.inner.device.queue_wait_idle(transfer_queue) }.map_err(Error::wrap)?;
@@ -1106,11 +1160,14 @@ impl VulkanDevice {
         if regions.is_empty() {
             return Ok(());
         }
+        let _copy_span = trace_span!(
+            "vulkan.copy.submit",
+            region_count = regions.len(),
+            queue = "transfer_or_compute"
+        )
+        .entered();
         self.cleanup_pending_submissions(false)?;
-        // Phase-1 safety: copies are submitted on the compute queue to avoid
-        // cross-family ownership transfers for exclusive buffers.
-        let queue_family_index = self.inner.queue_family_index;
-        let queue = self.inner.queue;
+        let (queue, queue_family_index) = self.copy_queue_and_family();
         let command_pool_info =
             vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_index);
         let command_pool = unsafe {
@@ -1194,6 +1251,12 @@ impl VulkanDevice {
     }
 
     fn write_buffer(&self, buffer: &VulkanBuffer, bytes: &[u8]) -> Result<()> {
+        let _upload_span = trace_span!(
+            "vulkan.upload",
+            requested_bytes = bytes.len(),
+            buffer_bytes = buffer.size
+        )
+        .entered();
         let staging = self.create_upload_staging_buffer(buffer.size)?;
         self.map_write_host_buffer(staging.as_ref(), bytes)?;
         self.submit_copy_and_track(staging.as_ref(), buffer, buffer.size)?;
@@ -1202,6 +1265,7 @@ impl VulkanDevice {
     }
 
     fn read_buffer(&self, buffer: &VulkanBuffer) -> Result<Vec<u8>> {
+        let _readback_span = trace_span!("vulkan.readback", buffer_bytes = buffer.size).entered();
         self.synchronize_pending()?;
         let staging = self.create_readback_staging_buffer(buffer.size)?;
         self.submit_copy_and_track(buffer, staging.as_ref(), buffer.size)?;
@@ -1276,8 +1340,9 @@ impl VulkanDevice {
                 specialization_u32,
                 require_full_subgroups,
                 required_subgroup_size,
-            )
+            )?
         }
+        self.synchronize_pending()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1291,27 +1356,58 @@ impl VulkanDevice {
         require_full_subgroups: bool,
         required_subgroup_size: Option<u32>,
     ) -> Result<()> {
+        let push_constants_len = push_constants.map(|bytes| bytes.len() as u32).unwrap_or(0);
+        if push_constants_len > self.inner.max_push_constants_size {
+            crate::bail!(
+                "vulkan push constants too large: {} > {}",
+                push_constants_len,
+                self.inner.max_push_constants_size
+            );
+        }
+        let _dispatch_span = trace_span!(
+            "vulkan.dispatch",
+            bindings = bindings.len(),
+            push_constants = push_constants_len,
+            wg_x = workgroups.0,
+            wg_y = workgroups.1,
+            wg_z = workgroups.2
+        )
+        .entered();
         self.cleanup_pending_submissions(false)?;
         let cache_key = VulkanPipelineCacheKey {
             shader_ptr: spirv.as_ptr() as usize,
             shader_len: spirv.len(),
             binding_count: bindings.len(),
-            push_constant_len: push_constants.map(|bytes| bytes.len() as u32).unwrap_or(0),
+            push_constant_len: push_constants_len,
             specialization_u32: specialization_u32
                 .map(|specs| specs.to_vec())
                 .unwrap_or_default(),
             require_full_subgroups,
             required_subgroup_size,
         };
-        let cached = {
+        let (cached, pipeline_cache_hit) = {
+            let _lookup_span = trace_span!(
+                "vulkan.pipeline.lookup",
+                shader_words = spirv.len(),
+                bindings = bindings.len(),
+                push_constants = push_constants_len
+            )
+            .entered();
             let mut cache = self
                 .inner
                 .pipeline_cache
                 .lock()
                 .map_err(|e| Error::wrap(e.to_string()))?;
             if let Some(cached) = cache.get(&cache_key) {
-                cached.clone()
+                (cached.clone(), true)
             } else {
+                let _create_span = trace_span!(
+                    "vulkan.pipeline.create",
+                    shader_words = spirv.len(),
+                    bindings = bindings.len(),
+                    push_constants = push_constants_len
+                )
+                .entered();
                 let shader_info = vk::ShaderModuleCreateInfo::default().code(spirv);
                 let shader = self
                     .inner
@@ -1398,7 +1494,11 @@ impl VulkanDevice {
                 let pipelines = self
                     .inner
                     .device
-                    .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                    .create_compute_pipelines(
+                        self.inner.driver_pipeline_cache,
+                        &[pipeline_info],
+                        None,
+                    )
                     .map_err(|(_, e)| Error::wrap(e))?;
                 let cached = Arc::new(VulkanCachedPipeline {
                     shader,
@@ -1407,7 +1507,7 @@ impl VulkanDevice {
                     descriptor_set_layout,
                 });
                 cache.insert(cache_key, cached.clone());
-                cached
+                (cached, false)
             }
         };
 
@@ -1521,6 +1621,8 @@ impl VulkanDevice {
             .device
             .create_fence(&vk::FenceCreateInfo::default(), None)
             .map_err(Error::wrap)?;
+        let _submit_span =
+            trace_span!("vulkan.dispatch.submit", cache_hit = pipeline_cache_hit).entered();
         self.inner
             .device
             .queue_submit(self.inner.queue, std::slice::from_ref(&submit_info), fence)
@@ -4464,6 +4566,10 @@ impl Drop for VulkanInner {
             if let Ok(mut allocator) = self.allocator.lock() {
                 let _ = allocator.take();
             }
+            if self.driver_pipeline_cache != vk::PipelineCache::null() {
+                self.device
+                    .destroy_pipeline_cache(self.driver_pipeline_cache, None);
+            }
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -4778,6 +4884,7 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
+        self.device.synchronize_pending()?;
         match self.run_conv1d_f32(layout, kernel, kernel_l, params) {
             Ok(out) => Ok(out),
             Err(err) if should_cpu_fallback(&err) => {
@@ -4802,6 +4909,7 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose1D,
     ) -> Result<Self> {
+        self.device.synchronize_pending()?;
         match self.run_conv_transpose1d_f32(layout, kernel, kernel_l, params) {
             Ok(out) => Ok(out),
             Err(err)
@@ -4828,6 +4936,7 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
+        self.device.synchronize_pending()?;
         match self.run_conv2d_f32(layout, kernel, kernel_l, params) {
             Ok(out) => Ok(out),
             Err(err) if should_cpu_fallback(&err) => {
@@ -4852,6 +4961,7 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self> {
+        self.device.synchronize_pending()?;
         match self.run_conv_transpose2d_f32(layout, kernel, kernel_l, params) {
             Ok(out) => Ok(out),
             Err(err)
@@ -5107,11 +5217,11 @@ impl BackendStorage for VulkanStorage {
                     return self.run_copy_into(src_l, dst, dst_offset, spirv);
                 }
                 _ => {
-                    return Err(Error::UnsupportedDTypeForOp(
-                        self.dtype,
-                        "vulkan copy_strided_src",
-                    )
-                    .bt());
+                    let src_cpu = self.to_cpu_storage()?;
+                    let mut dst_cpu = dst.to_cpu_storage()?;
+                    src_cpu.copy_strided_src(&mut dst_cpu, dst_offset, src_l)?;
+                    *dst = dst.device.storage_from_cpu_storage(&dst_cpu)?;
+                    return Ok(());
                 }
             }
         }
@@ -5128,7 +5238,11 @@ impl BackendStorage for VulkanStorage {
             src_offset,
             dst_offset,
             size,
-        )
+        )?;
+        if self.device.inner.transfer_queue.is_some() {
+            self.device.synchronize_pending()?;
+        }
+        Ok(())
     }
 
     fn copy2d(
@@ -5171,7 +5285,11 @@ impl BackendStorage for VulkanStorage {
             self.buffer.as_ref(),
             dst.buffer.as_ref(),
             &regions,
-        )
+        )?;
+        if self.device.inner.transfer_queue.is_some() {
+            self.device.synchronize_pending()?;
+        }
+        Ok(())
     }
 
     fn const_set(&mut self, scalar: crate::scalar::Scalar, layout: &Layout) -> Result<()> {
@@ -5254,6 +5372,11 @@ impl BackendDevice for VulkanDevice {
             .properties
             .limits
             .max_compute_work_group_count[1]
+            .max(1);
+        let max_push_constants_size = physical_device_properties
+            .properties
+            .limits
+            .max_push_constants_size
             .max(1);
         let vendor_id = physical_device_properties.properties.vendor_id;
         let subgroup_arithmetic = subgroup_properties
@@ -5382,6 +5505,10 @@ impl BackendDevice for VulkanDevice {
         }
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
             .map_err(Error::wrap)?;
+        let driver_pipeline_cache = unsafe {
+            device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+        }
+        .map_err(Error::wrap)?;
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
         let transfer_queue =
             transfer_queue_family_index.map(|family| unsafe { device.get_device_queue(family, 0) });
@@ -5411,9 +5538,11 @@ impl BackendDevice for VulkanDevice {
                 max_workgroup_size_log2,
                 max_workgroup_count_x,
                 max_workgroup_count_y,
+                max_push_constants_size,
                 robust_buffer_access,
                 vulkan_memory_model,
                 device,
+                driver_pipeline_cache,
                 queue_family_index,
                 queue,
                 transfer_queue_family_index,
@@ -5589,6 +5718,365 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_conv1d_im2col_matches_reference() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let src_vals = vec![1.0f32, 2.0, 3.0, 4.0];
+        let src = device.storage_from_cpu_storage(&CpuStorage::F32(src_vals))?;
+        let src_l = Layout::contiguous((1, 1, 4));
+        let params = crate::conv::ParamsConv1D {
+            b_size: 1,
+            l_in: 4,
+            c_out: 1,
+            c_in: 1,
+            k_size: 3,
+            padding: 0,
+            stride: 1,
+            dilation: 1,
+            cudnn_fwd_algo: None,
+        };
+
+        let col = src.run_im2col_conv1d_f32(&src_l, &params)?;
+        let col_cpu = col.to_cpu_storage()?;
+        let got = match col_cpu {
+            CpuStorage::F32(v) => v,
+            other => crate::bail!("unexpected dtype from im2col: {other:?}"),
+        };
+        let expected = vec![1.0f32, 2.0, 3.0, 2.0, 3.0, 4.0];
+        assert_eq!(got, expected);
+
+        let params_pad = crate::conv::ParamsConv1D {
+            padding: 1,
+            ..params
+        };
+        let col_pad = src.run_im2col_conv1d_f32(&src_l, &params_pad)?;
+        let col_pad_cpu = col_pad.to_cpu_storage()?;
+        let got_pad = match col_pad_cpu {
+            CpuStorage::F32(v) => v,
+            other => crate::bail!("unexpected dtype from im2col (pad): {other:?}"),
+        };
+        let expected_pad = vec![
+            0.0f32, 1.0, 2.0, //
+            1.0, 2.0, 3.0, //
+            2.0, 3.0, 4.0, //
+            3.0, 4.0, 0.0,
+        ];
+        assert_eq!(got_pad, expected_pad);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_conv1d_matmul_stage_matches_reference() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let src_vals = vec![1.0f32, 2.0, 3.0, 4.0];
+        let kernel_vals = vec![1.0f32, 0.0, 1.0];
+        let src = device.storage_from_cpu_storage(&CpuStorage::F32(src_vals))?;
+        let kernel = device.storage_from_cpu_storage(&CpuStorage::F32(kernel_vals))?;
+        let src_l = Layout::contiguous((1, 1, 4));
+        let _kernel_l = Layout::contiguous((1, 1, 3));
+        let params = crate::conv::ParamsConv1D {
+            b_size: 1,
+            l_in: 4,
+            c_out: 1,
+            c_in: 1,
+            k_size: 3,
+            padding: 0,
+            stride: 1,
+            dilation: 1,
+            cudnn_fwd_algo: None,
+        };
+
+        let col = src.run_im2col_conv1d_f32(&src_l, &params)?;
+        let b = params.b_size;
+        let n = params.c_out;
+        let l_out = params.l_out();
+        let k = params.k_size * params.c_in;
+        let m = l_out;
+        let col_l = Layout::contiguous((b * m, k));
+        let kernel_l_mm = Layout::contiguous_with_offset((n, k), 0).transpose(0, 1)?;
+        let res = col.matmul(&kernel, (1, b * m, n, k), &col_l, &kernel_l_mm)?;
+
+        let res_cpu = res.to_cpu_storage()?;
+        let got_res = match res_cpu {
+            CpuStorage::F32(v) => v,
+            other => crate::bail!("unexpected dtype from conv1d matmul stage: {other:?}"),
+        };
+        assert_eq!(got_res, vec![4.0f32, 6.0]);
+
+        let res_l = Layout::contiguous((b, l_out, n)).transpose(1, 2)?;
+        let mut out = unsafe { device.alloc_uninit(&Shape::from(params.out_dims()), DType::F32)? };
+        res.copy_strided_src(&mut out, 0, &res_l)?;
+        let out_cpu = out.to_cpu_storage()?;
+        let got_out = match out_cpu {
+            CpuStorage::F32(v) => v,
+            other => crate::bail!("unexpected dtype from conv1d out stage: {other:?}"),
+        };
+        assert_eq!(got_out, vec![4.0f32, 6.0]);
+
+        let params_pad = crate::conv::ParamsConv1D {
+            padding: 1,
+            ..params
+        };
+        let col_pad = src.run_im2col_conv1d_f32(&src_l, &params_pad)?;
+        let b = params_pad.b_size;
+        let n = params_pad.c_out;
+        let l_out = params_pad.l_out();
+        let k = params_pad.k_size * params_pad.c_in;
+        let m = l_out;
+        let col_pad_l = Layout::contiguous((b * m, k));
+        let res_pad = col_pad.matmul(&kernel, (1, b * m, n, k), &col_pad_l, &kernel_l_mm)?;
+        let res_pad_cpu = res_pad.to_cpu_storage()?;
+        let got_res_pad = match res_pad_cpu {
+            CpuStorage::F32(v) => v,
+            other => crate::bail!("unexpected dtype from conv1d matmul stage (pad): {other:?}"),
+        };
+        assert_eq!(got_res_pad, vec![2.0f32, 4.0, 6.0, 3.0]);
+
+        let res_pad_l = Layout::contiguous((b, l_out, n)).transpose(1, 2)?;
+        let mut out_pad = unsafe { device.alloc_uninit(&Shape::from(params_pad.out_dims()), DType::F32)? };
+        res_pad.copy_strided_src(&mut out_pad, 0, &res_pad_l)?;
+        let out_pad_cpu = out_pad.to_cpu_storage()?;
+        let got_out_pad = match out_pad_cpu {
+            CpuStorage::F32(v) => v,
+            other => crate::bail!("unexpected dtype from conv1d out stage (pad): {other:?}"),
+        };
+        assert_eq!(got_out_pad, vec![2.0f32, 4.0, 6.0, 3.0]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_conv2d_native_matches_reference() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let src_vals = vec![
+            1.0f32, 2.0, 3.0, //
+            4.0, 5.0, 6.0, //
+            7.0, 8.0, 9.0,
+        ];
+        let kernel_vals = vec![
+            1.0f32, 0.0, //
+            0.0, 1.0,
+        ];
+        let src = device.storage_from_cpu_storage(&CpuStorage::F32(src_vals))?;
+        let kernel = device.storage_from_cpu_storage(&CpuStorage::F32(kernel_vals))?;
+        let src_l = Layout::contiguous((1, 1, 3, 3));
+        let kernel_l = Layout::contiguous((1, 1, 2, 2));
+        let params = crate::conv::ParamsConv2D {
+            b_size: 1,
+            i_h: 3,
+            i_w: 3,
+            k_h: 2,
+            k_w: 2,
+            c_out: 1,
+            c_in: 1,
+            padding: 0,
+            stride: 1,
+            dilation: 1,
+            cudnn_fwd_algo: None,
+        };
+        let out = src.run_conv2d_f32(&src_l, &kernel, &kernel_l, &params)?;
+        let out_cpu = out.to_cpu_storage()?;
+        let got = match out_cpu {
+            CpuStorage::F32(v) => v,
+            other => crate::bail!("unexpected dtype from conv2d out stage: {other:?}"),
+        };
+        assert_eq!(got, vec![6.0f32, 8.0, 12.0, 14.0]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_conv2d_im2col_matches_reference() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let src_vals = vec![
+            1.0f32, 2.0, 3.0, //
+            4.0, 5.0, 6.0, //
+            7.0, 8.0, 9.0,
+        ];
+        let src = device.storage_from_cpu_storage(&CpuStorage::F32(src_vals))?;
+        let src_l = Layout::contiguous((1, 1, 3, 3));
+        let params = crate::conv::ParamsConv2D {
+            b_size: 1,
+            i_h: 3,
+            i_w: 3,
+            k_h: 2,
+            k_w: 2,
+            c_out: 1,
+            c_in: 1,
+            padding: 0,
+            stride: 1,
+            dilation: 1,
+            cudnn_fwd_algo: None,
+        };
+        let col = src.run_im2col_f32(&src_l, &params)?;
+        let col_cpu = col.to_cpu_storage()?;
+        let got = match col_cpu {
+            CpuStorage::F32(v) => v,
+            other => crate::bail!("unexpected dtype from conv2d im2col: {other:?}"),
+        };
+        let expected = vec![
+            1.0f32, 2.0, 4.0, 5.0, //
+            2.0, 3.0, 5.0, 6.0, //
+            4.0, 5.0, 7.0, 8.0, //
+            5.0, 6.0, 8.0, 9.0,
+        ];
+        assert_eq!(got, expected);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_conv2d_matmul_stage_matches_reference() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let src_vals = vec![
+            1.0f32, 2.0, 3.0, //
+            4.0, 5.0, 6.0, //
+            7.0, 8.0, 9.0,
+        ];
+        let kernel_vals = vec![
+            1.0f32, 0.0, //
+            0.0, 1.0,
+        ];
+        let src = device.storage_from_cpu_storage(&CpuStorage::F32(src_vals))?;
+        let kernel = device.storage_from_cpu_storage(&CpuStorage::F32(kernel_vals))?;
+        let src_l = Layout::contiguous((1, 1, 3, 3));
+        let _kernel_l = Layout::contiguous((1, 1, 2, 2));
+        let params = crate::conv::ParamsConv2D {
+            b_size: 1,
+            i_h: 3,
+            i_w: 3,
+            k_h: 2,
+            k_w: 2,
+            c_out: 1,
+            c_in: 1,
+            padding: 0,
+            stride: 1,
+            dilation: 1,
+            cudnn_fwd_algo: None,
+        };
+
+        let col = src.run_im2col_f32(&src_l, &params)?;
+        let h_out = params.out_h();
+        let w_out = params.out_w();
+        let b = params.b_size;
+        let n = params.c_out;
+        let k = params.k_h * params.k_w * params.c_in;
+        let m = h_out * w_out;
+        let col_l = Layout::contiguous((b * m, k));
+        let kernel_l_mm = Layout::contiguous_with_offset((n, k), 0).transpose(0, 1)?;
+        let res = col.matmul(&kernel, (1, b * m, n, k), &col_l, &kernel_l_mm)?;
+
+        let res_cpu = res.to_cpu_storage()?;
+        let got_res = match res_cpu {
+            CpuStorage::F32(v) => v,
+            other => crate::bail!("unexpected dtype from conv2d matmul stage: {other:?}"),
+        };
+        assert_eq!(got_res, vec![6.0f32, 8.0, 12.0, 14.0]);
+
+        let res_l = Layout::contiguous((b, h_out, w_out, n))
+            .transpose(1, 2)?
+            .transpose(1, 3)?;
+        let mut out = unsafe { device.alloc_uninit(res_l.shape(), DType::F32)? };
+        res.copy_strided_src(&mut out, 0, &res_l)?;
+        let out_cpu = out.to_cpu_storage()?;
+        let got_out = match out_cpu {
+            CpuStorage::F32(v) => v,
+            other => crate::bail!("unexpected dtype from conv2d reordered out: {other:?}"),
+        };
+        assert_eq!(got_out, vec![6.0f32, 8.0, 12.0, 14.0]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_conv1d_after_matmul_regression_probe() -> Result<()> {
+        let device = crate::Device::Vulkan(VulkanDevice::new(0)?);
+
+        let lhs = crate::Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), &device)?;
+        let rhs = crate::Tensor::from_slice(&[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0], (3, 2), &device)?;
+        let _ = lhs.matmul(&rhs)?.to_vec2::<f32>()?;
+
+        let lhs_b = crate::Tensor::from_slice(
+            &[
+                1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, //
+                2.0, 0.0, 1.0, 3.0, 4.0, 5.0,
+            ],
+            (2, 2, 3),
+            &device,
+        )?;
+        let rhs_b = crate::Tensor::from_slice(
+            &[
+                7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0, //
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
+            ],
+            (2, 3, 2),
+            &device,
+        )?;
+        let _ = lhs_b.matmul(&rhs_b)?.to_vec3::<f32>()?;
+
+        let input = crate::Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, 1, 4), &device)?;
+        let kernel = crate::Tensor::from_slice(&[1.0f32, 0.0, 1.0], (1, 1, 3), &device)?;
+        let got = input.conv1d(&kernel, 0, 1, 1, 1)?.to_vec3::<f32>()?;
+        assert_eq!(got, [[[4.0f32, 6.0]]]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_conv1d_after_gather_scatter_probe() -> Result<()> {
+        let device = crate::Device::Vulkan(VulkanDevice::new(0)?);
+
+        let xs = crate::Tensor::from_slice(&[1.0f32, 10.0, 2.0, 20.0, 3.0, 30.0], (3, 2), &device)?;
+        let ids = crate::Tensor::from_slice(&[0u32, 1, 2, 0], (2, 2), &device)?;
+        let _ = xs.gather(&ids, 0)?.to_vec2::<f32>()?;
+        let base = crate::Tensor::zeros((3, 2), DType::F32, &device)?;
+        let src = crate::Tensor::from_slice(&[7.0f32, 70.0, 8.0, 80.0], (2, 2), &device)?;
+        let _ = base.scatter(&ids, &src, 0)?.to_vec2::<f32>()?;
+
+        let xs_f16 = crate::Tensor::from_slice(
+            &[
+                half::f16::from_f32(1.0),
+                half::f16::from_f32(10.0),
+                half::f16::from_f32(2.0),
+                half::f16::from_f32(20.0),
+                half::f16::from_f32(3.0),
+                half::f16::from_f32(30.0),
+            ],
+            (3, 2),
+            &device,
+        )?;
+        let src_f16 = crate::Tensor::from_slice(
+            &[
+                half::f16::from_f32(7.0),
+                half::f16::from_f32(70.0),
+                half::f16::from_f32(8.0),
+                half::f16::from_f32(80.0),
+            ],
+            (2, 2),
+            &device,
+        )?;
+        let _ = xs_f16.gather(&ids, 0)?.to_vec2::<half::f16>()?;
+        let base_f16 = crate::Tensor::zeros((3, 2), DType::F16, &device)?;
+        let _ = base_f16.scatter(&ids, &src_f16, 0)?.to_vec2::<half::f16>()?;
+
+        let xs_t = xs.t()?;
+        let _ = xs_t.contiguous()?.to_vec2::<f32>()?;
+        let xs_u32 = crate::Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6], (3, 2), &device)?;
+        let _ = xs_u32.t()?.contiguous()?.to_vec2::<u32>()?;
+        let _ = xs_f16.t()?.contiguous()?.to_vec2::<half::f16>()?;
+        device.synchronize()?;
+
+        let input = crate::Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, 1, 4), &device)?;
+        let kernel = crate::Tensor::from_slice(&[1.0f32, 0.0, 1.0], (1, 1, 3), &device)?;
+        let got0 = input.conv1d(&kernel, 0, 1, 1, 1)?.to_vec3::<f32>()?;
+        let got1 = input.conv1d(&kernel, 1, 1, 1, 1)?.to_vec3::<f32>()?;
+        assert_eq!(got0, [[[4.0f32, 6.0]]]);
+        assert_eq!(got1, [[[2.0f32, 4.0, 6.0, 3.0]]]);
+        Ok(())
     }
 
     #[test]

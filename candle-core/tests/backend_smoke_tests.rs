@@ -856,6 +856,30 @@ fn smoke_f32_gather_scatter_non_last_dim(device: &Device) -> Result<()> {
             [f16::from_f32(8.0), f16::from_f32(0.0)]
         ]
     );
+
+    // Ensure non-contiguous copy paths remain correct across core dtypes.
+    let xs_t = xs.t()?;
+    assert_eq!(
+        xs_t.contiguous()?.to_vec2::<f32>()?,
+        [[1.0, 2.0, 3.0], [10.0, 20.0, 30.0]]
+    );
+
+    let xs_u32 = Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6], (3, 2), device)?;
+    let xs_u32_t = xs_u32.t()?;
+    assert_eq!(xs_u32_t.contiguous()?.to_vec2::<u32>()?, [[1, 3, 5], [2, 4, 6]]);
+
+    let xs_f16_t = xs_f16.t()?;
+    assert_eq!(
+        xs_f16_t.contiguous()?.to_vec2::<f16>()?,
+        [
+            [f16::from_f32(1.0), f16::from_f32(2.0), f16::from_f32(3.0)],
+            [
+                f16::from_f32(10.0),
+                f16::from_f32(20.0),
+                f16::from_f32(30.0)
+            ]
+        ]
+    );
     Ok(())
 }
 
