@@ -62,7 +62,7 @@ impl Qwen3RotaryEmbedding {
         }
         let sin = Tensor::from_vec(sin_f32, (max_seq_len, half_dim), dev)?.to_dtype(dtype)?;
         let cos = Tensor::from_vec(cos_f32, (max_seq_len, half_dim), dev)?.to_dtype(dtype)?;
-        let positions = Tensor::arange(0u32, max_seq_len as u32, dev)?.to_dtype(DType::I32)?;
+        let positions = Tensor::arange(0i32, max_seq_len as i32, dev)?;
         Ok(Self {
             sin,
             cos,
@@ -80,7 +80,13 @@ impl Qwen3RotaryEmbedding {
             // ggml rope shaders expect positions on i2 and GPT-NeoX pairing.
             const GGML_ROPE_TYPE_NEOX: u32 = 2;
             let (_, _, seq_len, _) = q.dims4()?;
-            let positions = self.positions.narrow(0, offset, seq_len)?;
+            let positions = if q.device().is_vulkan() {
+                self.positions
+                    .narrow(0, offset, seq_len)?
+                    .force_contiguous()?
+            } else {
+                self.positions.narrow(0, offset, seq_len)?
+            };
             let q_ggml = q.transpose(1, 2)?.contiguous()?;
             let k_ggml = k.transpose(1, 2)?.contiguous()?;
             let q_embed = candle_nn::rotary_emb::rope_ggml(
