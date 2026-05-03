@@ -49,8 +49,8 @@ impl LogitsProcessor {
         sampled.to_scalar::<u32>()
     }
 
-    fn sample_multinomial(&mut self, prs: &Vec<f32>) -> Result<u32> {
-        let mut prs = prs.clone();
+    fn sample_multinomial(&mut self, prs: &[f32]) -> Result<u32> {
+        let mut prs = prs.to_owned();
         for p in &mut prs {
             if !p.is_finite() || *p < 0.0 {
                 *p = 0.0;

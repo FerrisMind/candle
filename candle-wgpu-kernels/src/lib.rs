@@ -36,6 +36,7 @@ pub enum DType {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(non_camel_case_types)]
 pub enum QuantizedDType {
     Q4_0,
     Q4_1,

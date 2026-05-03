@@ -718,10 +718,10 @@ mod tests {
         match tensor.dims() {
             [b, l, h] if *b == 1 && *l <= 4 && *h >= 4 => {
                 let rows = tensor.to_vec3::<f32>()?;
-                for row in 0..*l {
+                for (row, row_vals) in rows[0].iter().take(*l).enumerate() {
                     println!(
                         "{label}[row={row}]: {:.6} {:.6} {:.6} {:.6}",
-                        rows[0][row][0], rows[0][row][1], rows[0][row][2], rows[0][row][3],
+                        row_vals[0], row_vals[1], row_vals[2], row_vals[3],
                     );
                 }
             }
