@@ -36,6 +36,7 @@ pub struct Config {
 pub(crate) struct Qwen3RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
+    positions: Tensor,
     head_dim: usize,
     rope_theta: f32,
 }
@@ -61,9 +62,11 @@ impl Qwen3RotaryEmbedding {
         }
         let sin = Tensor::from_vec(sin_f32, (max_seq_len, half_dim), dev)?.to_dtype(dtype)?;
         let cos = Tensor::from_vec(cos_f32, (max_seq_len, half_dim), dev)?.to_dtype(dtype)?;
+        let positions = Tensor::arange(0u32, max_seq_len as u32, dev)?.to_dtype(DType::I32)?;
         Ok(Self {
             sin,
             cos,
+            positions,
             head_dim: cfg.head_dim,
             rope_theta: cfg.rope_theta as f32,
         })
@@ -77,11 +80,7 @@ impl Qwen3RotaryEmbedding {
             // ggml rope shaders expect positions on i2 and GPT-NeoX pairing.
             const GGML_ROPE_TYPE_NEOX: u32 = 2;
             let (_, _, seq_len, _) = q.dims4()?;
-            let positions = Tensor::from_vec(
-                (offset..offset + seq_len).map(|v| v as i32).collect(),
-                seq_len,
-                q.device(),
-            )?;
+            let positions = self.positions.narrow(0, offset, seq_len)?;
             let q_ggml = q.transpose(1, 2)?.contiguous()?;
             let k_ggml = k.transpose(1, 2)?.contiguous()?;
             let q_embed = candle_nn::rotary_emb::rope_ggml(
