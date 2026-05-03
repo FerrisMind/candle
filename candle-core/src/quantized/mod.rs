@@ -1409,33 +1409,39 @@ impl QTensor {
         let mut out_dims = self.shape.dims().to_vec();
         out_dims[0] = ids_len;
         let out_shape = Shape::from(out_dims);
-        let ids_storage = ids.storage();
-        let out = match (&self.storage, &*ids_storage) {
-            (QStorage::Wgpu(storage), Storage::Wgpu(ids_storage)) => {
-                let out = storage.index_select_f32(&self.shape, ids_storage, ids.layout(), 0)?;
-                Ok(crate::tensor::from_storage(
-                    Storage::Wgpu(out),
-                    out_shape,
-                    crate::op::BackpropOp::none(),
-                    false,
-                ))
+        let out = {
+            let ids_storage = ids.storage();
+            match (&self.storage, &*ids_storage) {
+                (QStorage::Wgpu(storage), Storage::Wgpu(ids_storage)) => {
+                    let out =
+                        storage.index_select_f32(&self.shape, ids_storage, ids.layout(), 0)?;
+                    Some(Ok(crate::tensor::from_storage(
+                        Storage::Wgpu(out),
+                        out_shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    )))
+                }
+                (QStorage::Vulkan(storage), Storage::Vulkan(ids_storage)) => {
+                    let out =
+                        storage.index_select_f32(&self.shape, ids_storage, ids.layout(), 0)?;
+                    Some(Ok(crate::tensor::from_storage(
+                        Storage::Vulkan(out),
+                        out_shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    )))
+                }
+                _ => None,
             }
-            (QStorage::Vulkan(storage), Storage::Vulkan(ids_storage)) => {
-                let out = storage.index_select_f32(&self.shape, ids_storage, ids.layout(), 0)?;
-                Ok(crate::tensor::from_storage(
-                    Storage::Vulkan(out),
-                    out_shape,
-                    crate::op::BackpropOp::none(),
-                    false,
-                ))
-            }
-            _ => {
+        };
+        match out {
+            Some(out) => out,
+            None => {
                 let weights = self.dequantize(&device)?;
                 weights.index_select(&ids, 0)
             }
-        };
-        drop(ids_storage);
-        out
+        }
     }
 
     fn indexed_moe_forward_quantized_gpu(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
@@ -1775,29 +1781,35 @@ impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             Self::QTensor(t) => {
-                let xs_storage = xs.storage();
-                match (&t.storage, &*xs_storage) {
-                    (QStorage::Wgpu(wgpu), Storage::Wgpu(storage)) => {
-                        let (storage, shape) = wgpu.fwd(&t.shape, storage, xs.layout())?;
-                        let out = crate::tensor::from_storage(
-                            Storage::Wgpu(storage),
-                            shape,
-                            crate::op::BackpropOp::none(),
-                            false,
-                        );
-                        Ok(out)
+                let out = {
+                    let xs_storage = xs.storage();
+                    match (&t.storage, &*xs_storage) {
+                        (QStorage::Wgpu(wgpu), Storage::Wgpu(storage)) => {
+                            let (storage, shape) = wgpu.fwd(&t.shape, storage, xs.layout())?;
+                            let out = crate::tensor::from_storage(
+                                Storage::Wgpu(storage),
+                                shape,
+                                crate::op::BackpropOp::none(),
+                                false,
+                            );
+                            Some(Ok(out))
+                        }
+                        (QStorage::Vulkan(vulkan), Storage::Vulkan(storage)) => {
+                            let (storage, shape) = vulkan.fwd(&t.shape, storage, xs.layout())?;
+                            let out = crate::tensor::from_storage(
+                                Storage::Vulkan(storage),
+                                shape,
+                                crate::op::BackpropOp::none(),
+                                false,
+                            );
+                            Some(Ok(out))
+                        }
+                        _ => None,
                     }
-                    (QStorage::Vulkan(vulkan), Storage::Vulkan(storage)) => {
-                        let (storage, shape) = vulkan.fwd(&t.shape, storage, xs.layout())?;
-                        let out = crate::tensor::from_storage(
-                            Storage::Vulkan(storage),
-                            shape,
-                            crate::op::BackpropOp::none(),
-                            false,
-                        );
-                        Ok(out)
-                    }
-                    _ => xs.apply_op1_no_bwd(t.as_ref()),
+                };
+                match out {
+                    Some(out) => out,
+                    None => xs.apply_op1_no_bwd(t.as_ref()),
                 }
             }
             Self::Tensor(w) => {

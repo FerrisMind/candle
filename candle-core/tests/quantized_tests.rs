@@ -263,6 +263,22 @@ fn qmm_batch(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn quantized_embedding_cpu_fallback() -> Result<()> {
+    let device = Device::Cpu;
+    let values = (0..4 * 32).map(|v| v as f32 / 32.).collect::<Vec<_>>();
+    let weights = Tensor::from_slice(&values, (4, 32), &device)?;
+    let quantized = quantized::QTensor::quantize(&weights, GgmlDType::Q4_0)?;
+    let ids = Tensor::from_slice(&[2u32, 0, 3], (3,), &device)?;
+
+    let expected = quantized.dequantize(&device)?.index_select(&ids, 0)?;
+    let actual = quantized.embedding(&ids)?;
+
+    assert_eq!(actual.shape(), expected.shape());
+    assert_eq!(actual.to_vec2::<f32>()?, expected.to_vec2::<f32>()?);
+    Ok(())
+}
+
 test_device!(quantized_matmul, qmm_cpu, qmm_cuda, qmm_metal);
 test_device!(quantized_matmul_neg, qmm_n_cpu, qmm_n_cuda, qmm_n_metal);
 test_device!(qmm_batch, qmm_b_cpu, qmm_b_cuda, qmm_b_metal);
