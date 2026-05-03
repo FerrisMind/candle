@@ -1,0 +1,46 @@
+name: CI / vulkan
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  test-vulkan:
+    # Optional repo var CI_VULKAN_RUNNER_LABELS can pin a dedicated runner, e.g. ["self-hosted","linux","vulkan"].
+    runs-on: ${{ fromJSON(vars.CI_VULKAN_RUNNER_LABELS != '' && vars.CI_VULKAN_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Vulkan build/runtime deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential glslc vulkan-tools mesa-vulkan-drivers
+
+      - name: Shader compile smoke (candle-vulkan-kernels)
+        run: cargo test -p candle-vulkan-kernels --lib
+
+      - name: Vulkan feature smoke (candle-core)
+        run: cargo test -p candle-core --features vulkan backend_smoke_vulkan_feature_flag_is_visible -- --exact
+
+      - name: Detect Vulkan runtime
+        if: runner.os == 'Linux'
+        id: vulkan-runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v vulkaninfo >/dev/null 2>&1 && timeout 20s vulkaninfo --summary >/tmp/vulkaninfo.txt 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "Vulkan runtime detected."
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Vulkan runtime not available; skipping Vulkan runtime smoke test."
+            if [ -f /tmp/vulkaninfo.txt ]; then
+              tail -n 20 /tmp/vulkaninfo.txt
+            fi
+          fi
+
+      - name: Vulkan runtime smoke (candle-core)
+        if: runner.os == 'Linux' && steps.vulkan-runtime.outputs.available == 'true'
+        run: cargo test -p candle-core --features vulkan backend_smoke_vulkan_f32_upload_unary_binary_roundtrip -- --ignored --exact

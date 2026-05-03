@@ -112,6 +112,7 @@ fn moe_gemm_fallback(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn moe_gemm_gguf_fallback(
     input: &Tensor,
     weights: &QTensor,

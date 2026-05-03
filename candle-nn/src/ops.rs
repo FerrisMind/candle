@@ -1328,7 +1328,7 @@ fn sdpa_expand_kv_for_gqa(q_heads: usize, k: &Tensor, v: &Tensor) -> Result<(Ten
     if q_heads == kv_heads_k {
         return Ok((k.clone(), v.clone()));
     }
-    if q_heads % kv_heads_k != 0 {
+    if !q_heads.is_multiple_of(kv_heads_k) {
         candle::bail!(
             "query `n_heads` must be a multiple of `n_kv_heads` in sdpa: q_heads={q_heads} kv_heads={kv_heads_k}"
         );

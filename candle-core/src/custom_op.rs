@@ -18,10 +18,9 @@ pub trait CustomOp1 {
     /// The forward pass, as run on a gpu device. Note that the storage can use arbitrary strides,
     /// offsets etc so the associated layout should be used to access it.
     fn cuda_fwd(&self, _storage: &CudaStorage, _layout: &Layout) -> Result<(CudaStorage, Shape)> {
-        Err(crate::Error::Cuda(format!(
-            "no cuda implementation for {}",
-            self.name()
-        )))
+        Err(crate::Error::Cuda(
+            format!("no cuda implementation for {}", self.name()).into(),
+        ))
     }
 
     /// The forward pass, as run on a metal gpu device. Note that the storage can use arbitrary strides,
@@ -31,10 +30,9 @@ pub trait CustomOp1 {
         _storage: &MetalStorage,
         _layout: &Layout,
     ) -> Result<(MetalStorage, Shape)> {
-        Err(crate::Error::Metal(format!(
-            "no metal implementation for {}",
-            self.name()
-        )))
+        Err(crate::Error::Metal(
+            format!("no metal implementation for {}", self.name()).into(),
+        ))
     }
 
     fn wgpu_fwd(&self, _storage: &WgpuStorage, _layout: &Layout) -> Result<(WgpuStorage, Shape)> {
@@ -85,10 +83,9 @@ pub trait CustomOp2 {
         _: &CudaStorage,
         _: &Layout,
     ) -> Result<(CudaStorage, Shape)> {
-        Err(crate::Error::Cuda(format!(
-            "no cuda implementation for {}",
-            self.name()
-        )))
+        Err(crate::Error::Cuda(
+            format!("no cuda implementation for {}", self.name()).into(),
+        ))
     }
 
     /// The forward pass, as run on a metal gpu device. Note that the storage can use arbitrary strides,
@@ -100,10 +97,9 @@ pub trait CustomOp2 {
         _: &MetalStorage,
         _: &Layout,
     ) -> Result<(MetalStorage, Shape)> {
-        Err(crate::Error::Metal(format!(
-            "no metal implementation for {}",
-            self.name()
-        )))
+        Err(crate::Error::Metal(
+            format!("no metal implementation for {}", self.name()).into(),
+        ))
     }
 
     fn wgpu_fwd(
@@ -169,10 +165,9 @@ pub trait CustomOp3 {
         _: &CudaStorage,
         _: &Layout,
     ) -> Result<(CudaStorage, Shape)> {
-        Err(crate::Error::Cuda(format!(
-            "no cuda implementation for {}",
-            self.name()
-        )))
+        Err(crate::Error::Cuda(
+            format!("no cuda implementation for {}", self.name()).into(),
+        ))
     }
 
     /// The forward pass, as run on a metal gpu device. Note that the storage can use arbitrary strides,
@@ -186,10 +181,9 @@ pub trait CustomOp3 {
         _: &MetalStorage,
         _: &Layout,
     ) -> Result<(MetalStorage, Shape)> {
-        Err(crate::Error::Metal(format!(
-            "no metal implementation for {}",
-            self.name()
-        )))
+        Err(crate::Error::Metal(
+            format!("no metal implementation for {}", self.name()).into(),
+        ))
     }
 
     fn wgpu_fwd(
@@ -341,19 +335,17 @@ pub trait InplaceOp1 {
     /// The forward pass, as run on a gpu device. Note that the storage can use arbitrary strides,
     /// offsets etc so the associated layout should be used to access it.
     fn cuda_fwd(&self, _storage: &mut CudaStorage, _layout: &Layout) -> Result<()> {
-        Err(crate::Error::Cuda(format!(
-            "no cuda implementation for {}",
-            self.name()
-        )))
+        Err(crate::Error::Cuda(
+            format!("no cuda implementation for {}", self.name()).into(),
+        ))
     }
 
     /// The forward pass, as run on a metal gpu device. Note that the storage can use arbitrary strides,
     /// offsets etc so the associated layout should be used to access it.
     fn metal_fwd(&self, _storage: &mut MetalStorage, _layout: &Layout) -> Result<()> {
-        Err(crate::Error::Metal(format!(
-            "no metal implementation for {}",
-            self.name()
-        )))
+        Err(crate::Error::Metal(
+            format!("no metal implementation for {}", self.name()).into(),
+        ))
     }
 }
 
@@ -368,10 +360,9 @@ pub trait InplaceOp2 {
     /// The forward pass, as run on a gpu device. Note that the storage can use arbitrary strides,
     /// offsets etc so the associated layout should be used to access it.
     fn cuda_fwd(&self, _: &mut CudaStorage, _: &Layout, _: &CudaStorage, _: &Layout) -> Result<()> {
-        Err(crate::Error::Cuda(format!(
-            "no cuda implementation for {}",
-            self.name()
-        )))
+        Err(crate::Error::Cuda(
+            format!("no cuda implementation for {}", self.name()).into(),
+        ))
     }
 
     /// The forward pass, as run on a metal gpu device. Note that the storage can use arbitrary strides,
@@ -383,10 +374,9 @@ pub trait InplaceOp2 {
         _: &MetalStorage,
         _: &Layout,
     ) -> Result<()> {
-        Err(crate::Error::Metal(format!(
-            "no metal implementation for {}",
-            self.name()
-        )))
+        Err(crate::Error::Metal(
+            format!("no metal implementation for {}", self.name()).into(),
+        ))
     }
 }
 
@@ -416,10 +406,9 @@ pub trait InplaceOp3 {
         _: &CudaStorage,
         _: &Layout,
     ) -> Result<()> {
-        Err(crate::Error::Cuda(format!(
-            "no cuda implementation for {}",
-            self.name()
-        )))
+        Err(crate::Error::Cuda(
+            format!("no cuda implementation for {}", self.name()).into(),
+        ))
     }
 
     /// The forward pass, as run on a metal gpu device. Note that the storage can use arbitrary strides,
@@ -433,10 +422,9 @@ pub trait InplaceOp3 {
         _: &MetalStorage,
         _: &Layout,
     ) -> Result<()> {
-        Err(crate::Error::Metal(format!(
-            "no metal implementation for {}",
-            self.name()
-        )))
+        Err(crate::Error::Metal(
+            format!("no metal implementation for {}", self.name()).into(),
+        ))
     }
 }
 

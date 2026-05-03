@@ -136,15 +136,14 @@ fn generate_spirv_with_ggml_generator(shaders_dir: &Path, out_dir: &Path) -> std
 }
 
 fn glslc_supports_feature(glslc: &str, source: &Path, output: &Path) -> bool {
-    match Command::new(glslc)
-        .arg(source)
-        .arg("-o")
-        .arg(output)
-        .output()
-    {
-        Ok(result) if result.status.success() => true,
-        _ => false,
-    }
+    matches!(
+        Command::new(glslc)
+            .arg(source)
+            .arg("-o")
+            .arg(output)
+            .output(),
+        Ok(result) if result.status.success()
+    )
 }
 
 fn compile_generator(

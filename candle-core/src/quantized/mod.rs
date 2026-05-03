@@ -170,7 +170,7 @@ pub struct QTensor {
     shape: Shape,
 }
 
-struct QWgpuStorage {
+pub struct QWgpuStorage {
     dtype: GgmlDType,
     len_bytes: usize,
     storage: crate::WgpuStorage,
@@ -438,7 +438,7 @@ impl QWgpuStorage {
     }
 }
 
-struct QVulkanStorage {
+pub struct QVulkanStorage {
     dtype: GgmlDType,
     len_bytes: usize,
     storage: crate::VulkanStorage,

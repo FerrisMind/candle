@@ -619,9 +619,7 @@ impl WgpuDevice {
             let _ = tx.send(result);
         });
         self.synchronize()?;
-        rx.recv()
-            .map_err(Error::wrap)?
-            .map_err(Error::wrap)?;
+        rx.recv().map_err(Error::wrap)?.map_err(Error::wrap)?;
         let mut data = slice.get_mapped_range().to_vec();
         data.truncate(size);
         staging.unmap();

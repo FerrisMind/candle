@@ -47,6 +47,17 @@ fn backend_smoke_dummy_vulkan_does_not_claim_bf16() {
     assert_eq!(device.bf16_default_to_f32(), candle_core::DType::F32);
 }
 
+#[cfg(feature = "vulkan")]
+fn vulkan_device_or_skip(test_name: &str) -> Result<Option<Device>> {
+    match Device::new_vulkan(0) {
+        Ok(device) => Ok(Some(device)),
+        Err(err) => {
+            eprintln!("skipping {test_name}: Vulkan device unavailable: {err}");
+            Ok(None)
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
@@ -59,10 +70,13 @@ fn backend_smoke_wgpu_f32_upload_unary_binary_roundtrip() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_f32_upload_unary_binary_roundtrip() -> Result<()> {
-    let device = Device::new_vulkan(0)?;
+    let Some(device) =
+        vulkan_device_or_skip("backend_smoke_vulkan_f32_upload_unary_binary_roundtrip")?
+    else {
+        return Ok(());
+    };
     assert!(device.is_vulkan());
 
     smoke_f32_upload_unary_binary_roundtrip(&device)?;
@@ -71,10 +85,11 @@ fn backend_smoke_vulkan_f32_upload_unary_binary_roundtrip() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_quantized_paths_only() -> Result<()> {
-    let device = Device::new_vulkan(0)?;
+    let Some(device) = vulkan_device_or_skip("backend_smoke_vulkan_quantized_paths_only")? else {
+        return Ok(());
+    };
     assert!(device.is_vulkan());
 
     smoke_quantized_paths(&device)?;
@@ -83,11 +98,12 @@ fn backend_smoke_vulkan_quantized_paths_only() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_q8_1_qmatmul_regression() -> Result<()> {
     let cpu = Device::Cpu;
-    let vk = Device::new_vulkan(0)?;
+    let Some(vk) = vulkan_device_or_skip("backend_smoke_vulkan_q8_1_qmatmul_regression")? else {
+        return Ok(());
+    };
     let k = 256;
     let lhs_vals = (0..k).map(|v| v as f32 / 32.0).collect::<Vec<_>>();
     let rhs_vals = (0..(k * 4))
@@ -175,10 +191,39 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     smoke_f32_cmp_where(device)?;
     smoke_f32_scatter_add_and_index_add(device)?;
     smoke_f32_extended_unary_ops(device)?;
-    smoke_rank5_unary_binary_fallback(device)?;
+    if device.is_wgpu() {
+        smoke_rank5_unary_binary_fallback(device)?;
+    }
+    #[cfg(feature = "vulkan")]
+    if device.is_vulkan() {
+        smoke_rank5_unary_binary_native_only(device)?;
+    }
     smoke_quantized_paths(device)?;
 
     device.synchronize()?;
+    Ok(())
+}
+
+#[cfg(feature = "vulkan")]
+fn smoke_rank5_unary_binary_native_only(device: &Device) -> Result<()> {
+    candle_core::reset_vulkan_cpu_fallback_count();
+
+    let xs = Tensor::from_slice(
+        &[-2.0f32, -1.0, 0.0, 1.0, 2.0, 3.0],
+        (1, 1, 1, 2, 3),
+        device,
+    )?;
+    let ys = Tensor::from_slice(&[10.0f32, 20.0, 30.0], (1, 1, 1, 1, 3), device)?;
+
+    // Core Vulkan paths are strict: unsupported rank/layout should return errors
+    // instead of silently falling back to CPU.
+    let _ = xs.relu();
+    let _ = xs.broadcast_add(&ys);
+    assert_eq!(
+        candle_core::vulkan_cpu_fallback_count(),
+        0,
+        "vulkan core paths must not trigger silent CPU fallback"
+    );
     Ok(())
 }
 
@@ -1437,8 +1482,8 @@ fn q8_1_activation_indexed_moe_reference(
     let id_vals = ids.to_vec2::<u32>()?;
     let mut out = vec![0f32; batch * topk * n];
     for batch_idx in 0..batch {
-        for topk_idx in 0..topk {
-            let expert = id_vals[batch_idx][topk_idx] as usize;
+        for (topk_idx, expert_id) in id_vals[batch_idx].iter().take(topk).enumerate() {
+            let expert = *expert_id as usize;
             assert!(expert < num_experts);
             let input_slot = if input_dim1 == topk { topk_idx } else { 0 };
             let out_base = (batch_idx * topk + topk_idx) * n;

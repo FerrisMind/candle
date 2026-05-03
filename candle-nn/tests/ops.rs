@@ -335,6 +335,17 @@ test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);
 
+#[cfg(feature = "vulkan")]
+fn vulkan_device_or_skip(test_name: &str) -> Result<Option<Device>> {
+    match Device::new_vulkan(0) {
+        Ok(device) => Ok(Some(device)),
+        Err(err) => {
+            eprintln!("skipping {test_name}: Vulkan device unavailable: {err}");
+            Ok(None)
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
@@ -360,26 +371,29 @@ fn sigmoid_wgpu() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn softmax_vulkan() -> Result<()> {
-    let device = Device::new_vulkan(0)?;
+    let Some(device) = vulkan_device_or_skip("softmax_vulkan")? else {
+        return Ok(());
+    };
     softmax_last_dim_backend(&device)
 }
 
 #[test]
-#[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn rms_norm_vulkan() -> Result<()> {
-    let device = Device::new_vulkan(0)?;
+    let Some(device) = vulkan_device_or_skip("rms_norm_vulkan")? else {
+        return Ok(());
+    };
     rms_norm_backend(&device)
 }
 
 #[test]
-#[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn sigmoid_vulkan() -> Result<()> {
-    let device = Device::new_vulkan(0)?;
+    let Some(device) = vulkan_device_or_skip("sigmoid_vulkan")? else {
+        return Ok(());
+    };
     sigmoid_backend(&device)
 }
 

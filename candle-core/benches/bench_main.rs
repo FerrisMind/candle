@@ -13,5 +13,6 @@ criterion_main!(
     benchmarks::random::benches,
     benchmarks::reduce::benches,
     benchmarks::unary::benches,
+    benchmarks::vulkan_minimal::benches,
     benchmarks::where_cond::benches,
 );

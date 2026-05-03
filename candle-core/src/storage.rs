@@ -6,6 +6,9 @@ use crate::{
     VulkanStorage, WgpuStorage,
 };
 use crate::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static VULKAN_CPU_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn is_backend_not_implemented_msg(msg: &str, backend: &str) -> bool {
     let backend_rank_limit = msg.contains(backend) && msg.contains("supports up to rank-4 tensors");
@@ -42,10 +45,21 @@ fn should_wgpu_cpu_fallback(err: &Error) -> bool {
 
 fn should_vulkan_cpu_fallback(err: &Error) -> bool {
     let fallback = is_backend_not_implemented(err, "vulkan");
-    if fallback && std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
-        eprintln!("[candle][vulkan][cpu-fallback] {err:?}");
+    if fallback {
+        let count = VULKAN_CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
+            eprintln!("[candle][vulkan][cpu-fallback#{count}] {err:?}");
+        }
     }
     fallback
+}
+
+pub fn vulkan_cpu_fallback_count() -> usize {
+    VULKAN_CPU_FALLBACK_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn reset_vulkan_cpu_fallback_count() {
+    VULKAN_CPU_FALLBACK_COUNT.store(0, Ordering::Relaxed);
 }
 
 // We do not want to implement Clone on Storage as cloning may fail because of
@@ -353,13 +367,6 @@ impl Storage {
             },
             Self::Vulkan(storage) => match storage.reduce_op(op, layout, s) {
                 Ok(storage) => Ok(Self::Vulkan(storage)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.reduce_op(op, layout, s)?;
-                    Ok(Self::Vulkan(
-                        storage.device().storage_from_cpu_storage(&cpu)?,
-                    ))
-                }
                 Err(err) => Err(err),
             },
         }
@@ -732,13 +739,6 @@ impl Storage {
             },
             Self::Vulkan(storage) => match storage.unary_impl::<B>(layout) {
                 Ok(storage) => Ok(Self::Vulkan(storage)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.unary_impl::<B>(layout)?;
-                    Ok(Self::Vulkan(
-                        storage.device().storage_from_cpu_storage(&cpu)?,
-                    ))
-                }
                 Err(err) => Err(err),
             },
         }
@@ -780,12 +780,6 @@ impl Storage {
             (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
                 match lhs.binary_impl::<B>(rhs, lhs_layout, rhs_layout) {
                     Ok(storage) => Ok(Self::Vulkan(storage)),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu_lhs = lhs.to_cpu_storage()?;
-                        let cpu_rhs = rhs.to_cpu_storage()?;
-                        let cpu = cpu_lhs.binary_impl::<B>(&cpu_rhs, lhs_layout, rhs_layout)?;
-                        Ok(Self::Vulkan(lhs.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -1615,12 +1609,6 @@ impl Storage {
             (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
                 match lhs.matmul(rhs, bmnk, lhs_layout, rhs_layout) {
                     Ok(storage) => Ok(Self::Vulkan(storage)),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu_lhs = lhs.to_cpu_storage()?;
-                        let cpu_rhs = rhs.to_cpu_storage()?;
-                        let cpu = cpu_lhs.matmul(&cpu_rhs, bmnk, lhs_layout, rhs_layout)?;
-                        Ok(Self::Vulkan(lhs.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -1662,13 +1650,6 @@ impl Storage {
             (Self::Vulkan(src), Self::Vulkan(dst)) => {
                 match src.copy_strided_src(dst, dst_offset, src_l) {
                     Ok(()) => Ok(()),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu_src = src.to_cpu_storage()?;
-                        let mut cpu_dst = dst.to_cpu_storage()?;
-                        cpu_src.copy_strided_src(&mut cpu_dst, dst_offset, src_l)?;
-                        *dst = dst.device().storage_from_cpu_storage(&cpu_dst)?;
-                        Ok(())
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -1716,13 +1697,6 @@ impl Storage {
             (Self::Vulkan(src), Self::Vulkan(dst)) => {
                 match src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o) {
                     Ok(()) => Ok(()),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu_src = src.to_cpu_storage()?;
-                        let mut cpu_dst = dst.to_cpu_storage()?;
-                        cpu_src.copy2d(&mut cpu_dst, d1, d2, src_s, dst_s, src_o, dst_o)?;
-                        *dst = dst.device().storage_from_cpu_storage(&cpu_dst)?;
-                        Ok(())
-                    }
                     Err(err) => Err(err),
                 }
             }
