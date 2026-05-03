@@ -359,20 +359,59 @@ struct VulkanInner {
     seed_value: RwLock<u64>,
     pipeline_cache: Mutex<HashMap<VulkanPipelineCacheKey, Arc<VulkanCachedPipeline>>>,
     pending_submissions: Mutex<Vec<VulkanPendingSubmission>>,
+    active_compute_batch: Mutex<Option<VulkanActiveBatch>>,
+    active_transfer_batch: Mutex<Option<VulkanActiveBatch>>,
+    reusable_compute_submissions: Mutex<Vec<VulkanSubmissionResources>>,
+    reusable_transfer_submissions: Mutex<Vec<VulkanSubmissionResources>>,
     deferred_buffer_frees: Mutex<Vec<VulkanDeferredBuffer>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmissionQueueKind {
+    Compute,
+    Transfer,
+}
+
 struct VulkanPendingSubmission {
+    resources: VulkanSubmissionResources,
+    queue_kind: SubmissionQueueKind,
+    dispatch_count: u32,
+    copy_count: u32,
+    transfer_bytes: usize,
+    compute_bytes: usize,
+    retained_buffers: Vec<Arc<VulkanBuffer>>,
+}
+
+struct VulkanActiveBatch {
+    resources: VulkanSubmissionResources,
+    queue_kind: SubmissionQueueKind,
+    dispatch_count: u32,
+    copy_count: u32,
+    descriptor_set_count: u32,
+    storage_descriptor_count: u32,
+    transfer_bytes: usize,
+    compute_bytes: usize,
+    retained_buffers: Vec<Arc<VulkanBuffer>>,
+}
+
+struct VulkanSubmissionResources {
     fence: vk::Fence,
     command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
     descriptor_pool: vk::DescriptorPool,
+}
+
+impl VulkanActiveBatch {
+    fn has_commands(&self) -> bool {
+        self.dispatch_count > 0 || self.copy_count > 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct VulkanPipelineCacheKey {
-    shader_ptr: usize,
-    shader_len: usize,
-    binding_count: usize,
+    shader_hash: u64,
+    shader_len_words: usize,
+    binding_signature: Vec<u32>,
     push_constant_len: u32,
     specialization_u32: Vec<(u32, u32)>,
     require_full_subgroups: bool,
@@ -389,6 +428,53 @@ struct VulkanCachedPipeline {
 struct VulkanDeferredBuffer {
     buffer: vk::Buffer,
     allocation: Allocation,
+}
+
+struct VulkanInitGuard {
+    instance: Option<ash::Instance>,
+    device: Option<ash::Device>,
+    driver_pipeline_cache: vk::PipelineCache,
+}
+
+impl VulkanInitGuard {
+    fn new(instance: ash::Instance) -> Self {
+        Self {
+            instance: Some(instance),
+            device: None,
+            driver_pipeline_cache: vk::PipelineCache::null(),
+        }
+    }
+
+    fn attach_device(&mut self, device: ash::Device) {
+        self.device = Some(device);
+    }
+
+    fn attach_pipeline_cache(&mut self, pipeline_cache: vk::PipelineCache) {
+        self.driver_pipeline_cache = pipeline_cache;
+    }
+
+    fn disarm(mut self) {
+        self.instance = None;
+        self.device = None;
+        self.driver_pipeline_cache = vk::PipelineCache::null();
+    }
+}
+
+impl Drop for VulkanInitGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(device) = self.device.as_ref() {
+                let _ = device.device_wait_idle();
+                if self.driver_pipeline_cache != vk::PipelineCache::null() {
+                    device.destroy_pipeline_cache(self.driver_pipeline_cache, None);
+                }
+                device.destroy_device(None);
+            }
+            if let Some(instance) = self.instance.as_ref() {
+                instance.destroy_instance(None);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for VulkanInner {
@@ -719,8 +805,8 @@ fn quantize_f32_storage_to_q8_1_x4(
     device.run_compute_specialized(
         spirv,
         &[
-            VulkanBinding::Storage(src.buffer.as_ref()),
-            VulkanBinding::Storage(out.as_ref()),
+            VulkanBinding::Storage(&src.buffer),
+            VulkanBinding::Storage(&out),
         ],
         Some(any_as_bytes(&params)),
         (workgroups_x, 1, 1),
@@ -836,16 +922,423 @@ fn scalar_bytes(scalar: crate::scalar::Scalar, dtype: DType, op: &'static str) -
     }
 }
 
-impl VulkanDevice {
-    fn copy_queue_and_family(&self) -> (vk::Queue, u32) {
-        if let (Some(queue), Some(family)) = (
-            self.inner.transfer_queue,
-            self.inner.transfer_queue_family_index,
-        ) {
-            (queue, family)
-        } else {
-            (self.inner.queue, self.inner.queue_family_index)
+fn hash_spirv_words(words: &[u32]) -> u64 {
+    // Stable process-local digest used only for in-memory pipeline cache keys.
+    let mut hash = 0xcbf29ce484222325u64;
+    for &word in words {
+        for byte in word.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
         }
+    }
+    hash
+}
+
+impl VulkanDevice {
+    const SUBMISSION_DESCRIPTOR_CAPACITY: u32 = 64;
+    const MAX_REUSABLE_SUBMISSIONS_PER_QUEUE: usize = 64;
+    const MAX_BATCH_DISPATCHES: u32 = 32;
+    const MAX_BATCH_COPIES: u32 = 64;
+    const MAX_BATCH_DESCRIPTOR_SETS: u32 = Self::MAX_BATCH_DISPATCHES;
+    const MAX_BATCH_STORAGE_DESCRIPTORS: u32 =
+        Self::MAX_BATCH_DESCRIPTOR_SETS * Self::SUBMISSION_DESCRIPTOR_CAPACITY;
+    const MAX_BATCH_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
+    const MAX_BATCH_COMPUTE_BYTES: usize = 512 * 1024 * 1024;
+
+    fn copy_queue_and_family(
+        &self,
+        prefer_transfer: bool,
+    ) -> (vk::Queue, u32, SubmissionQueueKind) {
+        if prefer_transfer {
+            if let (Some(queue), Some(family)) = (
+                self.inner.transfer_queue,
+                self.inner.transfer_queue_family_index,
+            ) {
+                return (queue, family, SubmissionQueueKind::Transfer);
+            }
+        }
+        (
+            self.inner.queue,
+            self.inner.queue_family_index,
+            SubmissionQueueKind::Compute,
+        )
+    }
+
+    fn create_submission_resources(
+        &self,
+        queue_kind: SubmissionQueueKind,
+        queue_family_index: u32,
+    ) -> Result<VulkanSubmissionResources> {
+        let command_pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .flags(
+                vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER
+                    | vk::CommandPoolCreateFlags::TRANSIENT,
+            );
+        let command_pool = unsafe {
+            self.inner
+                .device
+                .create_command_pool(&command_pool_info, None)
+        }
+        .map_err(Error::wrap)?;
+        let command_alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let command_buffer = unsafe { self.inner.device.allocate_command_buffers(&command_alloc) }
+            .map_err(|err| {
+                unsafe {
+                    self.inner.device.destroy_command_pool(command_pool, None);
+                }
+                Error::wrap(err)
+            })?[0];
+
+        let (max_sets, descriptor_count) = match queue_kind {
+            SubmissionQueueKind::Compute => (
+                Self::MAX_BATCH_DESCRIPTOR_SETS.max(1),
+                Self::MAX_BATCH_STORAGE_DESCRIPTORS.max(1),
+            ),
+            SubmissionQueueKind::Transfer => (1, 1),
+        };
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(descriptor_count)];
+        let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(max_sets)
+            .pool_sizes(&pool_sizes);
+        let descriptor_pool = unsafe {
+            self.inner
+                .device
+                .create_descriptor_pool(&descriptor_pool_info, None)
+        }
+        .map_err(|err| {
+            unsafe {
+                self.inner.device.destroy_command_pool(command_pool, None);
+            }
+            Error::wrap(err)
+        })?;
+
+        let fence = unsafe {
+            self.inner
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+        }
+        .map_err(|err| {
+            unsafe {
+                self.inner
+                    .device
+                    .destroy_descriptor_pool(descriptor_pool, None);
+                self.inner.device.destroy_command_pool(command_pool, None);
+            }
+            Error::wrap(err)
+        })?;
+
+        Ok(VulkanSubmissionResources {
+            fence,
+            command_pool,
+            command_buffer,
+            descriptor_pool,
+        })
+    }
+
+    fn acquire_submission_resources(
+        &self,
+        queue_kind: SubmissionQueueKind,
+        queue_family_index: u32,
+    ) -> Result<VulkanSubmissionResources> {
+        let pool = match queue_kind {
+            SubmissionQueueKind::Compute => &self.inner.reusable_compute_submissions,
+            SubmissionQueueKind::Transfer => &self.inner.reusable_transfer_submissions,
+        };
+        let resources =
+            if let Some(resources) = pool.lock().map_err(|e| Error::wrap(e.to_string()))?.pop() {
+                resources
+            } else {
+                self.create_submission_resources(queue_kind, queue_family_index)?
+            };
+        unsafe {
+            self.inner
+                .device
+                .reset_fences(std::slice::from_ref(&resources.fence))
+                .map_err(Error::wrap)?;
+            self.inner
+                .device
+                .reset_command_pool(resources.command_pool, vk::CommandPoolResetFlags::empty())
+                .map_err(Error::wrap)?;
+            self.inner
+                .device
+                .reset_descriptor_pool(
+                    resources.descriptor_pool,
+                    vk::DescriptorPoolResetFlags::empty(),
+                )
+                .map_err(Error::wrap)?;
+        }
+        Ok(resources)
+    }
+
+    fn recycle_submission_resources(
+        &self,
+        queue_kind: SubmissionQueueKind,
+        resources: VulkanSubmissionResources,
+    ) -> Result<()> {
+        let pool = match queue_kind {
+            SubmissionQueueKind::Compute => &self.inner.reusable_compute_submissions,
+            SubmissionQueueKind::Transfer => &self.inner.reusable_transfer_submissions,
+        };
+        let mut pool = pool.lock().map_err(|e| Error::wrap(e.to_string()))?;
+        if pool.len() >= Self::MAX_REUSABLE_SUBMISSIONS_PER_QUEUE {
+            drop(pool);
+            unsafe {
+                self.inner.device.destroy_fence(resources.fence, None);
+                self.inner
+                    .device
+                    .destroy_command_pool(resources.command_pool, None);
+                self.inner
+                    .device
+                    .destroy_descriptor_pool(resources.descriptor_pool, None);
+            }
+            return Ok(());
+        }
+        pool.push(resources);
+        Ok(())
+    }
+
+    fn active_batch_slot(
+        &self,
+        queue_kind: SubmissionQueueKind,
+    ) -> &Mutex<Option<VulkanActiveBatch>> {
+        match queue_kind {
+            SubmissionQueueKind::Compute => &self.inner.active_compute_batch,
+            SubmissionQueueKind::Transfer => &self.inner.active_transfer_batch,
+        }
+    }
+
+    fn begin_active_batch(
+        &self,
+        queue_kind: SubmissionQueueKind,
+        queue_family_index: u32,
+    ) -> Result<VulkanActiveBatch> {
+        let resources = self.acquire_submission_resources(queue_kind, queue_family_index)?;
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            self.inner
+                .device
+                .begin_command_buffer(resources.command_buffer, &begin_info)
+                .map_err(Error::wrap)?;
+        }
+        Ok(VulkanActiveBatch {
+            resources,
+            queue_kind,
+            dispatch_count: 0,
+            copy_count: 0,
+            descriptor_set_count: 0,
+            storage_descriptor_count: 0,
+            transfer_bytes: 0,
+            compute_bytes: 0,
+            retained_buffers: Vec::new(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_active_batch_capacity(
+        &self,
+        queue_kind: SubmissionQueueKind,
+        queue_family_index: u32,
+        dispatches_to_add: u32,
+        copies_to_add: u32,
+        descriptor_sets_to_add: u32,
+        storage_descriptors_to_add: u32,
+        transfer_bytes_to_add: usize,
+        compute_bytes_to_add: usize,
+    ) -> Result<()> {
+        loop {
+            let mut should_create = false;
+            let mut should_flush = false;
+            {
+                let slot = self
+                    .active_batch_slot(queue_kind)
+                    .lock()
+                    .map_err(|e| Error::wrap(e.to_string()))?;
+                if let Some(batch) = slot.as_ref() {
+                    should_flush = batch.dispatch_count + dispatches_to_add
+                        > Self::MAX_BATCH_DISPATCHES
+                        || batch.copy_count + copies_to_add > Self::MAX_BATCH_COPIES
+                        || batch.descriptor_set_count + descriptor_sets_to_add
+                            > Self::MAX_BATCH_DESCRIPTOR_SETS
+                        || batch.storage_descriptor_count + storage_descriptors_to_add
+                            > Self::MAX_BATCH_STORAGE_DESCRIPTORS
+                        || batch.transfer_bytes + transfer_bytes_to_add
+                            > Self::MAX_BATCH_TRANSFER_BYTES
+                        || batch.compute_bytes + compute_bytes_to_add
+                            > Self::MAX_BATCH_COMPUTE_BYTES;
+                } else {
+                    should_create = true;
+                }
+            }
+            if should_flush {
+                self.flush_active_batch(queue_kind, "batch_limit")?;
+                continue;
+            }
+            if should_create {
+                let batch = self.begin_active_batch(queue_kind, queue_family_index)?;
+                let mut slot = self
+                    .active_batch_slot(queue_kind)
+                    .lock()
+                    .map_err(|e| Error::wrap(e.to_string()))?;
+                if slot.is_none() {
+                    *slot = Some(batch);
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    fn flush_active_batch(
+        &self,
+        queue_kind: SubmissionQueueKind,
+        reason: &'static str,
+    ) -> Result<bool> {
+        let batch = {
+            let mut slot = self
+                .active_batch_slot(queue_kind)
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            slot.take()
+        };
+        let Some(batch) = batch else {
+            return Ok(false);
+        };
+        if !batch.has_commands() {
+            self.recycle_submission_resources(queue_kind, batch.resources)?;
+            return Ok(false);
+        }
+        unsafe {
+            self.inner
+                .device
+                .end_command_buffer(batch.resources.command_buffer)
+                .map_err(Error::wrap)?;
+        }
+        let queue = match queue_kind {
+            SubmissionQueueKind::Compute => self.inner.queue,
+            SubmissionQueueKind::Transfer => self
+                .inner
+                .transfer_queue
+                .ok_or_else(|| Error::msg("missing transfer queue for active batch flush"))?,
+        };
+        let queue_name = match queue_kind {
+            SubmissionQueueKind::Compute => "compute",
+            SubmissionQueueKind::Transfer => "transfer",
+        };
+        let _flush_span = trace_span!(
+            "vulkan.batch.flush",
+            queue = queue_name,
+            reason = reason,
+            dispatches_in_batch = batch.dispatch_count,
+            copies_in_batch = batch.copy_count,
+            transfer_bytes_in_batch = batch.transfer_bytes,
+            compute_bytes_in_batch = batch.compute_bytes
+        )
+        .entered();
+        let submit_info = vk::SubmitInfo::default()
+            .command_buffers(std::slice::from_ref(&batch.resources.command_buffer));
+        let _submit_span = if batch.dispatch_count > 0 {
+            Some(
+                trace_span!(
+                    "vulkan.dispatch.submit",
+                    dispatches_in_batch = batch.dispatch_count,
+                    copies_in_batch = batch.copy_count
+                )
+                .entered(),
+            )
+        } else {
+            Some(
+                trace_span!(
+                    "vulkan.copy.submit",
+                    copies_in_batch = batch.copy_count,
+                    queue = queue_name
+                )
+                .entered(),
+            )
+        };
+        unsafe {
+            self.inner
+                .device
+                .queue_submit(
+                    queue,
+                    std::slice::from_ref(&submit_info),
+                    batch.resources.fence,
+                )
+                .map_err(Error::wrap)?;
+        }
+        self.inner
+            .pending_submissions
+            .lock()
+            .map_err(|e| Error::wrap(e.to_string()))?
+            .push(VulkanPendingSubmission {
+                resources: batch.resources,
+                queue_kind: batch.queue_kind,
+                dispatch_count: batch.dispatch_count,
+                copy_count: batch.copy_count,
+                transfer_bytes: batch.transfer_bytes,
+                compute_bytes: batch.compute_bytes,
+                retained_buffers: batch.retained_buffers,
+            });
+        Ok(true)
+    }
+
+    fn flush_all_active_batches(&self, reason: &'static str) -> Result<()> {
+        self.flush_active_batch(SubmissionQueueKind::Compute, reason)?;
+        if self.inner.transfer_queue.is_some() {
+            self.flush_active_batch(SubmissionQueueKind::Transfer, reason)?;
+        }
+        Ok(())
+    }
+
+    fn cmd_batch_memory_barrier(&self, command_buffer: vk::CommandBuffer) {
+        let memory_barrier = vk::MemoryBarrier::default()
+            .src_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            )
+            .dst_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            );
+        unsafe {
+            self.inner.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&memory_barrier),
+                &[],
+                &[],
+            );
+        }
+    }
+
+    fn wait_for_transfer_dependencies(&self) -> Result<()> {
+        if self.inner.transfer_queue.is_none() {
+            return Ok(());
+        }
+        self.flush_active_batch(SubmissionQueueKind::Transfer, "transfer_dependency")?;
+        let has_pending_transfer = self
+            .inner
+            .pending_submissions
+            .lock()
+            .map_err(|e| Error::wrap(e.to_string()))?
+            .iter()
+            .any(|submission| submission.queue_kind == SubmissionQueueKind::Transfer);
+        if has_pending_transfer {
+            let _wait_span = trace_span!("vulkan.transfer.wait_before_compute").entered();
+            self.cleanup_pending_submissions_for_queue(SubmissionQueueKind::Transfer, true)?;
+        }
+        Ok(())
     }
 
     pub fn transfer_to_device(&self, storage: &VulkanStorage) -> Result<VulkanStorage> {
@@ -967,18 +1460,6 @@ impl VulkanDevice {
         )
     }
 
-    fn destroy_submission(&self, submission: VulkanPendingSubmission) {
-        unsafe {
-            self.inner.device.destroy_fence(submission.fence, None);
-            self.inner
-                .device
-                .destroy_command_pool(submission.command_pool, None);
-            self.inner
-                .device
-                .destroy_descriptor_pool(submission.descriptor_pool, None);
-        }
-    }
-
     fn destroy_deferred_buffers(&self) -> Result<()> {
         let deferred = {
             let mut deferred = self
@@ -1008,7 +1489,23 @@ impl VulkanDevice {
         Ok(())
     }
 
+    fn cleanup_pending_submissions_for_queue(
+        &self,
+        queue_kind: SubmissionQueueKind,
+        wait: bool,
+    ) -> Result<()> {
+        self.cleanup_pending_submissions_impl(wait, Some(queue_kind))
+    }
+
     fn cleanup_pending_submissions(&self, wait: bool) -> Result<()> {
+        self.cleanup_pending_submissions_impl(wait, None)
+    }
+
+    fn cleanup_pending_submissions_impl(
+        &self,
+        wait: bool,
+        only_queue_kind: Option<SubmissionQueueKind>,
+    ) -> Result<()> {
         let ready = {
             let mut pending = self
                 .inner
@@ -1018,11 +1515,21 @@ impl VulkanDevice {
             let mut ready = Vec::new();
             let mut idx = 0;
             while idx < pending.len() {
+                if let Some(queue_kind) = only_queue_kind {
+                    if pending[idx].queue_kind != queue_kind {
+                        idx += 1;
+                        continue;
+                    }
+                }
                 let is_ready = if wait {
                     true
                 } else {
-                    unsafe { self.inner.device.get_fence_status(pending[idx].fence) }
-                        .map_err(Error::wrap)?
+                    unsafe {
+                        self.inner
+                            .device
+                            .get_fence_status(pending[idx].resources.fence)
+                    }
+                    .map_err(Error::wrap)?
                 };
                 if is_ready {
                     ready.push(pending.swap_remove(idx));
@@ -1034,15 +1541,27 @@ impl VulkanDevice {
         };
         for submission in ready {
             if wait {
-                let _wait_span = trace_span!("vulkan.submit.wait_fence").entered();
+                let _wait_span = trace_span!(
+                    "vulkan.submit.wait_fence",
+                    dispatches_in_batch = submission.dispatch_count,
+                    copies_in_batch = submission.copy_count,
+                    transfer_bytes_in_batch = submission.transfer_bytes,
+                    compute_bytes_in_batch = submission.compute_bytes
+                )
+                .entered();
                 unsafe {
                     self.inner
                         .device
-                        .wait_for_fences(std::slice::from_ref(&submission.fence), true, u64::MAX)
+                        .wait_for_fences(
+                            std::slice::from_ref(&submission.resources.fence),
+                            true,
+                            u64::MAX,
+                        )
                         .map_err(Error::wrap)?;
                 }
             }
-            self.destroy_submission(submission);
+            drop(submission.retained_buffers);
+            self.recycle_submission_resources(submission.queue_kind, submission.resources)?;
         }
         let pending_empty = self
             .inner
@@ -1050,20 +1569,31 @@ impl VulkanDevice {
             .lock()
             .map_err(|e| Error::wrap(e.to_string()))?
             .is_empty();
-        if pending_empty {
+        let active_batches_empty = self
+            .inner
+            .active_compute_batch
+            .lock()
+            .map_err(|e| Error::wrap(e.to_string()))?
+            .is_none()
+            && self
+                .inner
+                .active_transfer_batch
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?
+                .is_none();
+        if pending_empty && active_batches_empty {
             self.destroy_deferred_buffers()?;
         }
         Ok(())
     }
 
     fn synchronize_pending(&self) -> Result<()> {
-        let _wait_span =
-            trace_span!("vulkan.submit.wait_idle", wait_transfer = self.inner.transfer_queue.is_some())
-                .entered();
-        unsafe { self.inner.device.queue_wait_idle(self.inner.queue) }.map_err(Error::wrap)?;
-        if let Some(transfer_queue) = self.inner.transfer_queue {
-            unsafe { self.inner.device.queue_wait_idle(transfer_queue) }.map_err(Error::wrap)?;
-        }
+        let _wait_span = trace_span!(
+            "vulkan.submit.wait_fences",
+            wait_transfer = self.inner.transfer_queue.is_some()
+        )
+        .entered();
+        self.flush_all_active_batches("synchronize")?;
         self.cleanup_pending_submissions(true)
     }
 
@@ -1153,83 +1683,77 @@ impl VulkanDevice {
 
     fn submit_copy_regions_and_track(
         &self,
-        src: &VulkanBuffer,
-        dst: &VulkanBuffer,
+        src: &Arc<VulkanBuffer>,
+        dst: &Arc<VulkanBuffer>,
         regions: &[vk::BufferCopy],
+        prefer_transfer: bool,
     ) -> Result<()> {
         if regions.is_empty() {
             return Ok(());
         }
-        let _copy_span = trace_span!(
-            "vulkan.copy.submit",
-            region_count = regions.len(),
-            queue = "transfer_or_compute"
-        )
-        .entered();
         self.cleanup_pending_submissions(false)?;
-        let (queue, queue_family_index) = self.copy_queue_and_family();
-        let command_pool_info =
-            vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_index);
-        let command_pool = unsafe {
-            self.inner
-                .device
-                .create_command_pool(&command_pool_info, None)
+        let (queue, queue_family_index, queue_kind) = self.copy_queue_and_family(prefer_transfer);
+        if queue_kind == SubmissionQueueKind::Compute {
+            self.wait_for_transfer_dependencies()?;
+        } else {
+            self.flush_active_batch(SubmissionQueueKind::Compute, "transfer_copy_dependency")?;
+            self.cleanup_pending_submissions_for_queue(SubmissionQueueKind::Compute, true)?;
         }
-        .map_err(Error::wrap)?;
-        let command_alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let command_buffer = unsafe { self.inner.device.allocate_command_buffers(&command_alloc) }
-            .map_err(Error::wrap)?[0];
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe {
-            self.inner
-                .device
-                .begin_command_buffer(command_buffer, &begin_info)
-                .map_err(Error::wrap)?;
-            self.inner
-                .device
-                .cmd_copy_buffer(command_buffer, src.buffer, dst.buffer, regions);
-            self.inner
-                .device
-                .end_command_buffer(command_buffer)
-                .map_err(Error::wrap)?;
+        let total_bytes = regions.iter().try_fold(0usize, |acc, region| {
+            acc.checked_add(region.size as usize)
+                .ok_or_else(|| Error::msg("vulkan copy batch byte count overflow"))
+        })?;
+        let (transfer_bytes_to_add, compute_bytes_to_add) = match queue_kind {
+            SubmissionQueueKind::Transfer => (total_bytes, 0),
+            SubmissionQueueKind::Compute => (0, total_bytes),
+        };
+        self.ensure_active_batch_capacity(
+            queue_kind,
+            queue_family_index,
+            0,
+            1,
+            0,
+            0,
+            transfer_bytes_to_add,
+            compute_bytes_to_add,
+        )?;
+        {
+            let mut slot = self
+                .active_batch_slot(queue_kind)
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            let batch = slot
+                .as_mut()
+                .ok_or_else(|| Error::msg("vulkan active batch missing after ensure"))?;
+            unsafe {
+                self.inner.device.cmd_copy_buffer(
+                    batch.resources.command_buffer,
+                    src.buffer,
+                    dst.buffer,
+                    regions,
+                );
+            }
+            if queue_kind == SubmissionQueueKind::Compute {
+                self.cmd_batch_memory_barrier(batch.resources.command_buffer);
+            }
+            batch.copy_count += 1;
+            batch.transfer_bytes += transfer_bytes_to_add;
+            batch.compute_bytes += compute_bytes_to_add;
+            batch.retained_buffers.push(src.clone());
+            batch.retained_buffers.push(dst.clone());
         }
-        let submit_info =
-            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
-        let fence = unsafe {
-            self.inner
-                .device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-        }
-        .map_err(Error::wrap)?;
-        unsafe {
-            self.inner
-                .device
-                .queue_submit(queue, std::slice::from_ref(&submit_info), fence)
-        }
-        .map_err(Error::wrap)?;
-        self.inner
-            .pending_submissions
-            .lock()
-            .map_err(|e| Error::wrap(e.to_string()))?
-            .push(VulkanPendingSubmission {
-                fence,
-                command_pool,
-                descriptor_pool: vk::DescriptorPool::null(),
-            });
+        let _ = queue;
         Ok(())
     }
 
     fn submit_copy_region_and_track(
         &self,
-        src: &VulkanBuffer,
-        dst: &VulkanBuffer,
+        src: &Arc<VulkanBuffer>,
+        dst: &Arc<VulkanBuffer>,
         src_offset: usize,
         dst_offset: usize,
         size: usize,
+        prefer_transfer: bool,
     ) -> Result<()> {
         if size == 0 {
             return Ok(());
@@ -1238,19 +1762,20 @@ impl VulkanDevice {
             .src_offset(src_offset as u64)
             .dst_offset(dst_offset as u64)
             .size(size as u64);
-        self.submit_copy_regions_and_track(src, dst, std::slice::from_ref(&region))
+        self.submit_copy_regions_and_track(src, dst, std::slice::from_ref(&region), prefer_transfer)
     }
 
     fn submit_copy_and_track(
         &self,
-        src: &VulkanBuffer,
-        dst: &VulkanBuffer,
+        src: &Arc<VulkanBuffer>,
+        dst: &Arc<VulkanBuffer>,
         size: usize,
+        prefer_transfer: bool,
     ) -> Result<()> {
-        self.submit_copy_region_and_track(src, dst, 0, 0, size)
+        self.submit_copy_region_and_track(src, dst, 0, 0, size, prefer_transfer)
     }
 
-    fn write_buffer(&self, buffer: &VulkanBuffer, bytes: &[u8]) -> Result<()> {
+    fn write_buffer(&self, buffer: &Arc<VulkanBuffer>, bytes: &[u8]) -> Result<()> {
         let _upload_span = trace_span!(
             "vulkan.upload",
             requested_bytes = bytes.len(),
@@ -1259,17 +1784,21 @@ impl VulkanDevice {
         .entered();
         let staging = self.create_upload_staging_buffer(buffer.size)?;
         self.map_write_host_buffer(staging.as_ref(), bytes)?;
-        self.submit_copy_and_track(staging.as_ref(), buffer, buffer.size)?;
-        self.synchronize_pending()?;
+        self.submit_copy_and_track(&staging, buffer, buffer.size, true)?;
         Ok(())
     }
 
-    fn read_buffer(&self, buffer: &VulkanBuffer) -> Result<Vec<u8>> {
+    fn read_buffer(&self, buffer: &Arc<VulkanBuffer>) -> Result<Vec<u8>> {
         let _readback_span = trace_span!("vulkan.readback", buffer_bytes = buffer.size).entered();
-        self.synchronize_pending()?;
+        self.flush_all_active_batches("read_buffer_before_wait")?;
+        self.cleanup_pending_submissions(true)?;
         let staging = self.create_readback_staging_buffer(buffer.size)?;
-        self.submit_copy_and_track(buffer, staging.as_ref(), buffer.size)?;
-        self.synchronize_pending()?;
+        self.submit_copy_and_track(buffer, &staging, buffer.size, true)?;
+        self.flush_active_batch(
+            self.copy_queue_and_family(true).2,
+            "read_buffer_after_copy_record",
+        )?;
+        self.cleanup_pending_submissions(true)?;
         self.map_read_host_buffer(staging.as_ref())
     }
 
@@ -1342,7 +1871,7 @@ impl VulkanDevice {
                 required_subgroup_size,
             )?
         }
-        self.synchronize_pending()
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1373,11 +1902,16 @@ impl VulkanDevice {
             wg_z = workgroups.2
         )
         .entered();
+        self.wait_for_transfer_dependencies()?;
         self.cleanup_pending_submissions(false)?;
+        let binding_signature = bindings
+            .iter()
+            .map(|binding| binding.descriptor_type().as_raw() as u32)
+            .collect::<Vec<_>>();
         let cache_key = VulkanPipelineCacheKey {
-            shader_ptr: spirv.as_ptr() as usize,
-            shader_len: spirv.len(),
-            binding_count: bindings.len(),
+            shader_hash: hash_spirv_words(spirv),
+            shader_len_words: spirv.len(),
+            binding_signature,
             push_constant_len: push_constants_len,
             specialization_u32: specialization_u32
                 .map(|specs| specs.to_vec())
@@ -1517,24 +2051,36 @@ impl VulkanDevice {
                 VulkanBinding::Storage(_) => storage_count += 1,
             }
         }
-        let mut pool_sizes = Vec::new();
-        if storage_count > 0 {
-            pool_sizes.push(
-                vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(storage_count),
+        if storage_count > Self::SUBMISSION_DESCRIPTOR_CAPACITY {
+            crate::bail!(
+                "vulkan descriptor requirement {} exceeds submission capacity {}",
+                storage_count,
+                Self::SUBMISSION_DESCRIPTOR_CAPACITY
             );
         }
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(1)
-            .pool_sizes(&pool_sizes);
-        let descriptor_pool = self
-            .inner
-            .device
-            .create_descriptor_pool(&pool_info, None)
-            .map_err(Error::wrap)?;
+        let compute_bytes = bindings.iter().try_fold(0usize, |acc, binding| {
+            acc.checked_add(binding.buffer().size)
+                .ok_or_else(|| Error::msg("vulkan compute batch byte count overflow"))
+        })?;
+        self.ensure_active_batch_capacity(
+            SubmissionQueueKind::Compute,
+            self.inner.queue_family_index,
+            1,
+            0,
+            1,
+            storage_count,
+            0,
+            compute_bytes,
+        )?;
+        let mut slot = self
+            .active_batch_slot(SubmissionQueueKind::Compute)
+            .lock()
+            .map_err(|e| Error::wrap(e.to_string()))?;
+        let batch = slot
+            .as_mut()
+            .ok_or_else(|| Error::msg("vulkan compute batch missing after ensure"))?;
         let set_alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(descriptor_pool)
+            .descriptor_pool(batch.resources.descriptor_pool)
             .set_layouts(std::slice::from_ref(&cached.descriptor_set_layout));
         let descriptor_set = self
             .inner
@@ -1563,28 +2109,7 @@ impl VulkanDevice {
             })
             .collect::<Vec<_>>();
         self.inner.device.update_descriptor_sets(&writes, &[]);
-
-        let command_pool_info =
-            vk::CommandPoolCreateInfo::default().queue_family_index(self.inner.queue_family_index);
-        let command_pool = self
-            .inner
-            .device
-            .create_command_pool(&command_pool_info, None)
-            .map_err(Error::wrap)?;
-        let command_alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let command_buffer = self
-            .inner
-            .device
-            .allocate_command_buffers(&command_alloc)
-            .map_err(Error::wrap)?[0];
-        let begin_info = vk::CommandBufferBeginInfo::default();
-        self.inner
-            .device
-            .begin_command_buffer(command_buffer, &begin_info)
-            .map_err(Error::wrap)?;
+        let command_buffer = batch.resources.command_buffer;
         self.inner.device.cmd_bind_pipeline(
             command_buffer,
             vk::PipelineBindPoint::COMPUTE,
@@ -1610,50 +2135,39 @@ impl VulkanDevice {
         self.inner
             .device
             .cmd_dispatch(command_buffer, workgroups.0, workgroups.1, workgroups.2);
-        self.inner
-            .device
-            .end_command_buffer(command_buffer)
-            .map_err(Error::wrap)?;
-        let submit_info =
-            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
-        let fence = self
-            .inner
-            .device
-            .create_fence(&vk::FenceCreateInfo::default(), None)
-            .map_err(Error::wrap)?;
-        let _submit_span =
-            trace_span!("vulkan.dispatch.submit", cache_hit = pipeline_cache_hit).entered();
-        self.inner
-            .device
-            .queue_submit(self.inner.queue, std::slice::from_ref(&submit_info), fence)
-            .map_err(Error::wrap)?;
-        self.inner
-            .pending_submissions
-            .lock()
-            .map_err(|e| Error::wrap(e.to_string()))?
-            .push(VulkanPendingSubmission {
-                fence,
-                command_pool,
-                descriptor_pool,
-            });
+        self.cmd_batch_memory_barrier(command_buffer);
+        batch.dispatch_count += 1;
+        batch.descriptor_set_count += 1;
+        batch.storage_descriptor_count += storage_count;
+        batch.compute_bytes += compute_bytes;
+        batch
+            .retained_buffers
+            .extend(bindings.iter().map(VulkanBinding::retained_buffer));
+        let _ = pipeline_cache_hit;
         Ok(())
     }
 }
 
 enum VulkanBinding<'a> {
-    Storage(&'a VulkanBuffer),
+    Storage(&'a Arc<VulkanBuffer>),
 }
 
 impl VulkanBinding<'_> {
     fn buffer(&self) -> &VulkanBuffer {
         match self {
-            Self::Storage(buffer) => buffer,
+            Self::Storage(buffer) => buffer.as_ref(),
         }
     }
 
     fn descriptor_type(&self) -> vk::DescriptorType {
         match self {
             Self::Storage(_) => vk::DescriptorType::STORAGE_BUFFER,
+        }
+    }
+
+    fn retained_buffer(&self) -> Arc<VulkanBuffer> {
+        match self {
+            Self::Storage(buffer) => (*buffer).clone(),
         }
     }
 }
@@ -1691,9 +2205,7 @@ fn ggml_linear_workgroups(count: usize) -> Result<(u32, u32, u32)> {
 fn next_power_of_two_u32(value: usize, op: &'static str) -> Result<u32> {
     value
         .checked_next_power_of_two()
-        .ok_or_else(|| {
-            Error::Msg(format!("vulkan backend op {op} dimension overflow")).bt()
-        })?
+        .ok_or_else(|| Error::Msg(format!("vulkan backend op {op} dimension overflow")).bt())?
         .try_into()
         .map_err(Error::wrap)
 }
@@ -1830,9 +2342,9 @@ fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
         (DType::F16, DType::F32) => "cpy_f16_f32",
         (DType::F16, DType::F16) => "cpy_f16_f16",
         _ => {
-            return Err(Error::Msg(
-                format!("vulkan backend op to_dtype {src:?}->{dst:?} not implemented"),
-            )
+            return Err(Error::Msg(format!(
+                "vulkan backend op to_dtype {src:?}->{dst:?} not implemented"
+            ))
             .bt())
         }
     };
@@ -1895,18 +2407,17 @@ impl VulkanStorage {
             param3: 0,
         };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(ids.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&ids.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv_name = match dtype {
             DType::F16 => "get_rows_bf16",
             DType::F32 => "get_rows_bf16_f32",
             _ => unreachable!(),
         };
-        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
-            Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
-        })?;
+        let spirv = candle_vulkan_kernels::spirv(spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         self.device.run_compute_3d(
             spirv,
             &bindings,
@@ -1936,8 +2447,8 @@ impl VulkanStorage {
             param4: 0.0,
         };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let workgroups = ggml_linear_workgroups(count)?;
         self.device
@@ -2012,8 +2523,8 @@ impl VulkanStorage {
             ne1_0l,
         };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let workgroups = ggml_linear_workgroups(count)?;
         self.device
@@ -2088,9 +2599,9 @@ impl VulkanStorage {
             param3: 0,
         };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(rhs.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&rhs.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv = binary_spirv(op, self.dtype)?;
         let workgroups = ggml_linear_workgroups(count)?;
@@ -2183,8 +2694,8 @@ impl VulkanStorage {
             ne1_0l,
         };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let workgroups = ggml_linear_workgroups(count)?;
         self.device
@@ -2227,8 +2738,8 @@ impl VulkanStorage {
             ne0_1l,
         };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv = candle_vulkan_kernels::spirv("sum_rows_f32")
             .ok_or_else(|| Error::Msg("vulkan shader sum_rows_f32 not generated".into()).bt())?;
@@ -2265,8 +2776,8 @@ impl VulkanStorage {
             param4: 0.0,
         };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv = candle_vulkan_kernels::spirv("argmax_f32")
             .ok_or_else(|| Error::Msg("vulkan shader argmax_f32 not generated".into()).bt())?;
@@ -2418,9 +2929,9 @@ impl VulkanStorage {
 
         if use_small {
             let bindings = [
-                VulkanBinding::Storage(self.buffer.as_ref()),
-                VulkanBinding::Storage(dst.buffer.as_ref()),
-                VulkanBinding::Storage(dst.buffer.as_ref()),
+                VulkanBinding::Storage(&self.buffer),
+                VulkanBinding::Storage(&dst.buffer),
+                VulkanBinding::Storage(&dst.buffer),
             ];
             let spirv = candle_vulkan_kernels::spirv("argsort_f32")
                 .ok_or_else(|| Error::Msg("vulkan shader argsort_f32 not generated".into()).bt())?;
@@ -2443,9 +2954,9 @@ impl VulkanStorage {
             .device
             .create_buffer(tmp_size, "candle-vulkan-argsort-large-tmp")?;
         self.run_argsort_large_pass(
-            self.buffer.as_ref(),
-            tmp.as_ref(),
-            dst.buffer.as_ref(),
+            &self.buffer,
+            &tmp,
+            &dst.buffer,
             base_params,
             workgroups_y,
             pipeline_idx,
@@ -2466,9 +2977,9 @@ impl VulkanStorage {
                     (pipeline_idx.saturating_sub(2), inner_start + 1)
                 };
                 self.run_argsort_large_pass(
-                    self.buffer.as_ref(),
-                    tmp.as_ref(),
-                    dst.buffer.as_ref(),
+                    &self.buffer,
+                    &tmp,
+                    &dst.buffer,
                     base_params,
                     workgroups_y,
                     pass_idx,
@@ -2485,9 +2996,9 @@ impl VulkanStorage {
     #[allow(clippy::too_many_arguments)]
     fn run_argsort_large_pass(
         &self,
-        src: &VulkanBuffer,
-        tmp: &VulkanBuffer,
-        dst: &VulkanBuffer,
+        src: &Arc<VulkanBuffer>,
+        tmp: &Arc<VulkanBuffer>,
+        dst: &Arc<VulkanBuffer>,
         base_params: VulkanArgsortParams,
         workgroups_y: u32,
         pass_idx: u32,
@@ -2558,8 +3069,8 @@ impl VulkanStorage {
             ne0_1l,
         };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv = candle_vulkan_kernels::spirv("cumsum_f32")
             .ok_or_else(|| Error::Msg("vulkan shader cumsum_f32 not generated".into()).bt())?;
@@ -2614,10 +3125,10 @@ impl VulkanStorage {
             has_sinks: 0,
         };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv = candle_vulkan_kernels::spirv("soft_max_f32")
             .ok_or_else(|| Error::Msg("vulkan shader soft_max_f32 not generated".into()).bt())?;
@@ -2685,20 +3196,19 @@ impl VulkanStorage {
             nb13: dst_strides[3],
         };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(pos.buffer.as_ref()),
-            VulkanBinding::Storage(pos.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
-            VulkanBinding::Storage(pos.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&pos.buffer),
+            VulkanBinding::Storage(&pos.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+            VulkanBinding::Storage(&pos.buffer),
         ];
         let spirv_name = match self.dtype {
             DType::F32 => "rope_norm_f32",
             DType::F16 => "rope_norm_f16",
             _ => unreachable!(),
         };
-        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
-            Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
-        })?;
+        let spirv = candle_vulkan_kernels::spirv(spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         let wg_y = ((n_dims / 2) as u32).div_ceil(256).max(1);
         let groups_x = rows_u32.min(32768);
         let groups_z = rows_u32.div_ceil(32768).max(1);
@@ -2776,9 +3286,9 @@ impl VulkanStorage {
             param3: 0,
         };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(alpha.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&alpha.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv = candle_vulkan_kernels::spirv("rms_norm_f32")
             .ok_or_else(|| Error::Msg("vulkan shader rms_norm_f32 not generated".into()).bt())?;
@@ -2867,18 +3377,17 @@ impl VulkanStorage {
             param3: 0,
         };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(ids.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&ids.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv_name = match self.dtype {
             DType::F32 => "get_rows_f32_f32",
             DType::F16 => "get_rows_f16",
             _ => unreachable!(),
         };
-        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
-            Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
-        })?;
+        let spirv = candle_vulkan_kernels::spirv(spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         self.device.run_compute_3d(
             spirv,
             &bindings,
@@ -2950,18 +3459,17 @@ impl VulkanStorage {
             param3: 0,
         };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(ids.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&ids.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv_name = match self.dtype {
             DType::F32 => "get_rows_f32_f32",
             DType::F16 => "get_rows_f16",
             _ => unreachable!(),
         };
-        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
-            Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
-        })?;
+        let spirv = candle_vulkan_kernels::spirv(spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         self.device.run_compute_3d(
             spirv,
             &bindings,
@@ -3056,9 +3564,9 @@ impl VulkanStorage {
             param3: 0,
         };
         let bindings = [
-            VulkanBinding::Storage(src.buffer.as_ref()),
-            VulkanBinding::Storage(ids.buffer.as_ref()),
-            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(&src.buffer),
+            VulkanBinding::Storage(&ids.buffer),
+            VulkanBinding::Storage(&self.buffer),
         ];
         let spirv = candle_vulkan_kernels::spirv("set_rows_f32_i32").ok_or_else(|| {
             Error::Msg("vulkan shader set_rows_f32_i32 not generated".into()).bt()
@@ -3156,11 +3664,11 @@ impl VulkanStorage {
                 broadcast3: 1,
             };
             let bindings = [
-                VulkanBinding::Storage(rhs_t.buffer.as_ref()),
-                VulkanBinding::Storage(lhs.buffer.as_ref()),
-                VulkanBinding::Storage(dst.buffer.as_ref()),
-                VulkanBinding::Storage(dst.buffer.as_ref()),
-                VulkanBinding::Storage(dst.buffer.as_ref()),
+                VulkanBinding::Storage(&rhs_t.buffer),
+                VulkanBinding::Storage(&lhs.buffer),
+                VulkanBinding::Storage(&dst.buffer),
+                VulkanBinding::Storage(&dst.buffer),
+                VulkanBinding::Storage(&dst.buffer),
             ];
             let dmmv_workgroup = vulkan_dmmv_workgroup(&self.device, GgmlDType::F32, n, k, false);
             let spirv_name = vulkan_dmmv_shader_name(
@@ -3231,17 +3739,16 @@ impl VulkanStorage {
             padded_n: m.try_into()?,
         };
         let bindings = [
-            VulkanBinding::Storage(rhs_t.buffer.as_ref()),
-            VulkanBinding::Storage(lhs.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&rhs_t.buffer),
+            VulkanBinding::Storage(&lhs.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv_name = match self.dtype {
             DType::F32 => "matmul_f32_f32",
             _ => unreachable!(),
         };
-        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
-            Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
-        })?;
+        let spirv = candle_vulkan_kernels::spirv(spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         let spec = [
             (0, 64),
             (1, 64),
@@ -3322,8 +3829,8 @@ impl VulkanStorage {
             batch_ic: (params.b_size * params.c_in).try_into()?,
         };
         let bindings = [
-            VulkanBinding::Storage(input.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&input.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv = candle_vulkan_kernels::spirv("im2col_f32")
             .ok_or_else(|| Error::Msg("vulkan shader im2col_f32 not generated".into()).bt())?;
@@ -3429,8 +3936,8 @@ impl VulkanStorage {
             batch_ic: (params.b_size * params.c_in).try_into()?,
         };
         let bindings = [
-            VulkanBinding::Storage(input.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&input.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv = candle_vulkan_kernels::spirv("im2col_f32")
             .ok_or_else(|| Error::Msg("vulkan shader im2col_f32 not generated".into()).bt())?;
@@ -3563,9 +4070,9 @@ impl VulkanStorage {
             owohl,
         };
         let bindings = [
-            VulkanBinding::Storage(kernel.buffer.as_ref()),
-            VulkanBinding::Storage(input.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&kernel.buffer),
+            VulkanBinding::Storage(&input.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv = candle_vulkan_kernels::spirv("conv_transpose_2d_f32_unroll")
             .or_else(|| candle_vulkan_kernels::spirv("conv_transpose_2d_f32"))
@@ -3676,9 +4183,9 @@ impl VulkanStorage {
             owohl,
         };
         let bindings = [
-            VulkanBinding::Storage(kernel.buffer.as_ref()),
-            VulkanBinding::Storage(input.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&kernel.buffer),
+            VulkanBinding::Storage(&input.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv = candle_vulkan_kernels::spirv("conv_transpose_2d_f32_unroll")
             .or_else(|| candle_vulkan_kernels::spirv("conv_transpose_2d_f32"))
@@ -3834,8 +4341,8 @@ impl VulkanStorage {
             p1: 0,
         };
         let bindings = [
-            VulkanBinding::Storage(input.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&input.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv = candle_vulkan_kernels::spirv("pool2d_f32")
             .ok_or_else(|| Error::Msg("vulkan shader pool2d_f32 not generated".into()).bt())?;
@@ -3920,14 +4427,13 @@ impl VulkanStorage {
             param3: 0,
         };
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
-            VulkanBinding::Storage(ids.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&ids.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv_name = format!("get_rows_{}_f32", vulkan_quantized_stem(qdtype)?);
-        let spirv = candle_vulkan_kernels::spirv(&spirv_name).ok_or_else(|| {
-            Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
-        })?;
+        let spirv = candle_vulkan_kernels::spirv(&spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         self.device.run_compute_3d(
             spirv,
             &bindings,
@@ -4059,14 +4565,11 @@ impl VulkanStorage {
         } else {
             None
         };
-        let rhs_binding = q8_1_rhs
-            .as_ref()
-            .map(|buffer| buffer.as_ref())
-            .unwrap_or(src.buffer.as_ref());
+        let rhs_binding = q8_1_rhs.as_ref().unwrap_or(&src.buffer);
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
             VulkanBinding::Storage(rhs_binding),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let rhs_suffix = if use_q8_1_rhs {
             "q8_1"
@@ -4080,9 +4583,8 @@ impl VulkanStorage {
             }
         };
         let spirv_name = format!("matmul_{}_{}", vulkan_quantized_stem(qdtype)?, rhs_suffix);
-        let spirv = candle_vulkan_kernels::spirv(&spirv_name).ok_or_else(|| {
-            Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
-        })?;
+        let spirv = candle_vulkan_kernels::spirv(&spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         let spec = if use_q8_1_rhs {
             let subgroup = self.device.inner.subgroup_size.max(8);
             let subgroup32 = self.device.inner.subgroup_size.max(32);
@@ -4254,16 +4756,13 @@ impl VulkanStorage {
         } else {
             None
         };
-        let rhs_binding = q8_1_rhs
-            .as_ref()
-            .map(|buffer| buffer.as_ref())
-            .unwrap_or(src.buffer.as_ref());
+        let rhs_binding = q8_1_rhs.as_ref().unwrap_or(&src.buffer);
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
             VulkanBinding::Storage(rhs_binding),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
+            VulkanBinding::Storage(&dst.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+            VulkanBinding::Storage(&dst.buffer),
         ];
         let dmmv_workgroup = vulkan_dmmv_workgroup(&self.device, qdtype, n, k, use_q8_1_rhs);
         let (spirv_name, rows_per_group, block_size) = if use_q8_1_rhs {
@@ -4303,9 +4802,8 @@ impl VulkanStorage {
                 vulkan_dmmv_block_size(&self.device, qdtype, dmmv_workgroup),
             )
         };
-        let spirv = candle_vulkan_kernels::spirv(&spirv_name).ok_or_else(|| {
-            Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
-        })?;
+        let spirv = candle_vulkan_kernels::spirv(&spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         let spec = [
             (0, block_size),
             (1, rows_per_group),
@@ -4440,17 +4938,14 @@ impl VulkanStorage {
         } else {
             None
         };
-        let rhs_binding = q8_1_rhs
-            .as_ref()
-            .map(|buffer| buffer.as_ref())
-            .unwrap_or(src.buffer.as_ref());
+        let rhs_binding = q8_1_rhs.as_ref().unwrap_or(&src.buffer);
         let bindings = [
-            VulkanBinding::Storage(self.buffer.as_ref()),
+            VulkanBinding::Storage(&self.buffer),
             VulkanBinding::Storage(rhs_binding),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
-            VulkanBinding::Storage(dst.buffer.as_ref()),
-            VulkanBinding::Storage(ids_src.buffer.as_ref()),
+            VulkanBinding::Storage(&dst.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+            VulkanBinding::Storage(&ids_src.buffer),
         ];
         let dmmv_workgroup = vulkan_dmmv_workgroup(&self.device, qdtype, n, k, use_q8_1_rhs);
         let (spirv_name, rows_per_group, block_size) = if use_q8_1_rhs {
@@ -4476,9 +4971,8 @@ impl VulkanStorage {
                 vulkan_dmmv_block_size(&self.device, qdtype, dmmv_workgroup),
             )
         };
-        let spirv = candle_vulkan_kernels::spirv(&spirv_name).ok_or_else(|| {
-            Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
-        })?;
+        let spirv = candle_vulkan_kernels::spirv(&spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         let spec = [(0, block_size), (1, rows_per_group), (2, 1)];
         let groups_x_max = self.device.inner.max_workgroup_count_x.max(1);
         let groups_x = (n as u32).div_ceil(rows_per_group).min(groups_x_max);
@@ -4533,14 +5027,78 @@ impl Drop for VulkanBuffer {
 impl Drop for VulkanInner {
     fn drop(&mut self) {
         unsafe {
+            let destroy_submission_resources = |resources: VulkanSubmissionResources| {
+                self.device.destroy_fence(resources.fence, None);
+                self.device
+                    .destroy_command_pool(resources.command_pool, None);
+                self.device
+                    .destroy_descriptor_pool(resources.descriptor_pool, None);
+            };
+
+            let mut submitted_active_batches = Vec::new();
+            let mut flush_active_batch_for_drop =
+                |slot: &Mutex<Option<VulkanActiveBatch>>, queue: vk::Queue| {
+                    if let Ok(mut slot) = slot.lock() {
+                        if let Some(batch) = slot.take() {
+                            if batch.has_commands() {
+                                if self
+                                    .device
+                                    .end_command_buffer(batch.resources.command_buffer)
+                                    .is_ok()
+                                {
+                                    let submit_info = vk::SubmitInfo::default().command_buffers(
+                                        std::slice::from_ref(&batch.resources.command_buffer),
+                                    );
+                                    if self
+                                        .device
+                                        .queue_submit(
+                                            queue,
+                                            std::slice::from_ref(&submit_info),
+                                            batch.resources.fence,
+                                        )
+                                        .is_ok()
+                                    {
+                                        submitted_active_batches.push(VulkanPendingSubmission {
+                                            resources: batch.resources,
+                                            queue_kind: batch.queue_kind,
+                                            dispatch_count: batch.dispatch_count,
+                                            copy_count: batch.copy_count,
+                                            transfer_bytes: batch.transfer_bytes,
+                                            compute_bytes: batch.compute_bytes,
+                                            retained_buffers: batch.retained_buffers,
+                                        });
+                                        return;
+                                    }
+                                }
+                            }
+                            destroy_submission_resources(batch.resources);
+                        }
+                    }
+                };
+
+            flush_active_batch_for_drop(&self.active_compute_batch, self.queue);
+            if let Some(transfer_queue) = self.transfer_queue {
+                flush_active_batch_for_drop(&self.active_transfer_batch, transfer_queue);
+            }
+            if let Ok(mut pending) = self.pending_submissions.lock() {
+                pending.extend(submitted_active_batches);
+            }
+
             let _ = self.device.device_wait_idle();
+
             if let Ok(mut pending) = self.pending_submissions.lock() {
                 for submission in pending.drain(..) {
-                    self.device.destroy_fence(submission.fence, None);
-                    self.device
-                        .destroy_command_pool(submission.command_pool, None);
-                    self.device
-                        .destroy_descriptor_pool(submission.descriptor_pool, None);
+                    destroy_submission_resources(submission.resources);
+                }
+            }
+            if let Ok(mut reusable) = self.reusable_compute_submissions.lock() {
+                for resources in reusable.drain(..) {
+                    destroy_submission_resources(resources);
+                }
+            }
+            if let Ok(mut reusable) = self.reusable_transfer_submissions.lock() {
+                for resources in reusable.drain(..) {
+                    destroy_submission_resources(resources);
                 }
             }
             if let Ok(mut cache) = self.pipeline_cache.lock() {
@@ -4884,7 +5442,6 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
-        self.device.synchronize_pending()?;
         match self.run_conv1d_f32(layout, kernel, kernel_l, params) {
             Ok(out) => Ok(out),
             Err(err) if should_cpu_fallback(&err) => {
@@ -4909,7 +5466,6 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose1D,
     ) -> Result<Self> {
-        self.device.synchronize_pending()?;
         match self.run_conv_transpose1d_f32(layout, kernel, kernel_l, params) {
             Ok(out) => Ok(out),
             Err(err)
@@ -4936,7 +5492,6 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        self.device.synchronize_pending()?;
         match self.run_conv2d_f32(layout, kernel, kernel_l, params) {
             Ok(out) => Ok(out),
             Err(err) if should_cpu_fallback(&err) => {
@@ -4961,7 +5516,6 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self> {
-        self.device.synchronize_pending()?;
         match self.run_conv_transpose2d_f32(layout, kernel, kernel_l, params) {
             Ok(out) => Ok(out),
             Err(err)
@@ -5233,15 +5787,13 @@ impl BackendStorage for VulkanStorage {
         let dst_offset = dst_offset * elem_size;
         let size = src_l.shape().elem_count() * elem_size;
         self.device.submit_copy_region_and_track(
-            self.buffer.as_ref(),
-            dst.buffer.as_ref(),
+            &self.buffer,
+            &dst.buffer,
             src_offset,
             dst_offset,
             size,
+            false,
         )?;
-        if self.device.inner.transfer_queue.is_some() {
-            self.device.synchronize_pending()?;
-        }
         Ok(())
     }
 
@@ -5281,14 +5833,8 @@ impl BackendStorage for VulkanStorage {
                     .size(len as u64),
             );
         }
-        self.device.submit_copy_regions_and_track(
-            self.buffer.as_ref(),
-            dst.buffer.as_ref(),
-            &regions,
-        )?;
-        if self.device.inner.transfer_queue.is_some() {
-            self.device.synchronize_pending()?;
-        }
+        self.device
+            .submit_copy_regions_and_track(&self.buffer, &dst.buffer, &regions, false)?;
         Ok(())
     }
 
@@ -5330,6 +5876,7 @@ impl BackendDevice for VulkanDevice {
         let instance_info = vk::InstanceCreateInfo::default().application_info(&app_info);
         let instance =
             unsafe { entry.create_instance(&instance_info, None) }.map_err(Error::wrap)?;
+        let mut init_guard = VulkanInitGuard::new(instance.clone());
         let physical_devices =
             unsafe { instance.enumerate_physical_devices() }.map_err(Error::wrap)?;
         let physical_device = *physical_devices
@@ -5505,10 +6052,11 @@ impl BackendDevice for VulkanDevice {
         }
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
             .map_err(Error::wrap)?;
-        let driver_pipeline_cache = unsafe {
-            device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
-        }
-        .map_err(Error::wrap)?;
+        init_guard.attach_device(device.clone());
+        let driver_pipeline_cache =
+            unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) }
+                .map_err(Error::wrap)?;
+        init_guard.attach_pipeline_cache(driver_pipeline_cache);
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
         let transfer_queue =
             transfer_queue_family_index.map(|family| unsafe { device.get_device_queue(family, 0) });
@@ -5521,6 +6069,7 @@ impl BackendDevice for VulkanDevice {
             allocation_sizes: Default::default(),
         })
         .map_err(Error::wrap)?;
+        init_guard.disarm();
         Ok(Self {
             inner: Arc::new(VulkanInner {
                 ordinal,
@@ -5551,6 +6100,10 @@ impl BackendDevice for VulkanDevice {
                 seed_value: RwLock::new(299_792_458),
                 pipeline_cache: Mutex::new(HashMap::new()),
                 pending_submissions: Mutex::new(Vec::new()),
+                active_compute_batch: Mutex::new(None),
+                active_transfer_batch: Mutex::new(None),
+                reusable_compute_submissions: Mutex::new(Vec::new()),
+                reusable_transfer_submissions: Mutex::new(Vec::new()),
                 deferred_buffer_frees: Mutex::new(Vec::new()),
             }),
         })
@@ -5837,7 +6390,8 @@ mod tests {
         assert_eq!(got_res_pad, vec![2.0f32, 4.0, 6.0, 3.0]);
 
         let res_pad_l = Layout::contiguous((b, l_out, n)).transpose(1, 2)?;
-        let mut out_pad = unsafe { device.alloc_uninit(&Shape::from(params_pad.out_dims()), DType::F32)? };
+        let mut out_pad =
+            unsafe { device.alloc_uninit(&Shape::from(params_pad.out_dims()), DType::F32)? };
         res_pad.copy_strided_src(&mut out_pad, 0, &res_pad_l)?;
         let out_pad_cpu = out_pad.to_cpu_storage()?;
         let got_out_pad = match out_pad_cpu {
@@ -5997,7 +6551,8 @@ mod tests {
         let device = crate::Device::Vulkan(VulkanDevice::new(0)?);
 
         let lhs = crate::Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), &device)?;
-        let rhs = crate::Tensor::from_slice(&[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0], (3, 2), &device)?;
+        let rhs =
+            crate::Tensor::from_slice(&[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0], (3, 2), &device)?;
         let _ = lhs.matmul(&rhs)?.to_vec2::<f32>()?;
 
         let lhs_b = crate::Tensor::from_slice(
@@ -6061,7 +6616,9 @@ mod tests {
         )?;
         let _ = xs_f16.gather(&ids, 0)?.to_vec2::<half::f16>()?;
         let base_f16 = crate::Tensor::zeros((3, 2), DType::F16, &device)?;
-        let _ = base_f16.scatter(&ids, &src_f16, 0)?.to_vec2::<half::f16>()?;
+        let _ = base_f16
+            .scatter(&ids, &src_f16, 0)?
+            .to_vec2::<half::f16>()?;
 
         let xs_t = xs.t()?;
         let _ = xs_t.contiguous()?.to_vec2::<f32>()?;
@@ -6088,7 +6645,7 @@ mod tests {
             .collect::<Vec<_>>();
         let src = device.storage_from_cpu_storage(&CpuStorage::F32(xs.clone()))?;
         let packed = quantize_f32_storage_to_q8_1_x4(&device, &src, xs.len())?;
-        let gpu = device.read_buffer(packed.as_ref())?;
+        let gpu = device.read_buffer(&packed)?;
         let cpu = exact_q8_1_x4_bytes(&xs);
         assert_eq!(gpu, cpu);
         Ok(())

@@ -146,6 +146,107 @@ fn backend_smoke_vulkan_q8_1_qmatmul_regression() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_non_zero_start_offset_roundtrip() -> Result<()> {
+    let Some(device) =
+        vulkan_device_or_skip("backend_smoke_vulkan_non_zero_start_offset_roundtrip")?
+    else {
+        return Ok(());
+    };
+
+    let values = (0..64).map(|v| v as f32 - 32.0).collect::<Vec<_>>();
+    let xs = Tensor::from_vec(values, (4, 16), &device)?;
+    let view = xs.narrow(1, 3, 10)?;
+    let got = view.to_vec2::<f32>()?;
+
+    let expected = (0..4)
+        .map(|row| {
+            (0..10)
+                .map(|col| (row * 16 + col + 3) as f32 - 32.0)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(got, expected);
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_boundary_sync_stale_readback_guard() -> Result<()> {
+    let Some(device) =
+        vulkan_device_or_skip("backend_smoke_vulkan_boundary_sync_stale_readback_guard")?
+    else {
+        return Ok(());
+    };
+
+    let ones = Tensor::ones((64, 64), DType::F32, &device)?;
+    let mut xs = Tensor::zeros((64, 64), DType::F32, &device)?;
+    for _ in 0..24 {
+        xs = xs.broadcast_add(&ones)?;
+        // Exercise copy/contiguous paths between compute dispatches.
+        xs = xs.transpose(0, 1)?.contiguous()?;
+        xs = xs.transpose(0, 1)?.contiguous()?;
+    }
+
+    let sample = xs.i((0, 0))?.to_scalar::<f32>()?;
+    assert!(
+        (sample - 24.0).abs() <= 1e-4,
+        "stale readback detected: got {sample}, expected 24.0"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_repeated_shape_reuse_regression_guard() -> Result<()> {
+    let Some(device) =
+        vulkan_device_or_skip("backend_smoke_vulkan_repeated_shape_reuse_regression_guard")?
+    else {
+        return Ok(());
+    };
+
+    candle_core::reset_vulkan_cpu_fallback_count();
+    let ones = Tensor::ones((128, 128), DType::F32, &device)?;
+    let mut xs = Tensor::zeros((128, 128), DType::F32, &device)?;
+    for _ in 0..64 {
+        xs = xs.broadcast_add(&ones)?;
+        xs = xs.relu()?;
+    }
+
+    let sample = xs.i((0, 0))?.to_scalar::<f32>()?;
+    assert!(
+        (sample - 64.0).abs() <= 1e-4,
+        "unexpected repeated-shape accumulation result: got {sample}, expected 64.0"
+    );
+    assert_eq!(
+        candle_core::vulkan_cpu_fallback_count(),
+        0,
+        "repeated-shape core path triggered vulkan cpu fallback"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_device_recreate_teardown_probe() -> Result<()> {
+    for probe_idx in 0..3 {
+        let Some(device) =
+            vulkan_device_or_skip("backend_smoke_vulkan_device_recreate_teardown_probe")?
+        else {
+            return Ok(());
+        };
+        let xs = Tensor::zeros((32,), DType::F32, &device)?;
+        let values = xs.to_vec1::<f32>()?;
+        assert!(
+            values.iter().all(|&v| v == 0.0),
+            "probe {probe_idx}: expected zero tensor after device recreate"
+        );
+        device.synchronize()?;
+    }
+    Ok(())
+}
+
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     assert!(!device.supports_bf16());
@@ -866,7 +967,10 @@ fn smoke_f32_gather_scatter_non_last_dim(device: &Device) -> Result<()> {
 
     let xs_u32 = Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6], (3, 2), device)?;
     let xs_u32_t = xs_u32.t()?;
-    assert_eq!(xs_u32_t.contiguous()?.to_vec2::<u32>()?, [[1, 3, 5], [2, 4, 6]]);
+    assert_eq!(
+        xs_u32_t.contiguous()?.to_vec2::<u32>()?,
+        [[1, 3, 5], [2, 4, 6]]
+    );
 
     let xs_f16_t = xs_f16.t()?;
     assert_eq!(
