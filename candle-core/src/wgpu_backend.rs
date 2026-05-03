@@ -2450,8 +2450,7 @@ impl WgpuStorage {
             let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
             let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
             let rhs_f32_l = Layout::contiguous(rhs_l.shape().clone());
-            let out_f32 =
-                lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
+            let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
             let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
             let copy = copy_shader(DType::F32, DType::F16)?;
             return out_f32.run_copy_to_dtype(&out_l, DType::F16, &copy);
@@ -3477,14 +3476,26 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
-        match self.run_scale(layout, mul as f32, add as f32) {
+        let cpu_fallback = || -> Result<Self> {
+            let src_cpu = self.to_cpu_storage()?;
+            let out_cpu = <CpuStorage as BackendStorage>::affine(&src_cpu, layout, mul, add)?;
+            self.device.storage_from_cpu_storage(&out_cpu)
+        };
+        let gpu = match self.dtype {
+            DType::F32 => self.run_scale(layout, mul as f32, add as f32),
+            DType::F16 => {
+                let src_f32 = self.to_dtype(layout, DType::F32)?;
+                let scaled = src_f32.run_scale(layout, mul as f32, add as f32)?;
+                scaled.to_dtype(layout, DType::F16)
+            }
+            _ => Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu affine").bt()),
+        };
+        match gpu {
             Ok(out) => Ok(out),
             Err(err)
                 if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
             {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::affine(&src_cpu, layout, mul, add)?;
-                self.device.storage_from_cpu_storage(&out_cpu)
+                cpu_fallback()
             }
             Err(err) => Err(err),
         }

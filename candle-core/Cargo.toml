@@ -49,6 +49,8 @@ candle-ug = { workspace = true, optional = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 criterion = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 [features]
 default = []

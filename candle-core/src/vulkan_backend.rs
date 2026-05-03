@@ -2825,8 +2825,7 @@ impl VulkanStorage {
             let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
             let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
             let rhs_f32_l = Layout::contiguous(rhs_l.shape().clone());
-            let out_f32 =
-                lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
+            let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
             let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
             return out_f32.to_dtype(&out_l, DType::F16);
         }
