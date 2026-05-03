@@ -448,7 +448,7 @@ pub struct WgpuStorage {
 }
 
 fn unsupported(op: &'static str) -> Error {
-    Error::Msg(format!("wgpu backend op {op} not implemented").into()).bt()
+    Error::Msg(format!("wgpu backend op {op} not implemented")).bt()
 }
 
 fn should_cpu_fallback(err: &Error) -> bool {
@@ -620,8 +620,8 @@ impl WgpuDevice {
         });
         self.synchronize()?;
         rx.recv()
-            .map_err(|e| Error::wrap(e))?
-            .map_err(|e| Error::wrap(e))?;
+            .map_err(Error::wrap)?
+            .map_err(Error::wrap)?;
         let mut data = slice.get_mapped_range().to_vec();
         data.truncate(size);
         staging.unmap();
@@ -764,7 +764,7 @@ fn contiguous_strides(dims: [u32; 4]) -> [u32; 4] {
 fn next_power_of_two_u32(value: usize, op: &'static str) -> Result<u32> {
     value
         .checked_next_power_of_two()
-        .ok_or_else(|| Error::Msg(format!("wgpu backend op {op} dimension overflow").into()).bt())?
+        .ok_or_else(|| Error::Msg(format!("wgpu backend op {op} dimension overflow")).bt())?
         .try_into()
         .map_err(Error::wrap)
 }
@@ -876,7 +876,7 @@ fn unary_shader(op: &str, dtype: DType) -> Result<String> {
         "sqr" => candle_wgpu_kernels::UnaryOp::Square,
         "sqrt" => candle_wgpu_kernels::UnaryOp::Sqrt,
         "tanh" => candle_wgpu_kernels::UnaryOp::Tanh,
-        _ => return Err(Error::Msg(format!("wgpu backend op {op} not implemented").into()).bt()),
+        _ => return Err(Error::Msg(format!("wgpu backend op {op} not implemented")).bt()),
     };
     Ok(candle_wgpu_kernels::shader(
         candle_wgpu_kernels::ShaderOp::Unary(op),
@@ -903,7 +903,7 @@ fn binary_shader(op: &str, dtype: DType) -> Result<String> {
         "div" => candle_wgpu_kernels::BinaryOp::Div,
         "mul" => candle_wgpu_kernels::BinaryOp::Mul,
         "sub" => candle_wgpu_kernels::BinaryOp::Sub,
-        _ => return Err(Error::Msg(format!("wgpu backend op {op} not implemented").into()).bt()),
+        _ => return Err(Error::Msg(format!("wgpu backend op {op} not implemented")).bt()),
     };
     Ok(candle_wgpu_kernels::shader(
         candle_wgpu_kernels::ShaderOp::Binary(op),
@@ -2438,7 +2438,7 @@ impl WgpuStorage {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu matmul").bt());
         }
         let rank = lhs_l.dims().len();
-        if rank != rhs_l.dims().len() || rank < 2 || rank > 4 {
+        if rank != rhs_l.dims().len() || !(2..=4).contains(&rank) {
             return Err(unsupported("matmul rank"));
         }
         if b != lhs_l.dims()[..rank - 2].iter().product::<usize>() {
@@ -3124,7 +3124,7 @@ impl WgpuStorage {
             return Err(unsupported("quantized matmul f16"));
         }
         let rank = layout.dims().len();
-        if rank < 2 || rank > 4 {
+        if !(2..=4).contains(&rank) {
             return Err(unsupported("quantized matmul rank"));
         }
         let (n, k) = qshape.dims2()?;
@@ -4350,7 +4350,7 @@ impl BackendDevice for WgpuDevice {
             force_fallback_adapter: false,
             compatible_surface: None,
         }))
-        .map_err(|e| Error::wrap(e))?;
+        .map_err(Error::wrap)?;
         let adapter_features = adapter.features();
         let adapter_limits = adapter.limits();
         let required_features = adapter_features & wgpu::Features::SHADER_F16;
@@ -4360,7 +4360,7 @@ impl BackendDevice for WgpuDevice {
             required_limits: adapter_limits.clone(),
             ..Default::default()
         }))
-        .map_err(|e| Error::wrap(e))?;
+        .map_err(Error::wrap)?;
         Ok(Self {
             inner: Arc::new(WgpuInner {
                 ordinal,
@@ -4491,7 +4491,7 @@ impl BackendDevice for WgpuDevice {
         self.inner
             .device
             .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| Error::wrap(e))?;
+            .map_err(Error::wrap)?;
         Ok(())
     }
 }
