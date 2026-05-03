@@ -79,7 +79,7 @@ impl LogitsProcessor {
     /// top-p sampling (or "nucleus sampling") samples from the smallest set of tokens that exceed
     /// probability top_p. This way we never sample tokens that have very low probabilities and are
     /// less likely to go "off the rails".
-    fn sample_topp(&mut self, prs: &mut Vec<f32>, top_p: f32) -> Result<u32> {
+    fn sample_topp(&mut self, prs: &mut [f32], top_p: f32) -> Result<u32> {
         let mut argsort_indices = (0..prs.len()).collect::<Vec<_>>();
 
         // Sort by descending probability.
@@ -99,7 +99,7 @@ impl LogitsProcessor {
     }
 
     // top-k sampling samples from the k tokens with the largest probabilities.
-    fn sample_topk(&mut self, prs: &mut Vec<f32>, top_k: usize) -> Result<u32> {
+    fn sample_topk(&mut self, prs: &mut [f32], top_k: usize) -> Result<u32> {
         if top_k >= prs.len() {
             self.sample_multinomial(prs)
         } else {
@@ -114,7 +114,7 @@ impl LogitsProcessor {
 
     // top-k sampling samples from the k tokens with the largest probabilities.
     // then top-p sampling.
-    fn sample_topk_topp(&mut self, prs: &mut Vec<f32>, top_k: usize, top_p: f32) -> Result<u32> {
+    fn sample_topk_topp(&mut self, prs: &mut [f32], top_k: usize, top_p: f32) -> Result<u32> {
         if top_k >= prs.len() {
             self.sample_topp(prs, top_p)
         } else {

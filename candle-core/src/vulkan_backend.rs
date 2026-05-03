@@ -1818,7 +1818,10 @@ impl VulkanStorage {
 
     fn run_unary_head(&self, layout: &Layout, spirv: &[u32]) -> Result<Self> {
         if !layout.is_contiguous() || layout.start_offset() != 0 {
-            return Err(unsupported("unary strided"));
+            let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
+            let contiguous_layout = Layout::contiguous(layout.shape());
+            return materialized.run_unary_head(&contiguous_layout, spirv);
         }
         let count = layout.shape().elem_count();
         let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
@@ -4578,23 +4581,42 @@ impl BackendStorage for VulkanStorage {
         }
     }
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
-        if self.dtype != DType::F32 {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan reduce").bt());
         }
         let rank = layout.dims().len();
         if rank == 0 {
             crate::bail!("vulkan backend op reduce does not support rank-0 tensors")
         }
-        if reduce_dims.len() > 1 {
-            return self.run_reduce_multi_dim(op, layout, reduce_dims);
-        }
         if reduce_dims.is_empty() {
             return self.try_clone(layout);
         }
-        let dim = reduce_dims[0];
-        if dim >= rank {
-            crate::bail!("vulkan backend op reduce got out-of-range dim {dim} for rank {rank}")
+        for &dim in reduce_dims {
+            if dim >= rank {
+                crate::bail!("vulkan backend op reduce got out-of-range dim {dim} for rank {rank}")
+            }
         }
+        if self.dtype == DType::F16 {
+            let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), DType::F16)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
+            let contiguous_layout = Layout::contiguous(layout.shape());
+            let materialized_f32 = materialized.to_dtype(&contiguous_layout, DType::F32)?;
+            let reduced = materialized_f32.reduce_op(op, &contiguous_layout, reduce_dims)?;
+            if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
+                return Ok(reduced);
+            }
+            let mut out_dims = layout.dims().to_vec();
+            for &dim in reduce_dims {
+                out_dims[dim] = 1;
+            }
+            let out_layout = Layout::contiguous(Shape::from(out_dims));
+            return reduced.to_dtype(&out_layout, DType::F16);
+        }
+
+        if reduce_dims.len() > 1 {
+            return self.run_reduce_multi_dim(op, layout, reduce_dims);
+        }
+        let dim = reduce_dims[0];
         if dim != rank - 1 {
             return self.run_reduce_non_last_dim(op, layout, dim);
         }
@@ -4672,6 +4694,20 @@ impl BackendStorage for VulkanStorage {
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan unary").bt());
         }
+        if self.dtype == DType::F16 && matches!(B::NAME, "sin" | "cos" | "sqr" | "sqrt") {
+            let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), DType::F16)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
+            let contiguous_layout = Layout::contiguous(layout.shape());
+            let materialized_f32 = materialized.to_dtype(&contiguous_layout, DType::F32)?;
+            let (spirv, kind) = unary_spirv(B::NAME, DType::F32)?;
+            let out_f32 = match kind {
+                VulkanUnaryKind::Head => materialized_f32.run_unary_head(&contiguous_layout, spirv),
+                VulkanUnaryKind::Generic => {
+                    materialized_f32.run_unary_generic(&contiguous_layout, spirv)
+                }
+            }?;
+            return out_f32.to_dtype(&contiguous_layout, DType::F16);
+        }
         let (spirv, kind) = unary_spirv(B::NAME, self.dtype)?;
         match match kind {
             VulkanUnaryKind::Head => self.run_unary_head(layout, spirv),
@@ -4689,7 +4725,29 @@ impl BackendStorage for VulkanStorage {
     ) -> Result<Self> {
         match match B::NAME {
             "maximum" | "minimum" => {
-                self.run_binary_min_max_f32(rhs, lhs_layout, rhs_layout, B::NAME)
+                if self.dtype == DType::F16 && rhs.dtype == DType::F16 {
+                    let mut lhs_mat =
+                        unsafe { self.device.alloc_uninit(lhs_layout.shape(), DType::F16)? };
+                    <Self as BackendStorage>::copy_strided_src(self, &mut lhs_mat, 0, lhs_layout)?;
+                    let lhs_contiguous = Layout::contiguous(lhs_layout.shape());
+                    let lhs_f32 = lhs_mat.to_dtype(&lhs_contiguous, DType::F32)?;
+
+                    let mut rhs_mat =
+                        unsafe { self.device.alloc_uninit(rhs_layout.shape(), DType::F16)? };
+                    <Self as BackendStorage>::copy_strided_src(rhs, &mut rhs_mat, 0, rhs_layout)?;
+                    let rhs_contiguous = Layout::contiguous(rhs_layout.shape());
+                    let rhs_f32 = rhs_mat.to_dtype(&rhs_contiguous, DType::F32)?;
+
+                    let out_f32 = lhs_f32.run_binary_min_max_f32(
+                        &rhs_f32,
+                        &lhs_contiguous,
+                        &rhs_contiguous,
+                        B::NAME,
+                    )?;
+                    out_f32.to_dtype(&lhs_contiguous, DType::F16)
+                } else {
+                    self.run_binary_min_max_f32(rhs, lhs_layout, rhs_layout, B::NAME)
+                }
             }
             _ => self.run_binary_named(rhs, lhs_layout, rhs_layout, B::NAME),
         } {
