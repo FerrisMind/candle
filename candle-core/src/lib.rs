@@ -108,7 +108,10 @@ pub use error::{Context, Error, Result};
 pub use indexer::{IndexOp, TensorIndexer};
 pub use layout::Layout;
 pub use shape::{Shape, D};
-pub use storage::{reset_vulkan_cpu_fallback_count, vulkan_cpu_fallback_count, Storage};
+pub use storage::{
+    reset_vulkan_cpu_fallback_count, reset_wgpu_cpu_fallback_count, vulkan_cpu_fallback_count,
+    wgpu_cpu_fallback_count, Storage,
+};
 pub use streaming::{StreamTensor, StreamingBinOp, StreamingModule};
 pub use strided_index::{StridedBlocks, StridedIndex};
 pub use tensor::{Tensor, TensorId};

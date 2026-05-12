@@ -14,7 +14,13 @@ fn vulkan_device_or_skip() -> Option<Device> {
     }
 }
 
-fn run_upload_download_bench(c: &mut Criterion, device: &Device, rows: usize, cols: usize, tag: &str) {
+fn run_upload_download_bench(
+    c: &mut Criterion,
+    device: &Device,
+    rows: usize,
+    cols: usize,
+    tag: &str,
+) {
     let elem_count = rows * cols;
     let host_values = (0..elem_count)
         .map(|idx| idx as f32 * 0.001953125)

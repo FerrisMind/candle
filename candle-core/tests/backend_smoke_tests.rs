@@ -1,3 +1,5 @@
+mod support;
+
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
@@ -6,6 +8,21 @@ use candle_core::Module;
 use candle_core::{DType, Device, IndexOp, Result, Shape, Tensor};
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use half::{bf16, f16};
+#[cfg(feature = "vulkan")]
+use support::{backend_device_or_skip, backend_fallback_count};
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+use support::{fallback_allowed, native_required, TestBackend};
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+macro_rules! backend_family_test {
+    ($(#[$meta:meta])* $name:ident, $backend:expr, $runner:ident, $family:ident) => {
+        $(#[$meta])*
+        #[test]
+        fn $name() -> Result<()> {
+            $runner(stringify!($name), $backend, |device| $family(device))
+        }
+    };
+}
 
 #[test]
 #[cfg(feature = "wgpu")]
@@ -47,61 +64,131 @@ fn backend_smoke_dummy_vulkan_does_not_claim_bf16() {
     assert_eq!(device.bf16_default_to_f32(), candle_core::DType::F32);
 }
 
-#[cfg(feature = "vulkan")]
-fn vulkan_device_or_skip(test_name: &str) -> Result<Option<Device>> {
-    match Device::new_vulkan(0) {
-        Ok(device) => Ok(Some(device)),
-        Err(err) => {
-            eprintln!("skipping {test_name}: Vulkan device unavailable: {err}");
-            Ok(None)
-        }
-    }
-}
-
-#[test]
-#[ignore = "requires a usable wgpu adapter and driver"]
-#[cfg(feature = "wgpu")]
-fn backend_smoke_wgpu_f32_upload_unary_binary_roundtrip() -> Result<()> {
-    let device = Device::new_wgpu(0)?;
-    assert!(device.is_wgpu());
-
-    smoke_f32_upload_unary_binary_roundtrip(&device)?;
-    Ok(())
-}
-
-#[test]
-#[cfg(feature = "vulkan")]
-fn backend_smoke_vulkan_f32_upload_unary_binary_roundtrip() -> Result<()> {
-    let Some(device) =
-        vulkan_device_or_skip("backend_smoke_vulkan_f32_upload_unary_binary_roundtrip")?
-    else {
-        return Ok(());
-    };
-    assert!(device.is_vulkan());
-
-    smoke_f32_upload_unary_binary_roundtrip(&device)?;
-    smoke_i32_to_f32_dtype_conversion(&device)?;
-    Ok(())
-}
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_upload_and_dtype,
+    TestBackend::Wgpu,
+    fallback_allowed,
+    smoke_upload_and_dtype_family
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_upload_and_dtype,
+    TestBackend::Vulkan,
+    fallback_allowed,
+    smoke_upload_and_dtype_family
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_unary_binary,
+    TestBackend::Wgpu,
+    fallback_allowed,
+    smoke_unary_binary_family
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_unary_binary,
+    TestBackend::Vulkan,
+    fallback_allowed,
+    smoke_unary_binary_family
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_reductions,
+    TestBackend::Wgpu,
+    fallback_allowed,
+    smoke_reductions_family
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_reductions,
+    TestBackend::Vulkan,
+    fallback_allowed,
+    smoke_reductions_family
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_shape_layout,
+    TestBackend::Wgpu,
+    fallback_allowed,
+    smoke_shape_layout_family
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_shape_layout,
+    TestBackend::Vulkan,
+    fallback_allowed,
+    smoke_shape_layout_family
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_matmul_conv_pool,
+    TestBackend::Wgpu,
+    fallback_allowed,
+    smoke_matmul_conv_pool_family
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_matmul_conv_pool,
+    TestBackend::Vulkan,
+    fallback_allowed,
+    smoke_matmul_conv_pool_family
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_quantized_paths,
+    TestBackend::Wgpu,
+    fallback_allowed,
+    smoke_quantized_family
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_quantized_family,
+    TestBackend::Vulkan,
+    fallback_allowed,
+    smoke_quantized_family
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_rank5_fallback_policy,
+    TestBackend::Wgpu,
+    fallback_allowed,
+    smoke_rank5_unary_binary_fallback
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_rank5_native_policy,
+    TestBackend::Vulkan,
+    native_required,
+    smoke_rank5_unary_binary_native_only
+);
 
 #[test]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_quantized_paths_only() -> Result<()> {
-    let Some(device) = vulkan_device_or_skip("backend_smoke_vulkan_quantized_paths_only")? else {
-        return Ok(());
-    };
-    assert!(device.is_vulkan());
-
-    smoke_quantized_paths(&device)?;
-    device.synchronize()?;
-    Ok(())
+    fallback_allowed(
+        "backend_smoke_vulkan_quantized_paths_only",
+        TestBackend::Vulkan,
+        |device| smoke_quantized_paths(device),
+    )
 }
 
 #[test]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_q8_1_qmatmul_regression() -> Result<()> {
     let cpu = Device::Cpu;
-    let Some(vk) = vulkan_device_or_skip("backend_smoke_vulkan_q8_1_qmatmul_regression")? else {
+    let Some(vk) = backend_device_or_skip(
+        "backend_smoke_vulkan_q8_1_qmatmul_regression",
+        TestBackend::Vulkan,
+    )?
+    else {
         return Ok(());
     };
     let k = 256;
@@ -149,8 +236,10 @@ fn backend_smoke_vulkan_q8_1_qmatmul_regression() -> Result<()> {
 #[test]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_non_zero_start_offset_roundtrip() -> Result<()> {
-    let Some(device) =
-        vulkan_device_or_skip("backend_smoke_vulkan_non_zero_start_offset_roundtrip")?
+    let Some(device) = backend_device_or_skip(
+        "backend_smoke_vulkan_non_zero_start_offset_roundtrip",
+        TestBackend::Vulkan,
+    )?
     else {
         return Ok(());
     };
@@ -174,8 +263,10 @@ fn backend_smoke_vulkan_non_zero_start_offset_roundtrip() -> Result<()> {
 #[test]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_boundary_sync_stale_readback_guard() -> Result<()> {
-    let Some(device) =
-        vulkan_device_or_skip("backend_smoke_vulkan_boundary_sync_stale_readback_guard")?
+    let Some(device) = backend_device_or_skip(
+        "backend_smoke_vulkan_boundary_sync_stale_readback_guard",
+        TestBackend::Vulkan,
+    )?
     else {
         return Ok(());
     };
@@ -199,9 +290,50 @@ fn backend_smoke_vulkan_boundary_sync_stale_readback_guard() -> Result<()> {
 
 #[test]
 #[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_conv1d_multi_channel_regression() -> Result<()> {
+    let cpu = Device::Cpu;
+    let Some(device) = backend_device_or_skip(
+        "backend_smoke_vulkan_conv1d_multi_channel_regression",
+        TestBackend::Vulkan,
+    )?
+    else {
+        return Ok(());
+    };
+
+    let input_vals = (0..(2 * 9))
+        .map(|idx| (idx as f32 - 7.0) / 3.0)
+        .collect::<Vec<_>>();
+    let kernel_vals = (0..(3 * 2 * 3))
+        .map(|idx| (idx as f32 - 9.0) / 5.0)
+        .collect::<Vec<_>>();
+
+    let input_cpu = Tensor::from_slice(&input_vals, (1, 2, 9), &cpu)?;
+    let kernel_cpu = Tensor::from_slice(&kernel_vals, (3, 2, 3), &cpu)?;
+    let input_vk = Tensor::from_slice(&input_vals, (1, 2, 9), &device)?;
+    let kernel_vk = Tensor::from_slice(&kernel_vals, (3, 2, 3), &device)?;
+
+    let expected = input_cpu.conv1d(&kernel_cpu, 1, 1, 1, 1)?;
+    let actual = input_vk.conv1d(&kernel_vk, 1, 1, 1, 1)?;
+
+    let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+    let actual = actual.flatten_all()?.to_vec1::<f32>()?;
+    assert_eq!(expected.len(), actual.len());
+    for (idx, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (got - want).abs() <= 1e-4,
+            "multi-channel conv1d mismatch at idx {idx}: got {got}, expected {want}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_repeated_shape_reuse_regression_guard() -> Result<()> {
-    let Some(device) =
-        vulkan_device_or_skip("backend_smoke_vulkan_repeated_shape_reuse_regression_guard")?
+    let Some(device) = backend_device_or_skip(
+        "backend_smoke_vulkan_repeated_shape_reuse_regression_guard",
+        TestBackend::Vulkan,
+    )?
     else {
         return Ok(());
     };
@@ -231,8 +363,10 @@ fn backend_smoke_vulkan_repeated_shape_reuse_regression_guard() -> Result<()> {
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_device_recreate_teardown_probe() -> Result<()> {
     for probe_idx in 0..3 {
-        let Some(device) =
-            vulkan_device_or_skip("backend_smoke_vulkan_device_recreate_teardown_probe")?
+        let Some(device) = backend_device_or_skip(
+            "backend_smoke_vulkan_device_recreate_teardown_probe",
+            TestBackend::Vulkan,
+        )?
         else {
             return Ok(());
         };
@@ -248,7 +382,27 @@ fn backend_smoke_vulkan_device_recreate_teardown_probe() -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[allow(dead_code)]
 fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
+    smoke_upload_and_dtype_family(device)?;
+    smoke_unary_binary_family(device)?;
+    smoke_reductions_family(device)?;
+    smoke_shape_layout_family(device)?;
+    smoke_matmul_conv_pool_family(device)?;
+    if device.is_wgpu() {
+        smoke_rank5_unary_binary_fallback(device)?;
+    }
+    #[cfg(feature = "vulkan")]
+    if device.is_vulkan() {
+        smoke_rank5_unary_binary_native_only(device)?;
+    }
+    smoke_quantized_family(device)?;
+    device.synchronize()?;
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_upload_and_dtype_family(device: &Device) -> Result<()> {
     assert!(!device.supports_bf16());
     assert_eq!(device.bf16_default_to_f32(), DType::F32);
 
@@ -263,26 +417,51 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     let ys = Tensor::from_slice(&[10.0f32, 20.0, 30.0, 40.0], (2, 2), device)?;
     assert_eq!((&xs + &ys)?.to_vec2::<f32>()?, [[8.0, 19.0], [30.0, 43.0]]);
 
-    smoke_f32_large_linear_elementwise(device)?;
     smoke_non_f32_upload_download(device)?;
     smoke_f32_to_i32_dtype_conversion(device)?;
     smoke_f32_f16_dtype_conversion(device)?;
+    #[cfg(feature = "vulkan")]
+    if device.is_vulkan() {
+        smoke_i32_to_f32_dtype_conversion(device)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_unary_binary_family(device: &Device) -> Result<()> {
+    smoke_f32_large_linear_elementwise(device)?;
     smoke_f16_elementwise_ops(device)?;
     smoke_f32_binary_broadcast_and_strided_layout(device)?;
-    smoke_strided_contiguous_copy(device)?;
-    smoke_f32_cat_repeat_pad(device)?;
+    smoke_f32_extended_unary_ops(device)?;
     if device.is_wgpu() {
         smoke_strided_const_set(device)?;
     }
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_reductions_family(device: &Device) -> Result<()> {
     smoke_f32_sum_last_dim(device)?;
     smoke_f32_cumsum(device)?;
     smoke_f32_argmax_last_dim(device)?;
     smoke_f32_extrema_last_dim(device)?;
     smoke_f32_argsort_last_dim(device)?;
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_shape_layout_family(device: &Device) -> Result<()> {
+    smoke_strided_contiguous_copy(device)?;
+    smoke_f32_cat_repeat_pad(device)?;
     smoke_f32_index_select(device)?;
     smoke_f32_gather_last_dim(device)?;
     smoke_f32_scatter_set_last_dim(device)?;
     smoke_f32_gather_scatter_non_last_dim(device)?;
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_matmul_conv_pool_family(device: &Device) -> Result<()> {
     smoke_f32_matmul(device)?;
     smoke_f32_conv1d(device)?;
     smoke_f32_conv2d(device)?;
@@ -291,24 +470,16 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     smoke_f32_pool2d(device)?;
     smoke_f32_cmp_where(device)?;
     smoke_f32_scatter_add_and_index_add(device)?;
-    smoke_f32_extended_unary_ops(device)?;
-    if device.is_wgpu() {
-        smoke_rank5_unary_binary_fallback(device)?;
-    }
-    #[cfg(feature = "vulkan")]
-    if device.is_vulkan() {
-        smoke_rank5_unary_binary_native_only(device)?;
-    }
-    smoke_quantized_paths(device)?;
-
-    device.synchronize()?;
     Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_quantized_family(device: &Device) -> Result<()> {
+    smoke_quantized_paths(device)
 }
 
 #[cfg(feature = "vulkan")]
 fn smoke_rank5_unary_binary_native_only(device: &Device) -> Result<()> {
-    candle_core::reset_vulkan_cpu_fallback_count();
-
     let xs = Tensor::from_slice(
         &[-2.0f32, -1.0, 0.0, 1.0, 2.0, 3.0],
         (1, 1, 1, 2, 3),
@@ -321,7 +492,7 @@ fn smoke_rank5_unary_binary_native_only(device: &Device) -> Result<()> {
     let _ = xs.relu();
     let _ = xs.broadcast_add(&ys);
     assert_eq!(
-        candle_core::vulkan_cpu_fallback_count(),
+        backend_fallback_count(TestBackend::Vulkan),
         0,
         "vulkan core paths must not trigger silent CPU fallback"
     );

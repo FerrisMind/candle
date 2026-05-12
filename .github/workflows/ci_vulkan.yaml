@@ -2,7 +2,6 @@ name: CI / vulkan
 
 on:
   workflow_dispatch:
-  pull_request:
 
 jobs:
   shader-compile-vulkan:
@@ -23,14 +22,17 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_VULKAN_RUNNER_LABELS != '' && vars.CI_VULKAN_RUNNER_LABELS || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Vulkan runtime deps (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential glslc vulkan-tools mesa-vulkan-drivers
+          sudo apt-get install -y build-essential glslc spirv-tools vulkan-tools mesa-vulkan-drivers
       - name: Vulkan feature smoke
-        run: cargo test -p candle-core --features vulkan backend_smoke_vulkan_feature_flag_is_visible -- --exact
+        run: cargo test --release -p candle-core --features vulkan backend_smoke_vulkan_feature_flag_is_visible -- --exact
       - name: Detect Vulkan runtime
         if: runner.os == 'Linux'
         id: vulkan-runtime
@@ -46,12 +48,38 @@ jobs:
               tail -n 20 /tmp/vulkaninfo.txt
             fi
           fi
-      - name: gpu-correctness-vulkan
-        if: runner.os == 'Linux' && steps.vulkan-runtime.outputs.available == 'true'
+      - name: GPU correctness
+        if: runner.os != 'Linux' || steps.vulkan-runtime.outputs.available == 'true'
+        shell: pwsh
+        env:
+          CANDLE_REQUIRE_VULKAN_TEST_DEVICE: "1"
         run: |
-          cargo test -p candle-core --features vulkan --test backend_smoke_tests
-          cargo test -p candle-core --features vulkan ggml_fixture_ops_vulkan -- --ignored --exact
-          cargo test -p candle-core --lib --features vulkan vulkan_backend::tests:: -- --ignored
+          cargo test --release -p candle-core --features vulkan --test backend_smoke_tests
+          cargo test --release -p candle-core --features vulkan --test ggml_fixture_ops_tests ggml_fixture_ops_vulkan -- --ignored --exact
+          cargo test --release -p candle-core --features vulkan --test gpu_metamorphic_tests gpu_metamorphic_vulkan -- --exact
+          cargo test --release -p candle-core --features vulkan --test gpu_property_tests gpu_properties_vulkan -- --ignored --exact
+
+          $spvDir = Join-Path $env:RUNNER_TEMP 'candle-spv'
+          Remove-Item $spvDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $spvDir | Out-Null
+          $env:CANDLE_SPIRV_DUMP_DIR = $spvDir
+          cargo test --release -p candle-core --features vulkan --test gpu_shader_validation_tests vulkan_spirv_modules_can_be_materialized -- --ignored --exact
+          Get-ChildItem $spvDir -Recurse -Filter *.spv | ForEach-Object { spirv-val $_.FullName }
+
+          cargo test --release -p candle-nn --features vulkan --test ops softmax_vulkan -- --exact
+          cargo test --release -p candle-nn --features vulkan --test ops rms_norm_vulkan -- --exact
+          cargo test --release -p candle-nn --features vulkan --test ops sigmoid_vulkan -- --exact
+          cargo test --release -p candle-nn --features vulkan --test ops layer_norm_vulkan -- --exact
+          cargo test --release -p candle-nn --features vulkan --test ops rope_vulkan -- --exact
+          cargo test --release -p candle-nn --features vulkan --test ops sdpa_vulkan -- --exact
+          cargo test --release -p candle-nn --features vulkan --test ops mini_graph_vulkan -- --ignored --exact
+
+          cargo test --release -p candle-transformers --features vulkan --test gpu_model_matrix gpu_model_matrix_vulkan -- --ignored --exact
+          cargo test --release -p candle-transformers --features vulkan --lib qwen3_local_vulkan_stage_parity -- --ignored --exact
+          cargo test --release -p candle-transformers --features vulkan --lib qwen3_local_vulkan_forward_parity -- --ignored --exact
+          cargo test --release -p candle-transformers --features vulkan --lib qwen3_local_vulkan_layer1_topology_parity -- --ignored --exact
+
+          cargo test --release -p candle-core --lib --features vulkan vulkan_backend::tests:: -- --ignored
 
   perf-vulkan:
     needs: gpu-correctness-vulkan
@@ -77,5 +105,5 @@ jobs:
             echo "::warning::Vulkan runtime not available; skipping Vulkan perf stage."
           fi
       - name: perf-vulkan
-        if: runner.os == 'Linux' && steps.vulkan-runtime.outputs.available == 'true'
+        if: runner.os != 'Linux' || steps.vulkan-runtime.outputs.available == 'true'
         run: cargo bench -p candle-core --bench bench_main --features vulkan

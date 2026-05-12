@@ -8,6 +8,7 @@ use crate::{
 use crate::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+static WGPU_CPU_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VULKAN_CPU_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn is_backend_not_implemented_msg(msg: &str, backend: &str) -> bool {
@@ -37,8 +38,11 @@ fn is_backend_not_implemented(err: &Error, backend: &str) -> bool {
 
 fn should_wgpu_cpu_fallback(err: &Error) -> bool {
     let fallback = is_backend_not_implemented(err, "wgpu");
-    if fallback && std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
-        eprintln!("[candle][wgpu][cpu-fallback] {err:?}");
+    if fallback {
+        let count = WGPU_CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
+            eprintln!("[candle][wgpu][cpu-fallback#{count}] {err:?}");
+        }
     }
     fallback
 }
@@ -53,6 +57,14 @@ fn should_vulkan_cpu_fallback(err: &Error) -> bool {
         }
     }
     fallback
+}
+
+pub fn wgpu_cpu_fallback_count() -> usize {
+    WGPU_CPU_FALLBACK_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn reset_wgpu_cpu_fallback_count() {
+    WGPU_CPU_FALLBACK_COUNT.store(0, Ordering::Relaxed);
 }
 
 pub fn vulkan_cpu_fallback_count() -> usize {

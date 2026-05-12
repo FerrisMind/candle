@@ -694,6 +694,9 @@ fn vulkan_dmmv_workgroup(
     k: usize,
     q8_1_rhs: bool,
 ) -> VulkanDmmvWorkgroup {
+    if qdtype == GgmlDType::F32 {
+        return VulkanDmmvWorkgroup::Subgroup;
+    }
     let mut workgroup = VulkanDmmvWorkgroup::Subgroup;
     if matches!(
         device.inner.vendor_id,
@@ -2353,6 +2356,104 @@ fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
 }
 
 impl VulkanStorage {
+    fn run_rank2_matmul_f32_via_batched_matvec(
+        &self,
+        rhs_t: &Self,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        let dst_shape = Shape::from(vec![1, m, n]);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let bindings = [
+            VulkanBinding::Storage(&rhs_t.buffer),
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let dmmv_workgroup = vulkan_dmmv_workgroup(&self.device, GgmlDType::F32, n, k, false);
+        let spirv_name = vulkan_dmmv_shader_name(
+            &self.device,
+            GgmlDType::F32,
+            "mul_mat_vec_f32_f32_f32".to_string(),
+            dmmv_workgroup,
+        );
+        let spirv = candle_vulkan_kernels::spirv(&spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
+        let block_size = vulkan_dmmv_block_size(&self.device, GgmlDType::F32, dmmv_workgroup);
+        let rows_per_group = 1u32;
+        let use_dmmv_subgroups = vulkan_dmmv_use_subgroups(&self.device, GgmlDType::F32);
+        let required_subgroup_size = if use_dmmv_subgroups {
+            Some(vulkan_dmmv_subgroup_size(&self.device))
+        } else {
+            None
+        };
+        let workgroups = (n.div_ceil(rows_per_group as usize).try_into()?, 1, 1);
+        let mut row_idx = 0usize;
+        while row_idx < m {
+            let row_chunk = usize::min(VULKAN_MUL_MAT_VEC_MAX_COLS, m - row_idx);
+            let spec = [
+                (0, block_size),
+                (1, rows_per_group),
+                (2, row_chunk.try_into()?),
+            ];
+            let params = VulkanMatVecParams {
+                ncols: k.try_into()?,
+                stride_a: k.try_into()?,
+                stride_b: k.try_into()?,
+                stride_d: n.try_into()?,
+                batch_stride_a: 0,
+                batch_stride_b: k.try_into()?,
+                batch_stride_d: n.try_into()?,
+                fusion_flags: 0,
+                base_work_group_y: row_idx.try_into()?,
+                ne02: 1,
+                ne12: 1,
+                broadcast2: 1,
+                broadcast3: 1,
+            };
+            self.device.run_compute_specialized_with_options(
+                spirv,
+                &bindings,
+                Some(any_as_bytes(&params)),
+                workgroups,
+                Some(&spec),
+                use_dmmv_subgroups,
+                required_subgroup_size,
+            )?;
+            row_idx += row_chunk;
+        }
+        Ok(dst)
+    }
+
+    fn run_batched_matmul_f32_via_rank2_batches(
+        &self,
+        rhs_t: &Self,
+        b: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        let dst_shape = Shape::from(vec![b, m, n]);
+        let mut dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let lhs_batch_shape = Shape::from((m, k));
+        let rhs_batch_shape = Shape::from((n, k));
+        let batch_out_layout = Layout::contiguous((1, m, n));
+        for batch_idx in 0..b {
+            let lhs_batch_layout = Layout::contiguous_with_offset((m, k), batch_idx * m * k);
+            let rhs_batch_layout = Layout::contiguous_with_offset((n, k), batch_idx * n * k);
+            let mut lhs_batch = unsafe { self.device.alloc_uninit(&lhs_batch_shape, DType::F32)? };
+            let mut rhs_batch = unsafe { self.device.alloc_uninit(&rhs_batch_shape, DType::F32)? };
+            self.copy_strided_src(&mut lhs_batch, 0, &lhs_batch_layout)?;
+            rhs_t.copy_strided_src(&mut rhs_batch, 0, &rhs_batch_layout)?;
+            let batch_out =
+                lhs_batch.run_rank2_matmul_f32_via_batched_matvec(&rhs_batch, m, n, k)?;
+            batch_out.copy_strided_src(&mut dst, batch_idx * m * n, &batch_out_layout)?;
+        }
+        Ok(dst)
+    }
+
     fn run_bf16_to_dtype_via_get_rows(&self, layout: &Layout, dtype: DType) -> Result<Self> {
         if self.dtype != DType::BF16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan to_dtype").bt());
@@ -2647,7 +2748,7 @@ impl VulkanStorage {
         spirv: &[u32],
     ) -> Result<()> {
         if layout.start_offset() > u16::MAX as usize || dst_offset > u16::MAX as usize {
-            return Err(unsupported("copy_strided_src_offset"));
+            return self.run_copy_into_via_regions(layout, dst, dst_offset);
         }
         let count = layout.shape().elem_count();
         let (src_dims, src_strides) = dims4_ggml(layout)?;
@@ -2700,6 +2801,76 @@ impl VulkanStorage {
         let workgroups = ggml_linear_workgroups(count)?;
         self.device
             .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+        Ok(())
+    }
+
+    fn run_copy_into_via_regions(
+        &self,
+        layout: &Layout,
+        dst: &Self,
+        dst_offset: usize,
+    ) -> Result<()> {
+        let elem_size = self.dtype.size_in_bytes();
+        if elem_size == 0 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan copy").bt());
+        }
+        match layout.strided_blocks() {
+            crate::StridedBlocks::SingleBlock { start_offset, len } => {
+                let src_offset = start_offset
+                    .checked_mul(elem_size)
+                    .ok_or_else(|| Error::msg("vulkan copy src offset overflow"))?;
+                let dst_offset = dst_offset
+                    .checked_mul(elem_size)
+                    .ok_or_else(|| Error::msg("vulkan copy dst offset overflow"))?;
+                let size = len
+                    .checked_mul(elem_size)
+                    .ok_or_else(|| Error::msg("vulkan copy size overflow"))?;
+                self.device.submit_copy_region_and_track(
+                    &self.buffer,
+                    &dst.buffer,
+                    src_offset,
+                    dst_offset,
+                    size,
+                    false,
+                )?;
+            }
+            crate::StridedBlocks::MultipleBlocks {
+                block_start_index,
+                block_len,
+            } => {
+                if block_len == 0 {
+                    return Ok(());
+                }
+                let block_size = block_len
+                    .checked_mul(elem_size)
+                    .ok_or_else(|| Error::msg("vulkan copy block size overflow"))?;
+                let mut dst_elem_index = dst_offset;
+                let mut regions = Vec::with_capacity(block_start_index.len());
+                for src_index in block_start_index {
+                    let src_offset = src_index
+                        .checked_mul(elem_size)
+                        .ok_or_else(|| Error::msg("vulkan copy src offset overflow"))?;
+                    let dst_offset = dst_elem_index
+                        .checked_mul(elem_size)
+                        .ok_or_else(|| Error::msg("vulkan copy dst offset overflow"))?;
+                    regions.push(
+                        vk::BufferCopy::default()
+                            .src_offset(src_offset as u64)
+                            .dst_offset(dst_offset as u64)
+                            .size(block_size as u64),
+                    );
+                    dst_elem_index = dst_elem_index
+                        .checked_add(block_len)
+                        .ok_or_else(|| Error::msg("vulkan copy dst element overflow"))?;
+                }
+                self.device.submit_copy_regions_and_track(
+                    &self.buffer,
+                    &dst.buffer,
+                    &regions,
+                    false,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -3247,7 +3418,15 @@ impl VulkanStorage {
             || !alpha_layout.is_contiguous()
             || alpha_layout.start_offset() != 0
         {
-            return Err(unsupported("rms_norm strided"));
+            let src_shape = layout.shape().clone();
+            let alpha_shape = alpha_layout.shape().clone();
+            let mut src = unsafe { self.device.alloc_uninit(&src_shape, self.dtype)? };
+            let mut alpha_tmp = unsafe { alpha.device.alloc_uninit(&alpha_shape, alpha.dtype)? };
+            self.copy_strided_src(&mut src, 0, layout)?;
+            alpha.copy_strided_src(&mut alpha_tmp, 0, alpha_layout)?;
+            let src_layout = Layout::contiguous(src_shape);
+            let alpha_layout = Layout::contiguous(alpha_shape);
+            return src.rms_norm(&src_layout, &alpha_tmp, &alpha_layout, eps);
         }
         let (src_dims, src_strides) = dims4_ggml(layout)?;
         let (alpha_dims, alpha_strides) = dims4_ggml(alpha_layout)?;
@@ -3646,7 +3825,7 @@ impl VulkanStorage {
 
         let lhs_stride = lhs_layout.stride();
         let dst_shape = Shape::from(vec![b, m, n]);
-        if rank == 2 && self.dtype == DType::F32 && m <= VULKAN_MUL_MAT_VEC_MAX_COLS {
+        if rank == 2 && self.dtype == DType::F32 && m == 1 && m <= VULKAN_MUL_MAT_VEC_MAX_COLS {
             let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
             let params = VulkanMatVecParams {
                 ncols: k.try_into()?,
@@ -3698,6 +3877,19 @@ impl VulkanStorage {
                 use_dmmv_subgroups,
                 required_subgroup_size,
             )?;
+            drop(lhs_contiguous);
+            return Ok(dst);
+        }
+        if rank == 2 && self.dtype == DType::F32 && m > 1 {
+            let dst = lhs.run_rank2_matmul_f32_via_batched_matvec(rhs_t, m, n, k)?;
+            drop(lhs_contiguous);
+            return Ok(dst);
+        }
+        if rank > 2
+            && self.dtype == DType::F32
+            && lhs_l.dims()[..rank - 2] == rhs_l.dims()[..rank - 2]
+        {
+            let dst = lhs.run_batched_matmul_f32_via_rank2_batches(rhs_t, b, m, n, k)?;
             drop(lhs_contiguous);
             return Ok(dst);
         }
@@ -6399,6 +6591,149 @@ mod tests {
             other => crate::bail!("unexpected dtype from conv1d out stage (pad): {other:?}"),
         };
         assert_eq!(got_out_pad, vec![2.0f32, 4.0, 6.0, 3.0]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_conv1d_large_multi_channel_stage_probe() -> Result<()> {
+        fn deterministic_f32_data(len: usize, seed: u64) -> Vec<f32> {
+            let mut state = seed | 1;
+            (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let bits = ((state >> 41) as u32) | 0x3f80_0000;
+                    (f32::from_bits(bits) - 1.0) * 2.0 - 1.0
+                })
+                .collect()
+        }
+
+        fn max_abs_diff(actual: &[f32], expected: &[f32]) -> (usize, f32, f32, f32) {
+            let mut best_idx = 0usize;
+            let mut best_actual = 0f32;
+            let mut best_expected = 0f32;
+            let mut best_diff = 0f32;
+            for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                let diff = (a - e).abs();
+                if diff > best_diff {
+                    best_idx = idx;
+                    best_actual = *a;
+                    best_expected = *e;
+                    best_diff = diff;
+                }
+            }
+            (best_idx, best_actual, best_expected, best_diff)
+        }
+
+        fn conv1d_im2col_reference(
+            input: &[f32],
+            c_in: usize,
+            l_in: usize,
+            k_size: usize,
+            padding: usize,
+        ) -> Vec<f32> {
+            let l_out = l_in;
+            let chw = c_in * k_size;
+            let mut out = vec![0f32; l_out * chw];
+            for ow in 0..l_out {
+                for ic in 0..c_in {
+                    for kx in 0..k_size {
+                        let src_x = ow as isize + kx as isize - padding as isize;
+                        let val = if (0..l_in as isize).contains(&src_x) {
+                            input[ic * l_in + src_x as usize]
+                        } else {
+                            0.0
+                        };
+                        let chw_idx = ic * k_size + kx;
+                        out[ow * chw + chw_idx] = val;
+                    }
+                }
+            }
+            out
+        }
+
+        let cpu = crate::Device::Cpu;
+        let device = VulkanDevice::new(0)?;
+        let c_in = 80usize;
+        let c_out = 384usize;
+        let l_in = 3000usize;
+        let k_size = 3usize;
+        let padding = 1usize;
+
+        let src_vals = deterministic_f32_data(c_in * l_in, 0x5151);
+        let kernel_vals = deterministic_f32_data(c_out * c_in * k_size, 0xA11CE);
+
+        let src = device.storage_from_cpu_storage(&CpuStorage::F32(src_vals.clone()))?;
+        let kernel = device.storage_from_cpu_storage(&CpuStorage::F32(kernel_vals.clone()))?;
+        let src_l = Layout::contiguous((1, c_in, l_in));
+        let params = crate::conv::ParamsConv1D {
+            b_size: 1,
+            l_in,
+            c_out,
+            c_in,
+            k_size,
+            padding,
+            stride: 1,
+            dilation: 1,
+            cudnn_fwd_algo: None,
+        };
+
+        let col = src.run_im2col_conv1d_f32(&src_l, &params)?;
+        let col_cpu = match col.to_cpu_storage()? {
+            CpuStorage::F32(v) => v,
+            other => crate::bail!("unexpected dtype from large conv1d im2col: {other:?}"),
+        };
+        let expected_col = conv1d_im2col_reference(&src_vals, c_in, l_in, k_size, padding);
+        let (idx, got, expected, diff) = max_abs_diff(&col_cpu, &expected_col);
+        assert!(
+            diff <= 1e-6,
+            "large conv1d im2col mismatch at idx {idx}: got {got}, expected {expected}, diff {diff}"
+        );
+
+        let b = params.b_size;
+        let n = params.c_out;
+        let l_out = params.l_out();
+        let k = params.k_size * params.c_in;
+        let m = l_out;
+        let col_l = Layout::contiguous((b * m, k));
+        let kernel_l_mm = Layout::contiguous_with_offset((n, k), 0).transpose(0, 1)?;
+        let res = col.matmul(&kernel, (1, b * m, n, k), &col_l, &kernel_l_mm)?;
+        let res_cpu = match res.to_cpu_storage()? {
+            CpuStorage::F32(v) => v,
+            other => crate::bail!("unexpected dtype from large conv1d matmul: {other:?}"),
+        };
+
+        let col_ref = crate::Tensor::from_slice(&expected_col, (l_out, k), &cpu)?;
+        let kernel_ref = crate::Tensor::from_slice(&kernel_vals, (c_out, c_in, k_size), &cpu)?;
+        let kernel_ref = kernel_ref.reshape((c_out, k))?;
+        let expected_res = col_ref.matmul(&kernel_ref.t()?)?;
+        let expected_res = expected_res.flatten_all()?.to_vec1::<f32>()?;
+        let (idx, got, expected, diff) = max_abs_diff(&res_cpu, &expected_res);
+        assert!(
+            diff <= 1e-3,
+            "large conv1d matmul mismatch at idx {idx}: got {got}, expected {expected}, diff {diff}"
+        );
+
+        let res_l = Layout::contiguous((b, l_out, n)).transpose(1, 2)?;
+        let mut out = unsafe { device.alloc_uninit(&Shape::from(params.out_dims()), DType::F32)? };
+        res.copy_strided_src(&mut out, 0, &res_l)?;
+        let out_cpu = match out.to_cpu_storage()? {
+            CpuStorage::F32(v) => v,
+            other => crate::bail!("unexpected dtype from large conv1d reorder: {other:?}"),
+        };
+        let expected_out = expected_res
+            .chunks_exact(n)
+            .enumerate()
+            .flat_map(|(ow, row)| (0..n).map(move |oc| (oc, ow, row[oc])))
+            .fold(vec![0f32; n * l_out], |mut acc, (oc, ow, value)| {
+                acc[oc * l_out + ow] = value;
+                acc
+            });
+        let (idx, got, expected, diff) = max_abs_diff(&out_cpu, &expected_out);
+        assert!(
+            diff <= 1e-3,
+            "large conv1d reorder mismatch at idx {idx}: got {got}, expected {expected}, diff {diff}"
+        );
         Ok(())
     }
 

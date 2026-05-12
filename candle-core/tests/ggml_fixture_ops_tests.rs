@@ -1,5 +1,8 @@
+mod support;
+
 use candle_core::{DType, Device, Result, Tensor};
 use serde::Deserialize;
+use support::{fallback_allowed, TestBackend};
 
 #[derive(Debug, Deserialize)]
 struct FixtureRoot {
@@ -193,16 +196,18 @@ fn ggml_fixture_file_is_valid() {
 #[test]
 #[ignore = "requires WGPU runtime/device"]
 fn ggml_fixture_ops_wgpu() -> Result<()> {
-    let dev = Device::new_wgpu(0)?;
-    run_all_cases_on_device(&dev)
+    fallback_allowed("ggml_fixture_ops_wgpu", TestBackend::Wgpu, |device| {
+        run_all_cases_on_device(device)
+    })
 }
 
 #[cfg(feature = "vulkan")]
 #[test]
 #[ignore = "requires Vulkan runtime/device"]
 fn ggml_fixture_ops_vulkan() -> Result<()> {
-    let dev = Device::new_vulkan(0)?;
-    run_all_cases_on_device(&dev)
+    fallback_allowed("ggml_fixture_ops_vulkan", TestBackend::Vulkan, |device| {
+        run_all_cases_on_device(device)
+    })
 }
 
 #[cfg(feature = "cuda")]
