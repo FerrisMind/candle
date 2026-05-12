@@ -253,7 +253,8 @@ impl BertSelfAttention {
         let key_layer = self.transpose_for_scores(&key_layer)?;
         let value_layer = self.transpose_for_scores(&value_layer)?;
 
-        let attention_scores = query_layer.matmul(&key_layer.t()?)?;
+        let key_layer_t = key_layer.t()?.contiguous()?;
+        let attention_scores = query_layer.matmul(&key_layer_t)?;
         let attention_scores = (attention_scores / (self.attention_head_size as f64).sqrt())?;
         let attention_scores = attention_scores.broadcast_add(attention_mask)?;
         let attention_probs = {
@@ -519,12 +520,9 @@ fn get_extended_attention_mask(attention_mask: &Tensor, dtype: DType) -> Result<
         _ => candle::bail!("Wrong shape for input_ids or attention_mask"),
     };
     let attention_mask = attention_mask.to_dtype(dtype)?;
+    let min_value = Tensor::new(f32::MIN, attention_mask.device())?.to_dtype(dtype)?;
     // torch.finfo(dtype).min
-    (attention_mask.ones_like()? - &attention_mask)?.broadcast_mul(
-        &Tensor::try_from(f32::MIN)?
-            .to_device(attention_mask.device())?
-            .to_dtype(dtype)?,
-    )
+    (attention_mask.ones_like()? - &attention_mask)?.broadcast_mul(&min_value)
 }
 
 //https://github.com/huggingface/transformers/blob/1bd604d11c405dfb8b78bda4062d88fc75c17de0/src/transformers/models/bert/modeling_bert.py#L752-L766
@@ -621,5 +619,312 @@ impl BertForMaskedLM {
             .bert
             .forward(input_ids, token_type_ids, attention_mask)?;
         self.cls.forward(&sequence_output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::Device;
+    use candle_nn::VarBuilder;
+    use hf_hub::api::sync::Api;
+
+    fn minilm_fixture() -> Result<(Config, std::path::PathBuf)> {
+        let api = Api::new()
+            .map_err(|err| candle::Error::msg(format!("failed to initialize hf-hub api: {err}")))?;
+        let repo = api.repo(hf_hub::Repo::with_revision(
+            "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+            hf_hub::RepoType::Model,
+            "refs/pr/21".to_string(),
+        ));
+        let config_path = repo
+            .get("config.json")
+            .map_err(|err| candle::Error::msg(format!("failed to fetch MiniLM config: {err}")))?;
+        let weights_path = repo
+            .get("model.safetensors")
+            .map_err(|err| candle::Error::msg(format!("failed to fetch MiniLM weights: {err}")))?;
+        let config: Config = serde_json::from_str(&std::fs::read_to_string(config_path)?)
+            .map_err(|err| candle::Error::msg(format!("failed to parse MiniLM config: {err}")))?;
+        Ok((config, weights_path))
+    }
+
+    fn max_abs_diff(actual: &Tensor, expected: &Tensor) -> Result<(usize, f32, f32, f32)> {
+        let actual = actual
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected = expected
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let mut best_idx = 0usize;
+        let mut best_actual = 0f32;
+        let mut best_expected = 0f32;
+        let mut best_diff = 0f32;
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let diff = (a - e).abs();
+            if diff > best_diff {
+                best_idx = idx;
+                best_actual = *a;
+                best_expected = *e;
+                best_diff = diff;
+            }
+        }
+        Ok((best_idx, best_actual, best_expected, best_diff))
+    }
+
+    fn bert_stage_debug(device: &Device) -> Result<()> {
+        let (config, weights_path) = minilm_fixture()?;
+        let cpu = Device::Cpu;
+        let cpu_vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], DTYPE, &cpu)? };
+        let dev_vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, device)? };
+        let cpu_model = BertModel::load(cpu_vb.clone(), &config)?;
+        let dev_model = BertModel::load(dev_vb.clone(), &config)?;
+
+        let ids = [101u32, 2023, 2003, 1037, 3231, 102, 0, 0];
+        let mask = [1u32, 1, 1, 1, 1, 1, 0, 0];
+        let token_type_ids = [0u32; 8];
+        let ids_cpu = Tensor::from_slice(&ids, (1, ids.len()), &cpu)?;
+        let ids_dev = Tensor::from_slice(&ids, (1, ids.len()), device)?;
+        let mask_cpu = Tensor::from_slice(&mask, (1, mask.len()), &cpu)?;
+        let mask_dev = Tensor::from_slice(&mask, (1, mask.len()), device)?;
+        let tt_cpu = Tensor::from_slice(&token_type_ids, (1, token_type_ids.len()), &cpu)?;
+        let tt_dev = Tensor::from_slice(&token_type_ids, (1, token_type_ids.len()), device)?;
+
+        let emb_cpu = cpu_model.embeddings.forward(&ids_cpu, &tt_cpu)?;
+        let emb_dev = dev_model.embeddings.forward(&ids_dev, &tt_dev)?;
+        let (idx, got, expected, diff) = max_abs_diff(&emb_dev, &emb_cpu)?;
+        eprintln!("embeddings max diff idx={idx} got={got} expected={expected} diff={diff}");
+
+        let ext_cpu = get_extended_attention_mask(&mask_cpu, emb_cpu.dtype())?;
+        let ext_dev = get_extended_attention_mask(&mask_dev, emb_dev.dtype())?;
+        let (idx, got, expected, diff) = max_abs_diff(&ext_dev, &ext_cpu)?;
+        eprintln!("extended_mask max diff idx={idx} got={got} expected={expected} diff={diff}");
+
+        let mut hs_cpu = emb_cpu;
+        let mut hs_dev = emb_dev;
+        for (layer_idx, (cpu_layer, dev_layer)) in cpu_model
+            .encoder
+            .layers
+            .iter()
+            .zip(dev_model.encoder.layers.iter())
+            .enumerate()
+        {
+            if layer_idx == 0 {
+                let cpu_query = cpu_layer.attention.self_attention.query.forward(&hs_cpu)?;
+                let dev_query = dev_layer.attention.self_attention.query.forward(&hs_dev)?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_query, &cpu_query)?;
+                eprintln!(
+                    "layer0 query max diff idx={idx} got={got} expected={expected} diff={diff}"
+                );
+
+                let cpu_key = cpu_layer.attention.self_attention.key.forward(&hs_cpu)?;
+                let dev_key = dev_layer.attention.self_attention.key.forward(&hs_dev)?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_key, &cpu_key)?;
+                eprintln!(
+                    "layer0 key max diff idx={idx} got={got} expected={expected} diff={diff}"
+                );
+
+                let cpu_value = cpu_layer.attention.self_attention.value.forward(&hs_cpu)?;
+                let dev_value = dev_layer.attention.self_attention.value.forward(&hs_dev)?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_value, &cpu_value)?;
+                eprintln!(
+                    "layer0 value max diff idx={idx} got={got} expected={expected} diff={diff}"
+                );
+
+                let cpu_query = cpu_layer
+                    .attention
+                    .self_attention
+                    .transpose_for_scores(&cpu_query)?;
+                let dev_query = dev_layer
+                    .attention
+                    .self_attention
+                    .transpose_for_scores(&dev_query)?;
+                let cpu_key = cpu_layer
+                    .attention
+                    .self_attention
+                    .transpose_for_scores(&cpu_key)?;
+                let dev_key = dev_layer
+                    .attention
+                    .self_attention
+                    .transpose_for_scores(&dev_key)?;
+                let cpu_value = cpu_layer
+                    .attention
+                    .self_attention
+                    .transpose_for_scores(&cpu_value)?;
+                let dev_value = dev_layer
+                    .attention
+                    .self_attention
+                    .transpose_for_scores(&dev_value)?;
+
+                let cpu_scores = cpu_query.matmul(&cpu_key.t()?.contiguous()?)?;
+                let dev_scores = dev_query.matmul(&dev_key.t()?.contiguous()?)?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_scores, &cpu_scores)?;
+                eprintln!(
+                    "layer0 scores_pre_scale max diff idx={idx} got={got} expected={expected} diff={diff}"
+                );
+
+                let scale = (cpu_layer.attention.self_attention.attention_head_size as f64).sqrt();
+                let cpu_scores = (&cpu_scores / scale)?;
+                let dev_scores = (&dev_scores / scale)?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_scores, &cpu_scores)?;
+                eprintln!("layer0 scores_scaled max diff idx={idx} got={got} expected={expected} diff={diff}");
+
+                let cpu_scores = cpu_scores.broadcast_add(&ext_cpu)?;
+                let dev_scores = dev_scores.broadcast_add(&ext_dev)?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_scores, &cpu_scores)?;
+                eprintln!("layer0 scores_masked max diff idx={idx} got={got} expected={expected} diff={diff}");
+
+                let cpu_probs = candle_nn::ops::softmax(&cpu_scores, candle::D::Minus1)?;
+                let dev_probs = candle_nn::ops::softmax(&dev_scores, candle::D::Minus1)?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_probs, &cpu_probs)?;
+                eprintln!(
+                    "layer0 probs max diff idx={idx} got={got} expected={expected} diff={diff}"
+                );
+
+                let cpu_context = cpu_probs.matmul(&cpu_value)?;
+                let dev_context = dev_probs.matmul(&dev_value)?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_context, &cpu_context)?;
+                eprintln!("layer0 context_pre_merge max diff idx={idx} got={got} expected={expected} diff={diff}");
+
+                let cpu_context = cpu_context
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .flatten_from(candle::D::Minus2)?;
+                let dev_context = dev_context
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .flatten_from(candle::D::Minus2)?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_context, &cpu_context)?;
+                eprintln!(
+                    "layer0 context max diff idx={idx} got={got} expected={expected} diff={diff}"
+                );
+
+                let cpu_attn_out = cpu_layer
+                    .attention
+                    .self_output
+                    .forward(&cpu_context, &hs_cpu)?;
+                let dev_attn_out = dev_layer
+                    .attention
+                    .self_output
+                    .forward(&dev_context, &hs_dev)?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_attn_out, &cpu_attn_out)?;
+                eprintln!("layer0 attn_output max diff idx={idx} got={got} expected={expected} diff={diff}");
+
+                let cpu_inter = cpu_layer.intermediate.forward(&cpu_attn_out)?;
+                let dev_inter = dev_layer.intermediate.forward(&dev_attn_out)?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_inter, &cpu_inter)?;
+                eprintln!("layer0 intermediate max diff idx={idx} got={got} expected={expected} diff={diff}");
+
+                let cpu_output_dense = cpu_layer.output.dense.forward(&cpu_inter)?;
+                let dev_output_dense = dev_layer.output.dense.forward(&dev_inter)?;
+                let (idx, got, expected, diff) =
+                    max_abs_diff(&dev_output_dense, &cpu_output_dense)?;
+                eprintln!(
+                    "layer0 output_dense max diff idx={idx} got={got} expected={expected} diff={diff}"
+                );
+
+                let cpu_dense_vb = {
+                    let root = cpu_vb.pp("encoder").pp("layer.0").pp("output").pp("dense");
+                    if root.contains_tensor("weight") {
+                        root
+                    } else {
+                        cpu_vb
+                            .pp("bert")
+                            .pp("encoder")
+                            .pp("layer.0")
+                            .pp("output")
+                            .pp("dense")
+                    }
+                };
+                let dev_dense_vb = {
+                    let root = dev_vb.pp("encoder").pp("layer.0").pp("output").pp("dense");
+                    if root.contains_tensor("weight") {
+                        root
+                    } else {
+                        dev_vb
+                            .pp("bert")
+                            .pp("encoder")
+                            .pp("layer.0")
+                            .pp("output")
+                            .pp("dense")
+                    }
+                };
+                let cpu_dense_w =
+                    cpu_dense_vb.get((config.hidden_size, config.intermediate_size), "weight")?;
+                let dev_dense_w =
+                    dev_dense_vb.get((config.hidden_size, config.intermediate_size), "weight")?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_dense_w, &cpu_dense_w)?;
+                eprintln!(
+                    "layer0 output_dense_weight max diff idx={idx} got={got} expected={expected} diff={diff}"
+                );
+                let cpu_dense_b = cpu_dense_vb.get(config.hidden_size, "bias")?;
+                let dev_dense_b = dev_dense_vb.get(config.hidden_size, "bias")?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_dense_b, &cpu_dense_b)?;
+                eprintln!(
+                    "layer0 output_dense_bias max diff idx={idx} got={got} expected={expected} diff={diff}"
+                );
+
+                let cpu_output_mm = cpu_inter
+                    .reshape((ids.len(), config.intermediate_size))?
+                    .matmul(&cpu_dense_w.t()?.contiguous()?)?
+                    .reshape((1, ids.len(), config.hidden_size))?;
+                let dev_output_mm = dev_inter
+                    .reshape((ids.len(), config.intermediate_size))?
+                    .matmul(&dev_dense_w.t()?.contiguous()?)?
+                    .reshape((1, ids.len(), config.hidden_size))?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_output_mm, &cpu_output_mm)?;
+                eprintln!(
+                    "layer0 output_dense_manual_matmul max diff idx={idx} got={got} expected={expected} diff={diff}"
+                );
+
+                let cpu_output_residual = (&cpu_output_dense + &cpu_attn_out)?;
+                let dev_output_residual = (&dev_output_dense + &dev_attn_out)?;
+                let (idx, got, expected, diff) =
+                    max_abs_diff(&dev_output_residual, &cpu_output_residual)?;
+                eprintln!(
+                    "layer0 output_residual max diff idx={idx} got={got} expected={expected} diff={diff}"
+                );
+
+                let cpu_output_norm = cpu_layer.output.layer_norm.forward(&cpu_output_residual)?;
+                let dev_output_norm = dev_layer.output.layer_norm.forward(&dev_output_residual)?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_output_norm, &cpu_output_norm)?;
+                eprintln!(
+                    "layer0 output_norm max diff idx={idx} got={got} expected={expected} diff={diff}"
+                );
+
+                let cpu_out = cpu_layer.output.forward(&cpu_inter, &cpu_attn_out)?;
+                let dev_out = dev_layer.output.forward(&dev_inter, &dev_attn_out)?;
+                let (idx, got, expected, diff) = max_abs_diff(&dev_out, &cpu_out)?;
+                eprintln!(
+                    "layer0 final max diff idx={idx} got={got} expected={expected} diff={diff}"
+                );
+            }
+            hs_cpu = cpu_layer.forward(&hs_cpu, &ext_cpu)?;
+            hs_dev = dev_layer.forward(&hs_dev, &ext_dev)?;
+            let (idx, got, expected, diff) = max_abs_diff(&hs_dev, &hs_cpu)?;
+            eprintln!(
+                "encoder layer {layer_idx} max diff idx={idx} got={got} expected={expected} diff={diff}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "manual bert GPU stage diagnostic"]
+    fn bert_stage_debug_vulkan() -> Result<()> {
+        let device = Device::new_vulkan(0)?;
+        bert_stage_debug(&device)
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    #[ignore = "manual bert GPU stage diagnostic"]
+    fn bert_stage_debug_wgpu() -> Result<()> {
+        let device = Device::new_wgpu(0)?;
+        bert_stage_debug(&device)
     }
 }

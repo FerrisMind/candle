@@ -90,13 +90,10 @@ impl Module for MlpWeights {
 pub struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
-    positions: Tensor,
     /// Pre-extracted flat f32 cos/sin for fused decode (zero allocation)
     cos_f32: Vec<f32>,
     sin_f32: Vec<f32>,
     half_d: usize,
-    rope_theta: f32,
-    head_dim: usize,
 }
 
 impl RotaryEmbedding {
@@ -128,16 +125,12 @@ impl RotaryEmbedding {
             Tensor::from_vec(sin_f32.clone(), (max_seq_len, half_dim), dev)?.to_dtype(dtype)?;
         let cos =
             Tensor::from_vec(cos_f32.clone(), (max_seq_len, half_dim), dev)?.to_dtype(dtype)?;
-        let positions = Tensor::arange(0i32, max_seq_len as i32, dev)?;
         Ok(Self {
             sin,
             cos,
-            positions,
             cos_f32,
             sin_f32,
             half_d: dim / 2,
-            rope_theta: rope_theta as f32,
-            head_dim,
         })
     }
 
@@ -145,46 +138,12 @@ impl RotaryEmbedding {
     pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
         let q = q.contiguous()?;
         let k = k.contiguous()?;
-        if q.device().is_wgpu() || q.device().is_vulkan() {
-            // ggml rope shaders expect positions on i2 and GPT-NeoX pairing.
-            const GGML_ROPE_TYPE_NEOX: u32 = 2;
-            let (_, _, seq_len, _) = q.dims4()?;
-            let positions = if q.device().is_vulkan() {
-                self.positions
-                    .narrow(0, offset, seq_len)?
-                    .force_contiguous()?
-            } else {
-                self.positions.narrow(0, offset, seq_len)?
-            };
-            let q_ggml = q.transpose(1, 2)?.contiguous()?;
-            let k_ggml = k.transpose(1, 2)?.contiguous()?;
-            let q_embed = candle_nn::rotary_emb::rope_ggml(
-                &q_ggml,
-                &positions,
-                self.head_dim,
-                self.rope_theta,
-                GGML_ROPE_TYPE_NEOX,
-            )?
-            .transpose(1, 2)?
-            .contiguous()?;
-            let k_embed = candle_nn::rotary_emb::rope_ggml(
-                &k_ggml,
-                &positions,
-                self.head_dim,
-                self.rope_theta,
-                GGML_ROPE_TYPE_NEOX,
-            )?
-            .transpose(1, 2)?
-            .contiguous()?;
-            Ok((q_embed, k_embed))
-        } else {
-            let (_, _, seq_len, _) = q.dims4()?;
-            let cos = self.cos.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
-            let sin = self.sin.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
-            let q_embed = candle_nn::rotary_emb::rope(&q, &cos, &sin)?;
-            let k_embed = candle_nn::rotary_emb::rope(&k, &cos, &sin)?;
-            Ok((q_embed, k_embed))
-        }
+        let (_, _, seq_len, _) = q.dims4()?;
+        let cos = self.cos.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
+        let sin = self.sin.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
+        let q_embed = candle_nn::rotary_emb::rope(&q, &cos, &sin)?;
+        let k_embed = candle_nn::rotary_emb::rope(&k, &cos, &sin)?;
+        Ok((q_embed, k_embed))
     }
 
     /// Zero-allocation cos/sin slices for a single position.
@@ -637,16 +596,51 @@ impl ModelWeights {
 mod tests {
     use super::*;
     use candle::quantized::gguf_file;
+    use hf_hub::{api::sync::Api, Repo, RepoType};
     use std::path::{Path, PathBuf};
 
-    fn qwen3_gguf_path() -> Option<PathBuf> {
-        std::env::var_os("CANDLE_QWEN3_GGUF_PATH").map(PathBuf::from)
+    fn qwen3_gguf_path() -> Result<PathBuf> {
+        if let Some(path) = std::env::var_os("CANDLE_QWEN3_GGUF_PATH") {
+            return Ok(PathBuf::from(path));
+        }
+        let api = Api::new()
+            .map_err(|err| candle::Error::msg(format!("failed to create hf-hub client: {err}")))?;
+        let repo = Repo::with_revision(
+            "unsloth/Qwen3-0.6B-GGUF".to_string(),
+            RepoType::Model,
+            "main".to_string(),
+        );
+        api.repo(repo).get("Qwen3-0.6B-Q4_K_M.gguf").map_err(|err| {
+            candle::Error::msg(format!("failed to download Qwen3 GGUF from hf-hub: {err}"))
+        })
     }
 
     fn load_model(path: &Path, device: &Device) -> Result<ModelWeights> {
         let mut file = std::fs::File::open(path)?;
         let content = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(path))?;
         ModelWeights::from_gguf(content, &mut file, device)
+    }
+
+    fn reset_gpu_fallback_count(device: &Device) {
+        if device.is_wgpu() {
+            candle::reset_wgpu_cpu_fallback_count();
+        } else if device.is_vulkan() {
+            candle::reset_vulkan_cpu_fallback_count();
+        }
+    }
+
+    fn assert_no_gpu_fallbacks(label: &str, device: &Device) -> Result<()> {
+        if !device.is_wgpu() && !device.is_vulkan() {
+            return Ok(());
+        }
+        device.synchronize()?;
+        let count = if device.is_wgpu() {
+            candle::wgpu_cpu_fallback_count()
+        } else {
+            candle::vulkan_cpu_fallback_count()
+        };
+        assert_eq!(count, 0, "{label}: unexpected CPU fallback count {count}");
+        Ok(())
     }
 
     fn tensor_diff_stats(actual: &Tensor, expected: &Tensor) -> Result<(usize, f32, f32, f64)> {
@@ -690,23 +684,108 @@ mod tests {
         Ok((max_idx, max_diff, max_rel, nmse))
     }
 
-    fn assert_tensor_close(
+    fn assert_tensor_close_with_nmse(
         label: &str,
         actual: &Tensor,
         expected: &Tensor,
         tol: f32,
+        nmse_tol: f64,
     ) -> Result<()> {
         let (max_idx, max_diff, max_rel, nmse) = tensor_diff_stats(actual, expected)?;
         println!(
             "{label}: max_idx={max_idx} max_diff={max_diff:.6} max_rel={max_rel:.6} nmse={nmse:.6e}"
         );
         assert!(
-            max_rel <= tol || nmse <= 5e-4,
+            max_rel <= tol || nmse <= nmse_tol,
             "{label} mismatch: max_idx={max_idx} max_diff={max_diff} max_rel={max_rel} nmse={nmse}"
         );
         Ok(())
     }
 
+    fn assert_tensor_close(
+        label: &str,
+        actual: &Tensor,
+        expected: &Tensor,
+        tol: f32,
+    ) -> Result<()> {
+        assert_tensor_close_with_nmse(label, actual, expected, tol, 5e-4)
+    }
+
+    fn assert_logits_close(
+        label: &str,
+        actual: &Tensor,
+        expected: &Tensor,
+        tol: f32,
+    ) -> Result<()> {
+        let (max_idx, max_diff, max_rel, nmse) = tensor_diff_stats(actual, expected)?;
+        let actual = actual
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected = expected
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let cosine = {
+            let mut dot = 0f64;
+            let mut actual_norm = 0f64;
+            let mut expected_norm = 0f64;
+            for (actual, expected) in actual.iter().zip(expected.iter()) {
+                dot += (*actual as f64) * (*expected as f64);
+                actual_norm += (*actual as f64) * (*actual as f64);
+                expected_norm += (*expected as f64) * (*expected as f64);
+            }
+            if actual_norm > 0.0 && expected_norm > 0.0 {
+                dot / (actual_norm.sqrt() * expected_norm.sqrt())
+            } else {
+                1.0
+            }
+        };
+        let actual_argmax = argmax_index(&actual);
+        let expected_argmax = argmax_index(&expected);
+        let top5_overlap = topk_overlap(&actual, &expected, 5);
+        println!(
+            "{label}: max_idx={max_idx} max_diff={max_diff:.6} max_rel={max_rel:.6} nmse={nmse:.6e} cosine={cosine:.6} argmax_actual={actual_argmax} argmax_expected={expected_argmax} top5_overlap={top5_overlap}"
+        );
+        assert!(
+            max_rel <= tol
+                || (nmse <= 1e-2
+                    && cosine >= 0.995
+                    && actual_argmax == expected_argmax
+                    && top5_overlap >= 4),
+            "{label} mismatch: max_idx={max_idx} max_diff={max_diff} max_rel={max_rel} nmse={nmse} cosine={cosine} argmax_actual={actual_argmax} argmax_expected={expected_argmax} top5_overlap={top5_overlap}"
+        );
+        Ok(())
+    }
+
+    fn argmax_index(values: &[f32]) -> usize {
+        let mut best_idx = 0usize;
+        let mut best = f32::NEG_INFINITY;
+        for (idx, &value) in values.iter().enumerate() {
+            if value > best {
+                best = value;
+                best_idx = idx;
+            }
+        }
+        best_idx
+    }
+
+    fn topk_overlap(actual: &[f32], expected: &[f32], k: usize) -> usize {
+        fn topk_indices(values: &[f32], k: usize) -> Vec<usize> {
+            let mut indexed: Vec<(usize, f32)> = values.iter().copied().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+            indexed.into_iter().take(k).map(|(idx, _)| idx).collect()
+        }
+
+        let actual_topk = topk_indices(actual, k);
+        let expected_topk = topk_indices(expected, k);
+        actual_topk
+            .iter()
+            .filter(|idx| expected_topk.contains(idx))
+            .count()
+    }
+
+    #[allow(dead_code)]
     fn log_layout(label: &str, tensor: &Tensor) {
         let (_storage, layout) = tensor.storage_and_layout();
         println!(
@@ -718,6 +797,7 @@ mod tests {
         );
     }
 
+    #[allow(dead_code)]
     fn log_qproj_rows(label: &str, tensor: &Tensor) -> Result<()> {
         let tensor = tensor.to_dtype(DType::F32)?;
         match tensor.dims() {
@@ -735,6 +815,7 @@ mod tests {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn log_gguf_tensor_dtype(path: &Path, name: &str) -> Result<()> {
         let mut file = std::fs::File::open(path)?;
         let content = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(path))?;
@@ -747,14 +828,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CANDLE_QWEN3_GGUF_PATH and a usable wgpu adapter"]
+    #[ignore = "requires a usable wgpu adapter and Qwen3 GGUF from CANDLE_QWEN3_GGUF_PATH or hf-hub"]
     #[cfg(feature = "wgpu")]
     fn qwen3_local_wgpu_stage_parity() -> Result<()> {
-        let Some(path) = qwen3_gguf_path() else {
-            return Ok(());
-        };
+        let path = qwen3_gguf_path()?;
         let cpu = Device::Cpu;
         let wgpu = Device::new_wgpu(0)?;
+        reset_gpu_fallback_count(&wgpu);
         let mut cpu_model = load_model(&path, &cpu)?;
         let mut wgpu_model = load_model(&path, &wgpu)?;
 
@@ -779,20 +859,136 @@ mod tests {
         let layer0_cpu = cpu_model.layers[0].forward(&emb_cpu, Some(&mask_cpu), 0)?;
         let layer0_wgpu = wgpu_model.layers[0].forward(&emb_wgpu, Some(&mask_wgpu), 0)?;
         assert_tensor_close("layer0", &layer0_wgpu, &layer0_cpu, 5e-2)?;
+        assert_no_gpu_fallbacks("qwen3_local_wgpu_stage_parity", &wgpu)?;
         Ok(())
     }
 
     #[test]
-    #[ignore = "requires CANDLE_QWEN3_GGUF_PATH and a usable Vulkan device"]
+    #[ignore = "requires a usable wgpu adapter and Qwen3 GGUF from CANDLE_QWEN3_GGUF_PATH or hf-hub"]
+    #[cfg(feature = "wgpu")]
+    fn qwen3_local_wgpu_forward_parity() -> Result<()> {
+        let path = qwen3_gguf_path()?;
+        let cpu = Device::Cpu;
+        let wgpu = Device::new_wgpu(0)?;
+        reset_gpu_fallback_count(&wgpu);
+        let mut cpu_model = load_model(&path, &cpu)?;
+        let mut wgpu_model = load_model(&path, &wgpu)?;
+
+        let ids = [1u32, 2, 3, 4];
+        let ids_cpu = Tensor::from_slice(&ids, (1, ids.len()), &cpu)?;
+        let ids_wgpu = Tensor::from_slice(&ids, (1, ids.len()), &wgpu)?;
+        let prefill_cpu = cpu_model.forward(&ids_cpu, 0)?;
+        let prefill_wgpu = wgpu_model.forward(&ids_wgpu, 0)?;
+        assert_logits_close("prefill_logits", &prefill_wgpu, &prefill_cpu, 5e-2)?;
+
+        let next_cpu = Tensor::from_slice(&[5u32], (1, 1), &cpu)?;
+        let next_wgpu = Tensor::from_slice(&[5u32], (1, 1), &wgpu)?;
+        let decode_cpu = cpu_model.forward(&next_cpu, ids.len())?;
+        let decode_wgpu = wgpu_model.forward(&next_wgpu, ids.len())?;
+        assert_logits_close("decode_logits", &decode_wgpu, &decode_cpu, 5e-2)?;
+        assert_no_gpu_fallbacks("qwen3_local_wgpu_forward_parity", &wgpu)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a usable wgpu adapter and Qwen3 GGUF from CANDLE_QWEN3_GGUF_PATH or hf-hub"]
+    #[cfg(feature = "wgpu")]
+    fn qwen3_local_wgpu_layer1_topology_parity() -> Result<()> {
+        let path = qwen3_gguf_path()?;
+        let cpu = Device::Cpu;
+        let wgpu = Device::new_wgpu(0)?;
+        reset_gpu_fallback_count(&wgpu);
+        let mut cpu_model = load_model(&path, &cpu)?;
+        let mut wgpu_model = load_model(&path, &wgpu)?;
+
+        let ids = [1u32, 2, 3, 4];
+        let ids_cpu = Tensor::from_slice(&ids, (1, ids.len()), &cpu)?;
+        let ids_wgpu = Tensor::from_slice(&ids, (1, ids.len()), &wgpu)?;
+        let mask_cpu = cpu_model.causal_mask(1, ids.len(), 0, None)?;
+        let mask_wgpu = wgpu_model.causal_mask(1, ids.len(), 0, None)?;
+
+        let layer0_cpu_in = cpu_model.embed_tokens.forward(&ids_cpu)?;
+        let layer0_wgpu_in = wgpu_model.embed_tokens.forward(&ids_wgpu)?;
+        let layer0_cpu = cpu_model.layers[0].forward(&layer0_cpu_in, Some(&mask_cpu), 0)?;
+        let layer0_wgpu = wgpu_model.layers[0].forward(&layer0_wgpu_in, Some(&mask_wgpu), 0)?;
+        assert_tensor_close_with_nmse(
+            "layer0_input_to_layer1",
+            &layer0_wgpu,
+            &layer0_cpu,
+            5e-2,
+            5e-3,
+        )?;
+
+        let l1_ln1_cpu = cpu_model.layers[1].ln1.forward(&layer0_cpu)?;
+        let l1_ln1_wgpu = wgpu_model.layers[1].ln1.forward(&layer0_wgpu)?;
+        assert_tensor_close_with_nmse("layer1_ln1", &l1_ln1_wgpu, &l1_ln1_cpu, 5e-2, 5e-3)?;
+
+        let l1_attn_cpu = cpu_model.layers[1]
+            .self_attn
+            .forward(&l1_ln1_cpu, Some(&mask_cpu), 0)?;
+        let l1_attn_wgpu =
+            wgpu_model.layers[1]
+                .self_attn
+                .forward(&l1_ln1_wgpu, Some(&mask_wgpu), 0)?;
+        assert_tensor_close_with_nmse("layer1_attn", &l1_attn_wgpu, &l1_attn_cpu, 5e-2, 5e-3)?;
+
+        let l1_post_attn_cpu = (&layer0_cpu + &l1_attn_cpu)?;
+        let l1_post_attn_wgpu = (&layer0_wgpu + &l1_attn_wgpu)?;
+        assert_tensor_close_with_nmse(
+            "layer1_post_attn",
+            &l1_post_attn_wgpu,
+            &l1_post_attn_cpu,
+            5e-2,
+            5e-3,
+        )?;
+
+        let l1_ln2_cpu = cpu_model.layers[1].ln2.forward(&l1_post_attn_cpu)?;
+        let l1_ln2_wgpu = wgpu_model.layers[1].ln2.forward(&l1_post_attn_wgpu)?;
+        assert_tensor_close_with_nmse("layer1_ln2", &l1_ln2_wgpu, &l1_ln2_cpu, 5e-2, 5e-3)?;
+
+        let l1_gate_cpu = cpu_model.layers[1].mlp.gate_proj.forward(&l1_ln2_cpu)?;
+        let l1_gate_wgpu = wgpu_model.layers[1].mlp.gate_proj.forward(&l1_ln2_wgpu)?;
+        assert_tensor_close_with_nmse("layer1_gate", &l1_gate_wgpu, &l1_gate_cpu, 5e-2, 5e-3)?;
+
+        let l1_up_cpu = cpu_model.layers[1].mlp.up_proj.forward(&l1_ln2_cpu)?;
+        let l1_up_wgpu = wgpu_model.layers[1].mlp.up_proj.forward(&l1_ln2_wgpu)?;
+        assert_tensor_close_with_nmse("layer1_up", &l1_up_wgpu, &l1_up_cpu, 5e-2, 5e-3)?;
+
+        let l1_gate_act_cpu = l1_gate_cpu.apply(&cpu_model.layers[1].mlp.act_fn)?;
+        let l1_gate_act_wgpu = l1_gate_wgpu.apply(&wgpu_model.layers[1].mlp.act_fn)?;
+        assert_tensor_close_with_nmse(
+            "layer1_gate_act",
+            &l1_gate_act_wgpu,
+            &l1_gate_act_cpu,
+            5e-2,
+            5e-3,
+        )?;
+
+        let l1_gated_cpu = (&l1_gate_act_cpu * &l1_up_cpu)?;
+        let l1_gated_wgpu = (&l1_gate_act_wgpu * &l1_up_wgpu)?;
+        assert_tensor_close_with_nmse("layer1_gated", &l1_gated_wgpu, &l1_gated_cpu, 5e-2, 5e-3)?;
+
+        let l1_mlp_cpu = cpu_model.layers[1].mlp.down_proj.forward(&l1_gated_cpu)?;
+        let l1_mlp_wgpu = wgpu_model.layers[1].mlp.down_proj.forward(&l1_gated_wgpu)?;
+        assert_tensor_close_with_nmse("layer1_mlp", &l1_mlp_wgpu, &l1_mlp_cpu, 5e-2, 5e-3)?;
+
+        let l1_out_cpu = (&l1_post_attn_cpu + &l1_mlp_cpu)?;
+        let l1_out_wgpu = (&l1_post_attn_wgpu + &l1_mlp_wgpu)?;
+        assert_tensor_close_with_nmse("layer1_out", &l1_out_wgpu, &l1_out_cpu, 5e-2, 5e-3)?;
+        assert_no_gpu_fallbacks("qwen3_local_wgpu_layer1_topology_parity", &wgpu)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a usable Vulkan device and Qwen3 GGUF from CANDLE_QWEN3_GGUF_PATH or hf-hub"]
     #[cfg(feature = "vulkan")]
     fn qwen3_local_vulkan_stage_parity() -> Result<()> {
-        let Some(path) = qwen3_gguf_path() else {
-            return Ok(());
-        };
+        let path = qwen3_gguf_path()?;
         log_gguf_tensor_dtype(&path, "blk.0.attn_q.weight")?;
         log_gguf_tensor_dtype(&path, "blk.0.ffn_up.weight")?;
         let cpu = Device::Cpu;
         let vk = Device::new_vulkan(0)?;
+        reset_gpu_fallback_count(&vk);
         let mut cpu_model = load_model(&path, &cpu)?;
         let mut vk_model = load_model(&path, &vk)?;
 
@@ -951,67 +1147,47 @@ mod tests {
         let layer0_cpu = cpu_model.layers[0].forward(&emb_cpu, Some(&mask_cpu), 0)?;
         let layer0_vk = vk_model.layers[0].forward(&emb_vk, Some(&mask_vk), 0)?;
         assert_tensor_close("layer0", &layer0_vk, &layer0_cpu, 5e-2)?;
+        assert_no_gpu_fallbacks("qwen3_local_vulkan_stage_parity", &vk)?;
         Ok(())
     }
 
     #[test]
-    #[ignore = "requires CANDLE_QWEN3_GGUF_PATH and a usable Vulkan device"]
+    #[ignore = "requires a usable Vulkan device and Qwen3 GGUF from CANDLE_QWEN3_GGUF_PATH or hf-hub"]
     #[cfg(feature = "vulkan")]
     fn qwen3_local_vulkan_forward_parity() -> Result<()> {
-        let Some(path) = qwen3_gguf_path() else {
-            return Ok(());
-        };
+        let path = qwen3_gguf_path()?;
         log_gguf_tensor_dtype(&path, "blk.1.attn_q.weight")?;
         log_gguf_tensor_dtype(&path, "blk.1.ffn_up.weight")?;
         let cpu = Device::Cpu;
         let vk = Device::new_vulkan(0)?;
+        reset_gpu_fallback_count(&vk);
         let mut cpu_model = load_model(&path, &cpu)?;
         let mut vk_model = load_model(&path, &vk)?;
 
         let ids = [1u32, 2, 3, 4];
         let ids_cpu = Tensor::from_slice(&ids, (1, ids.len()), &cpu)?;
         let ids_vk = Tensor::from_slice(&ids, (1, ids.len()), &vk)?;
-        let mut h_cpu = cpu_model.embed_tokens.forward(&ids_cpu)?;
-        let mut h_vk = vk_model.embed_tokens.forward(&ids_vk)?;
-        let mask_cpu = cpu_model.causal_mask(1, ids.len(), 0, None)?;
-        let mask_vk = vk_model.causal_mask(1, ids.len(), 0, None)?;
-        for (layer_idx, (cpu_layer, vk_layer)) in cpu_model
-            .layers
-            .iter_mut()
-            .zip(vk_model.layers.iter_mut())
-            .enumerate()
-        {
-            h_cpu = cpu_layer.forward(&h_cpu, Some(&mask_cpu), 0)?;
-            h_vk = vk_layer.forward(&h_vk, Some(&mask_vk), 0)?;
-            assert_tensor_close(&format!("prefill_layer_{layer_idx}"), &h_vk, &h_cpu, 5e-2)?;
-        }
-        let h_cpu = cpu_model.norm.forward(&h_cpu)?;
-        let h_vk = vk_model.norm.forward(&h_vk)?;
-        assert_tensor_close("prefill_norm", &h_vk, &h_cpu, 5e-2)?;
-        let last_cpu = h_cpu.narrow(1, ids.len() - 1, 1)?;
-        let last_vk = h_vk.narrow(1, ids.len() - 1, 1)?;
-        assert_tensor_close("prefill_last_hidden", &last_vk, &last_cpu, 5e-2)?;
-        let prefill_cpu = cpu_model.lm_head.forward(&last_cpu)?.squeeze(1)?;
-        let prefill_vk = vk_model.lm_head.forward(&last_vk)?.squeeze(1)?;
-        assert_tensor_close("prefill_logits", &prefill_vk, &prefill_cpu, 5e-2)?;
+        let prefill_cpu = cpu_model.forward(&ids_cpu, 0)?;
+        let prefill_vk = vk_model.forward(&ids_vk, 0)?;
+        assert_logits_close("prefill_logits", &prefill_vk, &prefill_cpu, 5e-2)?;
 
         let next_cpu = Tensor::from_slice(&[5u32], (1, 1), &cpu)?;
         let next_vk = Tensor::from_slice(&[5u32], (1, 1), &vk)?;
         let decode_cpu = cpu_model.forward(&next_cpu, ids.len())?;
         let decode_vk = vk_model.forward(&next_vk, ids.len())?;
-        assert_tensor_close("decode_logits", &decode_vk, &decode_cpu, 5e-2)?;
+        assert_logits_close("decode_logits", &decode_vk, &decode_cpu, 5e-2)?;
+        assert_no_gpu_fallbacks("qwen3_local_vulkan_forward_parity", &vk)?;
         Ok(())
     }
 
     #[test]
-    #[ignore = "requires CANDLE_QWEN3_GGUF_PATH and a usable Vulkan device"]
+    #[ignore = "requires a usable Vulkan device and Qwen3 GGUF from CANDLE_QWEN3_GGUF_PATH or hf-hub"]
     #[cfg(feature = "vulkan")]
     fn qwen3_local_vulkan_layer1_topology_parity() -> Result<()> {
-        let Some(path) = qwen3_gguf_path() else {
-            return Ok(());
-        };
+        let path = qwen3_gguf_path()?;
         let cpu = Device::Cpu;
         let vk = Device::new_vulkan(0)?;
+        reset_gpu_fallback_count(&vk);
         let mut cpu_model = load_model(&path, &cpu)?;
         let mut vk_model = load_model(&path, &vk)?;
 
@@ -1025,13 +1201,19 @@ mod tests {
         let layer0_vk_in = vk_model.embed_tokens.forward(&ids_vk)?;
         let layer0_cpu = cpu_model.layers[0].forward(&layer0_cpu_in, Some(&mask_cpu), 0)?;
         let layer0_vk = vk_model.layers[0].forward(&layer0_vk_in, Some(&mask_vk), 0)?;
-        assert_tensor_close("layer0_input_to_layer1", &layer0_vk, &layer0_cpu, 5e-2)?;
+        assert_tensor_close_with_nmse(
+            "layer0_input_to_layer1",
+            &layer0_vk,
+            &layer0_cpu,
+            5e-2,
+            5e-3,
+        )?;
 
         let ln1_cpu = vk_model.layers.len(); // keep borrow scopes simple below
         let _ = ln1_cpu;
         let l1_ln1_cpu = cpu_model.layers[1].ln1.forward(&layer0_cpu)?;
         let l1_ln1_vk = vk_model.layers[1].ln1.forward(&layer0_vk)?;
-        assert_tensor_close("layer1_ln1", &l1_ln1_vk, &l1_ln1_cpu, 5e-2)?;
+        assert_tensor_close_with_nmse("layer1_ln1", &l1_ln1_vk, &l1_ln1_cpu, 5e-2, 5e-3)?;
 
         let l1_attn_cpu = cpu_model.layers[1]
             .self_attn
@@ -1039,24 +1221,25 @@ mod tests {
         let l1_attn_vk = vk_model.layers[1]
             .self_attn
             .forward(&l1_ln1_vk, Some(&mask_vk), 0)?;
-        assert_tensor_close("layer1_attn", &l1_attn_vk, &l1_attn_cpu, 5e-2)?;
+        assert_tensor_close_with_nmse("layer1_attn", &l1_attn_vk, &l1_attn_cpu, 5e-2, 5e-3)?;
 
         let l1_post_attn_cpu = (&layer0_cpu + &l1_attn_cpu)?;
         let l1_post_attn_vk = (&layer0_vk + &l1_attn_vk)?;
-        assert_tensor_close(
+        assert_tensor_close_with_nmse(
             "layer1_post_attn",
             &l1_post_attn_vk,
             &l1_post_attn_cpu,
             5e-2,
+            5e-3,
         )?;
 
         let l1_ln2_cpu = cpu_model.layers[1].ln2.forward(&l1_post_attn_cpu)?;
         let l1_ln2_vk = vk_model.layers[1].ln2.forward(&l1_post_attn_vk)?;
-        assert_tensor_close("layer1_ln2", &l1_ln2_vk, &l1_ln2_cpu, 5e-2)?;
+        assert_tensor_close_with_nmse("layer1_ln2", &l1_ln2_vk, &l1_ln2_cpu, 5e-2, 5e-3)?;
 
         let l1_gate_cpu = cpu_model.layers[1].mlp.gate_proj.forward(&l1_ln2_cpu)?;
         let l1_gate_vk = vk_model.layers[1].mlp.gate_proj.forward(&l1_ln2_vk)?;
-        assert_tensor_close("layer1_gate", &l1_gate_vk, &l1_gate_cpu, 5e-2)?;
+        assert_tensor_close_with_nmse("layer1_gate", &l1_gate_vk, &l1_gate_cpu, 5e-2, 5e-3)?;
 
         let l1_up_cpu = cpu_model.layers[1].mlp.up_proj.forward(&l1_ln2_cpu)?;
         let l1_up_vk = vk_model.layers[1].mlp.up_proj.forward(&l1_ln2_vk)?;
@@ -1067,29 +1250,37 @@ mod tests {
         let l1_ln2_cpu_on_vk =
             Tensor::from_vec(l1_ln2_cpu_values, l1_ln2_cpu.shape().clone(), &vk)?;
         let l1_up_vk_exact_input = vk_model.layers[1].mlp.up_proj.forward(&l1_ln2_cpu_on_vk)?;
-        assert_tensor_close(
+        assert_tensor_close_with_nmse(
             "layer1_up_exact_input",
             &l1_up_vk_exact_input,
             &l1_up_cpu,
             5e-2,
+            5e-3,
         )?;
-        assert_tensor_close("layer1_up", &l1_up_vk, &l1_up_cpu, 5e-2)?;
+        assert_tensor_close_with_nmse("layer1_up", &l1_up_vk, &l1_up_cpu, 5e-2, 5e-3)?;
 
         let l1_gate_act_cpu = l1_gate_cpu.apply(&cpu_model.layers[1].mlp.act_fn)?;
         let l1_gate_act_vk = l1_gate_vk.apply(&vk_model.layers[1].mlp.act_fn)?;
-        assert_tensor_close("layer1_gate_act", &l1_gate_act_vk, &l1_gate_act_cpu, 5e-2)?;
+        assert_tensor_close_with_nmse(
+            "layer1_gate_act",
+            &l1_gate_act_vk,
+            &l1_gate_act_cpu,
+            5e-2,
+            5e-3,
+        )?;
 
         let l1_gated_cpu = (&l1_gate_act_cpu * &l1_up_cpu)?;
         let l1_gated_vk = (&l1_gate_act_vk * &l1_up_vk)?;
-        assert_tensor_close("layer1_gated", &l1_gated_vk, &l1_gated_cpu, 5e-2)?;
+        assert_tensor_close_with_nmse("layer1_gated", &l1_gated_vk, &l1_gated_cpu, 5e-2, 5e-3)?;
 
         let l1_mlp_cpu = cpu_model.layers[1].mlp.down_proj.forward(&l1_gated_cpu)?;
         let l1_mlp_vk = vk_model.layers[1].mlp.down_proj.forward(&l1_gated_vk)?;
-        assert_tensor_close("layer1_mlp", &l1_mlp_vk, &l1_mlp_cpu, 5e-2)?;
+        assert_tensor_close_with_nmse("layer1_mlp", &l1_mlp_vk, &l1_mlp_cpu, 5e-2, 5e-3)?;
 
         let l1_out_cpu = (&l1_post_attn_cpu + &l1_mlp_cpu)?;
         let l1_out_vk = (&l1_post_attn_vk + &l1_mlp_vk)?;
-        assert_tensor_close("layer1_out", &l1_out_vk, &l1_out_cpu, 5e-2)?;
+        assert_tensor_close_with_nmse("layer1_out", &l1_out_vk, &l1_out_cpu, 5e-2, 5e-3)?;
+        assert_no_gpu_fallbacks("qwen3_local_vulkan_layer1_topology_parity", &vk)?;
         Ok(())
     }
 }

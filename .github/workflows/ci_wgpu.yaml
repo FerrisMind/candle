@@ -1,0 +1,122 @@
+name: CI / wgpu
+
+on:
+  workflow_dispatch:
+
+jobs:
+  shader-validate-wgpu:
+    runs-on: ${{ fromJSON(vars.CI_WGPU_RUNNER_LABELS != '' && vars.CI_WGPU_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install naga CLI
+        run: cargo install naga-cli --locked
+      - name: Validate checked-in WGSL
+        shell: pwsh
+        run: |
+          Get-ChildItem candle-wgpu-kernels/src/shaders -Recurse -Filter *.wgsl `
+            | Where-Object { $_.Name -notlike '*.tmpl.wgsl' } `
+            | ForEach-Object { naga $_.FullName }
+
+  gpu-correctness-wgpu:
+    needs: shader-validate-wgpu
+    name: WGPU correctness (${{ matrix.mode.label }})
+    runs-on: ${{ fromJSON(vars.CI_WGPU_RUNNER_LABELS != '' && vars.CI_WGPU_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - label: default
+            backend: default
+          - label: dx12
+            backend: dx12
+          - label: vulkan
+            backend: vulkan
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Vulkan runtime deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential vulkan-tools mesa-vulkan-drivers
+      - name: WGPU correctness
+        shell: pwsh
+        env:
+          WGPU_BACKEND_MODE: ${{ matrix.mode.backend }}
+          WGPU_VALIDATION: "1"
+          CANDLE_REQUIRE_WGPU_TEST_DEVICE: "1"
+        run: |
+          if ($env:WGPU_BACKEND_MODE -eq 'default') {
+            Remove-Item Env:WGPU_BACKEND -ErrorAction SilentlyContinue
+          } else {
+            $env:WGPU_BACKEND = $env:WGPU_BACKEND_MODE
+          }
+
+          cargo test --release -p candle-core --features wgpu --test backend_smoke_tests
+          cargo test --release -p candle-core --features wgpu --test backend_smoke_tests -- --ignored
+          cargo test --release -p candle-core --features wgpu --test ggml_fixture_ops_tests ggml_fixture_ops_wgpu -- --ignored --exact
+          cargo test --release -p candle-core --features wgpu --test gpu_metamorphic_tests gpu_metamorphic_wgpu -- --ignored --exact
+          cargo test --release -p candle-core --features wgpu --test gpu_property_tests gpu_properties_wgpu -- --ignored --exact
+
+          cargo test --release -p candle-nn --features wgpu --test ops softmax_wgpu -- --exact
+          cargo test --release -p candle-nn --features wgpu --test ops rms_norm_wgpu -- --exact
+          cargo test --release -p candle-nn --features wgpu --test ops sigmoid_wgpu -- --exact
+          cargo test --release -p candle-nn --features wgpu --test ops layer_norm_wgpu -- --exact
+          cargo test --release -p candle-nn --features wgpu --test ops rope_wgpu -- --exact
+          cargo test --release -p candle-nn --features wgpu --test ops sdpa_wgpu -- --exact
+          cargo test --release -p candle-nn --features wgpu --test ops mini_graph_wgpu -- --ignored --exact
+
+          cargo test --release -p candle-transformers --features wgpu --test gpu_model_matrix gpu_model_matrix_wgpu -- --ignored --exact
+          cargo test --release -p candle-transformers --features wgpu --lib qwen3_local_wgpu_stage_parity -- --ignored --exact
+          cargo test --release -p candle-transformers --features wgpu --lib qwen3_local_wgpu_forward_parity -- --ignored --exact
+          cargo test --release -p candle-transformers --features wgpu --lib qwen3_local_wgpu_layer1_topology_parity -- --ignored --exact
+
+  combined-gpu-features:
+    needs: gpu-correctness-wgpu
+    runs-on: ${{ fromJSON(vars.CI_WGPU_RUNNER_LABELS != '' && vars.CI_WGPU_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Vulkan runtime deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential vulkan-tools mesa-vulkan-drivers
+      - name: Combined feature correctness
+        shell: pwsh
+        env:
+          WGPU_BACKEND: vulkan
+          WGPU_VALIDATION: "1"
+          CANDLE_REQUIRE_WGPU_TEST_DEVICE: "1"
+          CANDLE_REQUIRE_VULKAN_TEST_DEVICE: "1"
+        run: |
+          cargo test --release -p candle-core --features wgpu,vulkan --test backend_smoke_tests
+          cargo test --release -p candle-core --features wgpu,vulkan --test backend_smoke_tests -- --ignored
+          cargo test --release -p candle-core --features wgpu,vulkan --test ggml_fixture_ops_tests ggml_fixture_ops_wgpu -- --ignored --exact
+          cargo test --release -p candle-core --features wgpu,vulkan --test ggml_fixture_ops_tests ggml_fixture_ops_vulkan -- --ignored --exact
+          cargo test --release -p candle-core --features wgpu,vulkan --test gpu_metamorphic_tests gpu_metamorphic_wgpu -- --ignored --exact
+          cargo test --release -p candle-core --features wgpu,vulkan --test gpu_metamorphic_tests gpu_metamorphic_vulkan -- --exact
+          cargo test --release -p candle-core --features wgpu,vulkan --test gpu_property_tests gpu_properties_wgpu -- --ignored --exact
+          cargo test --release -p candle-core --features wgpu,vulkan --test gpu_property_tests gpu_properties_vulkan -- --ignored --exact
+
+          cargo test --release -p candle-nn --features wgpu,vulkan --test ops softmax_wgpu -- --exact
+          cargo test --release -p candle-nn --features wgpu,vulkan --test ops rms_norm_wgpu -- --exact
+          cargo test --release -p candle-nn --features wgpu,vulkan --test ops sigmoid_wgpu -- --exact
+          cargo test --release -p candle-nn --features wgpu,vulkan --test ops layer_norm_wgpu -- --exact
+          cargo test --release -p candle-nn --features wgpu,vulkan --test ops rope_wgpu -- --exact
+          cargo test --release -p candle-nn --features wgpu,vulkan --test ops sdpa_wgpu -- --exact
+          cargo test --release -p candle-nn --features wgpu,vulkan --test ops softmax_vulkan -- --exact
+          cargo test --release -p candle-nn --features wgpu,vulkan --test ops rms_norm_vulkan -- --exact
+          cargo test --release -p candle-nn --features wgpu,vulkan --test ops sigmoid_vulkan -- --exact
+          cargo test --release -p candle-nn --features wgpu,vulkan --test ops layer_norm_vulkan -- --exact
+          cargo test --release -p candle-nn --features wgpu,vulkan --test ops rope_vulkan -- --exact
+          cargo test --release -p candle-nn --features wgpu,vulkan --test ops sdpa_vulkan -- --exact
+          cargo test --release -p candle-nn --features wgpu,vulkan --test ops mini_graph_wgpu -- --ignored --exact
+          cargo test --release -p candle-nn --features wgpu,vulkan --test ops mini_graph_vulkan -- --ignored --exact

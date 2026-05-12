@@ -35,3 +35,6 @@ mkl = ["dep:intel-mkl-src", "candle/mkl", "candle-nn/mkl"]
 metal = ["candle/metal", "candle-nn/metal"]
 vulkan = ["candle/vulkan", "candle-nn/vulkan"]
 wgpu = ["candle/wgpu", "candle-nn/wgpu"]
+
+[dev-dependencies]
+hf-hub = { workspace = true }

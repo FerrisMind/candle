@@ -46,28 +46,28 @@ impl super::Module for Linear {
         let x = match *x.dims() {
             [b1, b2, m, k] => {
                 if x.is_contiguous() {
-                    let w = self.weight.t()?;
+                    let w = self.weight.t()?.contiguous()?;
                     x.reshape((b1 * b2 * m, k))?
                         .matmul(&w)?
                         .reshape((b1, b2, m, ()))?
                 } else {
-                    let w = self.weight.broadcast_left((b1, b2))?.t()?;
+                    let w = self.weight.broadcast_left((b1, b2))?.t()?.contiguous()?;
                     x.matmul(&w)?
                 }
             }
             [bsize, m, k] => {
                 if x.is_contiguous() {
-                    let w = self.weight.t()?;
+                    let w = self.weight.t()?.contiguous()?;
                     x.reshape((bsize * m, k))?
                         .matmul(&w)?
                         .reshape((bsize, m, ()))?
                 } else {
-                    let w = self.weight.broadcast_left(bsize)?.t()?;
+                    let w = self.weight.broadcast_left(bsize)?.t()?.contiguous()?;
                     x.matmul(&w)?
                 }
             }
             _ => {
-                let w = self.weight.t()?;
+                let w = self.weight.t()?.contiguous()?;
                 x.matmul(&w)?
             }
         };

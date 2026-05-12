@@ -335,10 +335,23 @@ test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);
 
+#[cfg(feature = "wgpu")]
+fn wgpu_device_or_skip(test_name: &str) -> Result<Option<Device>> {
+    match Device::new_wgpu(0) {
+        Ok(device) => Ok(Some(device)),
+        Err(err) if std::env::var_os("CANDLE_REQUIRE_WGPU_TEST_DEVICE").is_some() => Err(err),
+        Err(err) => {
+            eprintln!("skipping {test_name}: wgpu device unavailable: {err}");
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(feature = "vulkan")]
 fn vulkan_device_or_skip(test_name: &str) -> Result<Option<Device>> {
     match Device::new_vulkan(0) {
         Ok(device) => Ok(Some(device)),
+        Err(err) if std::env::var_os("CANDLE_REQUIRE_VULKAN_TEST_DEVICE").is_some() => Err(err),
         Err(err) => {
             eprintln!("skipping {test_name}: Vulkan device unavailable: {err}");
             Ok(None)
@@ -350,7 +363,9 @@ fn vulkan_device_or_skip(test_name: &str) -> Result<Option<Device>> {
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
 fn softmax_wgpu() -> Result<()> {
-    let device = Device::new_wgpu(0)?;
+    let Some(device) = wgpu_device_or_skip("softmax_wgpu")? else {
+        return Ok(());
+    };
     softmax_last_dim_backend(&device)
 }
 
@@ -358,7 +373,9 @@ fn softmax_wgpu() -> Result<()> {
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
 fn rms_norm_wgpu() -> Result<()> {
-    let device = Device::new_wgpu(0)?;
+    let Some(device) = wgpu_device_or_skip("rms_norm_wgpu")? else {
+        return Ok(());
+    };
     rms_norm_backend(&device)
 }
 
@@ -366,7 +383,9 @@ fn rms_norm_wgpu() -> Result<()> {
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
 fn sigmoid_wgpu() -> Result<()> {
-    let device = Device::new_wgpu(0)?;
+    let Some(device) = wgpu_device_or_skip("sigmoid_wgpu")? else {
+        return Ok(());
+    };
     sigmoid_backend(&device)
 }
 
@@ -401,7 +420,9 @@ fn sigmoid_vulkan() -> Result<()> {
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
 fn layer_norm_wgpu() -> Result<()> {
-    let device = Device::new_wgpu(0)?;
+    let Some(device) = wgpu_device_or_skip("layer_norm_wgpu")? else {
+        return Ok(());
+    };
     layer_norm_backend(&device)
 }
 
@@ -409,7 +430,9 @@ fn layer_norm_wgpu() -> Result<()> {
 #[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn layer_norm_vulkan() -> Result<()> {
-    let device = Device::new_vulkan(0)?;
+    let Some(device) = vulkan_device_or_skip("layer_norm_vulkan")? else {
+        return Ok(());
+    };
     layer_norm_backend(&device)
 }
 
@@ -417,7 +440,9 @@ fn layer_norm_vulkan() -> Result<()> {
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
 fn rope_wgpu() -> Result<()> {
-    let device = Device::new_wgpu(0)?;
+    let Some(device) = wgpu_device_or_skip("rope_wgpu")? else {
+        return Ok(());
+    };
     rope_backend(&device)
 }
 
@@ -425,7 +450,9 @@ fn rope_wgpu() -> Result<()> {
 #[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn rope_vulkan() -> Result<()> {
-    let device = Device::new_vulkan(0)?;
+    let Some(device) = vulkan_device_or_skip("rope_vulkan")? else {
+        return Ok(());
+    };
     rope_backend(&device)
 }
 
@@ -433,7 +460,9 @@ fn rope_vulkan() -> Result<()> {
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
 fn sdpa_wgpu() -> Result<()> {
-    let device = Device::new_wgpu(0)?;
+    let Some(device) = wgpu_device_or_skip("sdpa_wgpu")? else {
+        return Ok(());
+    };
     sdpa_backend(&device)
 }
 
@@ -441,8 +470,30 @@ fn sdpa_wgpu() -> Result<()> {
 #[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn sdpa_vulkan() -> Result<()> {
-    let device = Device::new_vulkan(0)?;
+    let Some(device) = vulkan_device_or_skip("sdpa_vulkan")? else {
+        return Ok(());
+    };
     sdpa_backend(&device)
+}
+
+#[test]
+#[ignore = "heavy synthetic mini-graph; requires a usable wgpu adapter and driver"]
+#[cfg(feature = "wgpu")]
+fn mini_graph_wgpu() -> Result<()> {
+    let Some(device) = wgpu_device_or_skip("mini_graph_wgpu")? else {
+        return Ok(());
+    };
+    mini_graph_backend(&device)
+}
+
+#[test]
+#[ignore = "heavy synthetic mini-graph; requires a usable Vulkan compute device and driver"]
+#[cfg(feature = "vulkan")]
+fn mini_graph_vulkan() -> Result<()> {
+    let Some(device) = vulkan_device_or_skip("mini_graph_vulkan")? else {
+        return Ok(());
+    };
+    mini_graph_backend(&device)
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
@@ -615,4 +666,271 @@ fn sdpa_backend(device: &Device) -> Result<()> {
         .to_vec0::<f32>()?;
     assert!(diff < 2e-4, "sdpa backend diff too large: {diff}");
     Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn mini_graph_backend(device: &Device) -> Result<()> {
+    run_graph_case(
+        device,
+        "mini_graph_attention_block",
+        run_synthetic_attention_graph,
+        5e-3,
+        2e-3,
+    )?;
+    run_graph_case(
+        device,
+        "mini_graph_gated_mlp_block",
+        run_synthetic_gated_mlp_graph,
+        5e-3,
+        2e-3,
+    )?;
+    run_graph_case(
+        device,
+        "mini_graph_mixer_block",
+        run_synthetic_mixer_graph,
+        5e-3,
+        2e-3,
+    )?;
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn run_graph_case(
+    device: &Device,
+    label: &str,
+    graph: fn(&Device) -> Result<Tensor>,
+    atol: f32,
+    rtol: f32,
+) -> Result<()> {
+    let cpu = Device::Cpu;
+    reset_backend_fallback_count(device);
+    let expected = graph(&cpu)?;
+    let actual = graph(device)?;
+    let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+    let actual = actual.flatten_all()?.to_vec1::<f32>()?;
+    assert_close_vec(&actual, &expected, atol, rtol, label);
+
+    let fallback_count = backend_fallback_count(device);
+    assert_eq!(
+        fallback_count, 0,
+        "{label} triggered {fallback_count} CPU fallbacks"
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn run_synthetic_attention_graph(device: &Device) -> Result<Tensor> {
+    let (batch, seq, hidden, heads, vocab) = (2usize, 4usize, 8usize, 2usize, 16usize);
+    let head_dim = hidden / heads;
+
+    let ids_vals = vec![0u32, 1, 2, 3, 4, 5, 6, 7];
+    let ids = Tensor::from_vec(ids_vals, (batch, seq), device)?;
+    let emb = fake_tensor((vocab, hidden), vocab * hidden, 0, device)?;
+    let alpha = positive_fake_tensor(hidden, 10_000, device)?;
+    let qkv_w = fake_tensor((hidden, hidden * 3), hidden * hidden * 3, 20_000, device)?;
+    let out_w = fake_tensor((hidden, hidden), hidden * hidden, 30_000, device)?;
+    let mlp_in = fake_tensor((hidden, hidden * 2), hidden * hidden * 2, 40_000, device)?;
+    let mlp_out = fake_tensor((hidden * 2, hidden), hidden * hidden * 2, 50_000, device)?;
+    let logits_w = fake_tensor((hidden, vocab), hidden * vocab, 60_000, device)?;
+    let cos = fake_tensor((seq, head_dim / 2), seq * (head_dim / 2), 70_000, device)?;
+    let sin = fake_tensor((seq, head_dim / 2), seq * (head_dim / 2), 80_000, device)?;
+
+    let xs = emb
+        .embedding(&ids.flatten_all()?)?
+        .reshape((batch, seq, hidden))?;
+    let normed = candle_nn::ops::rms_norm(&xs, &alpha, 1e-5)?;
+    let qkv = normed
+        .reshape((batch * seq, hidden))?
+        .matmul(&qkv_w)?
+        .reshape((batch, seq, hidden * 3))?;
+
+    let q = qkv
+        .narrow(2, 0, hidden)?
+        .reshape((batch, seq, heads, head_dim))?
+        .transpose(1, 2)?
+        .contiguous()?;
+    let k = qkv
+        .narrow(2, hidden, hidden)?
+        .reshape((batch, seq, heads, head_dim))?
+        .transpose(1, 2)?
+        .contiguous()?;
+    let v = qkv
+        .narrow(2, hidden * 2, hidden)?
+        .reshape((batch, seq, heads, head_dim))?
+        .transpose(1, 2)?
+        .contiguous()?;
+
+    let q = candle_nn::rotary_emb::rope(&q, &cos, &sin)?;
+    let k = candle_nn::rotary_emb::rope(&k, &cos, &sin)?;
+    let att = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
+    let att = (att * (head_dim as f64).sqrt().recip())?;
+    let probs = candle_nn::ops::softmax_last_dim(&att)?;
+    let ctx = probs
+        .matmul(&v)?
+        .transpose(1, 2)?
+        .contiguous()?
+        .reshape((batch * seq, hidden))?;
+
+    let projected = ctx.matmul(&out_w)?.reshape((batch, seq, hidden))?;
+    let residual = normed.add(&projected)?;
+    let ff = residual
+        .reshape((batch * seq, hidden))?
+        .matmul(&mlp_in)?
+        .silu()?
+        .matmul(&mlp_out)?
+        .reshape((batch, seq, hidden))?;
+    let hidden_out = residual.add(&ff)?;
+    hidden_out
+        .reshape((batch * seq, hidden))?
+        .matmul(&logits_w)?
+        .reshape((batch, seq, vocab))
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn run_synthetic_gated_mlp_graph(device: &Device) -> Result<Tensor> {
+    let (batch, seq, hidden, ff, vocab) = (2usize, 5usize, 8usize, 16usize, 12usize);
+
+    let xs = fake_tensor((batch, seq, hidden), batch * seq * hidden, 90_000, device)?;
+    let alpha = positive_fake_tensor(hidden, 91_000, device)?;
+    let beta = fake_tensor(hidden, hidden, 92_000, device)?;
+    let up_w = fake_tensor((hidden, ff), hidden * ff, 93_000, device)?;
+    let gate_w = fake_tensor((hidden, ff), hidden * ff, 94_000, device)?;
+    let down_w = fake_tensor((ff, hidden), ff * hidden, 95_000, device)?;
+    let logits_w = fake_tensor((hidden, vocab), hidden * vocab, 96_000, device)?;
+
+    let normed = candle_nn::ops::layer_norm(&xs, &alpha, &beta, 1e-5)?;
+    let flat = normed.reshape((batch * seq, hidden))?;
+    let up = flat.matmul(&up_w)?.gelu()?;
+    let gate = candle_nn::ops::sigmoid(&flat.matmul(&gate_w)?)?;
+    let mixed = up.broadcast_mul(&gate)?;
+    let ff_out = mixed.matmul(&down_w)?.reshape((batch, seq, hidden))?;
+    let residual = xs.add(&ff_out)?;
+    residual
+        .reshape((batch * seq, hidden))?
+        .matmul(&logits_w)?
+        .reshape((batch, seq, vocab))
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn run_synthetic_mixer_graph(device: &Device) -> Result<Tensor> {
+    let (batch, seq, hidden, token_ff, channel_ff, vocab) =
+        (2usize, 6usize, 8usize, 10usize, 16usize, 11usize);
+
+    let xs = fake_tensor((batch, seq, hidden), batch * seq * hidden, 100_000, device)?;
+    let alpha1 = positive_fake_tensor(hidden, 101_000, device)?;
+    let beta1 = scaled_fake_tensor(hidden, hidden, 102_000, 0.1, device)?;
+    let token_w1 = scaled_fake_tensor((seq, token_ff), seq * token_ff, 103_000, 0.15, device)?;
+    let token_w2 = scaled_fake_tensor((token_ff, seq), token_ff * seq, 104_000, 0.15, device)?;
+    let alpha2 = positive_fake_tensor(hidden, 105_000, device)?;
+    let beta2 = scaled_fake_tensor(hidden, hidden, 106_000, 0.1, device)?;
+    let channel_w1 = scaled_fake_tensor(
+        (hidden, channel_ff),
+        hidden * channel_ff,
+        107_000,
+        0.15,
+        device,
+    )?;
+    let channel_w2 = scaled_fake_tensor(
+        (channel_ff, hidden),
+        channel_ff * hidden,
+        108_000,
+        0.15,
+        device,
+    )?;
+    let logits_w = scaled_fake_tensor((hidden, vocab), hidden * vocab, 109_000, 0.15, device)?;
+
+    let normed = candle_nn::ops::layer_norm(&xs, &alpha1, &beta1, 1e-5)?;
+    let token_mixed = normed
+        .transpose(1, 2)?
+        .contiguous()?
+        .reshape((batch * hidden, seq))?
+        .matmul(&token_w1)?
+        .gelu()?
+        .matmul(&token_w2)?
+        .reshape((batch, hidden, seq))?
+        .transpose(1, 2)?
+        .contiguous()?;
+    let residual = xs.add(&token_mixed)?;
+
+    let channel_mixed = candle_nn::ops::layer_norm(&residual, &alpha2, &beta2, 1e-5)?
+        .reshape((batch * seq, hidden))?
+        .matmul(&channel_w1)?
+        .gelu()?
+        .matmul(&channel_w2)?
+        .reshape((batch, seq, hidden))?;
+    let hidden_out = residual.add(&channel_mixed)?;
+    hidden_out
+        .reshape((batch * seq, hidden))?
+        .matmul(&logits_w)?
+        .reshape((batch, seq, vocab))
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn reset_backend_fallback_count(device: &Device) {
+    if device.is_wgpu() {
+        candle::reset_wgpu_cpu_fallback_count();
+    } else if device.is_vulkan() {
+        candle::reset_vulkan_cpu_fallback_count();
+    }
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn backend_fallback_count(device: &Device) -> usize {
+    if device.is_wgpu() {
+        candle::wgpu_cpu_fallback_count()
+    } else if device.is_vulkan() {
+        candle::vulkan_cpu_fallback_count()
+    } else {
+        0
+    }
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn fake_weight(idx: usize) -> f32 {
+    ((idx * 37 % 101) as f32 - 50.0) / 50.0
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn fake_tensor<S: candle::shape::ShapeWithOneHole>(
+    shape: S,
+    len: usize,
+    start: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    scaled_fake_tensor(shape, len, start, 1.0, device)
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn scaled_fake_tensor<S: candle::shape::ShapeWithOneHole>(
+    shape: S,
+    len: usize,
+    start: usize,
+    scale: f32,
+    device: &Device,
+) -> Result<Tensor> {
+    let data = (0..len)
+        .map(|idx| fake_weight(start + idx) * scale)
+        .collect::<Vec<_>>();
+    Tensor::from_vec(data, shape, device)
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn positive_fake_tensor(len: usize, start: usize, device: &Device) -> Result<Tensor> {
+    let data = (0..len)
+        .map(|idx| fake_weight(start + idx).abs() + 0.5)
+        .collect::<Vec<_>>();
+    Tensor::from_vec(data, len, device)
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn assert_close_vec(actual: &[f32], expected: &[f32], atol: f32, rtol: f32, label: &str) {
+    assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
+    for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+        let diff = (actual - expected).abs();
+        let tol = atol + rtol * actual.abs().max(expected.abs());
+        assert!(
+            diff <= tol,
+            "{label}: mismatch at idx {idx}: got {actual}, expected {expected}, diff {diff}, tol {tol}"
+        );
+    }
 }
