@@ -326,6 +326,19 @@ pub fn set_rows_f16_shader(workgroup_size: u32) -> Option<String> {
     Some(preprocess(source, &defines, &replacements, DType::F16))
 }
 
+pub fn set_rows_add_f32_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("set_rows.wgsl")?.source();
+    let defines = vec!["DST_F32".to_string(), "ADD".to_string()];
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        ("SRC_TYPE".to_string(), "f32".to_string()),
+        ("DST_INNER_TYPE".to_string(), "f32".to_string()),
+        ("DST_TYPE".to_string(), "f32".to_string()),
+        ("VEC_SIZE".to_string(), "1".to_string()),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
 pub fn matmul_f32_shader() -> Option<String> {
     let source = get("mul_mat.wgsl")?.source().replace(
         "#include \"common_decls.tmpl\"",

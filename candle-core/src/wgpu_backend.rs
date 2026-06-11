@@ -84,6 +84,31 @@ struct BinaryParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct WhereParams {
+    ne: u32,
+    offset_cond: u32,
+    offset_true: u32,
+    offset_false: u32,
+    offset_dst: u32,
+    stride_cond0: u32,
+    stride_cond1: u32,
+    stride_cond2: u32,
+    stride_cond3: u32,
+    stride_true0: u32,
+    stride_true1: u32,
+    stride_true2: u32,
+    stride_true3: u32,
+    stride_false0: u32,
+    stride_false1: u32,
+    stride_false2: u32,
+    stride_false3: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct SumRowsParams {
     offset_src: u32,
     offset_dst: u32,
@@ -413,6 +438,11 @@ pub struct WgpuDevice {
 #[derive(Debug)]
 struct WgpuInner {
     ordinal: usize,
+    adapter_name: String,
+    adapter_backend: String,
+    adapter_driver: String,
+    adapter_driver_info: String,
+    adapter_pci_bus_id: String,
     device: wgpu::Device,
     queue: wgpu::Queue,
     features: wgpu::Features,
@@ -445,6 +475,28 @@ pub struct WgpuStorage {
     device: WgpuDevice,
     count: usize,
     dtype: DType,
+}
+
+impl WgpuDevice {
+    pub fn adapter_name(&self) -> &str {
+        &self.inner.adapter_name
+    }
+
+    pub fn adapter_backend(&self) -> &str {
+        &self.inner.adapter_backend
+    }
+
+    pub fn adapter_driver(&self) -> &str {
+        &self.inner.adapter_driver
+    }
+
+    pub fn adapter_driver_info(&self) -> &str {
+        &self.inner.adapter_driver_info
+    }
+
+    pub fn adapter_pci_bus_id(&self) -> &str {
+        &self.inner.adapter_pci_bus_id
+    }
 }
 
 fn unsupported(op: &'static str) -> Error {
@@ -1043,6 +1095,193 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     )
 }
 
+fn wgpu_scalar_type(dtype: DType) -> Result<&'static str> {
+    match dtype {
+        DType::F32 => Ok("f32"),
+        DType::F16 => Ok("f16"),
+        DType::U32 => Ok("u32"),
+        DType::I32 => Ok("i32"),
+        _ => Err(Error::UnsupportedDTypeForOp(dtype, "wgpu shader").bt()),
+    }
+}
+
+fn custom_cmp_wgsl(op: CmpOp, dtype: DType) -> Result<String> {
+    let ty = wgpu_scalar_type(dtype)?;
+    let prelude = if dtype == DType::F16 {
+        "enable f16;\n"
+    } else {
+        ""
+    };
+    let pred = match op {
+        CmpOp::Eq => "a == b",
+        CmpOp::Ne => "a != b",
+        CmpOp::Lt => "a < b",
+        CmpOp::Le => "a <= b",
+        CmpOp::Gt => "a > b",
+        CmpOp::Ge => "a >= b",
+    };
+    Ok(format!(
+        r#"{prelude}
+struct Params {{
+    ne: u32,
+    offset_src0: u32,
+    offset_src1: u32,
+    offset_dst: u32,
+    stride_src0_0: u32,
+    stride_src0_1: u32,
+    stride_src0_2: u32,
+    stride_src0_3: u32,
+    stride_src1_0: u32,
+    stride_src1_1: u32,
+    stride_src1_2: u32,
+    stride_src1_3: u32,
+    a_ne0: u32,
+    a_ne1: u32,
+    a_ne2: u32,
+    b_ne0: u32,
+    b_ne1: u32,
+    b_ne2: u32,
+    b_ne3: u32,
+    _pad0: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> src0: array<{ty}>;
+@group(0) @binding(1) var<storage, read> src1: array<{ty}>;
+@group(0) @binding(2) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+fn src0_index(_i: u32) -> u32 {{
+    var i = _i;
+    let a_i3 = i / (params.a_ne2 * params.a_ne1 * params.a_ne0);
+    i = i % (params.a_ne2 * params.a_ne1 * params.a_ne0);
+    let a_i2 = i / (params.a_ne1 * params.a_ne0);
+    i = i % (params.a_ne1 * params.a_ne0);
+    let a_i1 = i / params.a_ne0;
+    let a_i0 = i % params.a_ne0;
+    return a_i0 * params.stride_src0_0 + a_i1 * params.stride_src0_1 +
+           a_i2 * params.stride_src0_2 + a_i3 * params.stride_src0_3;
+}}
+
+fn src1_index(_i: u32) -> u32 {{
+    var i = _i;
+    let a_i3 = i / (params.a_ne2 * params.a_ne1 * params.a_ne0);
+    i = i % (params.a_ne2 * params.a_ne1 * params.a_ne0);
+    let a_i2 = i / (params.a_ne1 * params.a_ne0);
+    i = i % (params.a_ne1 * params.a_ne0);
+    let a_i1 = i / params.a_ne0;
+    let a_i0 = i % params.a_ne0;
+    let b_i0 = a_i0 % params.b_ne0;
+    let b_i1 = a_i1 % params.b_ne1;
+    let b_i2 = a_i2 % params.b_ne2;
+    let b_i3 = a_i3 % params.b_ne3;
+    return b_i0 * params.stride_src1_0 + b_i1 * params.stride_src1_1 +
+           b_i2 * params.stride_src1_2 + b_i3 * params.stride_src1_3;
+}}
+
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let packed_words = (params.ne + 3u) / 4u;
+    if (gid.x >= packed_words) {{ return; }}
+    let base = gid.x * 4u;
+    var out_word: u32 = 0u;
+    for (var lane: u32 = 0u; lane < 4u; lane = lane + 1u) {{
+        let idx = base + lane;
+        if (idx >= params.ne) {{ break; }}
+        let a = src0[params.offset_src0 + src0_index(idx)];
+        let b = src1[params.offset_src1 + src1_index(idx)];
+        let value = select(0u, 1u, {pred});
+        out_word = out_word | (value << (lane * 8u));
+    }}
+    dst[params.offset_dst + gid.x] = out_word;
+}}
+"#
+    ))
+}
+
+fn custom_where_u8_wgsl(dtype: DType) -> Result<String> {
+    let ty = wgpu_scalar_type(dtype)?;
+    let prelude = if dtype == DType::F16 {
+        "enable f16;\n"
+    } else {
+        ""
+    };
+    Ok(format!(
+        r#"{prelude}
+struct Params {{
+    ne: u32,
+    offset_cond: u32,
+    offset_true: u32,
+    offset_false: u32,
+    offset_dst: u32,
+    stride_cond0: u32,
+    stride_cond1: u32,
+    stride_cond2: u32,
+    stride_cond3: u32,
+    stride_true0: u32,
+    stride_true1: u32,
+    stride_true2: u32,
+    stride_true3: u32,
+    stride_false0: u32,
+    stride_false1: u32,
+    stride_false2: u32,
+    stride_false3: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> cond_words: array<u32>;
+@group(0) @binding(1) var<storage, read> on_true: array<{ty}>;
+@group(0) @binding(2) var<storage, read> on_false: array<{ty}>;
+@group(0) @binding(3) var<storage, read_write> dst: array<{ty}>;
+@group(0) @binding(4) var<uniform> params: Params;
+
+fn decompose_idx(_i: u32) -> vec4<u32> {{
+    var i = _i;
+    let i3 = i / (params.ne2 * params.ne1 * params.ne0);
+    i = i % (params.ne2 * params.ne1 * params.ne0);
+    let i2 = i / (params.ne1 * params.ne0);
+    i = i % (params.ne1 * params.ne0);
+    let i1 = i / params.ne0;
+    let i0 = i % params.ne0;
+    return vec4<u32>(i0, i1, i2, i3);
+}}
+
+fn cond_index(idx: vec4<u32>) -> u32 {{
+    return idx.x * params.stride_cond0 + idx.y * params.stride_cond1 +
+           idx.z * params.stride_cond2 + idx.w * params.stride_cond3;
+}}
+
+fn true_index(idx: vec4<u32>) -> u32 {{
+    return idx.x * params.stride_true0 + idx.y * params.stride_true1 +
+           idx.z * params.stride_true2 + idx.w * params.stride_true3;
+}}
+
+fn false_index(idx: vec4<u32>) -> u32 {{
+    return idx.x * params.stride_false0 + idx.y * params.stride_false1 +
+           idx.z * params.stride_false2 + idx.w * params.stride_false3;
+}}
+
+fn cond_is_true(idx: u32) -> bool {{
+    let word = cond_words[idx / 4u];
+    let shift = (idx % 4u) * 8u;
+    return ((word >> shift) & 0xffu) != 0u;
+}}
+
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    if (gid.x >= params.ne) {{ return; }}
+    let logical_idx = gid.x;
+    let coords = decompose_idx(logical_idx);
+    let pred = cond_is_true(params.offset_cond + cond_index(coords));
+    let t = on_true[params.offset_true + true_index(coords)];
+    let f = on_false[params.offset_false + false_index(coords)];
+    dst[params.offset_dst + logical_idx] = select(f, t, pred);
+}}
+"#
+    ))
+}
+
 fn custom_unary_wgsl(expr: &str) -> String {
     format!(
         r#"
@@ -1274,6 +1513,211 @@ impl WgpuStorage {
             &bindings,
             workgroups,
             "candle-wgpu-clamp",
+        )?;
+        Ok(dst)
+    }
+
+    fn run_cmp_u8(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        op: CmpOp,
+    ) -> Result<Self> {
+        if self.dtype == DType::F16
+            && !self
+                .device
+                .inner
+                .features
+                .contains(wgpu::Features::SHADER_F16)
+        {
+            return Err(unsupported("cmp f16"));
+        }
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu cmp").bt());
+        }
+        if rhs.dtype != self.dtype {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "wgpu cmp").bt());
+        }
+        self.device
+            .same_device(&rhs.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: rhs.device.location(),
+                    op: "cmp",
+                }
+                .bt()
+            })?;
+        let (lhs_dims, lhs_strides) = dims4(lhs_layout)?;
+        let (rhs_dims, rhs_strides) = dims4(rhs_layout)?;
+        let count = lhs_layout.shape().elem_count();
+        let dst = unsafe { self.device.alloc_uninit(lhs_layout.shape(), DType::U8)? };
+        let params = BinaryParams {
+            ne: count.try_into()?,
+            offset_src0: lhs_layout.start_offset().try_into()?,
+            offset_src1: rhs_layout.start_offset().try_into()?,
+            offset_dst: 0,
+            stride_src0_0: lhs_strides[0],
+            stride_src0_1: lhs_strides[1],
+            stride_src0_2: lhs_strides[2],
+            stride_src0_3: lhs_strides[3],
+            stride_src1_0: rhs_strides[0],
+            stride_src1_1: rhs_strides[1],
+            stride_src1_2: rhs_strides[2],
+            stride_src1_3: rhs_strides[3],
+            a_ne0: lhs_dims[0],
+            a_ne1: lhs_dims[1],
+            a_ne2: lhs_dims[2],
+            b_ne0: rhs_dims[0],
+            b_ne1: rhs_dims[1],
+            b_ne2: rhs_dims[2],
+            b_ne3: rhs_dims[3],
+            _pad0: 0,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-cmp-params"),
+                size: std::mem::size_of::<BinaryParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &rhs.buffer),
+            buffer_binding(2, &dst.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let packed_words = count.div_ceil(4);
+        let workgroups: u32 = packed_words.try_into().map(|v: u32| v.div_ceil(WG_SIZE))?;
+        self.device.run_compute(
+            &custom_cmp_wgsl(op, self.dtype)?,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-cmp",
+        )?;
+        Ok(dst)
+    }
+
+    fn run_where_u8_cond(
+        &self,
+        layout: &Layout,
+        t: &Self,
+        t_l: &Layout,
+        f: &Self,
+        f_l: &Layout,
+    ) -> Result<Self> {
+        if self.dtype != DType::U8 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu where_cond").bt());
+        }
+        if t.dtype == DType::F16 && !t.device.inner.features.contains(wgpu::Features::SHADER_F16) {
+            return Err(unsupported("where_cond f16"));
+        }
+        if t.dtype != DType::F32 && t.dtype != DType::F16 {
+            return Err(Error::UnsupportedDTypeForOp(t.dtype, "wgpu where_cond").bt());
+        }
+        if f.dtype != t.dtype {
+            return Err(Error::UnsupportedDTypeForOp(f.dtype, "wgpu where_cond").bt());
+        }
+        self.device
+            .same_device(&t.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: t.device.location(),
+                    op: "where_cond",
+                }
+                .bt()
+            })?;
+        self.device
+            .same_device(&f.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: f.device.location(),
+                    op: "where_cond",
+                }
+                .bt()
+            })?;
+        let (dims, cond_strides) = dims4(layout)?;
+        let (_, true_strides) = dims4(t_l)?;
+        let (_, false_strides) = dims4(f_l)?;
+        let count = layout.shape().elem_count();
+        let dst = unsafe { t.device.alloc_uninit(layout.shape(), t.dtype)? };
+        let params = WhereParams {
+            ne: count.try_into()?,
+            offset_cond: layout.start_offset().try_into()?,
+            offset_true: t_l.start_offset().try_into()?,
+            offset_false: f_l.start_offset().try_into()?,
+            offset_dst: 0,
+            stride_cond0: cond_strides[0],
+            stride_cond1: cond_strides[1],
+            stride_cond2: cond_strides[2],
+            stride_cond3: cond_strides[3],
+            stride_true0: true_strides[0],
+            stride_true1: true_strides[1],
+            stride_true2: true_strides[2],
+            stride_true3: true_strides[3],
+            stride_false0: false_strides[0],
+            stride_false1: false_strides[1],
+            stride_false2: false_strides[2],
+            stride_false3: false_strides[3],
+            ne0: dims[0],
+            ne1: dims[1],
+            ne2: dims[2],
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-where-params"),
+                size: std::mem::size_of::<WhereParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, false),
+            uniform_entry(4),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &t.buffer),
+            buffer_binding(2, &f.buffer),
+            buffer_binding(3, &dst.buffer),
+            buffer_binding(4, &param_buffer),
+        ];
+        let workgroups = (count as u32).div_ceil(WG_SIZE);
+        t.device.run_compute(
+            &custom_where_u8_wgsl(t.dtype)?,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-where",
         )?;
         Ok(dst)
     }
@@ -2418,6 +2862,95 @@ impl WgpuStorage {
             &bindings,
             rows.div_ceil(WG_SIZE),
             "candle-wgpu-scatter-set",
+        )?;
+        Ok(())
+    }
+
+    fn run_scatter_add_last_dim_f32(
+        &mut self,
+        dst_l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+    ) -> Result<()> {
+        if self.dtype != DType::F32 || self.dtype != src.dtype {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu scatter_add").bt());
+        }
+        if ids.dtype != DType::U32 {
+            return Err(Error::UnsupportedDTypeForOp(ids.dtype, "wgpu scatter_add ids").bt());
+        }
+        if !dst_l.is_contiguous() {
+            return Err(unsupported("scatter_add strided dst"));
+        }
+        if !src_l.is_contiguous() {
+            return Err(unsupported("scatter_add strided src"));
+        }
+        if !ids_l.is_contiguous() {
+            return Err(unsupported("scatter_add strided ids"));
+        }
+        let rank = dst_l.dims().len();
+        if rank == 0 || ids_l.dims().len() != rank || src_l.dims().len() != rank {
+            return Err(unsupported("scatter_add rank"));
+        }
+        let ids_dim = ids_l.dims()[rank - 1];
+        let left_size: usize = ids_l.dims()[..rank - 1].iter().product();
+        let dst_dim = dst_l.dims()[rank - 1];
+        let params = GetRowsParams {
+            offset_src: src_l.start_offset().try_into()?,
+            offset_idx: ids_l.start_offset().try_into()?,
+            offset_dst: dst_l.start_offset().try_into()?,
+            stride_src1: 1,
+            stride_src2: ids_dim.try_into()?,
+            stride_src3: (ids_dim * left_size).try_into()?,
+            stride_idx0: 1,
+            stride_idx1: ids_dim.try_into()?,
+            stride_idx2: 0,
+            stride_dst1: 1,
+            stride_dst2: dst_dim.try_into()?,
+            stride_dst3: (dst_dim * left_size).try_into()?,
+            ne0: 1,
+            n_rows: ids_dim.try_into()?,
+            ne2: left_size.try_into()?,
+            ne3: 1,
+            idx1: left_size.try_into()?,
+            idx2: 1,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-scatter-add-params"),
+                size: std::mem::size_of::<GetRowsParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &src.buffer),
+            buffer_binding(1, &ids.buffer),
+            buffer_binding(2, &self.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::set_rows_add_f32_shader(WG_SIZE)
+            .ok_or_else(|| Error::Msg("wgpu shader set_rows.wgsl not embedded".into()).bt())?;
+        let rows: u32 = (left_size * ids_dim).try_into()?;
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            rows.div_ceil(WG_SIZE),
+            "candle-wgpu-scatter-add",
         )?;
         Ok(())
     }
@@ -3664,10 +4197,18 @@ impl BackendStorage for WgpuStorage {
         }
     }
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
-        let lhs_cpu = self.to_cpu_storage()?;
-        let rhs_cpu = rhs.to_cpu_storage()?;
-        let out_cpu = <CpuStorage as BackendStorage>::cmp(&lhs_cpu, op, &rhs_cpu, lhs_l, rhs_l)?;
-        self.device.storage_from_cpu_storage(&out_cpu)
+        let cpu_fallback = || -> Result<Self> {
+            let lhs_cpu = self.to_cpu_storage()?;
+            let rhs_cpu = rhs.to_cpu_storage()?;
+            let out_cpu =
+                <CpuStorage as BackendStorage>::cmp(&lhs_cpu, op, &rhs_cpu, lhs_l, rhs_l)?;
+            self.device.storage_from_cpu_storage(&out_cpu)
+        };
+        match self.run_cmp_u8(rhs, lhs_l, rhs_l, op) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+            Err(err) => Err(err),
+        }
     }
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
         let gpu = match (self.dtype, dtype) {
@@ -3838,13 +4379,20 @@ impl BackendStorage for WgpuStorage {
         f: &Self,
         f_l: &Layout,
     ) -> Result<Self> {
-        let cond_cpu = self.to_cpu_storage()?;
-        let t_cpu = t.to_cpu_storage()?;
-        let f_cpu = f.to_cpu_storage()?;
-        let out_cpu = <CpuStorage as BackendStorage>::where_cond(
-            &cond_cpu, layout, &t_cpu, t_l, &f_cpu, f_l,
-        )?;
-        self.device.storage_from_cpu_storage(&out_cpu)
+        let cpu_fallback = || -> Result<Self> {
+            let cond_cpu = self.to_cpu_storage()?;
+            let t_cpu = t.to_cpu_storage()?;
+            let f_cpu = f.to_cpu_storage()?;
+            let out_cpu = <CpuStorage as BackendStorage>::where_cond(
+                &cond_cpu, layout, &t_cpu, t_l, &f_cpu, f_l,
+            )?;
+            self.device.storage_from_cpu_storage(&out_cpu)
+        };
+        match self.run_where_u8_cond(layout, t, t_l, f, f_l) {
+            Ok(out) => Ok(out),
+            Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+            Err(err) => Err(err),
+        }
     }
     fn conv1d(
         &self,
@@ -4092,6 +4640,13 @@ impl BackendStorage for WgpuStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<()> {
+        if dim + 1 == dst_l.dims().len() {
+            match self.run_scatter_add_last_dim_f32(dst_l, ids, ids_l, src, src_l) {
+                Ok(()) => return Ok(()),
+                Err(err) if should_cpu_fallback(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
         let mut dst_cpu = self.to_cpu_storage()?;
         let ids_cpu = ids.to_cpu_storage()?;
         let src_cpu = src.to_cpu_storage()?;
@@ -4130,6 +4685,14 @@ impl BackendStorage for WgpuStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<Self> {
+        if dim + 1 == dst_l.dims().len() {
+            let mut out = self.try_clone(dst_l)?;
+            match out.run_scatter_add_last_dim_f32(dst_l, ids, ids_l, src, src_l) {
+                Ok(()) => return Ok(out),
+                Err(err) if should_cpu_fallback(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
         let dst_cpu = self.to_cpu_storage()?;
         let ids_cpu = ids.to_cpu_storage()?;
         let src_cpu = src.to_cpu_storage()?;
@@ -4342,13 +4905,49 @@ impl BackendDevice for WgpuDevice {
     fn new(ordinal: usize) -> Result<Self> {
         let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_desc.backends = wgpu::Backends::all();
+        let backends = instance_desc.backends;
         let instance = wgpu::Instance::new(instance_desc);
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        }))
-        .map_err(Error::wrap)?;
+        let mut adapters = pollster::block_on(instance.enumerate_adapters(backends));
+        if adapters.is_empty() {
+            crate::bail!("no wgpu adapters found")
+        }
+        let requested_name = std::env::var("CANDLE_WGPU_ADAPTER_NAME")
+            .ok()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty());
+        let selected_index = if let Some(requested_name) = requested_name {
+            let requested_name = requested_name.to_ascii_lowercase();
+            adapters
+                .iter()
+                .position(|adapter| {
+                    adapter
+                        .get_info()
+                        .name
+                        .to_ascii_lowercase()
+                        .contains(&requested_name)
+                })
+                .ok_or_else(|| {
+                    Error::msg(format!(
+                        "no wgpu adapter matching CANDLE_WGPU_ADAPTER_NAME={requested_name:?}"
+                    ))
+                })?
+        } else {
+            let mut preferred = adapters
+                .iter()
+                .enumerate()
+                .filter(|(_, adapter)| adapter.get_info().device_type != wgpu::DeviceType::Cpu)
+                .map(|(index, _)| index);
+            preferred
+                .nth(ordinal)
+                .or_else(|| {
+                    adapters
+                        .iter()
+                        .position(|adapter| adapter.get_info().device_type != wgpu::DeviceType::Cpu)
+                })
+                .unwrap_or(ordinal.min(adapters.len() - 1))
+        };
+        let adapter = adapters.swap_remove(selected_index);
+        let adapter_info = adapter.get_info();
         let adapter_features = adapter.features();
         let adapter_limits = adapter.limits();
         let required_features = adapter_features & wgpu::Features::SHADER_F16;
@@ -4362,6 +4961,11 @@ impl BackendDevice for WgpuDevice {
         Ok(Self {
             inner: Arc::new(WgpuInner {
                 ordinal,
+                adapter_name: adapter_info.name,
+                adapter_backend: format!("{:?}", adapter_info.backend),
+                adapter_driver: adapter_info.driver,
+                adapter_driver_info: adapter_info.driver_info,
+                adapter_pci_bus_id: adapter_info.device_pci_bus_id,
                 device,
                 queue,
                 features: required_features,

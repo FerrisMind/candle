@@ -1,6 +1,6 @@
 //! 1D and 2D Convolutions
 //!
-use crate::{op::BackpropOp, op::Op, Error, Result, Tensor};
+use crate::{op::BackpropOp, op::Op, DType, Error, Result, Tensor};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamsConv1D {
@@ -129,6 +129,209 @@ impl ParamsConvTranspose2D {
 }
 
 impl Tensor {
+    fn conv_transpose1d_wgpu_decomp(
+        &self,
+        kernel: &Self,
+        params: &ParamsConvTranspose1D,
+    ) -> Result<Option<Self>> {
+        if !self.device().is_wgpu() {
+            return Ok(None);
+        }
+        let src_dtype = match self.dtype() {
+            DType::F32 | DType::F16 => self.dtype(),
+            _ => return Ok(None),
+        };
+        if src_dtype != kernel.dtype() {
+            return Ok(None);
+        }
+
+        let src_len = match params.l_in.checked_mul(params.k_size) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let l_out = params.l_out();
+        if l_out > u32::MAX as usize {
+            return Ok(None);
+        }
+
+        let input = if src_dtype == DType::F32 {
+            self.clone()
+        } else {
+            self.to_dtype(DType::F32)?
+        };
+        let kernel = if src_dtype == DType::F32 {
+            kernel.clone()
+        } else {
+            kernel.to_dtype(DType::F32)?
+        };
+
+        let input_t = input
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((params.b_size * params.l_in, params.c_in))?;
+        let kernel_mm = kernel
+            .contiguous()?
+            .reshape((params.c_in, params.c_out * params.k_size))?;
+        let cols = input_t.matmul(&kernel_mm)?.reshape((
+            params.b_size,
+            params.l_in,
+            params.c_out,
+            params.k_size,
+        ))?;
+        let src = cols
+            .permute((0, 2, 1, 3))?
+            .contiguous()?
+            .reshape((params.b_size * params.c_out, src_len))?;
+
+        let mut ids = Vec::with_capacity(src_len);
+        let mut mask = Vec::with_capacity(src_len);
+        for t_in in 0..params.l_in {
+            let base = t_in * params.stride;
+            for k in 0..params.k_size {
+                let pos = base + k * params.dilation;
+                if pos >= params.padding {
+                    let out_idx = pos - params.padding;
+                    if out_idx < l_out {
+                        ids.push(out_idx as u32);
+                        mask.push(1f32);
+                        continue;
+                    }
+                }
+                ids.push(0);
+                mask.push(0f32);
+            }
+        }
+
+        let ids = Tensor::from_vec(ids, src_len, self.device())?;
+        let mask = Tensor::from_vec(mask, (1, src_len), self.device())?;
+        let src = src.broadcast_mul(&mask)?;
+        let out = Tensor::zeros(
+            (params.b_size * params.c_out, l_out),
+            DType::F32,
+            self.device(),
+        )?
+        .index_add(&ids, &src, 1)?
+        .reshape((params.b_size, params.c_out, l_out))?;
+        let out = if src_dtype == DType::F32 {
+            out
+        } else {
+            out.to_dtype(src_dtype)?
+        };
+        Ok(Some(out))
+    }
+
+    fn conv_transpose2d_wgpu_decomp(
+        &self,
+        kernel: &Self,
+        params: &ParamsConvTranspose2D,
+    ) -> Result<Option<Self>> {
+        if !self.device().is_wgpu() {
+            return Ok(None);
+        }
+        let src_dtype = match self.dtype() {
+            DType::F32 | DType::F16 => self.dtype(),
+            _ => return Ok(None),
+        };
+        if src_dtype != kernel.dtype() {
+            return Ok(None);
+        }
+
+        let input_spatial = match params.i_h.checked_mul(params.i_w) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let kernel_spatial = match params.k_h.checked_mul(params.k_w) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let src_len = match input_spatial.checked_mul(kernel_spatial) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let out_h = params.out_h();
+        let out_w = params.out_w();
+        let out_spatial = match out_h.checked_mul(out_w) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        if out_spatial > u32::MAX as usize {
+            return Ok(None);
+        }
+
+        let input = if src_dtype == DType::F32 {
+            self.clone()
+        } else {
+            self.to_dtype(DType::F32)?
+        };
+        let kernel = if src_dtype == DType::F32 {
+            kernel.clone()
+        } else {
+            kernel.to_dtype(DType::F32)?
+        };
+
+        let input_hw = input
+            .permute((0, 2, 3, 1))?
+            .contiguous()?
+            .reshape((params.b_size * input_spatial, params.c_in))?;
+        let kernel_mm = kernel
+            .contiguous()?
+            .reshape((params.c_in, params.c_out * kernel_spatial))?;
+        let cols = input_hw.matmul(&kernel_mm)?.reshape((
+            params.b_size,
+            input_spatial,
+            params.c_out,
+            params.k_h,
+            params.k_w,
+        ))?;
+        let src = cols
+            .permute((0, 2, 1, 3, 4))?
+            .contiguous()?
+            .reshape((params.b_size * params.c_out, src_len))?;
+
+        let mut ids = Vec::with_capacity(src_len);
+        let mut mask = Vec::with_capacity(src_len);
+        for i_h in 0..params.i_h {
+            let base_h = i_h * params.stride;
+            for i_w in 0..params.i_w {
+                let base_w = i_w * params.stride;
+                for k_h in 0..params.k_h {
+                    let out_h_idx = base_h + k_h * params.dilation;
+                    for k_w in 0..params.k_w {
+                        let out_w_idx = base_w + k_w * params.dilation;
+                        if out_h_idx >= params.padding && out_w_idx >= params.padding {
+                            let out_h_idx = out_h_idx - params.padding;
+                            let out_w_idx = out_w_idx - params.padding;
+                            if out_h_idx < out_h && out_w_idx < out_w {
+                                ids.push((out_h_idx * out_w + out_w_idx) as u32);
+                                mask.push(1f32);
+                                continue;
+                            }
+                        }
+                        ids.push(0);
+                        mask.push(0f32);
+                    }
+                }
+            }
+        }
+
+        let ids = Tensor::from_vec(ids, src_len, self.device())?;
+        let mask = Tensor::from_vec(mask, (1, src_len), self.device())?;
+        let src = src.broadcast_mul(&mask)?;
+        let out = Tensor::zeros(
+            (params.b_size * params.c_out, out_spatial),
+            DType::F32,
+            self.device(),
+        )?
+        .index_add(&ids, &src, 1)?
+        .reshape((params.b_size, params.c_out, out_h, out_w))?;
+        let out = if src_dtype == DType::F32 {
+            out
+        } else {
+            out.to_dtype(src_dtype)?
+        };
+        Ok(Some(out))
+    }
+
     fn conv1d_single_group(&self, kernel: &Self, params: &ParamsConv1D) -> Result<Self> {
         let storage =
             self.storage()
@@ -209,6 +412,20 @@ impl Tensor {
         kernel: &Self,
         params: &ParamsConvTranspose1D,
     ) -> Result<Self> {
+        if let Some(out) = self.conv_transpose1d_wgpu_decomp(kernel, params)? {
+            let out = out.contiguous()?;
+            let storage = out.storage().try_clone(out.layout())?;
+            let op = BackpropOp::new2(self, kernel, |arg, kernel| Op::ConvTranspose1D {
+                arg,
+                kernel,
+                padding: params.padding,
+                output_padding: params.output_padding,
+                stride: params.stride,
+                dilation: params.dilation,
+            });
+            let out_dims = params.out_dims();
+            return Ok(crate::tensor::from_storage(storage, out_dims, op, false));
+        }
         let storage = self.storage().conv_transpose1d(
             self.layout(),
             &kernel.storage(),
@@ -367,6 +584,20 @@ impl Tensor {
             stride,
             dilation,
         };
+        if let Some(out) = self.conv_transpose2d_wgpu_decomp(kernel, &params)? {
+            let out = out.contiguous()?;
+            let storage = out.storage().try_clone(out.layout())?;
+            let op = BackpropOp::new2(self, kernel, |arg, kernel| Op::ConvTranspose2D {
+                arg,
+                kernel,
+                padding: params.padding,
+                output_padding: params.output_padding,
+                stride: params.stride,
+                dilation: params.dilation,
+            });
+            let out_dims = params.out_dims();
+            return Ok(crate::tensor::from_storage(storage, out_dims, op, false));
+        }
         let storage = self.storage().conv_transpose2d(
             self.layout(),
             &kernel.storage(),

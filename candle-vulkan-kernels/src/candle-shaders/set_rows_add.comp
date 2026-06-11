@@ -1,0 +1,40 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+void atomic_add_f32(uint dst_idx, float value) {
+    uint expected = data_d[dst_idx];
+    while (true) {
+        const float current = uintBitsToFloat(expected);
+        const uint desired = floatBitsToUint(current + value);
+        const uint previous = atomicCompSwap(data_d[dst_idx], expected, desired);
+        if (previous == expected) {
+            return;
+        }
+        expected = previous;
+    }
+}
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+
+    uint i00, i01, i02, i03;
+    get_indices(idx, i00, i01, i02, i03);
+
+    const uint i12 = fastmod(i03, p.ne12);
+    const uint i11 = fastmod(i02, p.ne11);
+    const uint i10 = i01;
+    const uint dst_row = data_b[src1_idx(i10, i11, i12, 0) + get_boffset()];
+
+    const uint src_idx = src0_idx(i00, i01, i02, i03) + get_aoffset();
+    const uint out_idx = dst_idx(i00, dst_row, i02, i03) + get_doffset();
+    atomic_add_f32(out_idx, float(data_a[src_idx]));
+}

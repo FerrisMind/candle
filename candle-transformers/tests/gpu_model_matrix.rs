@@ -13,6 +13,23 @@ use support::{
     native_required, TestBackend,
 };
 
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
+const CASE_FILTER_ENV: &str = "CANDLE_GPU_MODEL_CASE_FILTER";
+
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
+type ModelCaseFn = fn(&Device) -> Result<()>;
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "manual GPU certification matrix"]
+fn gpu_model_matrix_cuda() -> Result<()> {
+    native_required(
+        "gpu_model_matrix_cuda",
+        TestBackend::Cuda,
+        run_public_model_matrix,
+    )
+}
+
 #[cfg(feature = "wgpu")]
 #[test]
 #[ignore = "manual GPU certification matrix"]
@@ -35,7 +52,7 @@ fn gpu_model_matrix_vulkan() -> Result<()> {
     )
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn run_public_model_matrix(device: &Device) -> Result<()> {
     if cfg!(debug_assertions) {
         println!(
@@ -43,23 +60,59 @@ fn run_public_model_matrix(device: &Device) -> Result<()> {
         );
     }
 
-    run_case(
-        "dense_causal_decoder_case",
-        device,
-        dense_causal_decoder_case,
-    )?;
-    run_case(
-        "quantized_causal_gguf_case",
-        device,
-        quantized_causal_gguf_case,
-    )?;
-    run_case("encoder_only_text_case", device, encoder_only_text_case)?;
-    run_case("audio_seq2seq_case", device, audio_seq2seq_case)?;
-    run_case("vision_convmixer_case", device, vision_convmixer_case)?;
+    let requested_cases = requested_case_names();
+    let cases: [(&str, ModelCaseFn); 5] = [
+        ("dense_causal_decoder_case", dense_causal_decoder_case),
+        ("quantized_causal_gguf_case", quantized_causal_gguf_case),
+        ("encoder_only_text_case", encoder_only_text_case),
+        ("audio_seq2seq_case", audio_seq2seq_case),
+        ("vision_convmixer_case", vision_convmixer_case),
+    ];
+    let mut ran_any = false;
+    for (name, case_fn) in cases {
+        if !case_is_requested(name, requested_cases.as_deref()) {
+            println!(
+                "skipping {name} on {} due to {CASE_FILTER_ENV}",
+                backend_name(device)
+            );
+            continue;
+        }
+        ran_any = true;
+        run_case(name, device, case_fn)?;
+    }
+    if !ran_any {
+        candle::bail!(
+            "{CASE_FILTER_ENV} did not match any public GPU model case: dense_causal_decoder_case, quantized_causal_gguf_case, encoder_only_text_case, audio_seq2seq_case, vision_convmixer_case"
+        );
+    }
     Ok(())
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
+fn requested_case_names() -> Option<Vec<String>> {
+    let value = std::env::var(CASE_FILTER_ENV).ok()?;
+    let cases = value
+        .split(',')
+        .map(str::trim)
+        .filter(|case_name| !case_name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if cases.is_empty() {
+        None
+    } else {
+        Some(cases)
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
+fn case_is_requested(name: &str, requested_cases: Option<&[String]>) -> bool {
+    match requested_cases {
+        None => true,
+        Some(requested_cases) => requested_cases.iter().any(|requested| requested == name),
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn fallback_count(device: &Device) -> usize {
     if device.is_wgpu() {
         candle::wgpu_cpu_fallback_count()
@@ -70,9 +123,11 @@ fn fallback_count(device: &Device) -> usize {
     }
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn backend_name(device: &Device) -> &'static str {
-    if device.is_wgpu() {
+    if device.is_cuda() {
+        "cuda"
+    } else if device.is_wgpu() {
         "wgpu"
     } else if device.is_vulkan() {
         "vulkan"
@@ -81,7 +136,7 @@ fn backend_name(device: &Device) -> &'static str {
     }
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn run_case(name: &str, device: &Device, f: fn(&Device) -> Result<()>) -> Result<()> {
     println!("running {name} on {}", backend_name(device));
     let start = Instant::now();
@@ -94,7 +149,7 @@ fn run_case(name: &str, device: &Device, f: fn(&Device) -> Result<()>) -> Result
     Ok(())
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn dense_causal_decoder_case(device: &Device) -> Result<()> {
     let model_path = download_model_artifact("karpathy/tinyllamas", "main", "stories15M.bin")?;
     let cpu = Device::Cpu;
@@ -129,11 +184,11 @@ fn dense_causal_decoder_case(device: &Device) -> Result<()> {
     )?;
 
     // The downloaded binary defines the config contract for this representative dense decoder.
-    assert!(config.seq_len >= ids.len() + 1);
+    assert!(config.seq_len > ids.len());
     Ok(())
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn encoder_only_text_case(device: &Device) -> Result<()> {
     let config_path = download_model_artifact(
         "sentence-transformers/all-MiniLM-L6-v2",
@@ -149,8 +204,9 @@ fn encoder_only_text_case(device: &Device) -> Result<()> {
         .map_err(|err| candle::Error::msg(format!("failed to parse MiniLM config: {err}")))?;
     let cpu = Device::Cpu;
 
-    let cpu_vb =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], bert::DTYPE, &cpu)? };
+    let cpu_vb = unsafe {
+        VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&weights_path), bert::DTYPE, &cpu)?
+    };
     let dev_vb =
         unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], bert::DTYPE, device)? };
     let cpu_model = bert::BertModel::load(cpu_vb, &config)?;
@@ -188,7 +244,7 @@ fn encoder_only_text_case(device: &Device) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn quantized_causal_gguf_case(device: &Device) -> Result<()> {
     let model_path = qwen3_gguf_path()?;
     let cpu = Device::Cpu;
@@ -223,7 +279,7 @@ fn quantized_causal_gguf_case(device: &Device) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn audio_seq2seq_case(device: &Device) -> Result<()> {
     let config_path =
         download_model_artifact("openai/whisper-tiny.en", "refs/pr/15", "config.json")?;
@@ -234,7 +290,11 @@ fn audio_seq2seq_case(device: &Device) -> Result<()> {
     let cpu = Device::Cpu;
 
     let cpu_vb = unsafe {
-        VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], whisper::DTYPE, &cpu)?
+        VarBuilder::from_mmaped_safetensors(
+            std::slice::from_ref(&weights_path),
+            whisper::DTYPE,
+            &cpu,
+        )?
     };
     let dev_vb =
         unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], whisper::DTYPE, device)? };
@@ -279,7 +339,7 @@ fn audio_seq2seq_case(device: &Device) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn vision_convmixer_case(device: &Device) -> Result<()> {
     let weights_path = download_model_artifact(
         "lmz/candle-convmixer",
@@ -288,8 +348,9 @@ fn vision_convmixer_case(device: &Device) -> Result<()> {
     )?;
     let cpu = Device::Cpu;
 
-    let cpu_vb =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], DType::F32, &cpu)? };
+    let cpu_vb = unsafe {
+        VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&weights_path), DType::F32, &cpu)?
+    };
     let dev_vb =
         unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device)? };
     let cpu_model = convmixer::c1024_20(1000, cpu_vb)?;
@@ -304,7 +365,7 @@ fn vision_convmixer_case(device: &Device) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn load_llama2_c_model(
     path: &std::path::Path,
     device: &Device,
@@ -318,7 +379,7 @@ fn load_llama2_c_model(
     Ok((model, cache, config))
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn qwen3_gguf_path() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("CANDLE_QWEN3_GGUF_PATH") {
         return Ok(PathBuf::from(path));
@@ -326,7 +387,7 @@ fn qwen3_gguf_path() -> Result<PathBuf> {
     download_model_artifact("unsloth/Qwen3-0.6B-GGUF", "main", "Qwen3-0.6B-Q4_K_M.gguf")
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn load_quantized_qwen3_model(
     path: &Path,
     device: &Device,
@@ -336,7 +397,7 @@ fn load_quantized_qwen3_model(
     quantized_qwen3::ModelWeights::from_gguf(content, &mut file, device)
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn assert_quantized_qwen3_close(
     actual: &Tensor,
     expected: &Tensor,
@@ -409,7 +470,7 @@ fn assert_quantized_qwen3_close(
     Ok(())
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn argmax_index(values: &[f32]) -> usize {
     let mut best_idx = 0usize;
     let mut best = f32::NEG_INFINITY;
@@ -422,7 +483,7 @@ fn argmax_index(values: &[f32]) -> usize {
     best_idx
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn topk_overlap(actual: &[f32], expected: &[f32], k: usize) -> usize {
     fn topk_indices(values: &[f32], k: usize) -> Vec<usize> {
         let mut indexed: Vec<(usize, f32)> = values.iter().copied().enumerate().collect();

@@ -132,13 +132,12 @@ fn multiply_add(src0_idx_base: u32, src1_idx_base: u32, offset: u32) -> f32 {
 fn multiply_add(src0_idx_base: u32, src1_idx_base: u32, offset: u32) -> f32 {
     let block_q8_1 = src0[src0_idx_base + offset];
     let d = f32(block_q8_1.d);
-    let m = f32(block_q8_1.m);
     var sum: f32 = 0.0;
     for (var j: u32 = 0; j < 8; j++) {
         let q_packed = block_q8_1.qs[j];
         for (var k: u32 = 0; k < 4; k++) {
             let q_byte = get_byte_i32(q_packed, k);
-            let q_val = f32(q_byte) * d + m;
+            let q_val = f32(q_byte) * d;
             let src1_offset = src1_idx_base + offset * 32 + j * 4 + k;
             sum += q_val * f32(src1[src1_offset]);
         }

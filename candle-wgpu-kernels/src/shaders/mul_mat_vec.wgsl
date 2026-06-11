@@ -373,13 +373,12 @@ fn main(
             if (output_row < params.m) {
                 let block_byte_base = (src0_batch_offset + output_row * params.stride_01 + block) * BLOCK_SIZE_BYTES;
                 let d = f32(load_f16_at_src0(block_byte_base));
-                let m = f32(load_f16_at_src0(block_byte_base + 2u));
                 var row_sum = 0.0;
 
                 for (var packed_idx = 0u; packed_idx < ELEMS_PER_THREAD / 4u; packed_idx++) {
                     let q_packed = load_u32_at_src0(block_byte_base + 4u + 4u * (thread_within_block * 2u + packed_idx));
                     for (var byte_idx = 0u; byte_idx < 4u; byte_idx++) {
-                        let q_val = f32(get_byte_i32(q_packed, byte_idx)) * d + m;
+                        let q_val = f32(get_byte_i32(q_packed, byte_idx)) * d;
                         row_sum += q_val * x_block[packed_idx * 4u + byte_idx];
                     }
                 }

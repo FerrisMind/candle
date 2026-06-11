@@ -1736,6 +1736,34 @@ impl Tensor {
         }
         let dim = dim.to_index(self.shape(), "scatter-set")?;
         self.scatter_checks(indexes, source, dim)?;
+        let rank = self.rank();
+        let use_gpu_comp = rank > 0
+            && dim + 1 != rank
+            && (self.device().is_wgpu() || self.device().is_vulkan())
+            && matches!(self.dtype(), DType::F32 | DType::F16)
+            && self.dtype() == source.dtype()
+            && indexes.dtype() == DType::U32;
+        if use_gpu_comp {
+            let mut perm = (0..rank).filter(|&idx| idx != dim).collect::<Vec<_>>();
+            perm.push(dim);
+            let mut inv_perm = vec![0usize; rank];
+            for (idx, &src_dim) in perm.iter().enumerate() {
+                inv_perm[src_dim] = idx;
+            }
+            let updated = self
+                .permute(perm.clone())?
+                .contiguous()?
+                .scatter(
+                    &indexes.permute(perm.clone())?.contiguous()?,
+                    &source.permute(perm)?.contiguous()?,
+                    rank - 1,
+                )?
+                .permute(inv_perm)?
+                .contiguous()?;
+            let mut storage = self.storage_mut();
+            *storage = updated.storage().try_clone(updated.layout())?;
+            return Ok(());
+        }
         self.storage_mut().scatter_set(
             self.layout(),
             &indexes.storage(),
@@ -1750,6 +1778,27 @@ impl Tensor {
     pub fn scatter_add<D: Dim>(&self, indexes: &Self, source: &Self, dim: D) -> Result<Self> {
         let dim = dim.to_index(self.shape(), "scatter-add")?;
         self.scatter_checks(indexes, source, dim)?;
+        let rank = self.rank();
+        let use_gpu_comp = rank > 0
+            && dim + 1 != rank
+            && (self.device().is_wgpu() || self.device().is_vulkan())
+            && self.dtype() == DType::F32
+            && self.dtype() == source.dtype()
+            && indexes.dtype() == DType::U32;
+        if use_gpu_comp {
+            let mut perm = (0..rank).filter(|&idx| idx != dim).collect::<Vec<_>>();
+            perm.push(dim);
+            let mut inv_perm = vec![0usize; rank];
+            for (idx, &src_dim) in perm.iter().enumerate() {
+                inv_perm[src_dim] = idx;
+            }
+            let self_p = self.permute(perm.clone())?.contiguous()?;
+            let indexes_p = indexes.permute(perm.clone())?.contiguous()?;
+            let source_p = source.permute(perm.clone())?.contiguous()?;
+            return self_p
+                .scatter_add(&indexes_p, &source_p, rank - 1)?
+                .permute(inv_perm);
+        }
         let shape = self.shape();
         let mut storage = unsafe { self.device().alloc_uninit(shape, self.dtype())? };
         self.storage()
@@ -1775,6 +1824,34 @@ impl Tensor {
         }
         let dim = dim.to_index(self.shape(), "scatter-add-set")?;
         self.scatter_checks(indexes, source, dim)?;
+        let rank = self.rank();
+        let use_gpu_comp = rank > 0
+            && dim + 1 != rank
+            && (self.device().is_wgpu() || self.device().is_vulkan())
+            && self.dtype() == DType::F32
+            && self.dtype() == source.dtype()
+            && indexes.dtype() == DType::U32;
+        if use_gpu_comp {
+            let mut perm = (0..rank).filter(|&idx| idx != dim).collect::<Vec<_>>();
+            perm.push(dim);
+            let mut inv_perm = vec![0usize; rank];
+            for (idx, &src_dim) in perm.iter().enumerate() {
+                inv_perm[src_dim] = idx;
+            }
+            let updated = self
+                .permute(perm.clone())?
+                .contiguous()?
+                .scatter_add(
+                    &indexes.permute(perm.clone())?.contiguous()?,
+                    &source.permute(perm)?.contiguous()?,
+                    rank - 1,
+                )?
+                .permute(inv_perm)?
+                .contiguous()?;
+            let mut storage = self.storage_mut();
+            *storage = updated.storage().try_clone(updated.layout())?;
+            return Ok(());
+        }
         self.storage_mut().scatter_add(
             self.layout(),
             &indexes.storage(),
@@ -1891,6 +1968,26 @@ impl Tensor {
                 rhs: source.shape().clone(),
             }
             .bt())?
+        }
+        let rank = self.rank();
+        let use_gpu_comp = rank > 0
+            && dim + 1 != rank
+            && (self.device().is_wgpu() || self.device().is_vulkan())
+            && self.dtype() == DType::F32
+            && self.dtype() == source.dtype()
+            && indexes.dtype() == DType::U32;
+        if use_gpu_comp {
+            let mut perm = (0..rank).filter(|&idx| idx != dim).collect::<Vec<_>>();
+            perm.push(dim);
+            let mut inv_perm = vec![0usize; rank];
+            for (idx, &src_dim) in perm.iter().enumerate() {
+                inv_perm[src_dim] = idx;
+            }
+            let self_p = self.permute(perm.clone())?.contiguous()?;
+            let source_p = source.permute(perm)?.contiguous()?;
+            return self_p
+                .index_add(indexes, &source_p, rank - 1)?
+                .permute(inv_perm);
         }
         let storage = self.storage().index_add(
             self.layout(),

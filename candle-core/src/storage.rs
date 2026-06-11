@@ -11,6 +11,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static WGPU_CPU_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VULKAN_CPU_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+pub(crate) fn record_wgpu_cpu_fallback(err: &Error) {
+    let count = WGPU_CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
+        eprintln!("[candle][wgpu][cpu-fallback#{count}] {err:?}");
+    }
+}
+
+pub(crate) fn record_vulkan_cpu_fallback(err: &Error) {
+    let count = VULKAN_CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
+        eprintln!("[candle][vulkan][cpu-fallback#{count}] {err:?}");
+    }
+}
+
 fn is_backend_not_implemented_msg(msg: &str, backend: &str) -> bool {
     let backend_rank_limit = msg.contains(backend) && msg.contains("supports up to rank-4 tensors");
     let backend_overflow = msg.contains(backend)
@@ -39,10 +53,7 @@ fn is_backend_not_implemented(err: &Error, backend: &str) -> bool {
 fn should_wgpu_cpu_fallback(err: &Error) -> bool {
     let fallback = is_backend_not_implemented(err, "wgpu");
     if fallback {
-        let count = WGPU_CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
-            eprintln!("[candle][wgpu][cpu-fallback#{count}] {err:?}");
-        }
+        record_wgpu_cpu_fallback(err);
     }
     fallback
 }
@@ -51,10 +62,7 @@ fn should_vulkan_cpu_fallback(err: &Error) -> bool {
     let fallback = is_backend_not_implemented(err, "vulkan")
         || matches!(err, Error::UnsupportedDTypeForOp(..));
     if fallback {
-        let count = VULKAN_CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
-            eprintln!("[candle][vulkan][cpu-fallback#{count}] {err:?}");
-        }
+        record_vulkan_cpu_fallback(err);
     }
     fallback
 }

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TestBackend {
+    Cuda,
     Wgpu,
     Vulkan,
 }
@@ -18,6 +19,7 @@ pub enum FallbackPolicy {
 
 pub fn backend_name(backend: TestBackend) -> &'static str {
     match backend {
+        TestBackend::Cuda => "cuda",
         TestBackend::Wgpu => "wgpu",
         TestBackend::Vulkan => "vulkan",
     }
@@ -54,6 +56,7 @@ where
 
 pub fn backend_fallback_count(backend: TestBackend) -> usize {
     match backend {
+        TestBackend::Cuda => 0,
         TestBackend::Wgpu => candle::wgpu_cpu_fallback_count(),
         TestBackend::Vulkan => candle::vulkan_cpu_fallback_count(),
     }
@@ -61,6 +64,7 @@ pub fn backend_fallback_count(backend: TestBackend) -> usize {
 
 pub fn reset_backend_fallback_count(backend: TestBackend) {
     match backend {
+        TestBackend::Cuda => {}
         TestBackend::Wgpu => candle::reset_wgpu_cpu_fallback_count(),
         TestBackend::Vulkan => candle::reset_vulkan_cpu_fallback_count(),
     }
@@ -160,6 +164,16 @@ where
 
 fn backend_device(backend: TestBackend) -> Result<Device> {
     match backend {
+        TestBackend::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                Device::new_cuda(0)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                candle::bail!("cuda backend feature not enabled")
+            }
+        }
         TestBackend::Wgpu => {
             #[cfg(feature = "wgpu")]
             {
@@ -185,6 +199,7 @@ fn backend_device(backend: TestBackend) -> Result<Device> {
 
 fn required_device_env_var(backend: TestBackend) -> &'static str {
     match backend {
+        TestBackend::Cuda => "CANDLE_REQUIRE_CUDA_TEST_DEVICE",
         TestBackend::Wgpu => "CANDLE_REQUIRE_WGPU_TEST_DEVICE",
         TestBackend::Vulkan => "CANDLE_REQUIRE_VULKAN_TEST_DEVICE",
     }

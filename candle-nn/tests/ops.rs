@@ -366,7 +366,7 @@ fn softmax_wgpu() -> Result<()> {
     let Some(device) = wgpu_device_or_skip("softmax_wgpu")? else {
         return Ok(());
     };
-    softmax_last_dim_backend(&device)
+    run_native_backend_case("softmax_wgpu", &device, softmax_last_dim_backend)
 }
 
 #[test]
@@ -376,7 +376,7 @@ fn rms_norm_wgpu() -> Result<()> {
     let Some(device) = wgpu_device_or_skip("rms_norm_wgpu")? else {
         return Ok(());
     };
-    rms_norm_backend(&device)
+    run_native_backend_case("rms_norm_wgpu", &device, rms_norm_backend)
 }
 
 #[test]
@@ -395,7 +395,7 @@ fn softmax_vulkan() -> Result<()> {
     let Some(device) = vulkan_device_or_skip("softmax_vulkan")? else {
         return Ok(());
     };
-    softmax_last_dim_backend(&device)
+    run_native_backend_case("softmax_vulkan", &device, softmax_last_dim_backend)
 }
 
 #[test]
@@ -404,7 +404,7 @@ fn rms_norm_vulkan() -> Result<()> {
     let Some(device) = vulkan_device_or_skip("rms_norm_vulkan")? else {
         return Ok(());
     };
-    rms_norm_backend(&device)
+    run_native_backend_case("rms_norm_vulkan", &device, rms_norm_backend)
 }
 
 #[test]
@@ -423,7 +423,7 @@ fn layer_norm_wgpu() -> Result<()> {
     let Some(device) = wgpu_device_or_skip("layer_norm_wgpu")? else {
         return Ok(());
     };
-    layer_norm_backend(&device)
+    run_native_backend_case("layer_norm_wgpu", &device, layer_norm_backend)
 }
 
 #[test]
@@ -433,7 +433,7 @@ fn layer_norm_vulkan() -> Result<()> {
     let Some(device) = vulkan_device_or_skip("layer_norm_vulkan")? else {
         return Ok(());
     };
-    layer_norm_backend(&device)
+    run_native_backend_case("layer_norm_vulkan", &device, layer_norm_backend)
 }
 
 #[test]
@@ -443,7 +443,7 @@ fn rope_wgpu() -> Result<()> {
     let Some(device) = wgpu_device_or_skip("rope_wgpu")? else {
         return Ok(());
     };
-    rope_backend(&device)
+    run_native_backend_case("rope_wgpu", &device, rope_backend)
 }
 
 #[test]
@@ -453,7 +453,7 @@ fn rope_vulkan() -> Result<()> {
     let Some(device) = vulkan_device_or_skip("rope_vulkan")? else {
         return Ok(());
     };
-    rope_backend(&device)
+    run_native_backend_case("rope_vulkan", &device, rope_backend)
 }
 
 #[test]
@@ -463,7 +463,7 @@ fn sdpa_wgpu() -> Result<()> {
     let Some(device) = wgpu_device_or_skip("sdpa_wgpu")? else {
         return Ok(());
     };
-    sdpa_backend(&device)
+    run_native_backend_case("sdpa_wgpu", &device, sdpa_backend)
 }
 
 #[test]
@@ -473,7 +473,7 @@ fn sdpa_vulkan() -> Result<()> {
     let Some(device) = vulkan_device_or_skip("sdpa_vulkan")? else {
         return Ok(());
     };
-    sdpa_backend(&device)
+    run_native_backend_case("sdpa_vulkan", &device, sdpa_backend)
 }
 
 #[test]
@@ -710,6 +710,23 @@ fn run_graph_case(
     let actual = actual.flatten_all()?.to_vec1::<f32>()?;
     assert_close_vec(&actual, &expected, atol, rtol, label);
 
+    let fallback_count = backend_fallback_count(device);
+    assert_eq!(
+        fallback_count, 0,
+        "{label} triggered {fallback_count} CPU fallbacks"
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn run_native_backend_case(
+    label: &str,
+    device: &Device,
+    body: fn(&Device) -> Result<()>,
+) -> Result<()> {
+    reset_backend_fallback_count(device);
+    body(device)?;
+    device.synchronize()?;
     let fallback_count = backend_fallback_count(device);
     assert_eq!(
         fallback_count, 0,

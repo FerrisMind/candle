@@ -106,7 +106,7 @@ fn wgpu_quantized_weight_requires_cpu_fallback(dtype: GgmlDType) -> bool {
 }
 
 fn vulkan_quantized_weight_requires_cpu_fallback(dtype: GgmlDType) -> bool {
-    matches!(dtype, GgmlDType::Q8_1 | GgmlDType::Q8K)
+    matches!(dtype, GgmlDType::Q8K)
 }
 
 fn cpu_storage_to_f32_vec(storage: &crate::CpuStorage) -> Result<Vec<f32>> {
@@ -218,22 +218,6 @@ impl QWgpuStorage {
 
     fn to_cpu_quantized(&self) -> Result<Box<dyn QuantizedType>> {
         Ok(self.dtype.from_data(Cow::Owned(self.data()?)))
-    }
-
-    fn q8_1_repacked_as_q8_0_storage(&self) -> Result<crate::WgpuStorage> {
-        debug_assert_eq!(self.dtype, GgmlDType::Q8_1);
-        let data = self.data()?;
-        let q8_1_block = std::mem::size_of::<BlockQ8_1>();
-        let q8_0_block = std::mem::size_of::<BlockQ8_0>();
-        debug_assert_eq!(data.len() % q8_1_block, 0);
-        let mut repacked = Vec::with_capacity(data.len() / q8_1_block * q8_0_block);
-        for chunk in data.chunks_exact(q8_1_block) {
-            repacked.extend_from_slice(&chunk[..2]);
-            repacked.extend_from_slice(&chunk[4..]);
-        }
-        repacked.resize(repacked.len() + 4, 0);
-        self.device()
-            .storage_from_cpu_storage(&crate::CpuStorage::U8(repacked))
     }
 
     fn quantize_from_cpu(
@@ -386,11 +370,12 @@ impl QWgpuStorage {
         storage: &crate::WgpuStorage,
         layout: &crate::Layout,
     ) -> Result<(crate::WgpuStorage, Shape)> {
-        if self.dtype == GgmlDType::Q8_1 {
-            let repacked = self.q8_1_repacked_as_q8_0_storage()?;
-            return repacked.quantized_matmul(GgmlDType::Q8_0, self_shape, storage, layout);
-        }
         if wgpu_quantized_weight_requires_cpu_fallback(self.dtype) {
+            let err = crate::Error::Msg(format!(
+                "wgpu quantized dtype {:?} uses explicit CPU fallback for matmul",
+                self.dtype
+            ));
+            crate::storage::record_wgpu_cpu_fallback(&err);
             return self.fwd_cpu_fallback(self_shape, storage, layout);
         }
         match self
@@ -399,6 +384,7 @@ impl QWgpuStorage {
         {
             Ok(out) => Ok(out),
             Err(err) if should_quantized_backend_fallback(&err, "wgpu") => {
+                crate::storage::record_wgpu_cpu_fallback(&err);
                 self.fwd_cpu_fallback(self_shape, storage, layout)
             }
             Err(err) => Err(err),
@@ -412,17 +398,12 @@ impl QWgpuStorage {
         ids_l: &crate::Layout,
         dim: usize,
     ) -> Result<crate::WgpuStorage> {
-        if self.dtype == GgmlDType::Q8_1 {
-            let repacked = self.q8_1_repacked_as_q8_0_storage()?;
-            return repacked.quantized_index_select_f32(
-                GgmlDType::Q8_0,
-                self_shape,
-                ids,
-                ids_l,
-                dim,
-            );
-        }
         if wgpu_quantized_weight_requires_cpu_fallback(self.dtype) {
+            let err = crate::Error::Msg(format!(
+                "wgpu quantized dtype {:?} uses explicit CPU fallback for index_select",
+                self.dtype
+            ));
+            crate::storage::record_wgpu_cpu_fallback(&err);
             return self.index_select_f32_cpu_fallback(self_shape, ids, ids_l, dim);
         }
         match self
@@ -431,6 +412,7 @@ impl QWgpuStorage {
         {
             Ok(out) => Ok(out),
             Err(err) if should_quantized_backend_fallback(&err, "wgpu") => {
+                crate::storage::record_wgpu_cpu_fallback(&err);
                 self.index_select_f32_cpu_fallback(self_shape, ids, ids_l, dim)
             }
             Err(err) => Err(err),
@@ -645,6 +627,11 @@ impl QVulkanStorage {
         layout: &crate::Layout,
     ) -> Result<(crate::VulkanStorage, Shape)> {
         if vulkan_quantized_weight_requires_cpu_fallback(self.dtype) {
+            let err = crate::Error::Msg(format!(
+                "vulkan quantized dtype {:?} uses explicit CPU fallback for matmul",
+                self.dtype
+            ));
+            crate::storage::record_vulkan_cpu_fallback(&err);
             return self.fwd_cpu_fallback(self_shape, storage, layout);
         }
         match self
@@ -653,6 +640,7 @@ impl QVulkanStorage {
         {
             Ok(out) => Ok(out),
             Err(err) if should_quantized_backend_fallback(&err, "vulkan") => {
+                crate::storage::record_vulkan_cpu_fallback(&err);
                 self.fwd_cpu_fallback(self_shape, storage, layout)
             }
             Err(err) => Err(err),
@@ -667,6 +655,11 @@ impl QVulkanStorage {
         dim: usize,
     ) -> Result<crate::VulkanStorage> {
         if vulkan_quantized_weight_requires_cpu_fallback(self.dtype) {
+            let err = crate::Error::Msg(format!(
+                "vulkan quantized dtype {:?} uses explicit CPU fallback for index_select",
+                self.dtype
+            ));
+            crate::storage::record_vulkan_cpu_fallback(&err);
             return self.index_select_f32_cpu_fallback(self_shape, ids, ids_l, dim);
         }
         match self
@@ -675,6 +668,7 @@ impl QVulkanStorage {
         {
             Ok(out) => Ok(out),
             Err(err) if should_quantized_backend_fallback(&err, "vulkan") => {
+                crate::storage::record_vulkan_cpu_fallback(&err);
                 self.index_select_f32_cpu_fallback(self_shape, ids, ids_l, dim)
             }
             Err(err) => Err(err),

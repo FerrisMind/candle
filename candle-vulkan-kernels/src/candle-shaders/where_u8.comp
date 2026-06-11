@@ -1,0 +1,76 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "utils.glsl"
+
+layout(push_constant) uniform parameter {
+    uint ne;
+    uint ne0;
+    uint ne1;
+    uint ne2;
+    uint ne3;
+    uint offset_cond;
+    uint offset_true;
+    uint offset_false;
+    uint cond_nb0;
+    uint cond_nb1;
+    uint cond_nb2;
+    uint cond_nb3;
+    uint true_nb0;
+    uint true_nb1;
+    uint true_nb2;
+    uint true_nb3;
+    uint false_nb0;
+    uint false_nb1;
+    uint false_nb2;
+    uint false_nb3;
+} p;
+
+layout(binding = 0) readonly buffer Cond { uint8_t data_cond[]; };
+layout(binding = 1) readonly buffer TrueBuf { T_TYPE data_true[]; };
+layout(binding = 2) readonly buffer FalseBuf { T_TYPE data_false[]; };
+layout(binding = 3) writeonly buffer Dst { D_TYPE data_dst[]; };
+
+const uint num_threads = 128;
+
+layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+
+uint cond_idx(uint i0, uint i1, uint i2, uint i3) {
+    return i3 * p.cond_nb3 + i2 * p.cond_nb2 + i1 * p.cond_nb1 + i0 * p.cond_nb0;
+}
+
+uint true_idx(uint i0, uint i1, uint i2, uint i3) {
+    return i3 * p.true_nb3 + i2 * p.true_nb2 + i1 * p.true_nb1 + i0 * p.true_nb0;
+}
+
+uint false_idx(uint i0, uint i1, uint i2, uint i3) {
+    return i3 * p.false_nb3 + i2 * p.false_nb2 + i1 * p.false_nb1 + i0 * p.false_nb0;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+
+    // num_threads * num_iter must equal 512, to match the wg_denoms and get_idx calculation
+    const uint num_iter = 4;
+
+    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
+        if (idx >= p.ne) {
+            continue;
+        }
+
+        uint i0, i1, i2, i3;
+        get_indices(idx, i0, i1, i2, i3, p.ne0, p.ne1, p.ne2, p.ne3);
+
+        const bool pred = data_cond[p.offset_cond + cond_idx(i0, i1, i2, i3)] != uint8_t(0);
+        const T_TYPE on_true = data_true[p.offset_true + true_idx(i0, i1, i2, i3)];
+        const T_TYPE on_false = data_false[p.offset_false + false_idx(i0, i1, i2, i3)];
+        data_dst[idx] = pred ? D_TYPE(on_true) : D_TYPE(on_false);
+
+        idx += num_threads;
+    }
+}

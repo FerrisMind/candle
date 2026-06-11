@@ -22,8 +22,13 @@ var<storage, read_write> src: array<SRC_TYPE>;
 @group(0) @binding(1)
 var<storage, read_write> idx: array<u32>;
 
+#ifdef ADD
+@group(0) @binding(2)
+var<storage, read_write> dst: array<atomic<u32>>;
+#else
 @group(0) @binding(2)
 var<storage, read_write> dst: array<DST_TYPE>;
+#endif
 
 #ifdef I64_IDX
 @group(0) @binding(3)
@@ -65,6 +70,20 @@ struct Params {
 @group(0) @binding(PARAMS_BINDING)
 var<uniform> params: Params;
 
+#ifdef ADD
+fn atomic_add_f32(dst_idx: u32, value: f32) {
+    loop {
+        let old_bits = atomicLoad(&dst[dst_idx]);
+        let old_value = bitcast<f32>(old_bits);
+        let new_bits = bitcast<u32>(old_value + value);
+        let result = atomicCompareExchangeWeak(&dst[dst_idx], old_bits, new_bits);
+        if result.exchanged {
+            return;
+        }
+    }
+}
+#endif
+
 @compute @workgroup_size(WG_SIZE)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= (params.ne3 * params.ne2 * params.n_rows * params.ne0) / VEC_SIZE) {
@@ -105,5 +124,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i_src_row = params.offset_src + i_src1 * params.stride_src1 + i_src2 * params.stride_src2 + i_src3 * params.stride_src3;
 
     let col_idx = (gid.x % elems_per_row);
+#ifdef ADD
+    atomic_add_f32(i_dst_row/VEC_SIZE + col_idx, f32(src[i_src_row/VEC_SIZE + col_idx]));
+#else
     dst[i_dst_row/VEC_SIZE + col_idx] = DST_TYPE(src[i_src_row/VEC_SIZE + col_idx]);
+#endif
 }

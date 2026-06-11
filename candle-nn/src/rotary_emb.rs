@@ -263,6 +263,40 @@ pub fn rope_i(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     if !sin.is_contiguous() {
         candle::bail!("sin has to be contiguous in rope")
     }
+    // Avoid per-call CPU fallback on WGPU/Vulkan for the custom-op path.
+    // Use a rank-4 tensor decomposition so execution stays on the backend
+    // without hitting the current rank-5 fallback paths.
+    if xs.device().is_wgpu() || xs.device().is_vulkan() {
+        let even_ids = Tensor::arange_step(0u32, n_embd as u32, 2u32, xs.device())?;
+        let odd_ids = Tensor::arange_step(1u32, n_embd as u32, 2u32, xs.device())?;
+        let x0 = xs.index_select(&even_ids, D::Minus1)?;
+        let x1 = xs.index_select(&odd_ids, D::Minus1)?;
+        let cos = match cos.dims() {
+            [_t, _d] => cos.unsqueeze(0)?.unsqueeze(0)?,
+            [_b, _t, _d] => cos.unsqueeze(1)?,
+            dims => candle::bail!("cos/sin has to be 2D or 3D in rope {b_sz} {dims:?}"),
+        };
+        let sin = match sin.dims() {
+            [_t, _d] => sin.unsqueeze(0)?.unsqueeze(0)?,
+            [_b, _t, _d] => sin.unsqueeze(1)?,
+            dims => candle::bail!("cos/sin has to be 2D or 3D in rope {b_sz} {dims:?}"),
+        };
+        let y0 = (x0.broadcast_mul(&cos)? - x1.broadcast_mul(&sin)?)?;
+        let y1 = (x0.broadcast_mul(&sin)? + x1.broadcast_mul(&cos)?)?;
+        let ids_shape = y0.dims().to_vec();
+        let even_ids = even_ids
+            .reshape((1, 1, 1, n_embd / 2))?
+            .broadcast_as(ids_shape.clone())?
+            .contiguous()?;
+        let odd_ids = odd_ids
+            .reshape((1, 1, 1, n_embd / 2))?
+            .broadcast_as(ids_shape)?
+            .contiguous()?;
+        let out = xs.zeros_like()?;
+        out.scatter_set(&even_ids, &y0, D::Minus1)?;
+        out.scatter_set(&odd_ids, &y1, D::Minus1)?;
+        return Ok(out);
+    }
     xs.apply_op3_no_bwd(cos, sin, &RotaryEmbI)
 }
 

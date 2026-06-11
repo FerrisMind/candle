@@ -37,11 +37,13 @@ fn collect(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) -> std::io:
 fn main() -> std::io::Result<()> {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=src/shaders");
+    println!("cargo::rerun-if-changed=src/candle-shaders");
     println!("cargo::rerun-if-env-changed=GLSLC");
     println!("cargo::rerun-if-env-changed=CXX");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let shaders_dir = manifest_dir.join("src/shaders");
+    let candle_shaders_dir = manifest_dir.join("src/candle-shaders");
     let mut shaders = Vec::new();
     collect(&shaders_dir, &shaders_dir, &mut shaders)?;
     shaders.sort_by(|a, b| a.1.cmp(&b.1));
@@ -59,12 +61,17 @@ fn main() -> std::io::Result<()> {
     }
     source.push_str("];\n");
     fs::write(out_dir.join("comp.rs"), source)?;
-    generate_spirv_with_ggml_generator(&shaders_dir, &out_dir)?;
+    generate_spirv_with_ggml_generator(&shaders_dir, &candle_shaders_dir, &out_dir)?;
     Ok(())
 }
 
-fn generate_spirv_with_ggml_generator(shaders_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
+fn generate_spirv_with_ggml_generator(
+    shaders_dir: &Path,
+    candle_shaders_dir: &Path,
+    out_dir: &Path,
+) -> std::io::Result<()> {
     let glslc = env::var("GLSLC").unwrap_or_else(|_| "glslc".to_string());
+    ensure_glslc_available(&glslc);
     let integer_dot_support = glslc_supports_feature(
         &glslc,
         &shaders_dir.join("feature-tests").join("integer_dot.comp"),
@@ -109,9 +116,17 @@ fn generate_spirv_with_ggml_generator(shaders_dir: &Path, out_dir: &Path) -> std
             );
         }
     }
+    generate_candle_spirv_modules(&glslc, shaders_dir, candle_shaders_dir, &spv_dir)?;
 
     let mut modules = Vec::new();
     collect_spv(&spv_dir, &mut modules)?;
+    if modules.is_empty() {
+        panic!(
+            "vulkan shader generation produced no SPIR-V modules in {} using {glslc}; \
+             verify that glslc is installed and shader compilation succeeded",
+            spv_dir.display()
+        );
+    }
     modules.sort_by(|a, b| a.0.cmp(&b.0));
     let mut generated = String::new();
     for (name, out_path) in &modules {
@@ -133,6 +148,113 @@ fn generate_spirv_with_ggml_generator(shaders_dir: &Path, out_dir: &Path) -> std
     generated.push_str("];\n");
     fs::write(out_dir.join("spv.rs"), generated)?;
     Ok(())
+}
+
+fn generate_candle_spirv_modules(
+    glslc: &str,
+    shaders_dir: &Path,
+    candle_shaders_dir: &Path,
+    spv_dir: &Path,
+) -> std::io::Result<()> {
+    let modules: &[(&str, PathBuf, &[&str])] = &[
+        (
+            "powf_f32",
+            candle_shaders_dir.join("powf.comp"),
+            &["A_TYPE=float", "D_TYPE=float", "FLOAT_TYPE=float"],
+        ),
+        (
+            "cmp_f32",
+            candle_shaders_dir.join("cmp.comp"),
+            &[
+                "A_TYPE=float",
+                "B_TYPE=float",
+                "D_TYPE=uint8_t",
+                "FLOAT_TYPE=float",
+            ],
+        ),
+        (
+            "cmp_f16",
+            candle_shaders_dir.join("cmp.comp"),
+            &[
+                "A_TYPE=float16_t",
+                "B_TYPE=float16_t",
+                "D_TYPE=uint8_t",
+                "FLOAT_TYPE=float16_t",
+            ],
+        ),
+        (
+            "where_u8_f32",
+            candle_shaders_dir.join("where_u8.comp"),
+            &["T_TYPE=float", "D_TYPE=float"],
+        ),
+        (
+            "where_u8_f16",
+            candle_shaders_dir.join("where_u8.comp"),
+            &["T_TYPE=float16_t", "D_TYPE=float16_t"],
+        ),
+        (
+            "set_rows_add_f32_i32",
+            candle_shaders_dir.join("set_rows_add.comp"),
+            &[
+                "A_TYPE=float",
+                "B_TYPE=uint",
+                "D_TYPE=uint",
+                "FLOAT_TYPE=float",
+                "D_READ_WRITE",
+            ],
+        ),
+        (
+            "repack_q8_1_to_q8_0",
+            candle_shaders_dir.join("repack_q8_1_to_q8_0.comp"),
+            &[],
+        ),
+    ];
+    for (name, source, defines) in modules {
+        let output = spv_dir.join(format!("{name}.spv"));
+        compile_spirv(glslc, source, &output, shaders_dir, defines)?;
+    }
+    Ok(())
+}
+
+fn compile_spirv(
+    glslc: &str,
+    source: &Path,
+    output: &Path,
+    include_dir: &Path,
+    defines: &[&str],
+) -> std::io::Result<()> {
+    let mut command = Command::new(glslc);
+    command
+        .arg("-fshader-stage=compute")
+        .arg("--target-env=vulkan1.2")
+        .arg("-O")
+        .arg(format!("-I{}", include_dir.display()));
+    for define in defines {
+        command.arg(format!("-D{define}"));
+    }
+    let output_result = command.arg(source).arg("-o").arg(output).output()?;
+    if !output_result.status.success() {
+        panic!(
+            "failed to compile Candle Vulkan shader {} with {glslc}: {}{}",
+            source.display(),
+            String::from_utf8_lossy(&output_result.stdout),
+            String::from_utf8_lossy(&output_result.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn ensure_glslc_available(glslc: &str) {
+    match Command::new(glslc).arg("--version").output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => panic!(
+            "glslc command {glslc:?} is not usable (exit status {:?}): {}{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(err) => panic!("failed to execute glslc command {glslc:?}: {err}"),
+    }
 }
 
 fn glslc_supports_feature(glslc: &str, source: &Path, output: &Path) -> bool {

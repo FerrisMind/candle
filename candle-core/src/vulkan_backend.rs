@@ -7,6 +7,7 @@ use gpu_allocator::vulkan::{
     Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc,
 };
 use gpu_allocator::MemoryLocation;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex, RwLock};
@@ -40,6 +41,7 @@ struct VulkanArgsortParams {
 const VULKAN_ARGSORT_NUM_PIPELINES: u32 = 11;
 const VULKAN_ARGSORT_WG_UNROLL_FACTOR: u32 = 2;
 const VULKAN_MUL_MAT_VEC_MAX_COLS: usize = 8;
+const VULKAN_DENSE_MUL_MAT_VEC_MAX_ROWS: usize = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -110,6 +112,31 @@ struct GgmlUnaryParams {
     ne1_01l: u32,
     ne1_0mp: u32,
     ne1_0l: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VulkanWhereU8Params {
+    ne: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
+    ne3: u32,
+    offset_cond: u32,
+    offset_true: u32,
+    offset_false: u32,
+    cond_nb0: u32,
+    cond_nb1: u32,
+    cond_nb2: u32,
+    cond_nb3: u32,
+    true_nb0: u32,
+    true_nb1: u32,
+    true_nb2: u32,
+    true_nb3: u32,
+    false_nb0: u32,
+    false_nb1: u32,
+    false_nb2: u32,
+    false_nb3: u32,
 }
 
 #[repr(C)]
@@ -248,6 +275,12 @@ struct VulkanQuantizeQ8_1Params {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct VulkanRepackQ8_1ToQ8_0Params {
+    num_blocks: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct VulkanIm2ColParams {
     dst_addr: [u32; 2],
     batch_offset: u32,
@@ -332,6 +365,8 @@ pub struct VulkanDevice {
 
 struct VulkanInner {
     ordinal: usize,
+    physical_device_name: String,
+    physical_device_type: vk::PhysicalDeviceType,
     _entry: ash::Entry,
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -366,6 +401,16 @@ struct VulkanInner {
     deferred_buffer_frees: Mutex<Vec<VulkanDeferredBuffer>>,
 }
 
+impl VulkanDevice {
+    pub fn physical_device_name(&self) -> &str {
+        &self.inner.physical_device_name
+    }
+
+    pub fn physical_device_type(&self) -> vk::PhysicalDeviceType {
+        self.inner.physical_device_type
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SubmissionQueueKind {
     Compute,
@@ -388,10 +433,12 @@ struct VulkanActiveBatch {
     dispatch_count: u32,
     copy_count: u32,
     descriptor_set_count: u32,
+    allocated_descriptor_set_count: u32,
     storage_descriptor_count: u32,
     transfer_bytes: usize,
     compute_bytes: usize,
     retained_buffers: Vec<Arc<VulkanBuffer>>,
+    cached_descriptor_sets: HashMap<vk::DescriptorSetLayout, SmallVec<[vk::DescriptorSet; 8]>>,
 }
 
 struct VulkanSubmissionResources {
@@ -411,9 +458,9 @@ impl VulkanActiveBatch {
 struct VulkanPipelineCacheKey {
     shader_hash: u64,
     shader_len_words: usize,
-    binding_signature: Vec<u32>,
+    binding_signature: SmallVec<[u32; 8]>,
     push_constant_len: u32,
-    specialization_u32: Vec<(u32, u32)>,
+    specialization_u32: SmallVec<[(u32, u32); 8]>,
     require_full_subgroups: bool,
     required_subgroup_size: Option<u32>,
 }
@@ -818,6 +865,44 @@ fn quantize_f32_storage_to_q8_1_x4(
     Ok(out)
 }
 
+fn repack_q8_1_storage_to_q8_0(
+    device: &VulkanDevice,
+    src: &VulkanStorage,
+    elem_count: usize,
+) -> Result<VulkanStorage> {
+    if src.dtype != DType::U8 {
+        return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan repack_q8_1_to_q8_0").bt());
+    }
+    if !elem_count.is_multiple_of(GgmlDType::Q8_1.block_size()) {
+        crate::bail!(
+            "vulkan repack_q8_1_to_q8_0 expects element count divisible by {}, got {elem_count}",
+            GgmlDType::Q8_1.block_size()
+        )
+    }
+    let num_blocks = elem_count / GgmlDType::Q8_1.block_size();
+    let out_count = num_blocks * GgmlDType::Q8_0.type_size();
+    let out = unsafe { device.alloc_uninit(&Shape::from(out_count), DType::U8)? };
+    let spirv = candle_vulkan_kernels::spirv("repack_q8_1_to_q8_0").ok_or_else(|| {
+        Error::Msg("vulkan shader repack_q8_1_to_q8_0 not generated".into()).bt()
+    })?;
+    let params = VulkanRepackQ8_1ToQ8_0Params {
+        num_blocks: num_blocks.try_into()?,
+    };
+    let workgroups_x = (num_blocks as u32)
+        .div_ceil(128)
+        .min(device.inner.max_workgroup_count_x.max(1));
+    device.run_compute(
+        spirv,
+        &[
+            VulkanBinding::Storage(&src.buffer),
+            VulkanBinding::Storage(&out.buffer),
+        ],
+        Some(any_as_bytes(&params)),
+        workgroups_x,
+    )?;
+    Ok(out)
+}
+
 fn byte_len(dtype: DType, count: usize, op: &'static str) -> Result<usize> {
     let size = dtype.size_in_bytes();
     if size == 0 {
@@ -942,9 +1027,14 @@ impl VulkanDevice {
     const MAX_REUSABLE_SUBMISSIONS_PER_QUEUE: usize = 64;
     const MAX_BATCH_DISPATCHES: u32 = 32;
     const MAX_BATCH_COPIES: u32 = 64;
+    const DESCRIPTOR_SET_ALLOC_CHUNK: u32 = 8;
     const MAX_BATCH_DESCRIPTOR_SETS: u32 = Self::MAX_BATCH_DISPATCHES;
+    const MAX_ALLOCATED_DESCRIPTOR_SETS_PER_BATCH: u32 =
+        Self::MAX_BATCH_DISPATCHES * Self::DESCRIPTOR_SET_ALLOC_CHUNK;
     const MAX_BATCH_STORAGE_DESCRIPTORS: u32 =
         Self::MAX_BATCH_DESCRIPTOR_SETS * Self::SUBMISSION_DESCRIPTOR_CAPACITY;
+    const MAX_ALLOCATED_STORAGE_DESCRIPTORS_PER_BATCH: u32 =
+        Self::MAX_ALLOCATED_DESCRIPTOR_SETS_PER_BATCH * Self::SUBMISSION_DESCRIPTOR_CAPACITY;
     const MAX_BATCH_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
     const MAX_BATCH_COMPUTE_BYTES: usize = 512 * 1024 * 1024;
 
@@ -998,8 +1088,8 @@ impl VulkanDevice {
 
         let (max_sets, descriptor_count) = match queue_kind {
             SubmissionQueueKind::Compute => (
-                Self::MAX_BATCH_DESCRIPTOR_SETS.max(1),
-                Self::MAX_BATCH_STORAGE_DESCRIPTORS.max(1),
+                Self::MAX_ALLOCATED_DESCRIPTOR_SETS_PER_BATCH.max(1),
+                Self::MAX_ALLOCATED_STORAGE_DESCRIPTORS_PER_BATCH.max(1),
             ),
             SubmissionQueueKind::Transfer => (1, 1),
         };
@@ -1136,10 +1226,12 @@ impl VulkanDevice {
             dispatch_count: 0,
             copy_count: 0,
             descriptor_set_count: 0,
+            allocated_descriptor_set_count: 0,
             storage_descriptor_count: 0,
             transfer_bytes: 0,
             compute_bytes: 0,
             retained_buffers: Vec::new(),
+            cached_descriptor_sets: HashMap::new(),
         })
     }
 
@@ -1910,14 +2002,14 @@ impl VulkanDevice {
         let binding_signature = bindings
             .iter()
             .map(|binding| binding.descriptor_type().as_raw() as u32)
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[u32; 8]>>();
         let cache_key = VulkanPipelineCacheKey {
             shader_hash: hash_spirv_words(spirv),
             shader_len_words: spirv.len(),
             binding_signature,
             push_constant_len: push_constants_len,
             specialization_u32: specialization_u32
-                .map(|specs| specs.to_vec())
+                .map(|specs| specs.iter().copied().collect::<SmallVec<[(u32, u32); 8]>>())
                 .unwrap_or_default(),
             require_full_subgroups,
             required_subgroup_size,
@@ -1961,7 +2053,7 @@ impl VulkanDevice {
                             .descriptor_count(1)
                             .stage_flags(vk::ShaderStageFlags::COMPUTE)
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<SmallVec<[vk::DescriptorSetLayoutBinding; 8]>>();
                 let set_layout_info =
                     vk::DescriptorSetLayoutCreateInfo::default().bindings(&layout_bindings);
                 let descriptor_set_layout = self
@@ -1971,10 +2063,12 @@ impl VulkanDevice {
                     .map_err(Error::wrap)?;
                 let push_constant_ranges = push_constants
                     .map(|bytes| {
-                        vec![vk::PushConstantRange::default()
-                            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                            .offset(0)
-                            .size(bytes.len() as u32)]
+                        SmallVec::<[vk::PushConstantRange; 1]>::from_buf([
+                            vk::PushConstantRange::default()
+                                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                                .offset(0)
+                                .size(bytes.len() as u32),
+                        ])
                     })
                     .unwrap_or_default();
                 let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
@@ -1986,8 +2080,8 @@ impl VulkanDevice {
                     .create_pipeline_layout(&pipeline_layout_info, None)
                     .map_err(Error::wrap)?;
                 let entry = CString::new("main").map_err(Error::wrap)?;
-                let mut spec_entries = Vec::new();
-                let mut spec_data = Vec::new();
+                let mut spec_entries = SmallVec::<[vk::SpecializationMapEntry; 8]>::new();
+                let mut spec_data = SmallVec::<[u8; 32]>::new();
                 let spec_info;
                 let mut stage_flags = vk::PipelineShaderStageCreateFlags::empty();
                 if require_full_subgroups && self.inner.compute_full_subgroups {
@@ -2082,14 +2176,76 @@ impl VulkanDevice {
         let batch = slot
             .as_mut()
             .ok_or_else(|| Error::msg("vulkan compute batch missing after ensure"))?;
-        let set_alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(batch.resources.descriptor_pool)
-            .set_layouts(std::slice::from_ref(&cached.descriptor_set_layout));
-        let descriptor_set = self
-            .inner
-            .device
-            .allocate_descriptor_sets(&set_alloc_info)
-            .map_err(Error::wrap)?[0];
+        let descriptor_set = if let Some(cached_sets) = batch
+            .cached_descriptor_sets
+            .get_mut(&cached.descriptor_set_layout)
+        {
+            if let Some(descriptor_set) = cached_sets.pop() {
+                descriptor_set
+            } else {
+                let remaining_capacity = Self::MAX_ALLOCATED_DESCRIPTOR_SETS_PER_BATCH
+                    .saturating_sub(batch.allocated_descriptor_set_count);
+                if remaining_capacity == 0 {
+                    crate::bail!("vulkan descriptor set cache exhausted inside active batch")
+                }
+                let alloc_count = remaining_capacity.min(Self::DESCRIPTOR_SET_ALLOC_CHUNK) as usize;
+                let set_layouts = SmallVec::<[vk::DescriptorSetLayout; 8]>::from_elem(
+                    cached.descriptor_set_layout,
+                    alloc_count,
+                );
+                let set_alloc_info = vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(batch.resources.descriptor_pool)
+                    .set_layouts(&set_layouts);
+                let mut descriptor_sets = self
+                    .inner
+                    .device
+                    .allocate_descriptor_sets(&set_alloc_info)
+                    .map_err(Error::wrap)?;
+                batch.allocated_descriptor_set_count += alloc_count as u32;
+                let descriptor_set = descriptor_sets
+                    .pop()
+                    .ok_or_else(|| Error::msg("vulkan descriptor allocation returned no sets"))?;
+                if !descriptor_sets.is_empty() {
+                    batch
+                        .cached_descriptor_sets
+                        .entry(cached.descriptor_set_layout)
+                        .or_default()
+                        .extend(descriptor_sets);
+                }
+                descriptor_set
+            }
+        } else {
+            let remaining_capacity = Self::MAX_ALLOCATED_DESCRIPTOR_SETS_PER_BATCH
+                .saturating_sub(batch.allocated_descriptor_set_count);
+            if remaining_capacity == 0 {
+                crate::bail!("vulkan descriptor set cache exhausted inside active batch")
+            }
+            let alloc_count = remaining_capacity.min(Self::DESCRIPTOR_SET_ALLOC_CHUNK) as usize;
+            let set_layouts = SmallVec::<[vk::DescriptorSetLayout; 8]>::from_elem(
+                cached.descriptor_set_layout,
+                alloc_count,
+            );
+            let set_alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(batch.resources.descriptor_pool)
+                .set_layouts(&set_layouts);
+            let mut descriptor_sets = self
+                .inner
+                .device
+                .allocate_descriptor_sets(&set_alloc_info)
+                .map_err(Error::wrap)?;
+            batch.allocated_descriptor_set_count += alloc_count as u32;
+            let descriptor_set = descriptor_sets
+                .pop()
+                .ok_or_else(|| Error::msg("vulkan descriptor allocation returned no sets"))?;
+            if !descriptor_sets.is_empty() {
+                batch
+                    .cached_descriptor_sets
+                    .entry(cached.descriptor_set_layout)
+                    .or_default()
+                    .extend(descriptor_sets);
+            }
+            descriptor_set
+        };
         let buffer_infos = bindings
             .iter()
             .map(|binding| {
@@ -2099,7 +2255,7 @@ impl VulkanDevice {
                     .offset(0)
                     .range(buffer.size as u64)
             })
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[vk::DescriptorBufferInfo; 8]>>();
         let writes = bindings
             .iter()
             .enumerate()
@@ -2110,7 +2266,7 @@ impl VulkanDevice {
                     .descriptor_type(entry.descriptor_type())
                     .buffer_info(std::slice::from_ref(&buffer_infos[binding]))
             })
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[vk::WriteDescriptorSet<'_>; 8]>>();
         self.inner.device.update_descriptor_sets(&writes, &[]);
         let command_buffer = batch.resources.command_buffer;
         self.inner.device.cmd_bind_pipeline(
@@ -2355,6 +2511,17 @@ fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
         .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated")).bt())
 }
 
+fn cmp_opcode(op: CmpOp) -> i32 {
+    match op {
+        CmpOp::Eq => 0,
+        CmpOp::Ne => 1,
+        CmpOp::Lt => 2,
+        CmpOp::Le => 3,
+        CmpOp::Gt => 4,
+        CmpOp::Ge => 5,
+    }
+}
+
 impl VulkanStorage {
     fn run_rank2_matmul_f32_via_batched_matvec(
         &self,
@@ -2392,7 +2559,11 @@ impl VulkanStorage {
         let workgroups = (n.div_ceil(rows_per_group as usize).try_into()?, 1, 1);
         let mut row_idx = 0usize;
         while row_idx < m {
-            let row_chunk = usize::min(VULKAN_MUL_MAT_VEC_MAX_COLS, m - row_idx);
+            // Dense f32 Conv/MatMul traffic is dominated by host-side per-dispatch
+            // overhead on the current Vulkan path. Processing more rows per dispatch
+            // amortizes descriptor-set allocation and command recording without
+            // changing shader semantics or quantized-path limits.
+            let row_chunk = usize::min(VULKAN_DENSE_MUL_MAT_VEC_MAX_ROWS, m - row_idx);
             let spec = [
                 (0, block_size),
                 (1, rows_per_group),
@@ -2635,6 +2806,184 @@ impl VulkanStorage {
 
     fn run_unary_generic(&self, layout: &Layout, spirv: &[u32]) -> Result<Self> {
         self.run_unary_generic_with_params(layout, spirv, 0.0, 0.0)
+    }
+
+    fn run_cmp_u8(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        op: CmpOp,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan cmp").bt());
+        }
+        if rhs.dtype != self.dtype {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan cmp").bt());
+        }
+        self.device
+            .same_device(&rhs.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: rhs.device.location(),
+                    op: "cmp",
+                }
+                .bt()
+            })?;
+        let (lhs_tmp, lhs_layout) = if lhs_layout.start_offset() == 0 {
+            (None, lhs_layout.clone())
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(lhs_layout.shape(), self.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut tmp, 0, lhs_layout)?;
+            (Some(tmp), Layout::contiguous(lhs_layout.shape().clone()))
+        };
+        let lhs = lhs_tmp.as_ref().unwrap_or(self);
+        let (rhs_tmp, rhs_layout) = if rhs_layout.start_offset() == 0 {
+            (None, rhs_layout.clone())
+        } else {
+            let mut tmp = unsafe { rhs.device.alloc_uninit(rhs_layout.shape(), rhs.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(rhs, &mut tmp, 0, rhs_layout)?;
+            (Some(tmp), Layout::contiguous(rhs_layout.shape().clone()))
+        };
+        let rhs = rhs_tmp.as_ref().unwrap_or(rhs);
+        let (lhs_dims, lhs_strides) = dims4_ggml(&lhs_layout)?;
+        let (rhs_dims, rhs_strides) = dims4_ggml(&rhs_layout)?;
+        let count = lhs_layout.shape().elem_count();
+        let dst = unsafe { self.device.alloc_uninit(lhs_layout.shape(), DType::U8)? };
+        let params = GgmlBinaryParams {
+            ne: count.try_into()?,
+            ne00: lhs_dims[0],
+            ne01: lhs_dims[1],
+            ne02: lhs_dims[2],
+            ne03: lhs_dims[3],
+            nb00: lhs_strides[0],
+            nb01: lhs_strides[1],
+            nb02: lhs_strides[2],
+            nb03: lhs_strides[3],
+            ne10: rhs_dims[0],
+            ne11: rhs_dims[1],
+            ne12: rhs_dims[2],
+            ne13: rhs_dims[3],
+            nb10: rhs_strides[0],
+            nb11: rhs_strides[1],
+            nb12: rhs_strides[2],
+            nb13: rhs_strides[3],
+            ne20: lhs_dims[0],
+            ne21: lhs_dims[1],
+            ne22: lhs_dims[2],
+            ne23: lhs_dims[3],
+            nb20: 1,
+            nb21: lhs_dims[0],
+            nb22: lhs_dims[0] * lhs_dims[1],
+            nb23: lhs_dims[0] * lhs_dims[1] * lhs_dims[2],
+            misalign_offsets: 0,
+            param1: 0.0,
+            param2: 0.0,
+            param3: cmp_opcode(op),
+        };
+        let bindings = [
+            VulkanBinding::Storage(&lhs.buffer),
+            VulkanBinding::Storage(&rhs.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv_name = if self.dtype == DType::F16 {
+            "cmp_f16"
+        } else {
+            "cmp_f32"
+        };
+        let spirv = candle_vulkan_kernels::spirv(spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
+        let workgroups = ggml_linear_workgroups(count)?;
+        self.device
+            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+        Ok(dst)
+    }
+
+    fn run_where_u8_cond(
+        &self,
+        layout: &Layout,
+        t: &Self,
+        t_l: &Layout,
+        f: &Self,
+        f_l: &Layout,
+    ) -> Result<Self> {
+        if self.dtype != DType::U8 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan where_cond").bt());
+        }
+        if t.dtype != DType::F32 && t.dtype != DType::F16 {
+            return Err(Error::UnsupportedDTypeForOp(t.dtype, "vulkan where_cond").bt());
+        }
+        if f.dtype != t.dtype {
+            return Err(Error::UnsupportedDTypeForOp(f.dtype, "vulkan where_cond").bt());
+        }
+        self.device
+            .same_device(&t.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: t.device.location(),
+                    op: "where_cond",
+                }
+                .bt()
+            })?;
+        self.device
+            .same_device(&f.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: f.device.location(),
+                    op: "where_cond",
+                }
+                .bt()
+            })?;
+        let (dims, cond_strides) = dims4_ggml(layout)?;
+        let (_, true_strides) = dims4_ggml(t_l)?;
+        let (_, false_strides) = dims4_ggml(f_l)?;
+        let count = layout.shape().elem_count();
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), t.dtype)? };
+        let params = VulkanWhereU8Params {
+            ne: count.try_into()?,
+            ne0: dims[0],
+            ne1: dims[1],
+            ne2: dims[2],
+            ne3: dims[3],
+            offset_cond: layout.start_offset().try_into()?,
+            offset_true: t_l.start_offset().try_into()?,
+            offset_false: f_l.start_offset().try_into()?,
+            cond_nb0: cond_strides[0],
+            cond_nb1: cond_strides[1],
+            cond_nb2: cond_strides[2],
+            cond_nb3: cond_strides[3],
+            true_nb0: true_strides[0],
+            true_nb1: true_strides[1],
+            true_nb2: true_strides[2],
+            true_nb3: true_strides[3],
+            false_nb0: false_strides[0],
+            false_nb1: false_strides[1],
+            false_nb2: false_strides[2],
+            false_nb3: false_strides[3],
+        };
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&t.buffer),
+            VulkanBinding::Storage(&f.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv_name = if t.dtype == DType::F16 {
+            "where_u8_f16"
+        } else {
+            "where_u8_f32"
+        };
+        let spirv = candle_vulkan_kernels::spirv(spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
+        let workgroups = ggml_linear_workgroups(count)?;
+        self.device
+            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+        Ok(dst)
     }
 
     fn run_binary_named(
@@ -3760,6 +4109,93 @@ impl VulkanStorage {
         Ok(())
     }
 
+    fn run_scatter_add_last_dim_f32(
+        &mut self,
+        dst_l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+    ) -> Result<()> {
+        if self.dtype != DType::F32 || self.dtype != src.dtype {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_add").bt());
+        }
+        if ids.dtype != DType::U32 {
+            return Err(Error::UnsupportedDTypeForOp(ids.dtype, "vulkan scatter_add ids").bt());
+        }
+        if !dst_l.is_contiguous() {
+            return Err(unsupported("scatter_add strided dst"));
+        }
+        if !src_l.is_contiguous() {
+            return Err(unsupported("scatter_add strided src"));
+        }
+        if !ids_l.is_contiguous() {
+            return Err(unsupported("scatter_add strided ids"));
+        }
+        if src_l.start_offset() > u16::MAX as usize
+            || ids_l.start_offset() > u8::MAX as usize
+            || dst_l.start_offset() > u8::MAX as usize
+        {
+            return Err(unsupported("scatter_add offset"));
+        }
+        let rank = dst_l.dims().len();
+        if rank == 0 || ids_l.dims().len() != rank || src_l.dims().len() != rank {
+            return Err(unsupported("scatter_add rank"));
+        }
+        let ids_dim = ids_l.dims()[rank - 1];
+        let left_size: usize = ids_l.dims()[..rank - 1].iter().product();
+        let dst_dim = dst_l.dims()[rank - 1];
+        let params = GgmlBinaryParams {
+            ne: (left_size * ids_dim).try_into()?,
+            ne00: 1,
+            ne01: ids_dim.try_into()?,
+            ne02: left_size.try_into()?,
+            ne03: 1,
+            nb00: 1,
+            nb01: 1,
+            nb02: ids_dim.try_into()?,
+            nb03: (ids_dim * left_size).try_into()?,
+            ne10: ids_dim.try_into()?,
+            ne11: left_size.try_into()?,
+            ne12: 1,
+            ne13: 1,
+            nb10: 1,
+            nb11: ids_dim.try_into()?,
+            nb12: 0,
+            nb13: 0,
+            ne20: 1,
+            ne21: dst_dim.try_into()?,
+            ne22: left_size.try_into()?,
+            ne23: 1,
+            nb20: 1,
+            nb21: 1,
+            nb22: dst_dim.try_into()?,
+            nb23: (dst_dim * left_size).try_into()?,
+            misalign_offsets: ((src_l.start_offset() as u32) << 16)
+                | ((ids_l.start_offset() as u32) << 8)
+                | dst_l.start_offset() as u32,
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(&src.buffer),
+            VulkanBinding::Storage(&ids.buffer),
+            VulkanBinding::Storage(&self.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("set_rows_add_f32_i32").ok_or_else(|| {
+            Error::Msg("vulkan shader set_rows_add_f32_i32 not generated".into()).bt()
+        })?;
+        let rows: u32 = (left_size * ids_dim).try_into()?;
+        self.device.run_compute(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            rows.div_ceil(512),
+        )?;
+        Ok(())
+    }
+
     fn run_matmul_f32(
         &self,
         rhs: &Self,
@@ -4574,6 +5010,10 @@ impl VulkanStorage {
         if dim >= dims.len() {
             crate::bail!("index_select dim {dim} out of range for {src_shape:?}")
         }
+        if qdtype == GgmlDType::Q8_1 {
+            let repacked = repack_q8_1_storage_to_q8_0(&self.device, self, src_shape.elem_count())?;
+            return repacked.quantized_index_select_f32(GgmlDType::Q8_0, src_shape, ids, ids_l, dim);
+        }
         let block_size = qdtype.block_size();
         let right_size: usize = dims[dim + 1..].iter().product();
         if !right_size.is_multiple_of(block_size) {
@@ -4660,6 +5100,10 @@ impl VulkanStorage {
         let last_k = layout.dims()[rank - 1];
         if last_k != k {
             crate::bail!("input tensor {layout:?} incompatible with quantized weights {qshape:?}")
+        }
+        if qdtype == GgmlDType::Q8_1 {
+            let repacked = repack_q8_1_storage_to_q8_0(&self.device, self, qshape.elem_count())?;
+            return repacked.quantized_matmul(GgmlDType::Q8_0, qshape, storage, layout);
         }
         let mut dst_dims = layout.dims().to_vec();
         dst_dims.pop();
@@ -5101,7 +5545,10 @@ impl VulkanStorage {
             return Err(unsupported("quantized indexed_moe ids inner stride"));
         }
         let src_elem_count = layout.shape().elem_count();
-        let use_q8_1_rhs = self.device.inner.integer_dot_product
+        // Q8_0 indexed MoE currently matches the native f32 rhs path more closely than
+        // the q8_1 rhs MMVQ variant on Vulkan, so keep it on the direct GPU path.
+        let use_q8_1_rhs = qdtype != GgmlDType::Q8_0
+            && self.device.inner.integer_dot_product
             && vulkan_supports_q8_1_rhs(qdtype)
             && vulkan_should_use_mmvq(&self.device, qdtype, batch, k)
             && src_elem_count.is_multiple_of(4);
@@ -5232,35 +5679,34 @@ impl Drop for VulkanInner {
                 |slot: &Mutex<Option<VulkanActiveBatch>>, queue: vk::Queue| {
                     if let Ok(mut slot) = slot.lock() {
                         if let Some(batch) = slot.take() {
-                            if batch.has_commands() {
-                                if self
+                            if batch.has_commands()
+                                && self
                                     .device
                                     .end_command_buffer(batch.resources.command_buffer)
                                     .is_ok()
+                            {
+                                let submit_info = vk::SubmitInfo::default().command_buffers(
+                                    std::slice::from_ref(&batch.resources.command_buffer),
+                                );
+                                if self
+                                    .device
+                                    .queue_submit(
+                                        queue,
+                                        std::slice::from_ref(&submit_info),
+                                        batch.resources.fence,
+                                    )
+                                    .is_ok()
                                 {
-                                    let submit_info = vk::SubmitInfo::default().command_buffers(
-                                        std::slice::from_ref(&batch.resources.command_buffer),
-                                    );
-                                    if self
-                                        .device
-                                        .queue_submit(
-                                            queue,
-                                            std::slice::from_ref(&submit_info),
-                                            batch.resources.fence,
-                                        )
-                                        .is_ok()
-                                    {
-                                        submitted_active_batches.push(VulkanPendingSubmission {
-                                            resources: batch.resources,
-                                            queue_kind: batch.queue_kind,
-                                            dispatch_count: batch.dispatch_count,
-                                            copy_count: batch.copy_count,
-                                            transfer_bytes: batch.transfer_bytes,
-                                            compute_bytes: batch.compute_bytes,
-                                            retained_buffers: batch.retained_buffers,
-                                        });
-                                        return;
-                                    }
+                                    submitted_active_batches.push(VulkanPendingSubmission {
+                                        resources: batch.resources,
+                                        queue_kind: batch.queue_kind,
+                                        dispatch_count: batch.dispatch_count,
+                                        copy_count: batch.copy_count,
+                                        transfer_bytes: batch.transfer_bytes,
+                                        compute_bytes: batch.compute_bytes,
+                                        retained_buffers: batch.retained_buffers,
+                                    });
+                                    return;
                                 }
                             }
                             destroy_submission_resources(batch.resources);
@@ -5517,10 +5963,19 @@ impl BackendStorage for VulkanStorage {
         }
     }
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
-        let lhs_cpu = self.to_cpu_storage()?;
-        let rhs_cpu = rhs.to_cpu_storage()?;
-        let out_cpu = <CpuStorage as BackendStorage>::cmp(&lhs_cpu, op, &rhs_cpu, lhs_l, rhs_l)?;
-        self.device.storage_from_cpu_storage(&out_cpu)
+        match self.run_cmp_u8(rhs, lhs_l, rhs_l, op) {
+            Ok(out) => Ok(out),
+            Err(err)
+                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
+            {
+                let lhs_cpu = self.to_cpu_storage()?;
+                let rhs_cpu = rhs.to_cpu_storage()?;
+                let out_cpu =
+                    <CpuStorage as BackendStorage>::cmp(&lhs_cpu, op, &rhs_cpu, lhs_l, rhs_l)?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
         if self.dtype == DType::BF16 && (dtype == DType::F16 || dtype == DType::F32) {
@@ -5619,13 +6074,21 @@ impl BackendStorage for VulkanStorage {
         f: &Self,
         f_l: &Layout,
     ) -> Result<Self> {
-        let cond_cpu = self.to_cpu_storage()?;
-        let t_cpu = t.to_cpu_storage()?;
-        let f_cpu = f.to_cpu_storage()?;
-        let out_cpu = <CpuStorage as BackendStorage>::where_cond(
-            &cond_cpu, layout, &t_cpu, t_l, &f_cpu, f_l,
-        )?;
-        self.device.storage_from_cpu_storage(&out_cpu)
+        match self.run_where_u8_cond(layout, t, t_l, f, f_l) {
+            Ok(out) => Ok(out),
+            Err(err)
+                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
+            {
+                let cond_cpu = self.to_cpu_storage()?;
+                let t_cpu = t.to_cpu_storage()?;
+                let f_cpu = f.to_cpu_storage()?;
+                let out_cpu = <CpuStorage as BackendStorage>::where_cond(
+                    &cond_cpu, layout, &t_cpu, t_l, &f_cpu, f_l,
+                )?;
+                self.device.storage_from_cpu_storage(&out_cpu)
+            }
+            Err(err) => Err(err),
+        }
     }
     fn conv1d(
         &self,
@@ -5889,6 +6352,13 @@ impl BackendStorage for VulkanStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<()> {
+        if dim + 1 == dst_l.dims().len() {
+            match self.run_scatter_add_last_dim_f32(dst_l, ids, ids_l, src, src_l) {
+                Ok(()) => return Ok(()),
+                Err(err) if should_cpu_fallback(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
         let mut dst_cpu = self.to_cpu_storage()?;
         let ids_cpu = ids.to_cpu_storage()?;
         let src_cpu = src.to_cpu_storage()?;
@@ -5927,6 +6397,14 @@ impl BackendStorage for VulkanStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<Self> {
+        if dim + 1 == dst_l.dims().len() {
+            let mut out = self.try_clone(dst_l)?;
+            match out.run_scatter_add_last_dim_f32(dst_l, ids, ids_l, src, src_l) {
+                Ok(()) => return Ok(out),
+                Err(err) if should_cpu_fallback(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
         let dst_cpu = self.to_cpu_storage()?;
         let ids_cpu = ids.to_cpu_storage()?;
         let src_cpu = src.to_cpu_storage()?;
@@ -6071,10 +6549,72 @@ impl BackendDevice for VulkanDevice {
         let mut init_guard = VulkanInitGuard::new(instance.clone());
         let physical_devices =
             unsafe { instance.enumerate_physical_devices() }.map_err(Error::wrap)?;
-        let physical_device = *physical_devices
-            .get(ordinal)
-            .or_else(|| physical_devices.first())
-            .ok_or_else(|| Error::msg("no vulkan physical device found"))?;
+        if physical_devices.is_empty() {
+            crate::bail!("no vulkan physical device found")
+        }
+        let requested_name = std::env::var("CANDLE_VULKAN_DEVICE_NAME")
+            .ok()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty());
+        let selected_device = if let Some(requested_name) = requested_name {
+            let requested_name = requested_name.to_ascii_lowercase();
+            physical_devices
+                .iter()
+                .find_map(|physical_device| {
+                    let properties = unsafe { instance.get_physical_device_properties(*physical_device) };
+                    let device_name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned();
+                    device_name
+                        .to_ascii_lowercase()
+                        .contains(&requested_name)
+                        .then_some((*physical_device, properties.device_type, device_name))
+                })
+                .ok_or_else(|| {
+                    Error::msg(format!(
+                        "no vulkan physical device matching CANDLE_VULKAN_DEVICE_NAME={requested_name:?}"
+                    ))
+                })?
+        } else {
+            let mut preferred = physical_devices.iter().filter_map(|physical_device| {
+                let properties =
+                    unsafe { instance.get_physical_device_properties(*physical_device) };
+                (properties.device_type != vk::PhysicalDeviceType::CPU).then(|| {
+                    let device_name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned();
+                    (*physical_device, properties.device_type, device_name)
+                })
+            });
+            preferred
+                .nth(ordinal)
+                .or_else(|| {
+                    physical_devices.iter().find_map(|physical_device| {
+                        let properties =
+                            unsafe { instance.get_physical_device_properties(*physical_device) };
+                        (properties.device_type != vk::PhysicalDeviceType::CPU).then(|| {
+                            let device_name =
+                                unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
+                                    .to_string_lossy()
+                                    .into_owned();
+                            (*physical_device, properties.device_type, device_name)
+                        })
+                    })
+                })
+                .or_else(|| {
+                    physical_devices.first().map(|physical_device| {
+                        let properties =
+                            unsafe { instance.get_physical_device_properties(*physical_device) };
+                        let device_name =
+                            unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
+                                .to_string_lossy()
+                                .into_owned();
+                        (*physical_device, properties.device_type, device_name)
+                    })
+                })
+                .ok_or_else(|| Error::msg("no vulkan physical device found"))?
+        };
+        let (physical_device, physical_device_type, physical_device_name) = selected_device;
         let device_extensions = unsafe {
             instance
                 .enumerate_device_extension_properties(physical_device)
@@ -6265,6 +6805,8 @@ impl BackendDevice for VulkanDevice {
         Ok(Self {
             inner: Arc::new(VulkanInner {
                 ordinal,
+                physical_device_name,
+                physical_device_type,
                 _entry: entry,
                 instance,
                 physical_device,
@@ -7164,10 +7706,7 @@ mod tests {
         let q_moe_vk = crate::quantized::QTensor::quantize(&moe_w_vk, GgmlDType::Q8_0)?;
         let actual = q_moe_vk.indexed_moe_forward(&moe_x_vk, &moe_ids_vk)?;
 
-        let use_q8_1_rhs = vk_dev.inner.integer_dot_product
-            && vulkan_supports_q8_1_rhs(GgmlDType::Q8_0)
-            && vulkan_should_use_mmvq(&vk_dev, GgmlDType::Q8_0, batch, k)
-            && (batch * k).is_multiple_of(4);
+        let use_q8_1_rhs = false;
 
         eprintln!(
             "vendor_id={:#x} integer_dot={} use_q8_1_rhs={}",

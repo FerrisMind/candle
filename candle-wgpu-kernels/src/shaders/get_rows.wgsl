@@ -147,6 +147,22 @@ fn copy_elements(src_base: u32, dst_base: u32, offset: u32) {
 }
 #endif
 
+#ifdef Q8_1
+fn copy_elements(src_base: u32, dst_base: u32, offset: u32) {
+    let block_q8_1 = src[src_base + offset];
+    let d = f32(block_q8_1.d);
+    for (var j: u32 = 0u; j < 8u; j++) {
+        let q_packed = block_q8_1.qs[j];
+        for (var k: u32 = 0u; k < 4u; k++) {
+            let q_byte = get_byte_i32(q_packed, k);
+            let q_val = f32(q_byte) * d;
+            let dst_offset = dst_base + offset * 32u + j * 4u + k;
+            dst[dst_offset] = q_val;
+        }
+    }
+}
+#endif
+
 #ifdef Q2_K
 fn copy_elements(src_base: u32, dst_base: u32, offset: u32) {
     let block = src[src_base + offset];

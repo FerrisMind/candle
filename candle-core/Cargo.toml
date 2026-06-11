@@ -35,6 +35,7 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 rayon = { workspace = true }
 safetensors = { workspace = true }
+smallvec = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 wgpu = { workspace = true, optional = true }

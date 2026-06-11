@@ -29,7 +29,11 @@ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32
 #endif
 
 layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
+#if defined(D_READ_WRITE)
+layout (binding = 2) buffer D {D_TYPE data_d[];};
+#else
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+#endif
 #endif
 
 // true if src0/src1 are the same shape and the indices can be reused without additional modulus
