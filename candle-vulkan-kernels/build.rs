@@ -204,8 +204,98 @@ fn generate_candle_spirv_modules(
             ],
         ),
         (
+            "convert_f32_u8",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=float", "D_TYPE=uint8_t", "DST_SAT_U8"],
+        ),
+        (
+            "convert_f32_u32",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=float", "D_TYPE=uint", "DST_SAT_U32"],
+        ),
+        (
+            "convert_f32_i64",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=float", "D_TYPE=int64_t", "DST_SAT_I64"],
+        ),
+        (
+            "convert_f16_u8",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=float16_t", "D_TYPE=uint8_t", "DST_SAT_U8"],
+        ),
+        (
+            "convert_f16_u32",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=float16_t", "D_TYPE=uint", "DST_SAT_U32"],
+        ),
+        (
+            "convert_f16_i64",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=float16_t", "D_TYPE=int64_t", "DST_SAT_I64"],
+        ),
+        (
+            "convert_u8_f32",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=uint8_t", "D_TYPE=float"],
+        ),
+        (
+            "convert_u8_f16",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=uint8_t", "D_TYPE=float16_t", "DST_VIA_F32"],
+        ),
+        (
+            "convert_u8_u32",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=uint8_t", "D_TYPE=uint"],
+        ),
+        (
+            "convert_u8_i64",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=uint8_t", "D_TYPE=int64_t"],
+        ),
+        (
+            "convert_u32_f16",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=uint", "D_TYPE=float16_t", "DST_VIA_F32"],
+        ),
+        (
+            "convert_u32_u8",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=uint", "D_TYPE=uint8_t"],
+        ),
+        (
+            "convert_u32_i64",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=uint", "D_TYPE=int64_t"],
+        ),
+        (
+            "convert_i64_f32",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=int64_t", "D_TYPE=float"],
+        ),
+        (
+            "convert_i64_f16",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=int64_t", "D_TYPE=float16_t", "DST_VIA_F32"],
+        ),
+        (
+            "convert_i64_u8",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=int64_t", "D_TYPE=uint8_t"],
+        ),
+        (
+            "convert_i64_u32",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=int64_t", "D_TYPE=uint"],
+        ),
+        (
             "repack_q8_1_to_q8_0",
             candle_shaders_dir.join("repack_q8_1_to_q8_0.comp"),
+            &[],
+        ),
+        (
+            "dequant_q8_k_f32",
+            candle_shaders_dir.join("dequant_q8_k_f32.comp"),
             &[],
         ),
     ];

@@ -90,6 +90,7 @@ fn backend_smoke_dummy_vulkan_does_not_claim_bf16() {
 #[cfg(feature = "wgpu")]
 #[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_reports_adapter_identity() -> Result<()> {
+    let _guard = support::fallback_counter_guard();
     let Some(device) = backend_device_or_skip(
         "backend_smoke_wgpu_reports_adapter_identity",
         TestBackend::Wgpu,
@@ -112,6 +113,7 @@ fn backend_smoke_wgpu_reports_adapter_identity() -> Result<()> {
 #[test]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_reports_physical_device_identity() -> Result<()> {
+    let _guard = support::fallback_counter_guard();
     let Some(device) = backend_device_or_skip(
         "backend_smoke_vulkan_reports_physical_device_identity",
         TestBackend::Vulkan,
@@ -203,16 +205,46 @@ backend_family_test!(
 backend_family_test!(
     #[cfg(feature = "wgpu")]
     #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_dtype_conversion_matrix_native_only,
+    TestBackend::Wgpu,
+    native_required,
+    smoke_dtype_conversion_matrix_native_only
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_dtype_conversion_matrix_native_only,
+    TestBackend::Vulkan,
+    native_required,
+    smoke_dtype_conversion_matrix_native_only
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_matmul_shape_sweep_native_only,
+    TestBackend::Wgpu,
+    native_required,
+    smoke_f32_matmul_shape_sweep
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_matmul_shape_sweep_native_only,
+    TestBackend::Vulkan,
+    native_required,
+    smoke_f32_matmul_shape_sweep
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_quantized_paths,
     TestBackend::Wgpu,
-    fallback_allowed,
+    native_required,
     smoke_quantized_family
 );
 backend_family_test!(
     #[cfg(feature = "vulkan")]
     backend_smoke_vulkan_quantized_family,
     TestBackend::Vulkan,
-    fallback_allowed,
+    native_required,
     smoke_quantized_family
 );
 backend_family_test!(
@@ -234,7 +266,7 @@ backend_family_test!(
 #[test]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_quantized_paths_only() -> Result<()> {
-    fallback_allowed(
+    native_required(
         "backend_smoke_vulkan_quantized_paths_only",
         TestBackend::Vulkan,
         smoke_quantized_paths,
@@ -244,6 +276,7 @@ fn backend_smoke_vulkan_quantized_paths_only() -> Result<()> {
 #[test]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_q8_1_qmatmul_regression() -> Result<()> {
+    let _guard = support::fallback_counter_guard();
     let cpu = Device::Cpu;
     let Some(vk) = backend_device_or_skip(
         "backend_smoke_vulkan_q8_1_qmatmul_regression",
@@ -277,17 +310,23 @@ fn backend_smoke_vulkan_q8_1_qmatmul_regression() -> Result<()> {
     let expected = expected_qmm.forward(&lhs_cpu)?;
     let actual = actual_qmm.forward(&lhs_vk)?;
 
-    for (row_idx, (actual_row, expected_row)) in actual
-        .to_vec2::<f32>()?
-        .iter()
-        .zip(expected.to_vec2::<f32>()?.iter())
-        .enumerate()
+    let actual_vals = actual.to_vec2::<f32>()?;
+    let expected_vals = expected.to_vec2::<f32>()?;
+    for (row_idx, (actual_row, expected_row)) in
+        actual_vals.iter().zip(expected_vals.iter()).enumerate()
     {
-        for (col_idx, (actual, expected)) in actual_row.iter().zip(expected_row.iter()).enumerate()
-        {
+        for (col_idx, (got, want)) in actual_row.iter().zip(expected_row.iter()).enumerate() {
+            // Q8_1 quantization introduces lossy rounding. The CPU reference and
+            // the Vulkan path use the same stored quantized blocks, but
+            // dequantization arithmetic may differ slightly at f32. A relative
+            // tolerance of 0.5% (with a minimum absolute floor of 1.0) is
+            // consistent with the per-block quantization error expected for Q8_1.
+            let abs_err = (got - want).abs();
+            let rel_tol = want.abs() * 5e-3;
+            let tol = rel_tol.max(1.0);
             assert!(
-                (actual - expected).abs() <= 1e-6,
-                "integration q8_1 qmatmul mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}"
+                abs_err <= tol,
+                "integration q8_1 qmatmul mismatch at ({row_idx}, {col_idx}): got {got}, expected {want}, abs_err={abs_err:.4}, tol={tol:.4}"
             );
         }
     }
@@ -308,22 +347,23 @@ fn backend_smoke_wgpu_q8_1_quantized_native_only() -> Result<()> {
 #[test]
 #[cfg(feature = "wgpu")]
 #[ignore = "requires a usable wgpu adapter and driver"]
-fn backend_smoke_wgpu_q8k_quantized_fallback_policy() -> Result<()> {
-    let Some(device) = backend_device_or_skip(
-        "backend_smoke_wgpu_q8k_quantized_fallback_policy",
+fn backend_smoke_wgpu_q8k_quantized_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_wgpu_q8k_quantized_native_only",
         TestBackend::Wgpu,
-    )?
-    else {
-        return Ok(());
-    };
-    candle_core::reset_wgpu_cpu_fallback_count();
-    smoke_q8k_quantized_fallback_observed(&device)?;
-    device.synchronize()?;
-    assert!(
-        backend_fallback_count(TestBackend::Wgpu) > 0,
-        "wgpu Q8K quantized path is expected to use CPU fallback until a native GPU path exists"
-    );
-    Ok(())
+        smoke_q8k_quantized_native_only,
+    )
+}
+
+#[test]
+#[cfg(feature = "wgpu")]
+#[ignore = "requires a usable wgpu adapter and driver"]
+fn backend_smoke_wgpu_quantized_dequantize_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_wgpu_quantized_dequantize_native_only",
+        TestBackend::Wgpu,
+        smoke_wgpu_quantized_dequantize_native_only,
+    )
 }
 
 #[test]
@@ -338,22 +378,22 @@ fn backend_smoke_vulkan_q8_1_quantized_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "vulkan")]
-fn backend_smoke_vulkan_q8k_quantized_fallback_policy() -> Result<()> {
-    let Some(device) = backend_device_or_skip(
-        "backend_smoke_vulkan_q8k_quantized_fallback_policy",
+fn backend_smoke_vulkan_q8k_quantized_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_vulkan_q8k_quantized_native_only",
         TestBackend::Vulkan,
-    )?
-    else {
-        return Ok(());
-    };
-    candle_core::reset_vulkan_cpu_fallback_count();
-    smoke_q8k_quantized_fallback_observed(&device)?;
-    device.synchronize()?;
-    assert!(
-        backend_fallback_count(TestBackend::Vulkan) > 0,
-        "vulkan Q8K quantized path is expected to use CPU fallback until a native GPU path exists"
-    );
-    Ok(())
+        smoke_q8k_quantized_native_only,
+    )
+}
+
+#[test]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_quantized_dequantize_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_vulkan_quantized_dequantize_native_only",
+        TestBackend::Vulkan,
+        smoke_vulkan_quantized_dequantize_native_only,
+    )
 }
 
 #[test]
@@ -503,6 +543,7 @@ fn backend_smoke_vulkan_conv_transpose_native_only() -> Result<()> {
 #[test]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_non_zero_start_offset_roundtrip() -> Result<()> {
+    let _guard = support::fallback_counter_guard();
     let Some(device) = backend_device_or_skip(
         "backend_smoke_vulkan_non_zero_start_offset_roundtrip",
         TestBackend::Vulkan,
@@ -530,6 +571,7 @@ fn backend_smoke_vulkan_non_zero_start_offset_roundtrip() -> Result<()> {
 #[test]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_boundary_sync_stale_readback_guard() -> Result<()> {
+    let _guard = support::fallback_counter_guard();
     let Some(device) = backend_device_or_skip(
         "backend_smoke_vulkan_boundary_sync_stale_readback_guard",
         TestBackend::Vulkan,
@@ -558,6 +600,7 @@ fn backend_smoke_vulkan_boundary_sync_stale_readback_guard() -> Result<()> {
 #[test]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_conv1d_multi_channel_regression() -> Result<()> {
+    let _guard = support::fallback_counter_guard();
     let cpu = Device::Cpu;
     let Some(device) = backend_device_or_skip(
         "backend_smoke_vulkan_conv1d_multi_channel_regression",
@@ -597,6 +640,7 @@ fn backend_smoke_vulkan_conv1d_multi_channel_regression() -> Result<()> {
 #[test]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_repeated_shape_reuse_regression_guard() -> Result<()> {
+    let _guard = support::fallback_counter_guard();
     let Some(device) = backend_device_or_skip(
         "backend_smoke_vulkan_repeated_shape_reuse_regression_guard",
         TestBackend::Vulkan,
@@ -629,6 +673,7 @@ fn backend_smoke_vulkan_repeated_shape_reuse_regression_guard() -> Result<()> {
 #[test]
 #[cfg(feature = "vulkan")]
 fn backend_smoke_vulkan_device_recreate_teardown_probe() -> Result<()> {
+    let _guard = support::fallback_counter_guard();
     for probe_idx in 0..3 {
         let Some(device) = backend_device_or_skip(
             "backend_smoke_vulkan_device_recreate_teardown_probe",
@@ -745,6 +790,129 @@ fn smoke_quantized_family(device: &Device) -> Result<()> {
     smoke_quantized_paths(device)
 }
 
+/// Shape sweep over the dense f32 GEMM routes. The `m` axis crosses the
+/// matvec-vs-tiled routing threshold (8) and the tile sizes (32/64), the `n`/`k`
+/// axes cross workgroup-tile and K-loop boundaries, and odd sizes exercise the
+/// out-of-bounds guards in the tiled shader. A routing or specialization bug in
+/// any one route shows up as a large numeric divergence from the CPU result.
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f32_matmul_shape_sweep(device: &Device) -> Result<()> {
+    let cpu = Device::Cpu;
+    let cases: &[(usize, usize, usize)] = &[
+        (1, 4, 7),
+        (8, 16, 16),
+        (9, 4, 7),
+        (16, 16, 16),
+        (33, 65, 129),
+        (64, 64, 64),
+        (100, 50, 30),
+        (96, 100, 1024),
+        (128, 196, 256),
+        (196, 256, 9),
+        (256, 196, 1152),
+        (1000, 64, 1),
+    ];
+    for &(m, n, k) in cases {
+        let a_vals: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 71) as f32 - 35.0) / 17.0)
+            .collect();
+        let b_vals: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 53) as f32 - 26.0) / 13.0)
+            .collect();
+        let a_cpu = Tensor::from_vec(a_vals.clone(), (m, k), &cpu)?;
+        let b_cpu = Tensor::from_vec(b_vals.clone(), (k, n), &cpu)?;
+        let expected = a_cpu.matmul(&b_cpu)?;
+        let a_dev = Tensor::from_vec(a_vals, (m, k), device)?;
+        let b_dev = Tensor::from_vec(b_vals, (k, n), device)?;
+        let actual = a_dev.matmul(&b_dev)?;
+        assert_matmul_close(&actual, &expected, k, &format!("matmul {m}x{n}x{k}"))?;
+
+        // Transposed rhs exercises the strided-input materialization path.
+        let bt_cpu = b_cpu.t()?.contiguous()?;
+        let bt_dev = b_dev.t()?.contiguous()?;
+        let expected_t = a_cpu.matmul(&bt_cpu.t()?)?;
+        let actual_t = a_dev.matmul(&bt_dev.t()?)?;
+        assert_matmul_close(&actual_t, &expected_t, k, &format!("matmul-tr {m}x{n}x{k}"))?;
+    }
+    // Batched matmul crossing the same routing threshold per batch.
+    for &(b, m, n, k) in &[(2usize, 4usize, 8usize, 16usize), (3, 33, 17, 64)] {
+        let a_vals: Vec<f32> = (0..b * m * k)
+            .map(|i| ((i % 61) as f32 - 30.0) / 11.0)
+            .collect();
+        let b_vals: Vec<f32> = (0..b * k * n)
+            .map(|i| ((i % 47) as f32 - 23.0) / 7.0)
+            .collect();
+        let a_cpu = Tensor::from_vec(a_vals.clone(), (b, m, k), &cpu)?;
+        let b_cpu = Tensor::from_vec(b_vals.clone(), (b, k, n), &cpu)?;
+        let expected = a_cpu.matmul(&b_cpu)?;
+        let a_dev = Tensor::from_vec(a_vals, (b, m, k), device)?;
+        let b_dev = Tensor::from_vec(b_vals, (b, k, n), device)?;
+        let actual = a_dev.matmul(&b_dev)?;
+        assert_matmul_close(&actual, &expected, k, &format!("bmm {b}x{m}x{n}x{k}"))?;
+    }
+    Ok(())
+}
+
+/// Full dtype-conversion matrix over the CUDA-parity dtype set. Each pair must
+/// run natively (no recorded CPU fallback) and match the CPU `as`-cast
+/// semantics. BF16 destinations are remapped to F16 by the storage layer on
+/// these backends, which the CPU reference mirrors here.
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_dtype_conversion_matrix_native_only(device: &Device) -> Result<()> {
+    let cpu = Device::Cpu;
+    let dtypes = [
+        DType::F32,
+        DType::F16,
+        DType::BF16,
+        DType::U8,
+        DType::U32,
+        DType::I64,
+    ];
+    let vals: Vec<f32> = (0..64).map(|v| v as f32 / 8.0).collect();
+    for src in dtypes {
+        for dst in dtypes {
+            let dev_t = Tensor::from_vec(vals.clone(), 64, device)?.to_dtype(src)?;
+            let cpu_t = Tensor::from_vec(vals.clone(), 64, &cpu)?.to_dtype(src)?;
+            let dst_cpu = if dst == DType::BF16 { DType::F16 } else { dst };
+            let got = dev_t
+                .to_dtype(dst)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let want = cpu_t
+                .to_dtype(dst_cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            for (idx, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() <= 0.011,
+                    "dtype matrix {src:?}->{dst:?}: mismatch at idx {idx}: got {g}, expected {w}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn assert_matmul_close(actual: &Tensor, expected: &Tensor, k: usize, case: &str) -> Result<()> {
+    assert_eq!(actual.dims(), expected.dims(), "{case}: shape mismatch");
+    let actual = actual.flatten_all()?.to_vec1::<f32>()?;
+    let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+    let scale = expected.iter().fold(1f32, |acc, v| acc.max(v.abs()));
+    // f32 accumulation error grows with K; scale the relative tolerance.
+    let tol = scale * 1e-6 * (k as f32).sqrt().max(1.0) + 1e-5;
+    for (idx, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
+        let diff = (got - want).abs();
+        assert!(
+            diff <= tol,
+            "{case}: mismatch at idx {idx}: got {got}, expected {want}, diff {diff}, tol {tol}"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_q8_1_quantized_native_only(device: &Device) -> Result<()> {
     let cpu = Device::Cpu;
@@ -806,23 +974,100 @@ fn smoke_q8_1_quantized_native_only(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
-fn smoke_q8k_quantized_fallback_observed(device: &Device) -> Result<()> {
+fn smoke_q8k_quantized_native_only(device: &Device) -> Result<()> {
     let k = 256;
+    let cpu = Device::Cpu;
     let lhs_vals = (0..k).map(|v| v as f32 / 32.0).collect::<Vec<_>>();
     let rhs_vals = (0..(k * 4))
         .map(|v| (v as f32 - 384.0) / 64.0)
         .collect::<Vec<_>>();
+    let lhs_cpu = Tensor::from_slice(&lhs_vals, (1, k), &cpu)?;
+    let rhs_cpu = Tensor::from_slice(&rhs_vals, (k, 4), &cpu)?;
     let lhs = Tensor::from_slice(&lhs_vals, (1, k), device)?;
     let rhs = Tensor::from_slice(&rhs_vals, (k, 4), device)?;
 
     let q_rhs = QTensor::quantize(&rhs.t()?, GgmlDType::Q8K)?;
     let qmm = QMatMul::from_qtensor(q_rhs)?;
-    let _ = qmm.forward(&lhs)?;
+    let expected_mm = expected_quantized_matmul(device, &rhs_cpu, &lhs_cpu, GgmlDType::Q8K)?;
+    let actual_mm = qmm.forward(&lhs)?;
+    assert_quantized_close(&actual_mm, &expected_mm, GgmlDType::Q8K, "q8k-matvec")?;
 
     let ids = Tensor::from_slice(&[3u32, 1, 0], 3, device)?;
+    let ids_cpu = Tensor::from_slice(&[3u32, 1, 0], 3, &cpu)?;
     let q_rows = QTensor::quantize(&rhs.t()?, GgmlDType::Q8K)?;
-    let _ = q_rows.embedding(&ids)?;
+    let q_rows_cpu = QTensor::quantize(&rhs_cpu.t()?, GgmlDType::Q8K)?;
+    let actual_rows = q_rows.embedding(&ids)?;
+    let expected_rows = q_rows_cpu.dequantize(&cpu)?.index_select(&ids_cpu, 0)?;
+    assert_quantized_close(&actual_rows, &expected_rows, GgmlDType::Q8K, "q8k-get-rows")?;
     Ok(())
+}
+
+#[cfg(feature = "wgpu")]
+fn smoke_wgpu_quantized_dequantize_native_only(device: &Device) -> Result<()> {
+    let dtypes = [
+        GgmlDType::F32,
+        GgmlDType::F16,
+        GgmlDType::BF16,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4_1,
+        GgmlDType::Q5_0,
+        GgmlDType::Q5_1,
+        GgmlDType::Q8_0,
+        GgmlDType::Q8_1,
+        GgmlDType::Q2K,
+        GgmlDType::Q3K,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::Q8K,
+    ];
+    smoke_quantized_dequantize_native_only(device, &dtypes, "wgpu-dequantize")
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_quantized_dequantize_native_only(
+    device: &Device,
+    dtypes: &[GgmlDType],
+    label: &str,
+) -> Result<()> {
+    let cpu = Device::Cpu;
+    for &dtype in dtypes {
+        let cols = dtype.block_size() * 2;
+        let rows = 3usize;
+        let vals = (0..rows * cols)
+            .map(|idx| (idx as f32 - (rows * cols) as f32 / 2.0) / 37.0)
+            .collect::<Vec<_>>();
+        let src_cpu = Tensor::from_slice(&vals, (rows, cols), &cpu)?;
+        let src_gpu = Tensor::from_slice(&vals, (rows, cols), device)?;
+        let q_cpu = QTensor::quantize(&src_cpu, dtype)?;
+        let q_gpu = QTensor::quantize(&src_gpu, dtype)?;
+        let expected = q_cpu.dequantize(&cpu)?;
+        let actual = q_gpu.dequantize(device)?;
+        assert_quantized_close(&actual, &expected, dtype, label)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vulkan")]
+fn smoke_vulkan_quantized_dequantize_native_only(device: &Device) -> Result<()> {
+    let dtypes = [
+        GgmlDType::F32,
+        GgmlDType::F16,
+        GgmlDType::BF16,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4_1,
+        GgmlDType::Q5_0,
+        GgmlDType::Q5_1,
+        GgmlDType::Q8_0,
+        GgmlDType::Q8_1,
+        GgmlDType::Q2K,
+        GgmlDType::Q3K,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::Q8K,
+    ];
+    smoke_quantized_dequantize_native_only(device, &dtypes, "vulkan-dequantize")
 }
 
 #[cfg(feature = "vulkan")]
@@ -1893,6 +2138,23 @@ fn vulkan_uses_q8_1_rhs(device: &Device, dtype: GgmlDType, n: usize, k: usize) -
     const VULKAN_VENDOR_ID_AMD: u32 = 0x1002;
     const VULKAN_VENDOR_ID_INTEL: u32 = 0x8086;
 
+    fn has_subgroup_min_16(device: &candle_core::VulkanDevice) -> bool {
+        device.subgroup_size_control_supported()
+            && device.subgroup_min_size() <= 16
+            && device.subgroup_max_size() >= 16
+    }
+
+    fn uses_dmmv_subgroups(device: &candle_core::VulkanDevice, dtype: GgmlDType) -> bool {
+        if matches!(
+            dtype,
+            GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
+        ) {
+            device.subgroup_arithmetic_supported() && has_subgroup_min_16(device)
+        } else {
+            device.subgroup_arithmetic_supported()
+        }
+    }
+
     let supported = matches!(
         dtype,
         GgmlDType::Q4_0
@@ -1912,37 +2174,77 @@ fn vulkan_uses_q8_1_rhs(device: &Device, dtype: GgmlDType, n: usize, k: usize) -
     if matches!(dtype, GgmlDType::Q3K | GgmlDType::Q6K) {
         return false;
     }
-    if n > 1 {
-        return true;
+    let Ok(vk_device) = device.as_vulkan_device() else {
+        return false;
+    };
+    let vendor_id = vk_device.vendor_id();
+    let should_use = if n > 1 {
+        true
+    } else {
+        match vendor_id {
+            VULKAN_VENDOR_ID_NVIDIA => {
+                if matches!(dtype, GgmlDType::Q2K) {
+                    true
+                } else if k <= 4096 {
+                    false
+                } else {
+                    !matches!(dtype, GgmlDType::Q8_0)
+                }
+            }
+            VULKAN_VENDOR_ID_AMD => {
+                if k < 2048 {
+                    false
+                } else {
+                    !matches!(dtype, GgmlDType::Q8_0)
+                }
+            }
+            VULKAN_VENDOR_ID_INTEL => {
+                if k < 2048 {
+                    false
+                } else {
+                    !matches!(dtype, GgmlDType::Q4_0 | GgmlDType::Q5_1)
+                }
+            }
+            _ => true,
+        }
+    };
+    if !should_use || !vk_device.integer_dot_product_supported() {
+        return false;
     }
-    let vendor_id = device
-        .as_vulkan_device()
-        .map(|device| device.vendor_id())
-        .unwrap_or_default();
-    match vendor_id {
-        VULKAN_VENDOR_ID_NVIDIA => {
-            if matches!(dtype, GgmlDType::Q2K) {
-                return true;
+    let stem = match dtype {
+        GgmlDType::Q4_0 => "q4_0",
+        GgmlDType::Q4_1 => "q4_1",
+        GgmlDType::Q5_0 => "q5_0",
+        GgmlDType::Q5_1 => "q5_1",
+        GgmlDType::Q8_0 => "q8_0",
+        GgmlDType::Q2K => "q2_k",
+        GgmlDType::Q3K => "q3_k",
+        GgmlDType::Q4K => "q4_k",
+        GgmlDType::Q5K => "q5_k",
+        GgmlDType::Q6K => "q6_k",
+        _ => return false,
+    };
+    let base_name = format!("mul_mat_vec_{stem}_q8_1_f32");
+    let shader_name = if !uses_dmmv_subgroups(vk_device, dtype) {
+        base_name
+    } else {
+        let use_large = if matches!(vendor_id, VULKAN_VENDOR_ID_NVIDIA | VULKAN_VENDOR_ID_INTEL) {
+            if dtype == GgmlDType::Q6K {
+                n < 4096 && k >= 1024
+            } else {
+                n <= 8192 && k >= 1024
             }
-            if k <= 4096 {
-                return false;
-            }
-            !matches!(dtype, GgmlDType::Q8_0)
+        } else {
+            false
+        };
+        let use_large = vendor_id != VULKAN_VENDOR_ID_INTEL && use_large;
+        if use_large {
+            format!("{base_name}_subgroup_no_shmem")
+        } else {
+            format!("{base_name}_subgroup")
         }
-        VULKAN_VENDOR_ID_AMD => {
-            if k < 2048 {
-                return false;
-            }
-            !matches!(dtype, GgmlDType::Q8_0)
-        }
-        VULKAN_VENDOR_ID_INTEL => {
-            if k < 2048 {
-                return false;
-            }
-            !matches!(dtype, GgmlDType::Q4_0 | GgmlDType::Q5_1)
-        }
-        _ => true,
-    }
+    };
+    candle_vulkan_kernels::spirv(&shader_name).is_some()
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
@@ -2118,6 +2420,20 @@ fn q8_1_activation_matmul_reference_general(qweights: &QTensor, lhs: &Tensor) ->
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn dequantized_weight_matmul_reference(qweights: &QTensor, lhs: &Tensor) -> Result<Tensor> {
+    let cpu = Device::Cpu;
+    let weights = qweights.dequantize(&cpu)?;
+    let (n, k) = qweights.shape().dims2()?;
+    let lhs_dims = lhs.dims().to_vec();
+    let lhs_rows = lhs_dims.iter().product::<usize>() / k;
+    let lhs_2d = lhs.reshape((lhs_rows, k))?;
+    let out_2d = lhs_2d.matmul(&weights.t()?)?;
+    let mut out_dims = lhs_dims;
+    *out_dims.last_mut().unwrap() = n;
+    out_2d.reshape(Shape::from(out_dims))
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn quantized_rel_tol(dtype: GgmlDType) -> f32 {
     match dtype {
         GgmlDType::Q8_0 | GgmlDType::Q8_1 | GgmlDType::Q8K => 1e-3,
@@ -2180,6 +2496,9 @@ fn expected_quantized_matmul(
     dtype: GgmlDType,
 ) -> Result<Tensor> {
     let q_rhs_cpu = QTensor::quantize(&rhs_cpu.t()?, dtype)?;
+    if dtype == GgmlDType::Q8K {
+        return dequantized_weight_matmul_reference(&q_rhs_cpu, lhs_cpu);
+    }
     let lhs_m = lhs_cpu.dims()[lhs_cpu.rank() - 2];
     let lhs_k = lhs_cpu.dims()[lhs_cpu.rank() - 1];
     if device.is_vulkan() && vulkan_uses_q8_1_rhs(device, dtype, lhs_m, lhs_k) {

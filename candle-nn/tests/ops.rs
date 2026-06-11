@@ -363,6 +363,7 @@ fn vulkan_device_or_skip(test_name: &str) -> Result<Option<Device>> {
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
 fn softmax_wgpu() -> Result<()> {
+    let _guard = gpu_test_guard();
     let Some(device) = wgpu_device_or_skip("softmax_wgpu")? else {
         return Ok(());
     };
@@ -373,6 +374,7 @@ fn softmax_wgpu() -> Result<()> {
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
 fn rms_norm_wgpu() -> Result<()> {
+    let _guard = gpu_test_guard();
     let Some(device) = wgpu_device_or_skip("rms_norm_wgpu")? else {
         return Ok(());
     };
@@ -383,6 +385,7 @@ fn rms_norm_wgpu() -> Result<()> {
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
 fn sigmoid_wgpu() -> Result<()> {
+    let _guard = gpu_test_guard();
     let Some(device) = wgpu_device_or_skip("sigmoid_wgpu")? else {
         return Ok(());
     };
@@ -392,6 +395,7 @@ fn sigmoid_wgpu() -> Result<()> {
 #[test]
 #[cfg(feature = "vulkan")]
 fn softmax_vulkan() -> Result<()> {
+    let _guard = gpu_test_guard();
     let Some(device) = vulkan_device_or_skip("softmax_vulkan")? else {
         return Ok(());
     };
@@ -401,6 +405,7 @@ fn softmax_vulkan() -> Result<()> {
 #[test]
 #[cfg(feature = "vulkan")]
 fn rms_norm_vulkan() -> Result<()> {
+    let _guard = gpu_test_guard();
     let Some(device) = vulkan_device_or_skip("rms_norm_vulkan")? else {
         return Ok(());
     };
@@ -410,6 +415,7 @@ fn rms_norm_vulkan() -> Result<()> {
 #[test]
 #[cfg(feature = "vulkan")]
 fn sigmoid_vulkan() -> Result<()> {
+    let _guard = gpu_test_guard();
     let Some(device) = vulkan_device_or_skip("sigmoid_vulkan")? else {
         return Ok(());
     };
@@ -420,6 +426,7 @@ fn sigmoid_vulkan() -> Result<()> {
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
 fn layer_norm_wgpu() -> Result<()> {
+    let _guard = gpu_test_guard();
     let Some(device) = wgpu_device_or_skip("layer_norm_wgpu")? else {
         return Ok(());
     };
@@ -430,6 +437,7 @@ fn layer_norm_wgpu() -> Result<()> {
 #[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn layer_norm_vulkan() -> Result<()> {
+    let _guard = gpu_test_guard();
     let Some(device) = vulkan_device_or_skip("layer_norm_vulkan")? else {
         return Ok(());
     };
@@ -440,6 +448,7 @@ fn layer_norm_vulkan() -> Result<()> {
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
 fn rope_wgpu() -> Result<()> {
+    let _guard = gpu_test_guard();
     let Some(device) = wgpu_device_or_skip("rope_wgpu")? else {
         return Ok(());
     };
@@ -450,6 +459,7 @@ fn rope_wgpu() -> Result<()> {
 #[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn rope_vulkan() -> Result<()> {
+    let _guard = gpu_test_guard();
     let Some(device) = vulkan_device_or_skip("rope_vulkan")? else {
         return Ok(());
     };
@@ -460,6 +470,7 @@ fn rope_vulkan() -> Result<()> {
 #[ignore = "requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
 fn sdpa_wgpu() -> Result<()> {
+    let _guard = gpu_test_guard();
     let Some(device) = wgpu_device_or_skip("sdpa_wgpu")? else {
         return Ok(());
     };
@@ -470,6 +481,7 @@ fn sdpa_wgpu() -> Result<()> {
 #[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn sdpa_vulkan() -> Result<()> {
+    let _guard = gpu_test_guard();
     let Some(device) = vulkan_device_or_skip("sdpa_vulkan")? else {
         return Ok(());
     };
@@ -480,6 +492,7 @@ fn sdpa_vulkan() -> Result<()> {
 #[ignore = "heavy synthetic mini-graph; requires a usable wgpu adapter and driver"]
 #[cfg(feature = "wgpu")]
 fn mini_graph_wgpu() -> Result<()> {
+    let _guard = gpu_test_guard();
     let Some(device) = wgpu_device_or_skip("mini_graph_wgpu")? else {
         return Ok(());
     };
@@ -490,6 +503,7 @@ fn mini_graph_wgpu() -> Result<()> {
 #[ignore = "heavy synthetic mini-graph; requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn mini_graph_vulkan() -> Result<()> {
+    let _guard = gpu_test_guard();
     let Some(device) = vulkan_device_or_skip("mini_graph_vulkan")? else {
         return Ok(());
     };
@@ -880,6 +894,19 @@ fn run_synthetic_mixer_graph(device: &Device) -> Result<Tensor> {
         .reshape((batch * seq, hidden))?
         .matmul(&logits_w)?
         .reshape((batch, seq, vocab))
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// GPU backend tests share process-global fallback counters and create/destroy
+/// real driver devices; serialize them so the parallel test runner cannot race
+/// concurrent wgpu/Vulkan device lifecycles or cross-pollute counter resets.
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn gpu_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]

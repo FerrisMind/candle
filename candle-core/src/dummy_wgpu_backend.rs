@@ -41,6 +41,14 @@ impl WgpuStorage {
     ) -> Result<(Self, Shape)> {
         Err(Error::NotCompiledWithWgpuSupport)
     }
+
+    pub(crate) fn quantized_raw_float_dequantize_f32(
+        &self,
+        _: crate::quantized::GgmlDType,
+        _: usize,
+    ) -> Result<Self> {
+        Err(Error::NotCompiledWithWgpuSupport)
+    }
 }
 
 #[derive(thiserror::Error, Debug)]

@@ -504,14 +504,24 @@ fn unsupported(op: &'static str) -> Error {
 }
 
 fn should_cpu_fallback(err: &Error) -> bool {
-    match err {
-        Error::UnsupportedDTypeForOp(..) => true,
-        Error::Msg(msg) => msg.contains("wgpu backend op") && msg.contains("not implemented"),
-        Error::Context { inner, .. }
-        | Error::WithPath { inner, .. }
-        | Error::WithBacktrace { inner, .. } => should_cpu_fallback(inner),
-        _ => false,
+    fn matches_fallback(err: &Error) -> bool {
+        match err {
+            Error::UnsupportedDTypeForOp(..) => true,
+            Error::Msg(msg) => msg.contains("wgpu backend op") && msg.contains("not implemented"),
+            Error::Context { inner, .. }
+            | Error::WithPath { inner, .. }
+            | Error::WithBacktrace { inner, .. } => matches_fallback(inner),
+            _ => false,
+        }
     }
+    let fallback = matches_fallback(err);
+    if fallback {
+        // Every backend-internal CPU recovery must be visible to the global
+        // fallback counter, otherwise native-required tests pass while work
+        // silently runs on the CPU.
+        crate::storage::record_wgpu_cpu_fallback(err);
+    }
+    fallback
 }
 
 fn byte_len(dtype: DType, count: usize, op: &'static str) -> Result<usize> {
@@ -894,6 +904,7 @@ fn wgpu_quantized_dtype(dtype: GgmlDType) -> Result<candle_wgpu_kernels::Quantiz
         GgmlDType::Q4K => Ok(candle_wgpu_kernels::QuantizedDType::Q4_K),
         GgmlDType::Q5K => Ok(candle_wgpu_kernels::QuantizedDType::Q5_K),
         GgmlDType::Q6K => Ok(candle_wgpu_kernels::QuantizedDType::Q6_K),
+        GgmlDType::Q8K => Ok(candle_wgpu_kernels::QuantizedDType::Q8_K),
         other => crate::bail!("wgpu backend quantized dtype {other:?} is not supported"),
     }
 }
@@ -967,8 +978,19 @@ fn copy_shader(src: DType, dst: DType) -> Result<String> {
         (DType::F32, DType::F32) => ["SRC_F32", "DST_F32"],
         (DType::F32, DType::F16) => ["SRC_F32", "DST_F16"],
         (DType::F32, DType::I32) => ["SRC_F32", "DST_I32"],
+        (DType::F32, DType::U32) => ["SRC_F32", "DST_U32"],
         (DType::F16, DType::F32) => ["SRC_F16", "DST_F32"],
         (DType::F16, DType::F16) => ["SRC_F16", "DST_F16"],
+        (DType::F16, DType::I32) => ["SRC_F16", "DST_I32"],
+        (DType::F16, DType::U32) => ["SRC_F16", "DST_U32"],
+        (DType::U32, DType::F32) => ["SRC_U32", "DST_F32"],
+        (DType::U32, DType::F16) => ["SRC_U32", "DST_F16"],
+        (DType::U32, DType::I32) => ["SRC_U32", "DST_I32"],
+        (DType::U32, DType::U32) => ["SRC_U32", "DST_U32"],
+        (DType::I32, DType::F32) => ["SRC_I32", "DST_F32"],
+        (DType::I32, DType::F16) => ["SRC_I32", "DST_F16"],
+        (DType::I32, DType::I32) => ["SRC_I32", "DST_I32"],
+        (DType::I32, DType::U32) => ["SRC_I32", "DST_U32"],
         _ => return Err(unsupported("to_dtype")),
     };
     let source = candle_wgpu_kernels::get("cpy.wgsl")
@@ -1762,6 +1784,215 @@ impl WgpuStorage {
         let workgroups = (count as u32).div_ceil(WG_SIZE);
         self.device
             .run_compute(&shader, &entries, &bindings, workgroups, "candle-wgpu-fill")
+    }
+
+    /// Emulated casts for dtypes WGSL cannot express directly: `U8` lives as
+    /// four packed bytes per `u32` word and `I64` as a lo/hi `u32` pair.
+    /// Float -> integer conversions follow Rust `as` semantics (saturating,
+    /// NaN -> 0); integer -> integer conversions truncate like Rust `as`.
+    fn run_emulated_cast(&self, layout: &Layout, dst_dtype: DType) -> Result<Self> {
+        if !layout.is_contiguous() || layout.start_offset() != 0 {
+            return Err(Error::Msg(format!(
+                "wgpu backend op to_dtype {:?}->{dst_dtype:?} strided not implemented",
+                self.dtype
+            ))
+            .bt());
+        }
+        let ne = layout.shape().elem_count();
+        // Loads the source element `i` as an f32 `v` plus, for I64 sources,
+        // exact lo/hi words (`v` alone loses precision past 2^24).
+        let load = match self.dtype {
+            DType::F32 => "let v = bitcast<f32>(src[i]); let lo = 0u; let hi = 0u;",
+            DType::F16 => {
+                "let v = unpack2x16float(src[i / 2u])[i % 2u]; let lo = 0u; let hi = 0u;"
+            }
+            DType::BF16 => {
+                "let v = bitcast<f32>(((src[i / 2u] >> (16u * (i % 2u))) & 0xffffu) << 16u); let lo = 0u; let hi = 0u;"
+            }
+            DType::U8 => {
+                "let b = (src[i / 4u] >> (8u * (i % 4u))) & 0xffu; let v = f32(b); let lo = b; let hi = 0u;"
+            }
+            DType::U32 => "let sw = src[i]; let v = f32(sw); let lo = sw; let hi = 0u;",
+            DType::I32 => {
+                "let sw = bitcast<i32>(src[i]); let v = f32(sw); let lo = src[i]; let hi = select(0u, 0xffffffffu, sw < 0);"
+            }
+            DType::I64 => {
+                "let lo = src[2u * i]; let hi = src[2u * i + 1u]; let v = f32(bitcast<i32>(hi)) * 4294967296.0 + f32(lo);"
+            }
+            other => return Err(Error::UnsupportedDTypeForOp(other, "wgpu emulated cast").bt()),
+        };
+        let src_is_float = matches!(self.dtype, DType::F32 | DType::F16 | DType::BF16);
+        // `conv_*` snippets produce the destination scalar from (v, lo, hi).
+        let conv_u8 = if src_is_float {
+            "select(u32(clamp(v, 0.0, 255.0)), 0u, v != v)"
+        } else {
+            "lo & 0xffu"
+        };
+        let conv_u32 = if src_is_float {
+            "select(select(u32(clamp(v, 0.0, 4294967040.0)), 0xffffffffu, v >= 4294967296.0), 0u, v != v || v <= 0.0)"
+        } else {
+            "lo"
+        };
+        let conv_f32 = "v";
+        let body = match dst_dtype {
+            DType::U8 => format!(
+                r#"
+    let base = gid.x * 4u;
+    if (base >= params.ne) {{ return; }}
+    var w: u32 = 0u;
+    for (var k: u32 = 0u; k < 4u; k++) {{
+        let i = base + k;
+        if (i < params.ne) {{
+            {load}
+            let b = {conv_u8};
+            w |= (b & 0xffu) << (8u * k);
+        }}
+    }}
+    dst[gid.x] = w;
+"#
+            ),
+            DType::F16 => format!(
+                r#"
+    let base = gid.x * 2u;
+    if (base >= params.ne) {{ return; }}
+    var v0: f32 = 0.0;
+    var v1: f32 = 0.0;
+    {{
+        let i = base;
+        {load}
+        v0 = {conv_f32};
+    }}
+    if (base + 1u < params.ne) {{
+        let i = base + 1u;
+        {load}
+        v1 = {conv_f32};
+    }}
+    dst[gid.x] = pack2x16float(vec2<f32>(v0, v1));
+"#
+            ),
+            DType::F32 => format!(
+                r#"
+    let i = gid.x;
+    if (i >= params.ne) {{ return; }}
+    {load}
+    dst[i] = bitcast<u32>({conv_f32});
+"#
+            ),
+            DType::U32 => format!(
+                r#"
+    let i = gid.x;
+    if (i >= params.ne) {{ return; }}
+    {load}
+    dst[i] = {conv_u32};
+"#
+            ),
+            DType::I64 => {
+                let split = if src_is_float {
+                    // Rust `as` saturates; f32 cannot exactly represent i64
+                    // bounds, so clamp on the f32 side before splitting.
+                    r#"
+    var out_lo: u32 = 0u;
+    var out_hi: u32 = 0u;
+    if (v == v) {
+        var x = clamp(v, -9223371487098961920.0, 9223371487098961920.0);
+        let neg = x < 0.0;
+        var a = abs(trunc(x));
+        let hi_f = floor(a / 4294967296.0);
+        let lo_f = a - hi_f * 4294967296.0;
+        out_hi = u32(hi_f);
+        out_lo = u32(lo_f);
+        if (neg) {
+            // two's complement negate
+            out_lo = ~out_lo;
+            out_hi = ~out_hi;
+            if (out_lo == 0xffffffffu) { out_lo = 0u; out_hi += 1u; } else { out_lo += 1u; }
+        }
+    }
+"#
+                } else {
+                    r#"
+    let out_lo = lo;
+    let out_hi = hi;
+"#
+                };
+                format!(
+                    r#"
+    let i = gid.x;
+    if (i >= params.ne) {{ return; }}
+    {load}
+    {split}
+    dst[2u * i] = out_lo;
+    dst[2u * i + 1u] = out_hi;
+"#
+                )
+            }
+            other => {
+                return Err(Error::UnsupportedDTypeForOp(other, "wgpu emulated cast dst").bt())
+            }
+        };
+        let shader = format!(
+            r#"
+struct Params {{
+    ne: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}};
+@group(0) @binding(0) var<storage, read_write> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+{body}
+}}
+"#
+        );
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), dst_dtype)? };
+        let params = ArgMaxParams {
+            offset_src: ne.try_into()?,
+            offset_dst: 0,
+            ne0: 0,
+            _pad0: 0,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-emulated-cast-params"),
+                size: std::mem::size_of::<ArgMaxParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+        let groups_of = match dst_dtype {
+            DType::U8 => 4,
+            DType::F16 => 2,
+            _ => 1,
+        };
+        let work_items = ne.div_ceil(groups_of);
+        let workgroups: u32 = work_items.try_into().map(|v: u32| v.div_ceil(WG_SIZE))?;
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-emulated-cast",
+        )?;
+        Ok(dst)
     }
 
     fn run_copy_to_dtype(&self, layout: &Layout, dtype: DType, shader: &str) -> Result<Self> {
@@ -2890,11 +3121,24 @@ impl WgpuStorage {
             return Err(unsupported("scatter_add strided ids"));
         }
         let rank = dst_l.dims().len();
-        if rank == 0 || ids_l.dims().len() != rank || src_l.dims().len() != rank {
+        if rank == 0 || src_l.dims().len() != rank {
             return Err(unsupported("scatter_add rank"));
         }
-        let ids_dim = ids_l.dims()[rank - 1];
-        let left_size: usize = ids_l.dims()[..rank - 1].iter().product();
+        let ids_dim = src_l.dims()[rank - 1];
+        let left_size: usize = src_l.dims()[..rank - 1].iter().product();
+        // `scatter_add` passes ids shaped like `src`; `index_add` passes one
+        // rank-1 id row shared by every leading row, which maps to a zero ids
+        // row stride in the shader.
+        let ids_row_stride: usize = if ids_l.dims().len() == rank {
+            if ids_l.dims() != src_l.dims() {
+                return Err(unsupported("scatter_add ids shape"));
+            }
+            ids_dim
+        } else if ids_l.dims() == [ids_dim] {
+            0
+        } else {
+            return Err(unsupported("scatter_add rank"));
+        };
         let dst_dim = dst_l.dims()[rank - 1];
         let params = GetRowsParams {
             offset_src: src_l.start_offset().try_into()?,
@@ -2904,7 +3148,7 @@ impl WgpuStorage {
             stride_src2: ids_dim.try_into()?,
             stride_src3: (ids_dim * left_size).try_into()?,
             stride_idx0: 1,
-            stride_idx1: ids_dim.try_into()?,
+            stride_idx1: ids_row_stride.try_into()?,
             stride_idx2: 0,
             stride_dst1: 1,
             stride_dst2: dst_dim.try_into()?,
@@ -3627,6 +3871,116 @@ impl WgpuStorage {
         Ok(dst)
     }
 
+    /// Dequantize GGUF raw-float payloads (`F32`/`F16`/`BF16` stored under the
+    /// GGML dtype enum) without leaving the GPU. `F32` is a plain device copy;
+    /// `F16`/`BF16` decode the packed 16-bit halves in WGSL via
+    /// `unpack2x16float` / exponent-shift, so no `SHADER_F16` feature or CPU
+    /// round-trip is required.
+    pub(crate) fn quantized_raw_float_dequantize_f32(
+        &self,
+        qdtype: GgmlDType,
+        elem_count: usize,
+    ) -> Result<Self> {
+        if self.dtype != DType::U8 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu raw-float dequantize").bt());
+        }
+        let dst_shape = Shape::from(elem_count);
+        if qdtype == GgmlDType::F32 {
+            let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+            let size = byte_len(DType::F32, elem_count, "wgpu raw-float dequantize")?;
+            let mut encoder =
+                self.device
+                    .inner
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("candle-wgpu-quant-f32-copy"),
+                    });
+            encoder.copy_buffer_to_buffer(
+                &self.buffer,
+                0,
+                &dst.buffer,
+                0,
+                wgpu_copy_size(size) as u64,
+            );
+            self.device.inner.queue.submit([encoder.finish()]);
+            return Ok(dst);
+        }
+        let decode = match qdtype {
+            GgmlDType::F16 => "unpack2x16float(word)[half_idx]",
+            // bf16 -> f32: the 16-bit payload is the top half of the f32 bits.
+            GgmlDType::BF16 => "bitcast<f32>(half_bits << 16u)",
+            _ => {
+                return Err(Error::Msg(format!(
+                    "wgpu raw-float dequantize expects F32/F16/BF16, got {qdtype:?}"
+                ))
+                .bt())
+            }
+        };
+        let shader = format!(
+            r#"
+struct Params {{
+    ne: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}};
+@group(0) @binding(0) var<storage, read_write> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    if (gid.x >= params.ne) {{ return; }}
+    let word = src[gid.x / 2u];
+    let half_idx = gid.x % 2u;
+    let half_bits = (word >> (16u * half_idx)) & 0xffffu;
+    dst[gid.x] = {decode};
+}}
+"#
+        );
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        // Reuse the 4-u32 uniform block layout; the shader only reads the
+        // first field (`ne`), which maps onto `offset_src` here.
+        let params = ArgMaxParams {
+            offset_src: elem_count.try_into()?,
+            offset_dst: 0,
+            ne0: 0,
+            _pad0: 0,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-quant-raw-float-params"),
+                size: std::mem::size_of::<ArgMaxParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+        let workgroups: u32 = elem_count.try_into().map(|v: u32| v.div_ceil(WG_SIZE))?;
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-quant-raw-float",
+        )?;
+        Ok(dst)
+    }
+
     pub(crate) fn quantized_matmul(
         &self,
         qdtype: GgmlDType,
@@ -4211,25 +4565,20 @@ impl BackendStorage for WgpuStorage {
         }
     }
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
-        let gpu = match (self.dtype, dtype) {
-            (DType::F32, DType::F16) | (DType::F16, DType::F32) | (DType::F16, DType::F16)
-                if !self
-                    .device
-                    .inner
-                    .features
-                    .contains(wgpu::Features::SHADER_F16) =>
-            {
-                Err(unsupported("to_dtype f16"))
+        let f16_involved = self.dtype == DType::F16 || dtype == DType::F16;
+        let gpu = if f16_involved
+            && !self
+                .device
+                .inner
+                .features
+                .contains(wgpu::Features::SHADER_F16)
+        {
+            Err(unsupported("to_dtype f16"))
+        } else {
+            match copy_shader(self.dtype, dtype) {
+                Ok(shader) => self.run_copy_to_dtype(layout, dtype, &shader),
+                Err(_) => self.run_emulated_cast(layout, dtype),
             }
-            (DType::F32, DType::F32)
-            | (DType::F32, DType::F16)
-            | (DType::F32, DType::I32)
-            | (DType::F16, DType::F32)
-            | (DType::F16, DType::F16) => {
-                let shader = copy_shader(self.dtype, dtype)?;
-                self.run_copy_to_dtype(layout, dtype, &shader)
-            }
-            _ => Err(unsupported("to_dtype")),
         };
         match gpu {
             Ok(out) => Ok(out),

@@ -1,0 +1,30 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer A { uint data_a[]; };
+layout(binding = 1) writeonly buffer D { float data_b[]; };
+
+void main() {
+    const uint i = gl_WorkGroupID.x;
+    if (i >= p.nel / 256) {
+        return;
+    }
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint word_base = i * 73;
+    const float d = uintBitsToFloat(data_a[word_base]);
+    const uint q_packed = data_a[word_base + 1 + tid];
+    const uint dst_base = i * 256;
+
+    [[unroll]] for (uint l = 0; l < 4; ++l) {
+        const uint raw = (q_packed >> (8 * l)) & 0xFF;
+        int q = int(raw);
+        if (q >= 128) {
+            q -= 256;
+        }
+        data_b[dst_base + tid * 4 + l] = d * float(q);
+    }
+}

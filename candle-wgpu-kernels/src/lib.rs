@@ -49,6 +49,7 @@ pub enum QuantizedDType {
     Q4_K,
     Q5_K,
     Q6_K,
+    Q8_K,
 }
 
 const MUL_MAT_TILE_M: u32 = 4;
@@ -577,6 +578,15 @@ fn quantized_shader_config(dtype: QuantizedDType) -> (Vec<String>, &'static str,
             "u32",
             "256",
         ),
+        QuantizedDType::Q8_K => (
+            vec![
+                "Q8_K".to_string(),
+                "BYTE_HELPERS".to_string(),
+                "U32_DEQUANT_HELPERS".to_string(),
+            ],
+            "u32",
+            "256",
+        ),
     }
 }
 
@@ -593,6 +603,7 @@ fn quantized_mul_acc_define(dtype: QuantizedDType) -> &'static str {
         QuantizedDType::Q4_K => "MUL_ACC_Q4_K",
         QuantizedDType::Q5_K => "MUL_ACC_Q5_K",
         QuantizedDType::Q6_K => "MUL_ACC_Q6_K",
+        QuantizedDType::Q8_K => "MUL_ACC_Q8_K",
     }
 }
 
@@ -602,7 +613,8 @@ pub fn quantized_matvec_outputs_per_wg(dtype: QuantizedDType) -> u32 {
         | QuantizedDType::Q3_K
         | QuantizedDType::Q4_K
         | QuantizedDType::Q5_K
-        | QuantizedDType::Q6_K => QUANT_MUL_MAT_VEC_K_Q_OUTPUTS_PER_WG,
+        | QuantizedDType::Q6_K
+        | QuantizedDType::Q8_K => QUANT_MUL_MAT_VEC_K_Q_OUTPUTS_PER_WG,
         _ => QUANT_MUL_MAT_VEC_LEGACY_Q_OUTPUTS_PER_WG,
     }
 }
@@ -752,6 +764,7 @@ fn quantized_mul_mat_id_init_define(dtype: QuantizedDType) -> &'static str {
         QuantizedDType::Q4_K => "INIT_SRC0_SHMEM_Q4_K",
         QuantizedDType::Q5_K => "INIT_SRC0_SHMEM_Q5_K",
         QuantizedDType::Q6_K => "INIT_SRC0_SHMEM_Q6_K",
+        QuantizedDType::Q8_K => "INIT_SRC0_SHMEM_Q8_K",
     }
 }
 

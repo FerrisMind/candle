@@ -43,6 +43,16 @@ const VULKAN_ARGSORT_WG_UNROLL_FACTOR: u32 = 2;
 const VULKAN_MUL_MAT_VEC_MAX_COLS: usize = 8;
 const VULKAN_DENSE_MUL_MAT_VEC_MAX_ROWS: usize = 8;
 
+/// Mirror of llama.cpp's `ggml-vulkan.cpp` dense-GEMM dispatch rule: the
+/// row-looped `mul_mat_vec` family is only profitable while the number of
+/// output rows stays at or below `mul_mat_vec_max_cols` (8). Larger dense
+/// GEMMs route to the tiled `matmul_f32_f32` shader so one dispatch covers the
+/// whole tile grid instead of `m / 8` host-side dispatches.
+fn vulkan_dense_gemm_prefers_tiled(m: usize, n: usize, k: usize) -> bool {
+    let _ = (n, k);
+    m > VULKAN_DENSE_MUL_MAT_VEC_MAX_ROWS
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GgmlBinaryParams {
@@ -275,6 +285,16 @@ struct VulkanQuantizeQ8_1Params {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct VulkanDequantizeParams {
+    m: u32,
+    k: u32,
+    stride_a: u32,
+    stride_b: u32,
+    nel: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct VulkanRepackQ8_1ToQ8_0Params {
     num_blocks: u32,
 }
@@ -408,6 +428,30 @@ impl VulkanDevice {
 
     pub fn physical_device_type(&self) -> vk::PhysicalDeviceType {
         self.inner.physical_device_type
+    }
+
+    pub fn integer_dot_product_supported(&self) -> bool {
+        self.inner.integer_dot_product
+    }
+
+    pub fn subgroup_arithmetic_supported(&self) -> bool {
+        self.inner.subgroup_arithmetic
+    }
+
+    pub fn subgroup_size(&self) -> u32 {
+        self.inner.subgroup_size
+    }
+
+    pub fn subgroup_size_control_supported(&self) -> bool {
+        self.inner.subgroup_size_control
+    }
+
+    pub fn subgroup_min_size(&self) -> u32 {
+        self.inner.subgroup_min_size
+    }
+
+    pub fn subgroup_max_size(&self) -> u32 {
+        self.inner.subgroup_max_size
     }
 }
 
@@ -573,18 +617,32 @@ fn unsupported(op: &'static str) -> Error {
 }
 
 fn should_cpu_fallback(err: &Error) -> bool {
-    match err {
-        Error::UnsupportedDTypeForOp(..) => true,
-        Error::Msg(msg) => msg.contains("vulkan backend op") && msg.contains("not implemented"),
-        Error::Context { inner, .. }
-        | Error::WithPath { inner, .. }
-        | Error::WithBacktrace { inner, .. } => should_cpu_fallback(inner),
-        _ => false,
+    fn matches_fallback(err: &Error) -> bool {
+        match err {
+            Error::UnsupportedDTypeForOp(..) => true,
+            Error::Msg(msg) => msg.contains("vulkan backend op") && msg.contains("not implemented"),
+            Error::Context { inner, .. }
+            | Error::WithPath { inner, .. }
+            | Error::WithBacktrace { inner, .. } => matches_fallback(inner),
+            _ => false,
+        }
     }
+    let fallback = matches_fallback(err);
+    if fallback {
+        // Every backend-internal CPU recovery must be visible to the global
+        // fallback counter, otherwise native-required tests pass while work
+        // silently runs on the CPU.
+        crate::storage::record_vulkan_cpu_fallback(err);
+    }
+    fallback
 }
 
 pub fn shader_source(name: &str) -> Option<&'static str> {
     candle_vulkan_kernels::get(name).map(|module| module.source())
+}
+
+fn vulkan_spirv_exists(name: &str) -> bool {
+    candle_vulkan_kernels::spirv(name).is_some()
 }
 
 fn vulkan_quantized_stem(dtype: GgmlDType) -> Result<&'static str> {
@@ -824,6 +882,34 @@ fn vulkan_dmmv_rows_per_group(
     Ok(rows)
 }
 
+fn vulkan_q8_1_rhs_matmul_shader_name(qdtype: GgmlDType) -> Result<Option<String>> {
+    if !vulkan_supports_q8_1_rhs(qdtype) {
+        return Ok(None);
+    }
+    let name = format!("matmul_{}_q8_1", vulkan_quantized_stem(qdtype)?);
+    Ok(vulkan_spirv_exists(&name).then_some(name))
+}
+
+fn vulkan_q8_1_rhs_matvec_shader_name(
+    device: &VulkanDevice,
+    qdtype: GgmlDType,
+    n: usize,
+    k: usize,
+    indexed: bool,
+) -> Result<Option<(String, VulkanDmmvWorkgroup)>> {
+    if !vulkan_supports_q8_1_rhs(qdtype) || !vulkan_should_use_mmvq(device, qdtype, n, k) {
+        return Ok(None);
+    }
+    let workgroup = vulkan_dmmv_workgroup(device, qdtype, n, k, true);
+    let base_name = if indexed {
+        format!("mul_mat_vec_id_{}_q8_1_f32", vulkan_quantized_stem(qdtype)?)
+    } else {
+        format!("mul_mat_vec_{}_q8_1_f32", vulkan_quantized_stem(qdtype)?)
+    };
+    let name = vulkan_dmmv_shader_name(device, qdtype, base_name, workgroup);
+    Ok(vulkan_spirv_exists(&name).then_some((name, workgroup)))
+}
+
 fn vulkan_q8_1_x4_bytes(elem_count: usize) -> Result<usize> {
     elem_count
         .div_ceil(128)
@@ -882,9 +968,8 @@ fn repack_q8_1_storage_to_q8_0(
     let num_blocks = elem_count / GgmlDType::Q8_1.block_size();
     let out_count = num_blocks * GgmlDType::Q8_0.type_size();
     let out = unsafe { device.alloc_uninit(&Shape::from(out_count), DType::U8)? };
-    let spirv = candle_vulkan_kernels::spirv("repack_q8_1_to_q8_0").ok_or_else(|| {
-        Error::Msg("vulkan shader repack_q8_1_to_q8_0 not generated".into()).bt()
-    })?;
+    let spirv = candle_vulkan_kernels::spirv("repack_q8_1_to_q8_0")
+        .ok_or_else(|| Error::Msg("vulkan shader repack_q8_1_to_q8_0 not generated".into()).bt())?;
     let params = VulkanRepackQ8_1ToQ8_0Params {
         num_blocks: num_blocks.try_into()?,
     };
@@ -2500,6 +2585,25 @@ fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
         (DType::F32, DType::F16) => "cpy_f32_f16",
         (DType::F16, DType::F32) => "cpy_f16_f32",
         (DType::F16, DType::F16) => "cpy_f16_f16",
+        // Candle-owned integer cast family; the copied ggml generator only
+        // covers the float pairs above.
+        (DType::F32, DType::U8) => "convert_f32_u8",
+        (DType::F32, DType::U32) => "convert_f32_u32",
+        (DType::F32, DType::I64) => "convert_f32_i64",
+        (DType::F16, DType::U8) => "convert_f16_u8",
+        (DType::F16, DType::U32) => "convert_f16_u32",
+        (DType::F16, DType::I64) => "convert_f16_i64",
+        (DType::U8, DType::F32) => "convert_u8_f32",
+        (DType::U8, DType::F16) => "convert_u8_f16",
+        (DType::U8, DType::U32) => "convert_u8_u32",
+        (DType::U8, DType::I64) => "convert_u8_i64",
+        (DType::U32, DType::F16) => "convert_u32_f16",
+        (DType::U32, DType::U8) => "convert_u32_u8",
+        (DType::U32, DType::I64) => "convert_u32_i64",
+        (DType::I64, DType::F32) => "convert_i64_f32",
+        (DType::I64, DType::F16) => "convert_i64_f16",
+        (DType::I64, DType::U8) => "convert_i64_u8",
+        (DType::I64, DType::U32) => "convert_i64_u32",
         _ => {
             return Err(Error::Msg(format!(
                 "vulkan backend op to_dtype {src:?}->{dst:?} not implemented"
@@ -2509,6 +2613,38 @@ fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
     };
     candle_vulkan_kernels::spirv(name)
         .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated")).bt())
+}
+
+fn quantized_dequant_spirv(qdtype: GgmlDType) -> Result<&'static [u32]> {
+    let name = match qdtype {
+        GgmlDType::Q4_0 => "dequant_q4_0",
+        GgmlDType::Q4_1 => "dequant_q4_1",
+        GgmlDType::Q5_0 => "dequant_q5_0",
+        GgmlDType::Q5_1 => "dequant_q5_1",
+        GgmlDType::Q8_0 => "dequant_q8_0",
+        GgmlDType::Q8K => "dequant_q8_k_f32",
+        GgmlDType::Q2K => "dequant_q2_k",
+        GgmlDType::Q3K => "dequant_q3_k",
+        GgmlDType::Q4K => "dequant_q4_k",
+        GgmlDType::Q5K => "dequant_q5_k",
+        GgmlDType::Q6K => "dequant_q6_k",
+        _ => return Err(unsupported("quantized dequantize")),
+    };
+    candle_vulkan_kernels::spirv(name)
+        .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated")).bt())
+}
+
+fn quantized_dequant_blocks_per_workgroup(qdtype: GgmlDType) -> Result<u32> {
+    match qdtype {
+        GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1 | GgmlDType::Q8_0 => {
+            Ok(4)
+        }
+        GgmlDType::Q8K => Ok(1),
+        GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => {
+            Ok(256)
+        }
+        _ => Err(unsupported("quantized dequantize")),
+    }
 }
 
 fn cmp_opcode(op: CmpOp) -> i32 {
@@ -2523,6 +2659,124 @@ fn cmp_opcode(op: CmpOp) -> i32 {
 }
 
 impl VulkanStorage {
+    pub(crate) fn quantized_dequantize_f32(
+        &self,
+        qdtype: GgmlDType,
+        elem_count: usize,
+    ) -> Result<Self> {
+        if !elem_count.is_multiple_of(qdtype.block_size()) {
+            crate::bail!(
+                "vulkan quantized dequantize expects element count divisible by block size {}, got {elem_count}",
+                qdtype.block_size()
+            )
+        }
+        let flat_shape = Shape::from(elem_count);
+        let flat_layout = Layout::contiguous(flat_shape.clone());
+        match qdtype {
+            // GGUF files store norm/bias tensors as raw float blobs under the
+            // GGML dtype enum. These need no dequant math, only a device-side
+            // reinterpret (and cast for f16/bf16), so keep them on the GPU
+            // instead of routing through the CPU fallback.
+            GgmlDType::F32 => {
+                let dst = unsafe { self.device.alloc_uninit(&flat_shape, DType::F32)? };
+                self.device.submit_copy_region_and_track(
+                    &self.buffer,
+                    &dst.buffer,
+                    0,
+                    0,
+                    elem_count * DType::F32.size_in_bytes(),
+                    false,
+                )?;
+                Ok(dst)
+            }
+            GgmlDType::F16 => {
+                let dst_f16 = unsafe { self.device.alloc_uninit(&flat_shape, DType::F16)? };
+                self.device.submit_copy_region_and_track(
+                    &self.buffer,
+                    &dst_f16.buffer,
+                    0,
+                    0,
+                    elem_count * DType::F16.size_in_bytes(),
+                    false,
+                )?;
+                dst_f16.to_dtype(&flat_layout, DType::F32)
+            }
+            GgmlDType::BF16 => {
+                let dst_bf16 = unsafe { self.device.alloc_uninit(&flat_shape, DType::BF16)? };
+                self.device.submit_copy_region_and_track(
+                    &self.buffer,
+                    &dst_bf16.buffer,
+                    0,
+                    0,
+                    elem_count * DType::BF16.size_in_bytes(),
+                    false,
+                )?;
+                dst_bf16.to_dtype(&flat_layout, DType::F32)
+            }
+            GgmlDType::Q8_1 => {
+                let repacked = repack_q8_1_storage_to_q8_0(&self.device, self, elem_count)?;
+                repacked.quantized_dequantize_f32(GgmlDType::Q8_0, elem_count)
+            }
+            GgmlDType::Q8K => {
+                let dst = unsafe { self.device.alloc_uninit(&flat_shape, DType::F32)? };
+                let spirv = quantized_dequant_spirv(qdtype)?;
+                let params = VulkanDequantizeParams {
+                    m: 0,
+                    k: 0,
+                    stride_a: 0,
+                    stride_b: 0,
+                    nel: elem_count.try_into()?,
+                };
+                let num_blocks = elem_count / qdtype.block_size();
+                let blocks_per_workgroup = quantized_dequant_blocks_per_workgroup(qdtype)?;
+                let workgroups = (num_blocks as u32).div_ceil(blocks_per_workgroup);
+                self.device.run_compute(
+                    spirv,
+                    &[
+                        VulkanBinding::Storage(&self.buffer),
+                        VulkanBinding::Storage(&dst.buffer),
+                    ],
+                    Some(any_as_bytes(&params)),
+                    workgroups,
+                )?;
+                Ok(dst)
+            }
+            GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K => {
+                let dst_f16 = unsafe { self.device.alloc_uninit(&flat_shape, DType::F16)? };
+                let spirv = quantized_dequant_spirv(qdtype)?;
+                let params = VulkanDequantizeParams {
+                    m: 0,
+                    k: 0,
+                    stride_a: 0,
+                    stride_b: 0,
+                    nel: elem_count.try_into()?,
+                };
+                let num_blocks = elem_count / qdtype.block_size();
+                let blocks_per_workgroup = quantized_dequant_blocks_per_workgroup(qdtype)?;
+                let workgroups = (num_blocks as u32).div_ceil(blocks_per_workgroup);
+                self.device.run_compute(
+                    spirv,
+                    &[
+                        VulkanBinding::Storage(&self.buffer),
+                        VulkanBinding::Storage(&dst_f16.buffer),
+                    ],
+                    Some(any_as_bytes(&params)),
+                    workgroups,
+                )?;
+                dst_f16.to_dtype(&flat_layout, DType::F32)
+            }
+        }
+    }
+
     fn run_rank2_matmul_f32_via_batched_matvec(
         &self,
         rhs_t: &Self,
@@ -2746,8 +3000,22 @@ impl VulkanStorage {
         param2: f32,
         dst_dtype: DType,
     ) -> Result<Self> {
-        if layout.start_offset() != 0 {
-            return Err(unsupported("unary offset"));
+        if !layout.is_contiguous() || layout.start_offset() != 0 {
+            // Several shaders dispatched through this helper (scale, powf,
+            // clamp) index linearly, and the ggml unary header only carries
+            // 16-bit misalign offsets, so strided or offset views are first
+            // materialized contiguously on the GPU instead of either producing
+            // wrong results or dropping the op to the CPU.
+            let mut tmp = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            self.copy_strided_src(&mut tmp, 0, layout)?;
+            let contiguous = Layout::contiguous(layout.shape().clone());
+            return tmp.run_unary_generic_with_params_dtype(
+                &contiguous,
+                spirv,
+                param1,
+                param2,
+                dst_dtype,
+            );
         }
         let count = layout.shape().elem_count();
         let dst = unsafe { self.device.alloc_uninit(layout.shape(), dst_dtype)? };
@@ -4139,11 +4407,25 @@ impl VulkanStorage {
             return Err(unsupported("scatter_add offset"));
         }
         let rank = dst_l.dims().len();
-        if rank == 0 || ids_l.dims().len() != rank || src_l.dims().len() != rank {
+        if rank == 0 || src_l.dims().len() != rank {
             return Err(unsupported("scatter_add rank"));
         }
-        let ids_dim = ids_l.dims()[rank - 1];
-        let left_size: usize = ids_l.dims()[..rank - 1].iter().product();
+        let ids_dim = src_l.dims()[rank - 1];
+        let left_size: usize = src_l.dims()[..rank - 1].iter().product();
+        // `scatter_add` passes ids with the same shape as `src`; `index_add`
+        // passes one rank-1 id row shared by every leading row. The shader
+        // reads ids through the `nb11` row stride, so the broadcast case is
+        // simply a zero row stride.
+        let ids_row_stride: usize = if ids_l.dims().len() == rank {
+            if ids_l.dims() != src_l.dims() {
+                return Err(unsupported("scatter_add ids shape"));
+            }
+            ids_dim
+        } else if ids_l.dims() == [ids_dim] {
+            0
+        } else {
+            return Err(unsupported("scatter_add rank"));
+        };
         let dst_dim = dst_l.dims()[rank - 1];
         let params = GgmlBinaryParams {
             ne: (left_size * ids_dim).try_into()?,
@@ -4160,7 +4442,7 @@ impl VulkanStorage {
             ne12: 1,
             ne13: 1,
             nb10: 1,
-            nb11: ids_dim.try_into()?,
+            nb11: ids_row_stride.try_into()?,
             nb12: 0,
             nb13: 0,
             ne20: 1,
@@ -4316,7 +4598,11 @@ impl VulkanStorage {
             drop(lhs_contiguous);
             return Ok(dst);
         }
-        if rank == 2 && self.dtype == DType::F32 && m > 1 {
+        if rank == 2
+            && self.dtype == DType::F32
+            && m > 1
+            && !vulkan_dense_gemm_prefers_tiled(m, n, k)
+        {
             let dst = lhs.run_rank2_matmul_f32_via_batched_matvec(rhs_t, m, n, k)?;
             drop(lhs_contiguous);
             return Ok(dst);
@@ -4324,6 +4610,7 @@ impl VulkanStorage {
         if rank > 2
             && self.dtype == DType::F32
             && lhs_l.dims()[..rank - 2] == rhs_l.dims()[..rank - 2]
+            && !vulkan_dense_gemm_prefers_tiled(m, n, k)
         {
             let dst = lhs.run_batched_matmul_f32_via_rank2_batches(rhs_t, b, m, n, k)?;
             drop(lhs_contiguous);
@@ -4372,13 +4659,23 @@ impl VulkanStorage {
             VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv_name = match self.dtype {
-            DType::F32 => "matmul_f32_f32",
+            // ggml shader naming: the un-suffixed `matmul_f32_f32` variant
+            // stages tiles as f16, which loses ~1e-3 precision against the
+            // CPU/CUDA f32 reference. `_fp32` keeps full f32 staging and
+            // accumulation, matching Candle's parity tolerances.
+            DType::F32 => "matmul_f32_f32_fp32",
             _ => unreachable!(),
         };
         let spirv = candle_vulkan_kernels::spirv(spirv_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
+        // ggml `m_warptile` layout: {BLOCK_SIZE, BM, BN, (BK), WM, WN, WMITER,
+        // TM, TN, (TK), WARP}. The thread count must satisfy
+        // `BLOCK_SIZE / WARP == (BM / WM) * (BN / WN)` so the warp grid covers
+        // the whole BM x BN output tile; with BM=BN=64 and WM=WN=32 that means
+        // four warps, i.e. BLOCK_SIZE = 4 * WARP.
+        let warp = self.device.inner.subgroup_size.max(1);
         let spec = [
-            (0, 64),
+            (0, warp * 4),
             (1, 64),
             (2, 64),
             (4, 32),
@@ -4386,7 +4683,7 @@ impl VulkanStorage {
             (6, 2),
             (7, 4),
             (8, 2),
-            (10, self.device.inner.subgroup_size.max(1)),
+            (10, warp),
         ];
         self.device.run_compute_specialized(
             spirv,
@@ -5012,7 +5309,13 @@ impl VulkanStorage {
         }
         if qdtype == GgmlDType::Q8_1 {
             let repacked = repack_q8_1_storage_to_q8_0(&self.device, self, src_shape.elem_count())?;
-            return repacked.quantized_index_select_f32(GgmlDType::Q8_0, src_shape, ids, ids_l, dim);
+            return repacked.quantized_index_select_f32(
+                GgmlDType::Q8_0,
+                src_shape,
+                ids,
+                ids_l,
+                dim,
+            );
         }
         let block_size = qdtype.block_size();
         let right_size: usize = dims[dim + 1..].iter().product();
@@ -5167,10 +5470,15 @@ impl VulkanStorage {
             input_m * k
         };
         let src_elem_count = src_layout.shape().elem_count();
-        let use_q8_1_rhs = src.dtype == DType::F32
+        let q8_1_rhs_spirv_name = if src.dtype == DType::F32
             && self.device.inner.integer_dot_product
-            && vulkan_supports_q8_1_rhs(qdtype)
-            && src_elem_count % 4 == 0;
+            && src_elem_count % 4 == 0
+        {
+            vulkan_q8_1_rhs_matmul_shader_name(qdtype)?
+        } else {
+            None
+        };
+        let use_q8_1_rhs = q8_1_rhs_spirv_name.is_some();
 
         let dst = unsafe { storage.device.alloc_uninit(&dst_shape, DType::F32)? };
         let params = VulkanMatmulParams {
@@ -5218,7 +5526,11 @@ impl VulkanStorage {
                 }
             }
         };
-        let spirv_name = format!("matmul_{}_{}", vulkan_quantized_stem(qdtype)?, rhs_suffix);
+        let spirv_name = if let Some(spirv_name) = q8_1_rhs_spirv_name {
+            spirv_name
+        } else {
+            format!("matmul_{}_{}", vulkan_quantized_stem(qdtype)?, rhs_suffix)
+        };
         let spirv = candle_vulkan_kernels::spirv(&spirv_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         let spec = if use_q8_1_rhs {
@@ -5354,11 +5666,15 @@ impl VulkanStorage {
         };
         let dispatch_y = if batch_n { 1 } else { batch_count };
         let src_elem_count = src_layout.shape().elem_count();
-        let use_q8_1_rhs = src.dtype == DType::F32
+        let q8_1_rhs_shader = if src.dtype == DType::F32
             && self.device.inner.integer_dot_product
-            && vulkan_supports_q8_1_rhs(qdtype)
-            && vulkan_should_use_mmvq(&self.device, qdtype, input_m, k)
-            && src_elem_count % 4 == 0;
+            && src_elem_count % 4 == 0
+        {
+            vulkan_q8_1_rhs_matvec_shader_name(&self.device, qdtype, input_m, k, false)?
+        } else {
+            None
+        };
+        let use_q8_1_rhs = q8_1_rhs_shader.is_some();
         let mut dst_dims = src_layout.dims().to_vec();
         dst_dims.pop();
         dst_dims.push(n);
@@ -5400,15 +5716,13 @@ impl VulkanStorage {
             VulkanBinding::Storage(&dst.buffer),
             VulkanBinding::Storage(&dst.buffer),
         ];
-        let dmmv_workgroup = vulkan_dmmv_workgroup(&self.device, qdtype, n, k, use_q8_1_rhs);
+        let dmmv_workgroup = q8_1_rhs_shader
+            .as_ref()
+            .map(|(_, workgroup)| *workgroup)
+            .unwrap_or_else(|| vulkan_dmmv_workgroup(&self.device, qdtype, n, k, false));
         let (spirv_name, rows_per_group, block_size) = if use_q8_1_rhs {
             (
-                vulkan_dmmv_shader_name(
-                    &self.device,
-                    qdtype,
-                    format!("mul_mat_vec_{}_q8_1_f32", vulkan_quantized_stem(qdtype)?),
-                    dmmv_workgroup,
-                ),
+                q8_1_rhs_shader.as_ref().unwrap().0.clone(),
                 vulkan_dmmv_rows_per_group(&self.device, qdtype, true)?,
                 vulkan_dmmv_block_size(&self.device, qdtype, dmmv_workgroup),
             )
@@ -5547,11 +5861,15 @@ impl VulkanStorage {
         let src_elem_count = layout.shape().elem_count();
         // Q8_0 indexed MoE currently matches the native f32 rhs path more closely than
         // the q8_1 rhs MMVQ variant on Vulkan, so keep it on the direct GPU path.
-        let use_q8_1_rhs = qdtype != GgmlDType::Q8_0
+        let q8_1_rhs_shader = if qdtype != GgmlDType::Q8_0
             && self.device.inner.integer_dot_product
-            && vulkan_supports_q8_1_rhs(qdtype)
-            && vulkan_should_use_mmvq(&self.device, qdtype, batch, k)
-            && src_elem_count.is_multiple_of(4);
+            && src_elem_count.is_multiple_of(4)
+        {
+            vulkan_q8_1_rhs_matvec_shader_name(&self.device, qdtype, batch, k, true)?
+        } else {
+            None
+        };
+        let use_q8_1_rhs = q8_1_rhs_shader.is_some();
         let dst_shape = Shape::from((batch, topk, n));
         let dst = unsafe { storage.device.alloc_uninit(&dst_shape, DType::F32)? };
         let params = VulkanMatVecIdParams {
@@ -5586,15 +5904,13 @@ impl VulkanStorage {
             VulkanBinding::Storage(&dst.buffer),
             VulkanBinding::Storage(&ids_src.buffer),
         ];
-        let dmmv_workgroup = vulkan_dmmv_workgroup(&self.device, qdtype, n, k, use_q8_1_rhs);
+        let dmmv_workgroup = q8_1_rhs_shader
+            .as_ref()
+            .map(|(_, workgroup)| *workgroup)
+            .unwrap_or_else(|| vulkan_dmmv_workgroup(&self.device, qdtype, n, k, false));
         let (spirv_name, rows_per_group, block_size) = if use_q8_1_rhs {
             (
-                vulkan_dmmv_shader_name(
-                    &self.device,
-                    qdtype,
-                    format!("mul_mat_vec_id_{}_q8_1_f32", vulkan_quantized_stem(qdtype)?),
-                    dmmv_workgroup,
-                ),
+                q8_1_rhs_shader.as_ref().unwrap().0.clone(),
                 vulkan_dmmv_rows_per_group(&self.device, qdtype, true)?,
                 vulkan_dmmv_block_size(&self.device, qdtype, dmmv_workgroup),
             )
@@ -5816,11 +6132,10 @@ impl BackendStorage for VulkanStorage {
             if self.dtype != DType::F32 {
                 return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan affine").bt());
             }
-            if !layout.is_contiguous() || layout.start_offset() != 0 {
-                return Err(unsupported("affine strided"));
-            }
             let spirv = candle_vulkan_kernels::spirv("scale_f32")
                 .ok_or_else(|| Error::Msg("vulkan shader scale_f32 not generated".into()).bt())?;
+            // Strided/offset views are materialized on the GPU inside the
+            // generic unary dispatch helper.
             self.run_unary_generic_with_params(layout, spirv, mul as f32, add as f32)
         };
         match gpu() {
@@ -5989,6 +6304,14 @@ impl BackendStorage for VulkanStorage {
                 }
                 Err(err) => Err(err),
             };
+        }
+        if self.dtype == DType::BF16 {
+            // No direct bf16 -> integer kernel exists; decompose into the
+            // native bf16 -> f32 path followed by the native f32 -> dst cast,
+            // keeping the whole chain on the GPU.
+            let f32_storage = self.to_dtype(layout, DType::F32)?;
+            let contiguous = Layout::contiguous(layout.shape().clone());
+            return f32_storage.to_dtype(&contiguous, dtype);
         }
         let spirv = copy_spirv(self.dtype, dtype)?;
         match self.run_unary_generic_with_params_dtype(layout, spirv, 0.0, 0.0, dtype) {
@@ -6665,11 +6988,13 @@ impl BackendDevice for VulkanDevice {
                 .supported_stages
                 .contains(vk::ShaderStageFlags::COMPUTE);
         let subgroup_size = subgroup_properties.subgroup_size.max(1);
+        let mut vulkan11_features = vk::PhysicalDeviceVulkan11Features::default();
         let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default();
         let mut integer_dot_features = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
         let mut subgroup_size_control_features =
             vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT::default();
         let mut physical_features2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut vulkan11_features)
             .push_next(&mut vulkan12_features)
             .push_next(&mut subgroup_size_control_features)
             .push_next(&mut integer_dot_features);
@@ -6721,6 +7046,7 @@ impl BackendDevice for VulkanDevice {
             })
             .filter(|idx| *idx != queue_family_index);
         let robust_buffer_access = physical_features2.features.robust_buffer_access == vk::TRUE;
+        let shader_int64 = physical_features2.features.shader_int64 == vk::TRUE;
         let vulkan_memory_model = vulkan12_features.vulkan_memory_model == vk::TRUE;
         let integer_dot_product = integer_dot_features.shader_integer_dot_product == vk::TRUE
             && integer_dot_properties.integer_dot_product4x8_bit_packed_signed_accelerated
@@ -6735,9 +7061,34 @@ impl BackendDevice for VulkanDevice {
         if robust_buffer_access {
             enabled_features.robust_buffer_access = vk::TRUE;
         }
+        // 64-bit integers are needed by the Candle-owned I64 cast kernels.
+        if shader_int64 {
+            enabled_features.shader_int64 = vk::TRUE;
+        }
+        let mut enabled_vulkan11 = vk::PhysicalDeviceVulkan11Features::default();
+        // The ggml shader corpus reads 16-bit storage buffers throughout.
+        if vulkan11_features.storage_buffer16_bit_access == vk::TRUE {
+            enabled_vulkan11.storage_buffer16_bit_access = vk::TRUE;
+        }
+        if vulkan11_features.uniform_and_storage_buffer16_bit_access == vk::TRUE {
+            enabled_vulkan11.uniform_and_storage_buffer16_bit_access = vk::TRUE;
+        }
         let mut enabled_vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
         if vulkan_memory_model {
             enabled_vulkan12.vulkan_memory_model = vk::TRUE;
+        }
+        // 8-bit storage backs both the quantized blocks and the U8 cast family.
+        if vulkan12_features.storage_buffer8_bit_access == vk::TRUE {
+            enabled_vulkan12.storage_buffer8_bit_access = vk::TRUE;
+        }
+        if vulkan12_features.uniform_and_storage_buffer8_bit_access == vk::TRUE {
+            enabled_vulkan12.uniform_and_storage_buffer8_bit_access = vk::TRUE;
+        }
+        if vulkan12_features.shader_int8 == vk::TRUE {
+            enabled_vulkan12.shader_int8 = vk::TRUE;
+        }
+        if vulkan12_features.shader_float16 == vk::TRUE {
+            enabled_vulkan12.shader_float16 = vk::TRUE;
         }
         let mut enabled_integer_dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
         if integer_dot_product {
@@ -6773,9 +7124,8 @@ impl BackendDevice for VulkanDevice {
             .queue_create_infos(&queue_infos)
             .enabled_features(&enabled_features)
             .enabled_extension_names(&enabled_extension_names);
-        if vulkan_memory_model {
-            device_info = device_info.push_next(&mut enabled_vulkan12);
-        }
+        device_info = device_info.push_next(&mut enabled_vulkan11);
+        device_info = device_info.push_next(&mut enabled_vulkan12);
         if subgroup_size_control {
             device_info = device_info.push_next(&mut enabled_subgroup_size_control);
         }

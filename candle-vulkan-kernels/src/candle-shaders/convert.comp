@@ -1,0 +1,55 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+
+#include "types.glsl"
+#include "generic_unary_head.glsl"
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+// Generic dtype-conversion kernel for the cast pairs that the copied ggml
+// generator does not provide (integer dtypes). Float -> integer conversions
+// follow Rust `as` semantics (saturating, NaN -> 0) to match the Candle CPU
+// reference; integer -> integer conversions truncate like Rust `as`.
+D_TYPE convert_value(A_TYPE v) {
+#if defined(DST_SAT_U8)
+    const float f = float(v);
+    if (isnan(f)) {
+        return D_TYPE(0);
+    }
+    return D_TYPE(clamp(f, 0.0, 255.0));
+#elif defined(DST_SAT_U32)
+    const float f = float(v);
+    if (isnan(f) || f <= 0.0) {
+        return D_TYPE(0);
+    }
+    if (f >= 4294967296.0) {
+        return D_TYPE(0xFFFFFFFFu);
+    }
+    return D_TYPE(f);
+#elif defined(DST_SAT_I64)
+    const float f = float(v);
+    if (isnan(f)) {
+        return D_TYPE(0);
+    }
+    if (f >= 9223372036854775808.0) {
+        return int64_t(0x7FFFFFFFFFFFFFFFL);
+    }
+    if (f <= -9223372036854775808.0) {
+        return -0x7FFFFFFFFFFFFFFFL - 1L;
+    }
+    return D_TYPE(f);
+#elif defined(DST_VIA_F32)
+    return D_TYPE(float(v));
+#else
+    return D_TYPE(v);
+#endif
+}
+
+void main() {
+    const uint idx = get_idx();
+    if (idx >= p.ne) {
+        return;
+    }
+    data_d[get_doffset() + dst_idx(idx)] = convert_value(data_a[get_aoffset() + src0_idx(idx)]);
+}

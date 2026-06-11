@@ -15,6 +15,14 @@ impl VulkanDevice {
 pub struct VulkanStorage;
 
 impl VulkanStorage {
+    pub(crate) fn quantized_dequantize_f32(
+        &self,
+        _: crate::quantized::GgmlDType,
+        _: usize,
+    ) -> Result<Self> {
+        Err(Error::NotCompiledWithVulkanSupport)
+    }
+
     pub(crate) fn quantized_index_select_f32(
         &self,
         _: crate::quantized::GgmlDType,

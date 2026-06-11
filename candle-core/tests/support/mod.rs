@@ -1,6 +1,20 @@
 #![allow(dead_code)]
 
 use candle_core::{DType, Device, Result, Tensor};
+use std::sync::{Mutex, MutexGuard};
+
+/// The CPU-fallback counters asserted by `native_required` are process-global,
+/// so any test that reads or resets them must hold this lock for its full
+/// duration. Otherwise a concurrently running `fallback_allowed` test can
+/// increment the counter between another test's reset and assertion, causing
+/// spurious `native_required` failures under the default parallel test runner.
+static FALLBACK_COUNTER_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn fallback_counter_guard() -> MutexGuard<'static, ()> {
+    FALLBACK_COUNTER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TestBackend {
@@ -142,6 +156,10 @@ fn run_backend_case<F>(
 where
     F: FnOnce(&Device) -> Result<()>,
 {
+    // Every backend case serializes on the global fallback-counter lock so
+    // `native_required` assertions cannot observe fallbacks recorded by other
+    // concurrently running tests.
+    let _guard = fallback_counter_guard();
     let Some(device) = backend_device_or_skip(test_name, backend)? else {
         return Ok(());
     };

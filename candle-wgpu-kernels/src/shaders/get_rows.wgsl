@@ -378,6 +378,20 @@ fn copy_elements(src_base: u32, dst_base: u32, offset: u32) {
 }
 #endif
 
+#ifdef Q8_K
+fn copy_elements(src_base: u32, dst_base: u32, offset: u32) {
+    let block_byte_base = (src_base + offset) * 292u; // Block stride: 292 bytes
+    let d = bitcast<f32>(load_u32_at_src(block_byte_base));
+    let dst_i = dst_base + offset * 256u;
+    for (var j: u32 = 0u; j < 64u; j++) {
+        let q_packed = load_u32_at_src(block_byte_base + 4u + j * 4u);
+        for (var k: u32 = 0u; k < 4u; k++) {
+            dst[dst_i + j * 4u + k] = f32(get_byte_i32(q_packed, k)) * d;
+        }
+    }
+}
+#endif
+
 #ifdef IQ2_XXS
 fn copy_elements(src_base: u32, dst_base: u32, offset: u32) {
     let block_byte_base = (src_base + offset) * 66; // Block stride: 66 bytes

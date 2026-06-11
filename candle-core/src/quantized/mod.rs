@@ -101,14 +101,6 @@ fn load_quantized_cuda_from_bytes<T: k_quants::GgmlType + Send + Sync + 'static>
     cuda::load_quantized(device, &values)
 }
 
-fn wgpu_quantized_weight_requires_cpu_fallback(dtype: GgmlDType) -> bool {
-    matches!(dtype, GgmlDType::Q8K)
-}
-
-fn vulkan_quantized_weight_requires_cpu_fallback(dtype: GgmlDType) -> bool {
-    matches!(dtype, GgmlDType::Q8K)
-}
-
 fn cpu_storage_to_f32_vec(storage: &crate::CpuStorage) -> Result<Vec<f32>> {
     match storage.dtype() {
         DType::F32 => Ok(storage.as_slice::<f32>()?.to_vec()),
@@ -124,6 +116,38 @@ fn cpu_storage_to_f32_vec(storage: &crate::CpuStorage) -> Result<Vec<f32>> {
             .collect()),
         dtype => crate::bail!("expected f32/f16/bf16 cpu storage, got {dtype:?}"),
     }
+}
+
+fn dense_qmatmul_shape_spec(
+    self_shape: &Shape,
+    layout: &crate::Layout,
+) -> Result<(Shape, usize, usize, usize, usize)> {
+    let (n, k) = self_shape.dims2()?;
+    let rank = layout.dims().len();
+    if rank < 2 {
+        crate::bail!("input tensor has only one dimension {layout:?}")
+    }
+    let input_m = layout.dims()[rank - 2];
+    let last_k = layout.dims()[rank - 1];
+    if last_k != k {
+        crate::bail!("input tensor {layout:?} incompatible with {self_shape:?}")
+    }
+    let batching = layout.dims()[..rank - 2].iter().product();
+    let mut dst_dims = layout.dims().to_vec();
+    dst_dims.pop();
+    dst_dims.push(n);
+    Ok((Shape::from(dst_dims), batching, input_m, n, k))
+}
+
+fn dense_qmatmul_rhs_layout(self_shape: &Shape, layout: &crate::Layout) -> Result<crate::Layout> {
+    let (n, k) = self_shape.dims2()?;
+    let rank = layout.dims().len();
+    let rhs = crate::Layout::contiguous(self_shape.clone()).transpose(0, 1)?;
+    if rank == 2 {
+        return Ok(rhs);
+    }
+    let shape = Shape::from(&layout.dims()[..rank - 2]).extend(&[k, n]);
+    rhs.broadcast_as(shape)
 }
 
 fn decode_block_q8_1_data(data: &[u8]) -> Vec<BlockQ8_1> {
@@ -273,8 +297,95 @@ impl QWgpuStorage {
     }
 
     fn dequantize(&self, elem_count: usize) -> Result<crate::WgpuStorage> {
-        let cpu = self.to_cpu_quantized()?.dequantize(elem_count)?;
-        self.device().storage_from_cpu_storage(&cpu)
+        // GGUF norm/bias tensors are stored as raw F32/F16/BF16 blobs under
+        // the GGML dtype enum; decode them with a dedicated device-side path
+        // instead of the block-quantized get-rows family.
+        if matches!(
+            self.dtype,
+            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
+        ) {
+            return match self
+                .storage
+                .quantized_raw_float_dequantize_f32(self.dtype, elem_count)
+            {
+                Ok(out) => Ok(out),
+                Err(err) if should_quantized_backend_fallback(&err, "wgpu") => {
+                    crate::storage::record_wgpu_cpu_fallback(&err);
+                    let cpu = self.to_cpu_quantized()?.dequantize(elem_count)?;
+                    self.device().storage_from_cpu_storage(&cpu)
+                }
+                Err(err) => Err(err),
+            };
+        }
+        let block_size = self.dtype.block_size();
+        if !elem_count.is_multiple_of(block_size) {
+            crate::bail!(
+                "wgpu quantized dequantize expects element count divisible by block size {}, got {elem_count}",
+                block_size
+            )
+        }
+        let num_blocks = elem_count / block_size;
+        let ids = (0..num_blocks)
+            .map(|idx| u32::try_from(idx).map_err(crate::Error::wrap))
+            .collect::<Result<Vec<_>>>()?;
+        let ids_storage = self
+            .device()
+            .storage_from_cpu_storage(&crate::CpuStorage::U32(ids))?;
+        let ids_layout = crate::Layout::contiguous(Shape::from(num_blocks));
+        let flat_shape = Shape::from((num_blocks, block_size));
+        match self.storage.quantized_index_select_f32(
+            self.dtype,
+            &flat_shape,
+            &ids_storage,
+            &ids_layout,
+            0,
+        ) {
+            Ok(out) => Ok(out),
+            Err(err) if should_quantized_backend_fallback(&err, "wgpu") => {
+                crate::storage::record_wgpu_cpu_fallback(&err);
+                let cpu = self.to_cpu_quantized()?.dequantize(elem_count)?;
+                self.device().storage_from_cpu_storage(&cpu)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn q8k_fwd_via_dense_gpu(
+        &self,
+        self_shape: &Shape,
+        storage: &crate::WgpuStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::WgpuStorage, Shape)> {
+        let (dst_shape, batching, input_m, n, k) = dense_qmatmul_shape_spec(self_shape, layout)?;
+        let weights = self.dequantize(self_shape.elem_count())?;
+        if storage.dtype() == DType::F32 {
+            let rhs_layout = dense_qmatmul_rhs_layout(self_shape, layout)?;
+            let out = storage.matmul(&weights, (batching, input_m, n, k), layout, &rhs_layout)?;
+            Ok((out, dst_shape))
+        } else {
+            let lhs = storage.to_dtype(layout, DType::F32)?;
+            let lhs_layout = crate::Layout::contiguous(layout.shape().clone());
+            let rhs_layout = dense_qmatmul_rhs_layout(self_shape, &lhs_layout)?;
+            let out = lhs.matmul(
+                &weights,
+                (batching, input_m, n, k),
+                &lhs_layout,
+                &rhs_layout,
+            )?;
+            Ok((out, dst_shape))
+        }
+    }
+
+    fn q8k_index_select_f32_via_dense_gpu(
+        &self,
+        self_shape: &Shape,
+        ids: &crate::WgpuStorage,
+        ids_l: &crate::Layout,
+        dim: usize,
+    ) -> Result<crate::WgpuStorage> {
+        let weights = self.dequantize(self_shape.elem_count())?;
+        let weights_l = crate::Layout::contiguous(self_shape.clone());
+        weights.index_select(ids, &weights_l, ids_l, dim)
     }
 
     fn fwd_cpu_fallback(
@@ -370,13 +481,8 @@ impl QWgpuStorage {
         storage: &crate::WgpuStorage,
         layout: &crate::Layout,
     ) -> Result<(crate::WgpuStorage, Shape)> {
-        if wgpu_quantized_weight_requires_cpu_fallback(self.dtype) {
-            let err = crate::Error::Msg(format!(
-                "wgpu quantized dtype {:?} uses explicit CPU fallback for matmul",
-                self.dtype
-            ));
-            crate::storage::record_wgpu_cpu_fallback(&err);
-            return self.fwd_cpu_fallback(self_shape, storage, layout);
+        if self.dtype == GgmlDType::Q8K {
+            return self.q8k_fwd_via_dense_gpu(self_shape, storage, layout);
         }
         match self
             .storage
@@ -398,13 +504,8 @@ impl QWgpuStorage {
         ids_l: &crate::Layout,
         dim: usize,
     ) -> Result<crate::WgpuStorage> {
-        if wgpu_quantized_weight_requires_cpu_fallback(self.dtype) {
-            let err = crate::Error::Msg(format!(
-                "wgpu quantized dtype {:?} uses explicit CPU fallback for index_select",
-                self.dtype
-            ));
-            crate::storage::record_wgpu_cpu_fallback(&err);
-            return self.index_select_f32_cpu_fallback(self_shape, ids, ids_l, dim);
+        if self.dtype == GgmlDType::Q8K {
+            return self.q8k_index_select_f32_via_dense_gpu(self_shape, ids, ids_l, dim);
         }
         match self
             .storage
@@ -523,8 +624,56 @@ impl QVulkanStorage {
     }
 
     fn dequantize(&self, elem_count: usize) -> Result<crate::VulkanStorage> {
-        let cpu = self.to_cpu_quantized()?.dequantize(elem_count)?;
-        self.device().storage_from_cpu_storage(&cpu)
+        match self
+            .storage
+            .quantized_dequantize_f32(self.dtype, elem_count)
+        {
+            Ok(out) => Ok(out),
+            Err(err) if should_quantized_backend_fallback(&err, "vulkan") => {
+                crate::storage::record_vulkan_cpu_fallback(&err);
+                let cpu = self.to_cpu_quantized()?.dequantize(elem_count)?;
+                self.device().storage_from_cpu_storage(&cpu)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn q8k_fwd_via_dense_gpu(
+        &self,
+        self_shape: &Shape,
+        storage: &crate::VulkanStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::VulkanStorage, Shape)> {
+        let (dst_shape, batching, input_m, n, k) = dense_qmatmul_shape_spec(self_shape, layout)?;
+        let weights = self.dequantize(self_shape.elem_count())?;
+        if storage.dtype() == DType::F32 {
+            let rhs_layout = dense_qmatmul_rhs_layout(self_shape, layout)?;
+            let out = storage.matmul(&weights, (batching, input_m, n, k), layout, &rhs_layout)?;
+            Ok((out, dst_shape))
+        } else {
+            let lhs = storage.to_dtype(layout, DType::F32)?;
+            let lhs_layout = crate::Layout::contiguous(layout.shape().clone());
+            let rhs_layout = dense_qmatmul_rhs_layout(self_shape, &lhs_layout)?;
+            let out = lhs.matmul(
+                &weights,
+                (batching, input_m, n, k),
+                &lhs_layout,
+                &rhs_layout,
+            )?;
+            Ok((out, dst_shape))
+        }
+    }
+
+    fn q8k_index_select_f32_via_dense_gpu(
+        &self,
+        self_shape: &Shape,
+        ids: &crate::VulkanStorage,
+        ids_l: &crate::Layout,
+        dim: usize,
+    ) -> Result<crate::VulkanStorage> {
+        let weights = self.dequantize(self_shape.elem_count())?;
+        let weights_l = crate::Layout::contiguous(self_shape.clone());
+        weights.index_select(ids, &weights_l, ids_l, dim)
     }
 
     fn fwd_cpu_fallback(
@@ -626,13 +775,8 @@ impl QVulkanStorage {
         storage: &crate::VulkanStorage,
         layout: &crate::Layout,
     ) -> Result<(crate::VulkanStorage, Shape)> {
-        if vulkan_quantized_weight_requires_cpu_fallback(self.dtype) {
-            let err = crate::Error::Msg(format!(
-                "vulkan quantized dtype {:?} uses explicit CPU fallback for matmul",
-                self.dtype
-            ));
-            crate::storage::record_vulkan_cpu_fallback(&err);
-            return self.fwd_cpu_fallback(self_shape, storage, layout);
+        if self.dtype == GgmlDType::Q8K {
+            return self.q8k_fwd_via_dense_gpu(self_shape, storage, layout);
         }
         match self
             .storage
@@ -654,13 +798,8 @@ impl QVulkanStorage {
         ids_l: &crate::Layout,
         dim: usize,
     ) -> Result<crate::VulkanStorage> {
-        if vulkan_quantized_weight_requires_cpu_fallback(self.dtype) {
-            let err = crate::Error::Msg(format!(
-                "vulkan quantized dtype {:?} uses explicit CPU fallback for index_select",
-                self.dtype
-            ));
-            crate::storage::record_vulkan_cpu_fallback(&err);
-            return self.index_select_f32_cpu_fallback(self_shape, ids, ids_l, dim);
+        if self.dtype == GgmlDType::Q8K {
+            return self.q8k_index_select_f32_via_dense_gpu(self_shape, ids, ids_l, dim);
         }
         match self
             .storage
