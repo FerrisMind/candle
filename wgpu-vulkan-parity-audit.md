@@ -776,3 +776,23 @@ The highest-value next Vulkan performance step is now concrete:
 - Tie-break and sign semantics verified against the CPU reference: first-index argmax/argmin, exact i64 sums with magnitudes past 2^32, negative-value extrema.
 - Test closure on RTX 3060 (native-required, fallback 0): `backend_smoke_{wgpu,vulkan}_int_reductions_native_only` — last-dim sum/max/min/argmax/argmin across u8/u32/i64, non-last-dim sum (permute path), multi-dim `sum_all`, and a negative/large-magnitude i64 block.
 - Regression + lint: `cargo clippy` clean on candle-core (vulkan,wgpu); 33 Vulkan + 23 wgpu smoke tests pass.
+
+## Regression Checkpoint: Real-Model Matrix After Integer DType Closure (RTX 3060, release)
+
+After the to_device, integer cmp/where, integer strided copy, integer binary, and integer reduction slices, the full five-model matrix was re-run in release on the RTX 3060. All cases pass with fallback count 0 — confirming the new integer paths did not regress the float/quantized model graphs:
+
+| Case | Model artifact | Vulkan | wgpu |
+| --- | --- | --- | --- |
+| dense_causal_decoder_case | karpathy/tinyllamas stories15M | 0.81s, fb 0 | 0.34s, fb 0 |
+| quantized_causal_gguf_case | unsloth/Qwen3-0.6B-GGUF Q4_K_M | 3.00s, fb 0 | 3.28s, fb 0 |
+| encoder_only_text_case | sentence-transformers/all-MiniLM-L6-v2 | 0.35s, fb 0 | 0.31s, fb 0 |
+| audio_seq2seq_case | openai/whisper-tiny.en | 1.06s, fb 0 | 1.41s, fb 0 |
+| vision_convmixer_case | lmz/candle-convmixer | 2.93s, fb 0 | 5.49s, fb 0 |
+
+Commands:
+```
+CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' \
+  cargo test --release -p candle-transformers --features vulkan gpu_model_matrix_vulkan -- --ignored --exact --nocapture
+CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' \
+  cargo test --release -p candle-transformers --features wgpu gpu_model_matrix_wgpu -- --ignored --exact --nocapture
+```
