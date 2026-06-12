@@ -2,20 +2,20 @@ mod support;
 
 use candle_core::{DType, Result, Tensor};
 use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestRunner};
-use support::{assert_tensors_close, deterministic_f32_data, fallback_allowed, TestBackend};
+use support::{assert_tensors_close, deterministic_f32_data, native_required, TestBackend};
 
 #[cfg(feature = "wgpu")]
 #[test]
 #[ignore = "heavy property suite; requires WGPU runtime/device"]
 fn gpu_properties_wgpu() -> Result<()> {
-    fallback_allowed("gpu_properties_wgpu", TestBackend::Wgpu, run_property_suite)
+    native_required("gpu_properties_wgpu", TestBackend::Wgpu, run_property_suite)
 }
 
 #[cfg(feature = "vulkan")]
 #[test]
 #[ignore = "heavy property suite; requires Vulkan runtime/device"]
 fn gpu_properties_vulkan() -> Result<()> {
-    fallback_allowed(
+    native_required(
         "gpu_properties_vulkan",
         TestBackend::Vulkan,
         run_property_suite,

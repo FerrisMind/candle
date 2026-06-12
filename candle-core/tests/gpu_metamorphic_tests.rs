@@ -1,13 +1,13 @@
 mod support;
 
 use candle_core::{DType, Result, Tensor};
-use support::{assert_tensors_close, fallback_allowed, TestBackend};
+use support::{assert_tensors_close, native_required, TestBackend};
 
 #[cfg(feature = "wgpu")]
 #[test]
 #[ignore = "requires a usable wgpu adapter and driver"]
 fn gpu_metamorphic_wgpu() -> Result<()> {
-    fallback_allowed(
+    native_required(
         "gpu_metamorphic_wgpu",
         TestBackend::Wgpu,
         run_metamorphic_suite,
@@ -17,7 +17,7 @@ fn gpu_metamorphic_wgpu() -> Result<()> {
 #[cfg(feature = "vulkan")]
 #[test]
 fn gpu_metamorphic_vulkan() -> Result<()> {
-    fallback_allowed(
+    native_required(
         "gpu_metamorphic_vulkan",
         TestBackend::Vulkan,
         run_metamorphic_suite,

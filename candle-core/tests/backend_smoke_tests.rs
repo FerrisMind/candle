@@ -277,6 +277,36 @@ backend_family_test!(
 backend_family_test!(
     #[cfg(feature = "wgpu")]
     #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_f16_affine_minmax_native_only,
+    TestBackend::Wgpu,
+    native_required,
+    smoke_f16_affine_minmax
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_f16_affine_minmax_native_only,
+    TestBackend::Vulkan,
+    native_required,
+    smoke_f16_affine_minmax
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_half_cumsum_native_only,
+    TestBackend::Wgpu,
+    native_required,
+    smoke_half_cumsum
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_half_cumsum_native_only,
+    TestBackend::Vulkan,
+    native_required,
+    smoke_half_cumsum
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_quantized_paths,
     TestBackend::Wgpu,
     native_required,
@@ -318,6 +348,21 @@ backend_family_test!(
     TestBackend::Vulkan,
     native_required,
     smoke_rank5_matmul
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_rank5_cumsum_native_only,
+    TestBackend::Wgpu,
+    native_required,
+    smoke_rank5_cumsum
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_rank5_cumsum_native_only,
+    TestBackend::Vulkan,
+    native_required,
+    smoke_rank5_cumsum
 );
 
 #[test]
@@ -1446,6 +1491,95 @@ fn smoke_rank5_unary_binary_native_only(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_rank5_cumsum(device: &Device) -> Result<()> {
+    let shape = (2, 1, 2, 2, 3);
+    let values = (0..24)
+        .map(|idx| (idx as f32 % 7.0) - 3.0)
+        .collect::<Vec<_>>();
+    let expected_last = rank5_cumsum_reference(&values, [2, 1, 2, 2, 3], 4);
+
+    let xs = Tensor::from_vec(values.clone(), shape, device)?;
+    assert_close_vec(
+        &xs.cumsum(4)?.flatten_all()?.to_vec1::<f32>()?,
+        &expected_last,
+        1e-5,
+        "rank5 f32 cumsum last dim",
+    );
+
+    let f16_values = values
+        .iter()
+        .copied()
+        .map(f16::from_f32)
+        .collect::<Vec<_>>();
+    let f16 = Tensor::from_slice(&f16_values, shape, device)?;
+    let f16_out = f16.cumsum(4)?;
+    assert_eq!(f16_out.dtype(), DType::F16);
+    assert_close_vec(
+        &f16_out
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?,
+        &expected_last,
+        1e-3,
+        "rank5 f16 cumsum last dim",
+    );
+
+    let bf16_values = values
+        .iter()
+        .copied()
+        .map(bf16::from_f32)
+        .collect::<Vec<_>>();
+    let bf16 = Tensor::from_slice(&bf16_values, shape, device)?;
+    let bf16_out = bf16.cumsum(4)?;
+    assert_eq!(bf16_out.dtype(), DType::BF16);
+    assert_close_vec(
+        &bf16_out
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?,
+        &expected_last,
+        2e-2,
+        "rank5 bf16 cumsum last dim",
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn rank5_cumsum_reference(values: &[f32], dims: [usize; 5], dim: usize) -> Vec<f32> {
+    let [d0, d1, d2, d3, d4] = dims;
+    let strides = [d1 * d2 * d3 * d4, d2 * d3 * d4, d3 * d4, d4, 1];
+    let mut out = vec![0.0; values.len()];
+    for i0 in 0..d0 {
+        for i1 in 0..d1 {
+            for i2 in 0..d2 {
+                for i3 in 0..d3 {
+                    for i4 in 0..d4 {
+                        let idx = i0 * strides[0]
+                            + i1 * strides[1]
+                            + i2 * strides[2]
+                            + i3 * strides[3]
+                            + i4;
+                        let mut prev = [i0, i1, i2, i3, i4];
+                        if prev[dim] == 0 {
+                            out[idx] = values[idx];
+                        } else {
+                            prev[dim] -= 1;
+                            let prev_idx = prev[0] * strides[0]
+                                + prev[1] * strides[1]
+                                + prev[2] * strides[2]
+                                + prev[3] * strides[3]
+                                + prev[4];
+                            out[idx] = out[prev_idx] + values[idx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_f32_large_linear_elementwise(device: &Device) -> Result<()> {
     let values = (0..4096)
         .map(|idx| idx as f32 / 128.0 - 8.0)
@@ -1756,6 +1890,134 @@ fn smoke_f16_elementwise_ops(device: &Device) -> Result<()> {
         3e-3,
     );
 
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f16_affine_minmax(device: &Device) -> Result<()> {
+    let xs = Tensor::from_slice(
+        &[
+            f16::from_f32(0.25),
+            f16::from_f32(1.0),
+            f16::from_f32(-2.0),
+            f16::from_f32(4.0),
+            f16::from_f32(2.5),
+            f16::from_f32(-6.0),
+        ],
+        (2, 3),
+        device,
+    )?;
+    let ys = Tensor::from_slice(
+        &[
+            f16::from_f32(1.0),
+            f16::from_f32(-4.0),
+            f16::from_f32(3.0),
+            f16::from_f32(2.0),
+            f16::from_f32(-1.5),
+            f16::from_f32(-7.0),
+        ],
+        (2, 3),
+        device,
+    )?;
+
+    assert_close_vec(
+        &xs.affine(0.5, 1.25)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &[1.375, 1.75, 0.25, 3.25, 2.5, -1.75],
+        1e-3,
+        "f16 affine",
+    );
+    assert_close_vec(
+        &xs.maximum(&ys)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &[1.0, 1.0, 3.0, 4.0, 2.5, -6.0],
+        1e-3,
+        "f16 maximum",
+    );
+    assert_close_vec(
+        &xs.minimum(&ys)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &[0.25, -4.0, -2.0, 2.0, -1.5, -7.0],
+        1e-3,
+        "f16 minimum",
+    );
+
+    let view = xs.t()?;
+    assert_close_vec(
+        &view
+            .affine(-2.0, 0.5)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &[0.0, -7.5, -1.5, -4.5, 4.5, 12.5],
+        1e-3,
+        "f16 strided affine",
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_half_cumsum(device: &Device) -> Result<()> {
+    let f16_values = [
+        f16::from_f32(1.0),
+        f16::from_f32(2.0),
+        f16::from_f32(-3.0),
+        f16::from_f32(0.5),
+        f16::from_f32(4.0),
+        f16::from_f32(-1.0),
+    ];
+    let xs = Tensor::from_slice(&f16_values, (2, 3), device)?;
+    let out = xs.cumsum(1)?;
+    assert_eq!(out.dtype(), DType::F16);
+    assert_close_vec(
+        &out.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
+        &[1.0, 3.0, 0.0, 0.5, 4.5, 3.5],
+        1e-3,
+        "f16 cumsum last dim",
+    );
+    assert_close_vec(
+        &xs.cumsum(0)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &[1.0, 2.0, -3.0, 1.5, 6.0, -4.0],
+        1e-3,
+        "f16 cumsum dim0",
+    );
+
+    let bf16_values = [
+        bf16::from_f32(1.0),
+        bf16::from_f32(2.0),
+        bf16::from_f32(-3.0),
+        bf16::from_f32(0.5),
+        bf16::from_f32(4.0),
+        bf16::from_f32(-1.0),
+    ];
+    let ys = Tensor::from_slice(&bf16_values, (2, 3), device)?;
+    let out = ys.cumsum(1)?;
+    assert_eq!(out.dtype(), DType::BF16);
+    assert_close_vec(
+        &out.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
+        &[1.0, 3.0, 0.0, 0.5, 4.5, 3.5],
+        2e-2,
+        "bf16 cumsum last dim",
+    );
+    assert_close_vec(
+        &ys.t()?
+            .cumsum(1)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &[1.0, 1.5, 2.0, 6.0, -3.0, -4.0],
+        2e-2,
+        "bf16 cumsum transposed dim",
+    );
     Ok(())
 }
 

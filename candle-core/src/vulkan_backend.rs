@@ -6825,6 +6825,16 @@ impl BackendStorage for VulkanStorage {
             if self.dtype == DType::BF16 {
                 return self.bf16_unary_via_f32(layout, |src, src_l| src.affine(src_l, mul, add));
             }
+            if self.dtype == DType::F16 {
+                let src_f32 = self.materialize_to_f32(layout)?;
+                let contiguous = if layout.dims().len() > 4 {
+                    Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+                } else {
+                    Layout::contiguous(layout.shape())
+                };
+                let out_f32 = src_f32.affine(&contiguous, mul, add)?;
+                return out_f32.to_dtype(&contiguous, DType::F16);
+            }
             if self.dtype != DType::F32 {
                 return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan affine").bt());
             }
@@ -6958,6 +6968,49 @@ impl BackendStorage for VulkanStorage {
         self.run_sum_rows(layout)
     }
     fn cumsum_last_dim(&self, layout: &Layout) -> Result<Self> {
+        if self.dtype == DType::F32 && (!layout.is_contiguous() || layout.dims().len() > 4) {
+            let src_f32 = self.materialize_to_f32(layout)?;
+            let src_f32_layout = if layout.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+            } else {
+                Layout::contiguous(layout.shape())
+            };
+            return src_f32.run_cumsum_last_dim(&src_f32_layout);
+        }
+        if self.dtype == DType::BF16 {
+            return match self.bf16_unary_via_f32(layout, |src, src_l| src.cumsum_last_dim(src_l)) {
+                Ok(out) => Ok(out),
+                Err(err) if should_cpu_fallback(&err) => {
+                    let src_cpu = self.to_cpu_storage()?;
+                    let out_cpu =
+                        <CpuStorage as BackendStorage>::cumsum_last_dim(&src_cpu, layout)?;
+                    self.device.storage_from_cpu_storage(&out_cpu)
+                }
+                Err(err) => Err(err),
+            };
+        }
+        if self.dtype == DType::F16 {
+            let gpu = || -> Result<Self> {
+                let src_f32 = self.materialize_to_f32(layout)?;
+                let src_f32_layout = if layout.dims().len() > 4 {
+                    Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+                } else {
+                    Layout::contiguous(layout.shape())
+                };
+                let out_f32 = src_f32.cumsum_last_dim(&src_f32_layout)?;
+                out_f32.to_dtype(&src_f32_layout, DType::F16)
+            };
+            return match gpu() {
+                Ok(out) => Ok(out),
+                Err(err) if should_cpu_fallback(&err) => {
+                    let src_cpu = self.to_cpu_storage()?;
+                    let out_cpu =
+                        <CpuStorage as BackendStorage>::cumsum_last_dim(&src_cpu, layout)?;
+                    self.device.storage_from_cpu_storage(&out_cpu)
+                }
+                Err(err) => Err(err),
+            };
+        }
         match self.run_cumsum_last_dim(layout) {
             Ok(out) => Ok(out),
             Err(err) if should_cpu_fallback(&err) => {

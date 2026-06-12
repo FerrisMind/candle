@@ -1237,3 +1237,113 @@ Remaining open (tracked, not final): optimized BF16-specialized arithmetic/reduc
     - passed
 - Remaining open after this closure:
   - Broader rank>4 reduction/cumsum/indexing coverage, wider dtype/layout sweeps, real-model attribution, and profiling remain open for final CUDA parity.
+
+## Progress Update: F16 Affine / MinMax and Native-Required Fixture Gates
+
+- Scope:
+  - closed WGPU `f16` `maximum` / `minimum` fallback exposed by the ggml fixture suite.
+  - closed Vulkan `f16` `affine` fallback exposed by the same fixture suite.
+  - fixed a WGPU correctness bug where strided `f16` affine used the original strided layout after materializing to contiguous `f32`.
+  - fixed a WGPU raw contiguous copy bug where odd-sized `f16` copies attempted a 6-byte `copy_buffer_to_buffer`, violating wgpu `COPY_BUFFER_ALIGNMENT`.
+- WGPU implementation:
+  - `binary_shader` now allows `f16` `maximum` / `minimum` through the existing custom WGSL binary path using `enable f16` and `array<f16>` bindings.
+  - `affine` now materializes `f16` inputs to contiguous `f32`, runs native GPU scale, then casts back to `f16`, matching the existing BF16 reuse-first decomposition pattern.
+  - contiguous copy now uses raw `copy_buffer_to_buffer` only for aligned source offset, destination offset, and size; unaligned logical copies use existing GPU copy shaders/emulated copy paths instead of CPU fallback.
+- Vulkan implementation:
+  - `affine` now supports `f16` through GPU-resident `materialize_to_f32 -> scale_f32 -> to_dtype(F16)`.
+  - no copied llama.cpp / ggml Vulkan shader generator source was modified.
+- Gating changes:
+  - `gpu_property_tests`, `gpu_metamorphic_tests`, and `ggml_fixture_ops_tests` now run under `native_required` for both WGPU and Vulkan.
+  - `backend_device_or_skip` now validates required-device identity when `CANDLE_REQUIRE_{WGPU,VULKAN}_TEST_DEVICE=1`, rejecting CPU/noop/software adapters such as `llvmpipe` and honoring `CANDLE_EXPECTED_GPU_NAME` / `CANDLE_EXPECTED_WGPU_BACKEND`.
+  - added `backend_smoke_{wgpu,vulkan}_f16_affine_minmax_native_only`.
+- Reference / source checks used for this slice:
+  - CUDA behavior: `candle-core/src/cuda_backend/mod.rs` binary / affine dispatch semantics.
+  - CPU semantics: `candle-core/src/storage.rs`, `candle-core/src/cpu_backend/mod.rs`.
+  - WGPU refs: `/home/mod479711/Downloads/candle_refs/wgpu--ae4c7cc9` copy-buffer alignment validation; llama.cpp WebGPU `wgsl-shaders/{binary,scale,cpy}.wgsl` reuse pattern.
+  - Vulkan refs: llama.cpp Vulkan `vulkan-shaders/scale.comp` and `vulkan-shaders/vulkan-shaders-gen.cpp` generated `scale_f32` route.
+- Targeted verification on the RTX 3060:
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_f16_affine_minmax_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' CANDLE_EXPECTED_WGPU_BACKEND=Vulkan cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_f16_affine_minmax_native_only -- --ignored --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan ggml_fixture_ops_vulkan -- --ignored --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' CANDLE_EXPECTED_WGPU_BACKEND=Vulkan cargo test -p candle-core --features wgpu,vulkan ggml_fixture_ops_wgpu -- --ignored --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_{WGPU,VULKAN}_TEST_DEVICE=1 ... gpu_metamorphic_{wgpu,vulkan}`
+    - passed on both backends
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_{WGPU,VULKAN}_TEST_DEVICE=1 ... gpu_properties_{wgpu,vulkan}`
+    - passed on both backends
+  - `cargo fmt --check`
+    - passed
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-nn --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-vulkan-kernels --all-targets -- -D warnings`
+    - passed
+- Remaining open after this closure:
+  - Full final CUDA parity is still not complete; broader dtype/layout/model/profiling closure remains governed by the parity matrix.
+
+## Progress Update: F16/BF16 Cumsum Public GPU Route (wgpu + Vulkan)
+
+- Scope:
+  - closed the public `Tensor::cumsum` route for WGPU/Vulkan `F16` and `BF16`; it previously only selected the backend `cumsum_last_dim` fast path for `F32`.
+  - closed backend-local `F16`/`BF16` `cumsum_last_dim` CPU fallbacks on both WGPU and Vulkan for the exercised last-dim and transposed/non-last-dim public API slice.
+- Public API / dispatch:
+  - `candle-core/src/tensor.rs::Tensor::cumsum` now routes `F32`, `F16`, and `BF16` tensors on WGPU/Vulkan through backend `cumsum_last_dim`, preserving the existing transpose/contiguous strategy for non-last dimensions.
+- WGPU implementation:
+  - `candle-core/src/wgpu_backend.rs::cumsum_last_dim` handles `BF16` through the existing GPU-resident `bf16_unary_via_f32` helper.
+  - `F16` materializes the logical input to contiguous `F32` on GPU, runs the existing WGPU `cumsum.wgsl` F32 kernel, then casts back to `F16`.
+- Vulkan implementation:
+  - `candle-core/src/vulkan_backend.rs::cumsum_last_dim` mirrors the same reuse-first route: `BF16` through `bf16_unary_via_f32`, and `F16` through GPU materialize-to-F32, existing `cumsum_f32`, and castback.
+- Reference / source checks used for this slice:
+  - CUDA behavior: `candle-core/src/cuda_backend/mod.rs` unary/reduction dispatch semantics and `candle-kernels/src/reduce.cu` as the CUDA reduction family reference.
+  - CPU semantics: `candle-core/src/storage.rs`, `candle-core/src/cpu_backend/mod.rs`, and public `Tensor::cumsum` behavior in `candle-core/src/tensor.rs`.
+  - WGPU refs: existing `candle-wgpu-kernels/src/shaders/cumsum.wgsl` and WGPU materialization/copy helpers.
+  - Vulkan refs: existing `candle-vulkan-kernels/src/shaders/cumsum.comp`; llama.cpp Vulkan uses the same F32 cumsum pipeline family in `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp::ggml_vk_cumsum`.
+- Test closure:
+  - Added `backend_smoke_{wgpu,vulkan}_half_cumsum_native_only`.
+  - Coverage: `F16` last-dim cumsum, `F16` non-last-dim cumsum through the public transpose route, `BF16` last-dim cumsum, and `BF16` transposed cumsum.
+  - Tests assert output dtype preservation and compare values after F32 readback, under native-required fallback accounting.
+- Targeted verification on the RTX 3060:
+  - `cargo fmt --check`
+    - passed
+  - `git diff --check`
+    - passed
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_half_cumsum_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' CANDLE_EXPECTED_WGPU_BACKEND=Vulkan cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_half_cumsum_native_only -- --ignored --exact --nocapture`
+    - passed
+- Remaining open after this closure:
+  - This closes the native-required synthetic/API half-cumsum slice only. Dedicated half cumsum shaders, broader layout/rank sweeps, model attribution, and cumsum profiling remain governed by the parity matrix.
+
+## Progress Update: Rank>4 Last-Dim Cumsum Compact Materialization (wgpu + Vulkan)
+
+- Scope:
+  - closes rank-5 last-dim `cumsum` for `F32`, `F16`, and `BF16` on both WGPU and Vulkan under native-required fallback accounting.
+  - keeps the claim intentionally narrow: non-last-dim rank>4 public `Tensor::cumsum` still needs broader rank>4 `contiguous` / layout materialization closure.
+- WGPU implementation:
+  - `candle-core/src/wgpu_backend.rs::cumsum_last_dim` now materializes non-contiguous `F32` layouts to contiguous GPU `F32` before dispatching the existing `cumsum.wgsl` kernel.
+  - Rank>4 `F16`/`BF16` reuse the same compact-rank materialization and F32 cumsum decomposition introduced for the half-cumsum route.
+- Vulkan implementation:
+  - `candle-core/src/vulkan_backend.rs::cumsum_last_dim` now routes rank>4 or non-contiguous `F32` layouts through GPU materialization before dispatching the existing `cumsum_f32` SPIR-V kernel.
+  - Rank>4 `F16`/`BF16` use the same GPU-resident F32 decomposition and castback path.
+- Reference / source checks used for this slice:
+  - CUDA behavior: Candle CUDA unary/reduction semantics in `candle-core/src/cuda_backend/mod.rs`.
+  - CPU semantics: public `Tensor::cumsum` contract in `candle-core/src/tensor.rs`; the test uses an explicit small rank-5 prefix-sum oracle because current CPU rank-5 cumsum can hit `MatMulUnexpectedStriding`.
+  - WGPU refs: existing `candle-wgpu-kernels/src/shaders/cumsum.wgsl` and compact materialization helpers.
+  - Vulkan refs: `candle-vulkan-kernels/src/shaders/cumsum.comp`; llama.cpp Vulkan `ggml_vk_cumsum` F32 pipeline route in `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp`.
+- Test closure:
+  - Added `backend_smoke_{wgpu,vulkan}_rank5_cumsum_native_only`.
+  - Coverage: rank-5 last-dim `F32` cumsum, rank-5 last-dim `F16` cumsum with dtype preservation, and rank-5 last-dim `BF16` cumsum with dtype preservation.
+  - Test readback flattens before half-to-F32 conversion so the assertion path itself does not trigger the still-open rank>4 cast fallback.
+- Targeted verification on the RTX 3060:
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_rank5_cumsum_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' CANDLE_EXPECTED_WGPU_BACKEND=Vulkan cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_rank5_cumsum_native_only -- --ignored --exact --nocapture`
+    - passed
+- Remaining open after this closure:
+  - Non-last-dim rank>4 public `Tensor::cumsum` still goes through `transpose(...).contiguous()` and can trigger the broader rank>4 layout fallback. That stays tracked under the shape/layout and unary/cumsum matrix rows.

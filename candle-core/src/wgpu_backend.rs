@@ -959,16 +959,16 @@ fn binary_shader(op: &str, dtype: DType) -> Result<String> {
         return custom_int_binary_wgsl(op, dtype);
     }
     if op == "maximum" {
-        if dtype != DType::F32 {
-            return Err(unsupported("binary maximum f16"));
+        if !matches!(dtype, DType::F32 | DType::F16) {
+            return Err(Error::UnsupportedDTypeForOp(dtype, "wgpu maximum").bt());
         }
-        return Ok(custom_binary_wgsl("max(a, b)"));
+        return custom_binary_wgsl("max(a, b)", dtype);
     }
     if op == "minimum" {
-        if dtype != DType::F32 {
-            return Err(unsupported("binary minimum f16"));
+        if !matches!(dtype, DType::F32 | DType::F16) {
+            return Err(Error::UnsupportedDTypeForOp(dtype, "wgpu minimum").bt());
         }
-        return Ok(custom_binary_wgsl("min(a, b)"));
+        return custom_binary_wgsl("min(a, b)", dtype);
     }
     let op = match op {
         "add" => candle_wgpu_kernels::BinaryOp::Add,
@@ -2172,9 +2172,15 @@ fn copy_shader(src: DType, dst: DType) -> Result<String> {
     Ok(out)
 }
 
-fn custom_binary_wgsl(expr: &str) -> String {
-    format!(
+fn custom_binary_wgsl(expr: &str, dtype: DType) -> Result<String> {
+    let (enable, data_type) = match dtype {
+        DType::F32 => ("", "f32"),
+        DType::F16 => ("enable f16;\n", "f16"),
+        _ => return Err(Error::UnsupportedDTypeForOp(dtype, "wgpu binary").bt()),
+    };
+    Ok(format!(
         r#"
+{enable}
 struct Params {{
     ne: u32,
     offset_src0: u32,
@@ -2198,9 +2204,9 @@ struct Params {{
     _pad0: u32,
 }};
 
-@group(0) @binding(0) var<storage, read_write> src0: array<f32>;
-@group(0) @binding(1) var<storage, read_write> src1: array<f32>;
-@group(0) @binding(2) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(0) var<storage, read_write> src0: array<{data_type}>;
+@group(0) @binding(1) var<storage, read_write> src1: array<{data_type}>;
+@group(0) @binding(2) var<storage, read_write> dst: array<{data_type}>;
 @group(0) @binding(3) var<uniform> params: Params;
 
 fn src0_index(_i: u32) -> u32 {{
@@ -2239,7 +2245,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     dst[params.offset_dst + gid.x] = {expr};
 }}
 "#
-    )
+    ))
 }
 
 fn wgpu_scalar_type(dtype: DType) -> Result<&'static str> {
@@ -6319,9 +6325,14 @@ impl BackendStorage for WgpuStorage {
         let gpu = match self.dtype {
             DType::F32 => self.run_scale(layout, mul as f32, add as f32),
             DType::F16 => {
-                let src_f32 = self.to_dtype(layout, DType::F32)?;
-                let scaled = src_f32.run_scale(layout, mul as f32, add as f32)?;
-                scaled.to_dtype(layout, DType::F16)
+                let src_f32 = self.materialize_to_f32(layout)?;
+                let src_f32_layout = if layout.dims().len() > 4 {
+                    Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+                } else {
+                    Layout::contiguous(layout.shape())
+                };
+                let scaled = src_f32.run_scale(&src_f32_layout, mul as f32, add as f32)?;
+                scaled.to_dtype(&src_f32_layout, DType::F16)
             }
             DType::BF16 => self.bf16_unary_via_f32(layout, |src, src_l| {
                 src.run_scale(src_l, mul as f32, add as f32)
@@ -6527,6 +6538,49 @@ impl BackendStorage for WgpuStorage {
         }
     }
     fn cumsum_last_dim(&self, layout: &Layout) -> Result<Self> {
+        if self.dtype == DType::F32 && !layout.is_contiguous() {
+            let src_f32 = self.materialize_to_f32(layout)?;
+            let src_f32_layout = if layout.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+            } else {
+                Layout::contiguous(layout.shape())
+            };
+            return src_f32.run_cumsum_last_dim(&src_f32_layout);
+        }
+        if self.dtype == DType::BF16 {
+            return match self.bf16_unary_via_f32(layout, |src, src_l| src.cumsum_last_dim(src_l)) {
+                Ok(out) => Ok(out),
+                Err(err) if should_cpu_fallback(&err) => {
+                    let src_cpu = self.to_cpu_storage()?;
+                    let out_cpu =
+                        <CpuStorage as BackendStorage>::cumsum_last_dim(&src_cpu, layout)?;
+                    self.device.storage_from_cpu_storage(&out_cpu)
+                }
+                Err(err) => Err(err),
+            };
+        }
+        if self.dtype == DType::F16 {
+            let gpu = || -> Result<Self> {
+                let src_f32 = self.materialize_to_f32(layout)?;
+                let src_f32_layout = if layout.dims().len() > 4 {
+                    Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+                } else {
+                    Layout::contiguous(layout.shape())
+                };
+                let out_f32 = src_f32.cumsum_last_dim(&src_f32_layout)?;
+                out_f32.to_dtype(&src_f32_layout, DType::F16)
+            };
+            return match gpu() {
+                Ok(out) => Ok(out),
+                Err(err) if should_cpu_fallback(&err) => {
+                    let src_cpu = self.to_cpu_storage()?;
+                    let out_cpu =
+                        <CpuStorage as BackendStorage>::cumsum_last_dim(&src_cpu, layout)?;
+                    self.device.storage_from_cpu_storage(&out_cpu)
+                }
+                Err(err) => Err(err),
+            };
+        }
         match self.run_cumsum_last_dim(layout) {
             Ok(out) => Ok(out),
             Err(err) if should_cpu_fallback(&err) => {
@@ -7233,7 +7287,33 @@ impl BackendStorage for WgpuStorage {
         }
         let src_offset = src_l.start_offset() * elem_size;
         let size = src_l.shape().elem_count() * elem_size;
-        let dst_offset = dst_offset * elem_size;
+        let dst_byte_offset = dst_offset * elem_size;
+        if !src_offset.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize)
+            || !dst_byte_offset.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize)
+            || !size.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize)
+        {
+            return match self.dtype {
+                DType::F32 | DType::F16 | DType::U32 | DType::I32 => {
+                    let shader = copy_shader(self.dtype, self.dtype)?;
+                    self.run_copy_into(src_l, dst, dst_offset, &shader)
+                }
+                DType::BF16 | DType::U8 | DType::I64 => {
+                    self.run_emulated_strided_copy_into(src_l, dst, dst_offset)
+                }
+                _ => {
+                    let src_cpu = self.to_cpu_storage()?;
+                    let mut dst_cpu = dst.to_cpu_storage()?;
+                    <CpuStorage as BackendStorage>::copy_strided_src(
+                        &src_cpu,
+                        &mut dst_cpu,
+                        dst_offset,
+                        src_l,
+                    )?;
+                    *dst = dst.device.storage_from_cpu_storage(&dst_cpu)?;
+                    Ok(())
+                }
+            };
+        }
         let mut encoder =
             self.device
                 .inner
@@ -7245,7 +7325,7 @@ impl BackendStorage for WgpuStorage {
             &self.buffer,
             src_offset as u64,
             &dst.buffer,
-            dst_offset as u64,
+            dst_byte_offset as u64,
             size as u64,
         );
         self.device.inner.queue.submit([encoder.finish()]);

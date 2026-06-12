@@ -3034,7 +3034,7 @@ impl Tensor {
         if rank == 0 {
             return Ok(self.clone());
         }
-        if self.dtype() == DType::F32 {
+        if matches!(self.dtype(), DType::F32 | DType::F16 | DType::BF16) {
             let last = rank - 1;
             let is_wgpu_or_vulkan =
                 matches!(&*self.storage(), Storage::Wgpu(_) | Storage::Vulkan(_));

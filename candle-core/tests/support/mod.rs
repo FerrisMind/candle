@@ -42,7 +42,12 @@ pub fn backend_device_or_skip(test_name: &str, backend: TestBackend) -> Result<O
         TestBackend::Vulkan => Device::new_vulkan(0),
     };
     match device {
-        Ok(device) => Ok(Some(device)),
+        Ok(device) => {
+            if require_device {
+                assert_required_device_identity(test_name, backend, &device)?;
+            }
+            Ok(Some(device))
+        }
         Err(err) if require_device => Err(err),
         Err(err) => {
             eprintln!(
@@ -52,6 +57,86 @@ pub fn backend_device_or_skip(test_name: &str, backend: TestBackend) -> Result<O
             Ok(None)
         }
     }
+}
+
+fn assert_required_device_identity(
+    test_name: &str,
+    backend: TestBackend,
+    device: &Device,
+) -> Result<()> {
+    match backend {
+        TestBackend::Wgpu => assert_required_wgpu_identity(test_name, device),
+        TestBackend::Vulkan => assert_required_vulkan_identity(test_name, device),
+    }
+}
+
+#[cfg(feature = "wgpu")]
+fn assert_required_wgpu_identity(test_name: &str, device: &Device) -> Result<()> {
+    let device = device.as_wgpu_device()?;
+    let name = device.adapter_name();
+    let backend = device.adapter_backend();
+    assert_non_cpu_device_name(test_name, "wgpu", name)?;
+    assert_non_cpu_backend_name(test_name, "wgpu", backend)?;
+    assert_expected_name(test_name, "wgpu", name, "CANDLE_EXPECTED_GPU_NAME")?;
+    assert_expected_name(
+        test_name,
+        "wgpu backend",
+        backend,
+        "CANDLE_EXPECTED_WGPU_BACKEND",
+    )
+}
+
+#[cfg(not(feature = "wgpu"))]
+fn assert_required_wgpu_identity(_: &str, _: &Device) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(feature = "vulkan")]
+fn assert_required_vulkan_identity(test_name: &str, device: &Device) -> Result<()> {
+    let device = device.as_vulkan_device()?;
+    let name = device.physical_device_name();
+    assert_non_cpu_device_name(test_name, "vulkan", name)?;
+    let device_type = format!("{:?}", device.physical_device_type());
+    assert_non_cpu_backend_name(test_name, "vulkan device type", &device_type)?;
+    assert_expected_name(test_name, "vulkan", name, "CANDLE_EXPECTED_GPU_NAME")
+}
+
+#[cfg(not(feature = "vulkan"))]
+fn assert_required_vulkan_identity(_: &str, _: &Device) -> Result<()> {
+    Ok(())
+}
+
+fn assert_expected_name(test_name: &str, label: &str, actual: &str, env_var: &str) -> Result<()> {
+    if let Some(expected) = std::env::var_os(env_var) {
+        let expected = expected.to_string_lossy().to_ascii_lowercase();
+        if !actual.to_ascii_lowercase().contains(&expected) {
+            candle_core::bail!(
+                "{test_name}: {label} selected {actual:?}, expected a value containing {expected:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn assert_non_cpu_device_name(test_name: &str, backend: &str, actual: &str) -> Result<()> {
+    let lower = actual.to_ascii_lowercase();
+    if lower.contains("llvmpipe")
+        || lower.contains("swiftshader")
+        || lower.contains("software")
+        || lower == "cpu"
+        || lower.contains(" cpu")
+    {
+        candle_core::bail!("{test_name}: {backend} selected non-GPU adapter {actual:?}");
+    }
+    Ok(())
+}
+
+fn assert_non_cpu_backend_name(test_name: &str, backend: &str, actual: &str) -> Result<()> {
+    let lower = actual.to_ascii_lowercase();
+    if lower.contains("noop") || lower.contains("cpu") {
+        candle_core::bail!("{test_name}: {backend} selected non-GPU backend {actual:?}");
+    }
+    Ok(())
 }
 
 pub fn fallback_allowed<F>(test_name: &str, backend: TestBackend, body: F) -> Result<()>
