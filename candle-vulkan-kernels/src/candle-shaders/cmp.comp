@@ -10,7 +10,9 @@ const uint num_threads = 128;
 
 layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
 
-uint cmp_result(float a, float b) {
+// Comparison happens directly in the source type so integer dtypes
+// (u8/u32/i64) keep exact semantics instead of routing through float.
+uint cmp_result(A_TYPE a, A_TYPE b) {
     switch (p.param3) {
         case 0: return uint(a == b);
         case 1: return uint(a != b);
@@ -36,8 +38,8 @@ void main() {
         uint i00, i01, i02, i03;
         get_indices(idx, i00, i01, i02, i03);
 
-        const float a = float(FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]));
-        const float b = float(FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]));
+        const A_TYPE a = data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)];
+        const A_TYPE b = A_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]);
         data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(cmp_result(a, b));
 
         idx += num_threads;

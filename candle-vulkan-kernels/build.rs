@@ -183,6 +183,36 @@ fn generate_candle_spirv_modules(
             ],
         ),
         (
+            "cmp_u8",
+            candle_shaders_dir.join("cmp.comp"),
+            &[
+                "A_TYPE=uint8_t",
+                "B_TYPE=uint8_t",
+                "D_TYPE=uint8_t",
+                "FLOAT_TYPE=float",
+            ],
+        ),
+        (
+            "cmp_u32",
+            candle_shaders_dir.join("cmp.comp"),
+            &[
+                "A_TYPE=uint",
+                "B_TYPE=uint",
+                "D_TYPE=uint8_t",
+                "FLOAT_TYPE=float",
+            ],
+        ),
+        (
+            "cmp_i64",
+            candle_shaders_dir.join("cmp.comp"),
+            &[
+                "A_TYPE=int64_t",
+                "B_TYPE=int64_t",
+                "D_TYPE=uint8_t",
+                "FLOAT_TYPE=float",
+            ],
+        ),
+        (
             "where_u8_f32",
             candle_shaders_dir.join("where_u8.comp"),
             &["T_TYPE=float", "D_TYPE=float"],
@@ -191,6 +221,21 @@ fn generate_candle_spirv_modules(
             "where_u8_f16",
             candle_shaders_dir.join("where_u8.comp"),
             &["T_TYPE=float16_t", "D_TYPE=float16_t"],
+        ),
+        (
+            "where_u8_u8",
+            candle_shaders_dir.join("where_u8.comp"),
+            &["T_TYPE=uint8_t", "D_TYPE=uint8_t"],
+        ),
+        (
+            "where_u8_u32",
+            candle_shaders_dir.join("where_u8.comp"),
+            &["T_TYPE=uint", "D_TYPE=uint"],
+        ),
+        (
+            "where_u8_i64",
+            candle_shaders_dir.join("where_u8.comp"),
+            &["T_TYPE=int64_t", "D_TYPE=int64_t"],
         ),
         (
             "set_rows_add_f32_i32",

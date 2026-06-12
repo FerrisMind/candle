@@ -453,6 +453,27 @@ fn backend_smoke_vulkan_cmp_where_native_only() -> Result<()> {
 #[test]
 #[cfg(feature = "wgpu")]
 #[ignore = "requires a usable wgpu adapter and driver"]
+fn backend_smoke_wgpu_int_cmp_where_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_wgpu_int_cmp_where_native_only",
+        TestBackend::Wgpu,
+        smoke_int_cmp_where,
+    )
+}
+
+#[test]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_int_cmp_where_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_vulkan_int_cmp_where_native_only",
+        TestBackend::Vulkan,
+        smoke_int_cmp_where,
+    )
+}
+
+#[test]
+#[cfg(feature = "wgpu")]
+#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_scatter_add_index_add_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_scatter_add_index_add_native_only",
@@ -2016,6 +2037,90 @@ fn smoke_f32_conv_transpose(device: &Device) -> Result<()> {
         &dilated_2d_cpu.flatten_all()?.to_vec1::<f32>()?,
         1e-5,
         "conv_transpose2d dilation/output_padding parity",
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_int_cmp_where(device: &Device) -> Result<()> {
+    let cpu = Device::Cpu;
+
+    // u8 cmp: exact integer semantics, including values > 127.
+    let lhs_u8 = Tensor::from_slice(&[1u8, 200, 3, 255, 0, 128], (2, 3), device)?;
+    let rhs_u8 = Tensor::from_slice(&[1u8, 199, 4, 255, 1, 127], (2, 3), device)?;
+    assert_eq!(lhs_u8.eq(&rhs_u8)?.to_vec2::<u8>()?, [[1, 0, 0], [1, 0, 0]]);
+    assert_eq!(lhs_u8.gt(&rhs_u8)?.to_vec2::<u8>()?, [[0, 1, 0], [0, 0, 1]]);
+    assert_eq!(lhs_u8.le(&rhs_u8)?.to_vec2::<u8>()?, [[1, 0, 1], [1, 1, 0]]);
+
+    // u32 cmp: values past the f32 24-bit mantissa must stay exact.
+    let lhs_u32 = Tensor::from_slice(&[16_777_217u32, 5, 4_000_000_000], (3,), device)?;
+    let rhs_u32 = Tensor::from_slice(&[16_777_216u32, 5, 4_000_000_001], (3,), device)?;
+    assert_eq!(lhs_u32.eq(&rhs_u32)?.to_vec1::<u8>()?, [0, 1, 0]);
+    assert_eq!(lhs_u32.gt(&rhs_u32)?.to_vec1::<u8>()?, [1, 0, 0]);
+    assert_eq!(lhs_u32.ge(&rhs_u32)?.to_vec1::<u8>()?, [1, 1, 0]);
+
+    // i64 cmp: sign handling and magnitudes past 2^32.
+    let lhs_i64 = Tensor::from_slice(&[-1i64, 1, 8_589_934_593, -8_589_934_593, 42], (5,), device)?;
+    let rhs_i64 = Tensor::from_slice(&[1i64, -1, 8_589_934_592, -8_589_934_592, 42], (5,), device)?;
+    assert_eq!(lhs_i64.lt(&rhs_i64)?.to_vec1::<u8>()?, [1, 0, 0, 1, 0]);
+    assert_eq!(lhs_i64.gt(&rhs_i64)?.to_vec1::<u8>()?, [0, 1, 1, 0, 0]);
+    assert_eq!(lhs_i64.eq(&rhs_i64)?.to_vec1::<u8>()?, [0, 0, 0, 0, 1]);
+    assert_eq!(lhs_i64.ne(&rhs_i64)?.to_vec1::<u8>()?, [1, 1, 1, 1, 0]);
+
+    // where_cond over integer value dtypes, compared against CPU reference.
+    let cond_vals = [1u8, 0, 0, 1, 1, 0];
+    let cond = Tensor::from_slice(&cond_vals, (2, 3), device)?;
+    let cond_cpu = Tensor::from_slice(&cond_vals, (2, 3), &cpu)?;
+
+    let t_u8 = [10u8, 20, 30, 40, 250, 60];
+    let f_u8 = [1u8, 2, 3, 4, 5, 6];
+    let got = Tensor::from_slice(&t_u8, (2, 3), device)?;
+    let alt = Tensor::from_slice(&f_u8, (2, 3), device)?;
+    let expected = cond_cpu.where_cond(
+        &Tensor::from_slice(&t_u8, (2, 3), &cpu)?,
+        &Tensor::from_slice(&f_u8, (2, 3), &cpu)?,
+    )?;
+    assert_eq!(
+        cond.where_cond(&got, &alt)?.to_vec2::<u8>()?,
+        expected.to_vec2::<u8>()?
+    );
+
+    let t_u32 = [16_777_217u32, 2, 3, 4_000_000_000, 5, 6];
+    let f_u32 = [9u32, 8, 7, 6, 5, 4];
+    let got = Tensor::from_slice(&t_u32, (2, 3), device)?;
+    let alt = Tensor::from_slice(&f_u32, (2, 3), device)?;
+    let expected = cond_cpu.where_cond(
+        &Tensor::from_slice(&t_u32, (2, 3), &cpu)?,
+        &Tensor::from_slice(&f_u32, (2, 3), &cpu)?,
+    )?;
+    assert_eq!(
+        cond.where_cond(&got, &alt)?.to_vec2::<u32>()?,
+        expected.to_vec2::<u32>()?
+    );
+
+    let t_i64 = [-8_589_934_593i64, 2, 3, 8_589_934_593, -5, 6];
+    let f_i64 = [9i64, -8, 7, -6, 5, -4];
+    let got = Tensor::from_slice(&t_i64, (2, 3), device)?;
+    let alt = Tensor::from_slice(&f_i64, (2, 3), device)?;
+    let expected = cond_cpu.where_cond(
+        &Tensor::from_slice(&t_i64, (2, 3), &cpu)?,
+        &Tensor::from_slice(&f_i64, (2, 3), &cpu)?,
+    )?;
+    assert_eq!(
+        cond.where_cond(&got, &alt)?.to_vec2::<i64>()?,
+        expected.to_vec2::<i64>()?
+    );
+
+    // Strided cond/value views must keep working for integer dtypes.
+    let strided_expected = cond_cpu.t()?.where_cond(
+        &Tensor::from_slice(&t_i64, (2, 3), &cpu)?.t()?,
+        &Tensor::from_slice(&f_i64, (2, 3), &cpu)?.t()?,
+    )?;
+    let got_t = Tensor::from_slice(&t_i64, (2, 3), device)?.t()?;
+    let alt_t = Tensor::from_slice(&f_i64, (2, 3), device)?.t()?;
+    assert_eq!(
+        cond.t()?.where_cond(&got_t, &alt_t)?.to_vec2::<i64>()?,
+        strided_expected.to_vec2::<i64>()?
     );
     Ok(())
 }

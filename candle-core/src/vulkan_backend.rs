@@ -3083,7 +3083,10 @@ impl VulkanStorage {
         rhs_layout: &Layout,
         op: CmpOp,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+        if !matches!(
+            self.dtype,
+            DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64
+        ) {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan cmp").bt());
         }
         if rhs.dtype != self.dtype {
@@ -3156,10 +3159,13 @@ impl VulkanStorage {
             VulkanBinding::Storage(&rhs.buffer),
             VulkanBinding::Storage(&dst.buffer),
         ];
-        let spirv_name = if self.dtype == DType::F16 {
-            "cmp_f16"
-        } else {
-            "cmp_f32"
+        let spirv_name = match self.dtype {
+            DType::F16 => "cmp_f16",
+            DType::F32 => "cmp_f32",
+            DType::U8 => "cmp_u8",
+            DType::U32 => "cmp_u32",
+            DType::I64 => "cmp_i64",
+            _ => return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan cmp").bt()),
         };
         let spirv = candle_vulkan_kernels::spirv(spirv_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
@@ -3180,7 +3186,10 @@ impl VulkanStorage {
         if self.dtype != DType::U8 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan where_cond").bt());
         }
-        if t.dtype != DType::F32 && t.dtype != DType::F16 {
+        if !matches!(
+            t.dtype,
+            DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64
+        ) {
             return Err(Error::UnsupportedDTypeForOp(t.dtype, "vulkan where_cond").bt());
         }
         if f.dtype != t.dtype {
@@ -3241,10 +3250,13 @@ impl VulkanStorage {
             VulkanBinding::Storage(&f.buffer),
             VulkanBinding::Storage(&dst.buffer),
         ];
-        let spirv_name = if t.dtype == DType::F16 {
-            "where_u8_f16"
-        } else {
-            "where_u8_f32"
+        let spirv_name = match t.dtype {
+            DType::F16 => "where_u8_f16",
+            DType::F32 => "where_u8_f32",
+            DType::U8 => "where_u8_u8",
+            DType::U32 => "where_u8_u32",
+            DType::I64 => "where_u8_i64",
+            _ => return Err(Error::UnsupportedDTypeForOp(t.dtype, "vulkan where_cond").bt()),
         };
         let spirv = candle_vulkan_kernels::spirv(spirv_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;

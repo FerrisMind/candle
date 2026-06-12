@@ -1128,19 +1128,54 @@ fn wgpu_scalar_type(dtype: DType) -> Result<&'static str> {
 }
 
 fn custom_cmp_wgsl(op: CmpOp, dtype: DType) -> Result<String> {
-    let ty = wgpu_scalar_type(dtype)?;
+    // U8 and I64 have no native WGSL scalar: U8 elements live as packed bytes
+    // in u32 words, I64 elements as lo/hi u32 word pairs (two's complement).
+    let (ty, load) = match dtype {
+        DType::U8 => (
+            "u32",
+            r#"let ea = params.offset_src0 + src0_index(idx);
+        let a = (src0[ea / 4u] >> (8u * (ea % 4u))) & 0xffu;
+        let eb = params.offset_src1 + src1_index(idx);
+        let b = (src1[eb / 4u] >> (8u * (eb % 4u))) & 0xffu;"#,
+        ),
+        DType::I64 => (
+            "u32",
+            r#"let ea = params.offset_src0 + src0_index(idx);
+        let a_lo = src0[2u * ea]; let a_hi = src0[2u * ea + 1u];
+        let eb = params.offset_src1 + src1_index(idx);
+        let b_lo = src1[2u * eb]; let b_hi = src1[2u * eb + 1u];
+        let i64_eq = (a_lo == b_lo) && (a_hi == b_hi);
+        let i64_lt = (bitcast<i32>(a_hi) < bitcast<i32>(b_hi)) || ((a_hi == b_hi) && (a_lo < b_lo));"#,
+        ),
+        _ => (
+            wgpu_scalar_type(dtype)?,
+            r#"let a = src0[params.offset_src0 + src0_index(idx)];
+        let b = src1[params.offset_src1 + src1_index(idx)];"#,
+        ),
+    };
     let prelude = if dtype == DType::F16 {
         "enable f16;\n"
     } else {
         ""
     };
-    let pred = match op {
-        CmpOp::Eq => "a == b",
-        CmpOp::Ne => "a != b",
-        CmpOp::Lt => "a < b",
-        CmpOp::Le => "a <= b",
-        CmpOp::Gt => "a > b",
-        CmpOp::Ge => "a >= b",
+    let pred = if dtype == DType::I64 {
+        match op {
+            CmpOp::Eq => "i64_eq",
+            CmpOp::Ne => "!i64_eq",
+            CmpOp::Lt => "i64_lt",
+            CmpOp::Le => "i64_lt || i64_eq",
+            CmpOp::Gt => "!(i64_lt || i64_eq)",
+            CmpOp::Ge => "!i64_lt",
+        }
+    } else {
+        match op {
+            CmpOp::Eq => "a == b",
+            CmpOp::Ne => "a != b",
+            CmpOp::Lt => "a < b",
+            CmpOp::Le => "a <= b",
+            CmpOp::Gt => "a > b",
+            CmpOp::Ge => "a >= b",
+        }
     };
     Ok(format!(
         r#"{prelude}
@@ -1209,8 +1244,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     for (var lane: u32 = 0u; lane < 4u; lane = lane + 1u) {{
         let idx = base + lane;
         if (idx >= params.ne) {{ break; }}
-        let a = src0[params.offset_src0 + src0_index(idx)];
-        let b = src1[params.offset_src1 + src1_index(idx)];
+        {load}
         let value = select(0u, 1u, {pred});
         out_word = out_word | (value << (lane * 8u));
     }}
@@ -1221,7 +1255,62 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 }
 
 fn custom_where_u8_wgsl(dtype: DType) -> Result<String> {
-    let ty = wgpu_scalar_type(dtype)?;
+    // U8 and I64 values have no native WGSL scalar; the value buffers are
+    // u32 words (U8: four packed bytes per word, I64: lo/hi pair per element)
+    // so element selection must address sub-word lanes explicitly.
+    let standard_main = format!(
+        r#"@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    if (gid.x >= params.ne) {{ return; }}
+    let logical_idx = gid.x;
+    let coords = decompose_idx(logical_idx);
+    let pred = cond_is_true(params.offset_cond + cond_index(coords));
+    let t = on_true[params.offset_true + true_index(coords)];
+    let f = on_false[params.offset_false + false_index(coords)];
+    dst[params.offset_dst + logical_idx] = select(f, t, pred);
+}}"#
+    );
+    let u8_main = format!(
+        r#"@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let base = gid.x * 4u;
+    if (base >= params.ne) {{ return; }}
+    var out_word: u32 = 0u;
+    for (var lane: u32 = 0u; lane < 4u; lane = lane + 1u) {{
+        let logical_idx = base + lane;
+        if (logical_idx >= params.ne) {{ break; }}
+        let coords = decompose_idx(logical_idx);
+        let pred = cond_is_true(params.offset_cond + cond_index(coords));
+        let t_idx = params.offset_true + true_index(coords);
+        let f_idx = params.offset_false + false_index(coords);
+        let t_b = (on_true[t_idx / 4u] >> (8u * (t_idx % 4u))) & 0xffu;
+        let f_b = (on_false[f_idx / 4u] >> (8u * (f_idx % 4u))) & 0xffu;
+        let b = select(f_b, t_b, pred);
+        out_word = out_word | (b << (8u * lane));
+    }}
+    dst[params.offset_dst / 4u + gid.x] = out_word;
+}}"#
+    );
+    let i64_main = format!(
+        r#"@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    if (gid.x >= params.ne) {{ return; }}
+    let logical_idx = gid.x;
+    let coords = decompose_idx(logical_idx);
+    let pred = cond_is_true(params.offset_cond + cond_index(coords));
+    let t_idx = params.offset_true + true_index(coords);
+    let f_idx = params.offset_false + false_index(coords);
+    let lo = select(on_false[2u * f_idx], on_true[2u * t_idx], pred);
+    let hi = select(on_false[2u * f_idx + 1u], on_true[2u * t_idx + 1u], pred);
+    dst[2u * (params.offset_dst + logical_idx)] = lo;
+    dst[2u * (params.offset_dst + logical_idx) + 1u] = hi;
+}}"#
+    );
+    let (ty, main) = match dtype {
+        DType::U8 => ("u32", u8_main),
+        DType::I64 => ("u32", i64_main),
+        _ => (wgpu_scalar_type(dtype)?, standard_main),
+    };
     let prelude = if dtype == DType::F16 {
         "enable f16;\n"
     } else {
@@ -1290,16 +1379,7 @@ fn cond_is_true(idx: u32) -> bool {{
     return ((word >> shift) & 0xffu) != 0u;
 }}
 
-@compute @workgroup_size({WG_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    if (gid.x >= params.ne) {{ return; }}
-    let logical_idx = gid.x;
-    let coords = decompose_idx(logical_idx);
-    let pred = cond_is_true(params.offset_cond + cond_index(coords));
-    let t = on_true[params.offset_true + true_index(coords)];
-    let f = on_false[params.offset_false + false_index(coords)];
-    dst[params.offset_dst + logical_idx] = select(f, t, pred);
-}}
+{main}
 "#
     ))
 }
@@ -1555,7 +1635,10 @@ impl WgpuStorage {
         {
             return Err(unsupported("cmp f16"));
         }
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+        if !matches!(
+            self.dtype,
+            DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64
+        ) {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu cmp").bt());
         }
         if rhs.dtype != self.dtype {
@@ -1650,7 +1733,10 @@ impl WgpuStorage {
         if t.dtype == DType::F16 && !t.device.inner.features.contains(wgpu::Features::SHADER_F16) {
             return Err(unsupported("where_cond f16"));
         }
-        if t.dtype != DType::F32 && t.dtype != DType::F16 {
+        if !matches!(
+            t.dtype,
+            DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64
+        ) {
             return Err(Error::UnsupportedDTypeForOp(t.dtype, "wgpu where_cond").bt());
         }
         if f.dtype != t.dtype {
