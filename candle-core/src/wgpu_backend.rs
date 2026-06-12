@@ -2395,7 +2395,9 @@ fn src_index(_i: u32) -> u32 {{
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{{body}}}
 "#
         );
-        if self.dtype == DType::U8 && (layout.start_offset() % 4 != 0 || dst_offset % 4 != 0) {
+        if self.dtype == DType::U8
+            && (!layout.start_offset().is_multiple_of(4) || !dst_offset.is_multiple_of(4))
+        {
             // Byte-level sub-word offsets would force read-modify-write on
             // shared destination words; keep that case on the safe path.
             return Err(unsupported("emulated u8 copy with sub-word offset"));
