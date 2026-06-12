@@ -812,7 +812,7 @@ New Candle-owned Vulkan shaders: `binary_int.comp`, `sum_rows_int.comp`, `reduce
 
 Parity matrix rows moved from `partial`/`gap` to `closed for core dtypes`: binary/compare/select, reductions. The cross-cutting "Error behavior and CPU fallback policy" row advances correspondingly (fewer silent CPU recoveries; all five real-model cases remain fallback 0).
 
-Remaining open (tracked, not final): bf16-native arithmetic/reductions/matmul beyond storage-preserving casts and argsort, I16 compute dtype, native f16 reduction accumulation (avoids an f32 materialization), and dedicated/profiling-backed top-k beyond the currently certified f32/f16/bf16/u8/u32/i64/f64 argsort slice.
+Remaining open (tracked, not final): optimized BF16-specialized arithmetic/reduction/matmul kernels beyond the GPU-resident BF16->F32->BF16 decomposition, I16 compute dtype, native f16/bf16 reduction accumulation (avoids an f32 materialization), and dedicated/profiling-backed top-k beyond the currently certified f32/f16/bf16/u8/u32/i64/f64 argsort slice.
 
 ## Progress Update: F16 Argsort / Sort Native Slice (wgpu + Vulkan)
 
@@ -1053,5 +1053,187 @@ Remaining open (tracked, not final): bf16-native arithmetic/reductions/matmul be
   - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_argsort_native_only -- --ignored --exact --nocapture`
     - passed
 - Remaining open after this closure:
-  - BF16-native arithmetic/reductions/matmul still need dedicated parity work; this update only preserves BF16 storage, closes BF16 destination casts, and closes BF16 argsort/sort via BF16->F32 sort keys plus raw BF16 sorted-value gather.
+  - BF16 arithmetic/reduction/matmul coverage was widened in later BF16 op-decomposition closures; optimized BF16-specialized kernels still need profiling-driven parity work.
   - Dedicated top-k kernels and sort/top-k throughput profiling remain open; current top-k coverage is still the `arg_sort + narrow + contiguous + gather` composition.
+
+## Progress Update: BF16 Unary / Binary / Reduction GPU-Resident Decomposition (wgpu + Vulkan)
+
+- Scope:
+  - closes the next BF16 parity gap after storage/cast/argsort: common unary/scalar ops, arithmetic binary ops, broadcast add, and reductions now stay on GPU for BF16 tensors.
+  - This is a reuse-first decomposition, not a claim of dedicated optimized BF16 arithmetic kernels: inputs are materialized on GPU, converted BF16->F32, computed through the already-certified F32 kernels, and cast back to BF16 for value outputs.
+- WGPU implementation:
+  - Added backend-local helpers in `candle-core/src/wgpu_backend.rs`:
+    - `materialize_to_f32` for GPU materialization + BF16/F16/F32 -> contiguous F32 storage.
+    - `bf16_unary_via_f32` and `bf16_binary_via_f32` for BF16->F32 op execution and BF16 castback.
+  - Routed BF16 `affine`, `powf`, `elu(alpha=1)`, `clamp`, generic unary ops, binary ops, and reductions through those helpers.
+  - Extended `run_emulated_strided_copy_into` and `copy_strided_src` to support packed BF16 same-dtype strided materialization on GPU, so BF16 op decomposition does not silently recover through CPU for transposed/view inputs in this slice.
+- Vulkan implementation:
+  - Added matching `materialize_to_f32`, `bf16_unary_via_f32`, and `bf16_binary_via_f32` helpers in `candle-core/src/vulkan_backend.rs`.
+  - Routed BF16 `affine`, `powf`, `elu(alpha=1)`, `clamp`, generic unary ops, binary ops, and reductions through the F32 GPU path with BF16 castback for value outputs.
+  - Added `convert_bf16_bf16` in `candle-vulkan-kernels/build.rs` / `copy_spirv` so BF16 same-dtype strided materialization uses the existing Candle-owned `convert.comp` path instead of CPU staging.
+- Test closure:
+  - `backend_smoke_{wgpu,vulkan}_bf16_unary_binary_native_only` covers BF16 `relu`, `neg`, `affine`, `clamp`, `add`, `mul`, `maximum`, `minimum`, `elu`, `log().exp()`, and broadcast add under `native_required`.
+  - `backend_smoke_{wgpu,vulkan}_bf16_reductions_native_only` covers BF16 last-dim, non-last-dim, multi-dim, and all-element `sum`, plus max/min and argmax/argmin under `native_required`.
+- Targeted verification on the RTX 3060:
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_bf16_unary_binary_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_bf16_reductions_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_bf16_unary_binary_native_only -- --ignored --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_bf16_reductions_native_only -- --ignored --exact --nocapture`
+    - passed
+  - `cargo fmt --check`
+    - passed
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-vulkan-kernels --all-targets -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-wgpu-kernels --all-targets -- -D warnings`
+    - passed
+- Remaining open after this closure:
+  - BF16 matmul / GEMM is closed by the later BF16 matmul decomposition slice.
+  - Native BF16-specialized arithmetic/reduction kernels and accumulation, if needed for performance, should be profiling-driven; the current closure is functional/API-level GPU residency.
+  - BF16 compare/select is closed by the later BF16 `cmp` / `where_cond` decomposition slice; broader model/profiling attribution remains open.
+
+## Progress Update: BF16 `cmp` / `where_cond` GPU-Resident Decomposition (wgpu + Vulkan)
+
+- Scope:
+  - closes the BF16 compare/select gap left after BF16 storage, cast, argsort, unary, binary, and reduction slices.
+  - Like the BF16 arithmetic slice, this is GPU-resident decomposition rather than dedicated BF16 compare/select shaders: BF16 inputs are materialized and converted to F32 on GPU, existing F32 compare/select kernels run, and BF16 `where_cond` casts the selected F32 result back to BF16.
+- WGPU implementation:
+  - Added `bf16_cmp_via_f32` and `bf16_where_via_f32` in `candle-core/src/wgpu_backend.rs`.
+  - `cmp` now routes BF16/BF16 comparisons through BF16->F32 materialization and the existing `run_cmp_u8` F32 path, producing packed `u8` predicates without CPU recovery.
+  - `where_cond` now routes BF16 true/false tensors through BF16->F32 materialization, existing F32 `where_u8` selection, and BF16 castback.
+- Vulkan implementation:
+  - Added matching `bf16_cmp_via_f32` and `bf16_where_via_f32` in `candle-core/src/vulkan_backend.rs`.
+  - BF16 compare/select now reuses the existing `cmp_f32` and `where_u8_f32` SPIR-V paths after GPU materialization, then uses the already-added BF16 conversion path for select outputs.
+- Test closure:
+  - Added `smoke_bf16_cmp_where` to `candle-core/tests/backend_smoke_tests.rs`.
+  - The smoke covers BF16 `eq`, `gt`, strided/transposed `le`, BF16 `where_cond`, and transposed BF16 `where_cond` against CPU reference.
+  - Added `backend_smoke_wgpu_bf16_cmp_where_native_only` and `backend_smoke_vulkan_bf16_cmp_where_native_only` under `native_required`; the broader matmul/conv/pool smoke family also exercises this BF16 compare/select case.
+- Targeted verification on the RTX 3060:
+  - `cargo fmt --check`
+    - passed
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_bf16_cmp_where_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_bf16_cmp_where_native_only -- --ignored --exact --nocapture`
+    - passed
+- Remaining open after this closure:
+  - BF16 matmul / GEMM is closed by the later BF16 matmul decomposition slice.
+  - Native BF16-specialized arithmetic/compare/select kernels and accumulation, if needed for performance, should be profiling-driven; current BF16 closure is functional/API-level GPU residency for the covered op families.
+
+## Progress Update: BF16 Matmul / GEMM GPU-Resident Decomposition (wgpu + Vulkan)
+
+- Scope:
+  - closes functional BF16 matmul/GEMM GPU residency for the exercised rank-2, batched, and strided-view cases.
+  - This mirrors the existing F16 route: BF16 inputs are materialized and converted to F32 on GPU, existing F32 matmul/GEMM kernels run, and outputs cast back to BF16.
+- WGPU implementation:
+  - `run_matmul_f32` now accepts BF16 alongside F32/F16.
+  - BF16 uses `materialize_to_f32` for lhs/rhs, so transposed BF16 views stay on GPU through the packed BF16 strided-copy path before F32 matmul.
+  - Output uses existing GPU `to_dtype(BF16)` castback.
+- Vulkan implementation:
+  - `run_matmul_f32` now accepts BF16 alongside F32/F16.
+  - BF16 uses `materialize_to_f32`, then the existing Vulkan F32 matmul routing (`mul_mat_vec` for small rank-2, tiled `matmul_f32_f32_fp32` where appropriate), then BF16 castback.
+- Test closure:
+  - Added `smoke_bf16_matmul`.
+  - Added `backend_smoke_wgpu_bf16_matmul_native_only` and `backend_smoke_vulkan_bf16_matmul_native_only`.
+  - Coverage: rank-2 BF16 matmul, batched BF16 matmul, and non-contiguous transposed BF16 batched views; expected values use CPU F32 matmul over BF16-quantized inputs followed by BF16 castback to match the decomposition contract.
+- Targeted verification on the RTX 3060:
+  - `cargo fmt --check`
+    - passed
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_bf16_matmul_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_bf16_matmul_native_only -- --ignored --exact --nocapture`
+    - passed
+- Remaining open after this closure:
+  - Dedicated BF16 matmul kernels and accumulation should be profiling-driven; current slice is functional/API-level GPU residency.
+  - Full matmul row still has broader rank/dtype/performance work.
+
+## Progress Update: Rank>4 Matmul Flatten / Materialization Decomposition (wgpu + Vulkan)
+
+- Scope:
+  - closes the rank>4 matmul gap for the exercised contiguous and non-contiguous F32/BF16 rank-5 cases.
+  - Contiguous layouts use a layout-preserving flatten route: when lhs/rhs have the same rank and rank is greater than 4, the backends collapse all batch dimensions into `(b, m, k)` and `(b, k, n)` and reuse the existing batched matmul implementation.
+  - Non-contiguous layouts use a safe GPU materialization route: each rank>4 batch matrix view is copied as a rank-2 layout into a compact rank-3 buffer, then the existing batched matmul route runs. This avoids unsafe stride collapse while keeping the operation GPU-resident under `native_required`.
+- WGPU implementation:
+  - `candle-core/src/wgpu_backend.rs::run_matmul_f32` now recognizes same-rank contiguous rank>4 layouts before the rank guard.
+  - The route builds `Layout::contiguous_with_offset((b, m, k), lhs_l.start_offset())` and `Layout::contiguous_with_offset((b, k, n), rhs_l.start_offset())`, then recursively calls the existing rank-3 batched matmul path.
+  - Non-contiguous rank>4 uses backend-local helpers to compute each batch start offset from the original strides, GPU-copy each matrix view into compact rank-3 storage, and run rank-3 batched matmul.
+  - BF16 rank>4 uses the already-closed BF16->F32 GEMM->BF16 route after flattening/materialization.
+- Vulkan implementation:
+  - `candle-core/src/vulkan_backend.rs::run_matmul_f32` uses the same rank>4 contiguous flatten route.
+  - Non-contiguous rank>4 uses matching per-batch GPU materialization helpers, then the flattened tensors reuse the existing Vulkan matmul routing, including tiled F32 GEMM for larger shapes and BF16 castback for BF16 inputs.
+- Test closure:
+  - Added `smoke_rank5_matmul` to `candle-core/tests/backend_smoke_tests.rs`.
+  - Added `backend_smoke_wgpu_rank5_matmul_native_only` and `backend_smoke_vulkan_rank5_matmul_native_only`.
+  - Coverage: contiguous rank-5 F32 `(2,2,3,4,5) x (2,2,3,5,6)`, transposed/non-contiguous rank-5 F32, contiguous rank-5 BF16, and transposed/non-contiguous rank-5 BF16.
+  - Expected values are computed through equivalent CPU rank-3 reshapes, because CPU direct rank-5 matmul currently rejects the original striding with `MatMulUnexpectedStriding`.
+- Targeted verification on the RTX 3060:
+  - `cargo fmt --check`
+    - passed
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_rank5_matmul_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_rank5_matmul_native_only -- --ignored --exact --nocapture`
+    - passed
+- Remaining open after this closure:
+  - Broader dtype coverage, dedicated BF16 kernels if profiling demands them, model attribution, and matmul performance sweeps remain open for final CUDA parity.
+
+## Progress Update: Rank>4 Unary / Broadcast Binary Compact Materialization (wgpu + Vulkan)
+
+- Scope:
+  - closes the exercised rank-5 F32 unary/broadcast-binary gap on both backends.
+  - The previous Vulkan native policy test only checked fallback count and accidentally ignored `Result`s from rank-5 `relu` and `broadcast_add`; it now verifies correctness and runs under `native_required` for both WGPU and Vulkan.
+- WGPU implementation:
+  - Added compact rank>4 materialization helpers in `candle-core/src/wgpu_backend.rs`.
+  - Rank>4 layouts are copied on GPU into compact rank-4 storage shaped as `(prefix_product, d[-3], d[-2], d[-1])`, preserving element order while satisfying the existing WGSL `dims4` shader parameter limit.
+  - `unary_impl` now routes rank>4 F32/F16 through compact GPU materialization before existing unary shaders.
+  - `binary_impl` now routes rank>4 operands through compact GPU materialization before existing binary shaders, including broadcasted rhs views materialized into the output shape.
+  - BF16 helper layout selection now uses the same compact rank>4 compute layout when BF16 values are decomposed through F32.
+- Vulkan implementation:
+  - Added matching compact rank>4 materialization helpers in `candle-core/src/vulkan_backend.rs`.
+  - `run_unary_head`, `run_unary_generic_with_params_dtype`, and `binary_impl` now materialize rank>4 views into compact rank-4 GPU storage before dispatching existing SPIR-V shaders.
+  - BF16 helper layout selection also uses compact rank>4 compute layouts, keeping future rank>4 BF16 decompositions GPU-resident through the same path.
+- Test closure:
+  - Replaced `backend_smoke_wgpu_rank5_fallback_policy` with `backend_smoke_wgpu_rank5_native_policy`.
+  - `backend_smoke_{wgpu,vulkan}_rank5_native_policy` now checks rank-5 F32 `relu` and rank-5 F32 `broadcast_add` results and requires zero CPU fallbacks on RTX 3060.
+- Targeted verification on the RTX 3060:
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_rank5_native_policy -- --ignored --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_rank5_native_policy -- --exact --nocapture`
+    - passed
+- Remaining open after this closure:
+  - Broader rank>4 compare/select/reduction/cumsum coverage, non-F32 dtype expansion, real-model attribution, and profiling remain open for final CUDA parity.
+
+## Progress Update: Rank>4 Compare / Select Compact Materialization (wgpu + Vulkan)
+
+- Scope:
+  - closes the exercised rank-5 F32 and BF16 compare/select gap on both backends.
+  - This extends the compact rank>4 materialization route from unary/binary into `cmp` and `where_cond`, so existing rank<=4 shaders are reused after a GPU-only layout copy.
+- WGPU implementation:
+  - `run_cmp_u8` now materializes any rank>4 lhs/rhs layout into compact rank-4 GPU storage before dispatching the existing compare shader.
+  - `run_where_u8_cond` now materializes rank>4 condition/true/false layouts into compact rank-4 GPU storage before dispatching the existing select shader.
+  - BF16 `cmp` and BF16 `where_cond` now select compact rank>4 F32 layouts during BF16->F32 decomposition, avoiding the old rank-5 layout passed into F32 compare/select.
+- Vulkan implementation:
+  - `run_cmp_u8` and `run_where_u8_cond` now use the same compact rank>4 materialization route before `dims4_ggml` parameter packing.
+  - BF16 `cmp` / `where_cond` layout selection was updated to use compact rank>4 compute layouts after GPU BF16->F32 materialization.
+- Test closure:
+  - Extended `smoke_rank5_unary_binary_native_only`.
+  - `backend_smoke_{wgpu,vulkan}_rank5_native_policy` now verifies rank-5 F32 `gt`, rank-5 F32 `where_cond`, rank-5 BF16 `gt`, and rank-5 BF16 `where_cond`, with native-required fallback accounting.
+- Targeted verification on the RTX 3060:
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_rank5_native_policy -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_rank5_native_policy -- --ignored --exact --nocapture`
+    - passed
+- Remaining open after this closure:
+  - Broader rank>4 reduction/cumsum/indexing coverage, wider dtype/layout sweeps, real-model attribution, and profiling remain open for final CUDA parity.

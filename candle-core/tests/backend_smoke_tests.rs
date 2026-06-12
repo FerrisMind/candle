@@ -9,7 +9,7 @@ use candle_core::{DType, Device, IndexOp, Result, Shape, Tensor};
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use half::{bf16, f16};
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
-use support::{backend_device_or_skip, backend_fallback_count};
+use support::backend_device_or_skip;
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use support::{fallback_allowed, native_required, TestBackend};
 
@@ -262,6 +262,21 @@ backend_family_test!(
 backend_family_test!(
     #[cfg(feature = "wgpu")]
     #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_bf16_matmul_native_only,
+    TestBackend::Wgpu,
+    native_required,
+    smoke_bf16_matmul
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_bf16_matmul_native_only,
+    TestBackend::Vulkan,
+    native_required,
+    smoke_bf16_matmul
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_quantized_paths,
     TestBackend::Wgpu,
     native_required,
@@ -277,10 +292,10 @@ backend_family_test!(
 backend_family_test!(
     #[cfg(feature = "wgpu")]
     #[ignore = "requires a usable wgpu adapter and driver"]
-    backend_smoke_wgpu_rank5_fallback_policy,
+    backend_smoke_wgpu_rank5_native_policy,
     TestBackend::Wgpu,
-    fallback_allowed,
-    smoke_rank5_unary_binary_fallback
+    native_required,
+    smoke_rank5_unary_binary_native_only
 );
 backend_family_test!(
     #[cfg(feature = "vulkan")]
@@ -288,6 +303,21 @@ backend_family_test!(
     TestBackend::Vulkan,
     native_required,
     smoke_rank5_unary_binary_native_only
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_rank5_matmul_native_only,
+    TestBackend::Wgpu,
+    native_required,
+    smoke_rank5_matmul
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_rank5_matmul_native_only,
+    TestBackend::Vulkan,
+    native_required,
+    smoke_rank5_matmul
 );
 
 #[test]
@@ -465,6 +495,27 @@ fn backend_smoke_vulkan_cmp_where_native_only() -> Result<()> {
 #[test]
 #[cfg(feature = "wgpu")]
 #[ignore = "requires a usable wgpu adapter and driver"]
+fn backend_smoke_wgpu_bf16_cmp_where_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_wgpu_bf16_cmp_where_native_only",
+        TestBackend::Wgpu,
+        smoke_bf16_cmp_where,
+    )
+}
+
+#[test]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_bf16_cmp_where_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_vulkan_bf16_cmp_where_native_only",
+        TestBackend::Vulkan,
+        smoke_bf16_cmp_where,
+    )
+}
+
+#[test]
+#[cfg(feature = "wgpu")]
+#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_int_cmp_where_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_int_cmp_where_native_only",
@@ -522,6 +573,48 @@ fn backend_smoke_wgpu_int_reductions_native_only() -> Result<()> {
         "backend_smoke_wgpu_int_reductions_native_only",
         TestBackend::Wgpu,
         smoke_int_reductions,
+    )
+}
+
+#[test]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_bf16_unary_binary_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_vulkan_bf16_unary_binary_native_only",
+        TestBackend::Vulkan,
+        smoke_bf16_elementwise_ops,
+    )
+}
+
+#[test]
+#[cfg(feature = "wgpu")]
+#[ignore = "requires a usable wgpu adapter and driver"]
+fn backend_smoke_wgpu_bf16_unary_binary_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_wgpu_bf16_unary_binary_native_only",
+        TestBackend::Wgpu,
+        smoke_bf16_elementwise_ops,
+    )
+}
+
+#[test]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_bf16_reductions_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_vulkan_bf16_reductions_native_only",
+        TestBackend::Vulkan,
+        smoke_bf16_reductions,
+    )
+}
+
+#[test]
+#[cfg(feature = "wgpu")]
+#[ignore = "requires a usable wgpu adapter and driver"]
+fn backend_smoke_wgpu_bf16_reductions_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_wgpu_bf16_reductions_native_only",
+        TestBackend::Wgpu,
+        smoke_bf16_reductions,
     )
 }
 
@@ -791,11 +884,7 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
     smoke_reductions_family(device)?;
     smoke_shape_layout_family(device)?;
     smoke_matmul_conv_pool_family(device)?;
-    if device.is_wgpu() {
-        smoke_rank5_unary_binary_fallback(device)?;
-    }
-    #[cfg(feature = "vulkan")]
-    if device.is_vulkan() {
+    if device.is_wgpu() || device.is_vulkan() {
         smoke_rank5_unary_binary_native_only(device)?;
     }
     smoke_quantized_family(device)?;
@@ -833,6 +922,7 @@ fn smoke_upload_and_dtype_family(device: &Device) -> Result<()> {
 fn smoke_unary_binary_family(device: &Device) -> Result<()> {
     smoke_f32_large_linear_elementwise(device)?;
     smoke_f16_elementwise_ops(device)?;
+    smoke_bf16_elementwise_ops(device)?;
     smoke_f32_binary_broadcast_and_strided_layout(device)?;
     smoke_f32_extended_unary_ops(device)?;
     if device.is_wgpu() {
@@ -844,6 +934,7 @@ fn smoke_unary_binary_family(device: &Device) -> Result<()> {
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_reductions_family(device: &Device) -> Result<()> {
     smoke_f32_sum_last_dim(device)?;
+    smoke_bf16_reductions(device)?;
     smoke_f32_cumsum(device)?;
     smoke_f32_argmax_last_dim(device)?;
     smoke_f32_extrema_last_dim(device)?;
@@ -865,12 +956,14 @@ fn smoke_shape_layout_family(device: &Device) -> Result<()> {
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_matmul_conv_pool_family(device: &Device) -> Result<()> {
     smoke_f32_matmul(device)?;
+    smoke_bf16_matmul(device)?;
     smoke_f32_conv1d(device)?;
     smoke_f32_conv2d(device)?;
     smoke_f32_conv_transpose(device)?;
     smoke_f32_upsample(device)?;
     smoke_f32_pool2d(device)?;
     smoke_f32_cmp_where(device)?;
+    smoke_bf16_cmp_where(device)?;
     smoke_f32_scatter_add_and_index_add(device)?;
     Ok(())
 }
@@ -940,6 +1033,111 @@ fn smoke_f32_matmul_shape_sweep(device: &Device) -> Result<()> {
         let actual = a_dev.matmul(&b_dev)?;
         assert_matmul_close(&actual, &expected, k, &format!("bmm {b}x{m}x{n}x{k}"))?;
     }
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_rank5_matmul(device: &Device) -> Result<()> {
+    let cpu = Device::Cpu;
+    let lhs_vals = (0..2 * 2 * 3 * 4 * 5)
+        .map(|idx| ((idx % 37) as f32 - 18.0) / 9.0)
+        .collect::<Vec<_>>();
+    let rhs_vals = (0..2 * 2 * 3 * 5 * 6)
+        .map(|idx| ((idx % 29) as f32 - 14.0) / 7.0)
+        .collect::<Vec<_>>();
+    let lhs_cpu = Tensor::from_vec(lhs_vals.clone(), (2, 2, 3, 4, 5), &cpu)?;
+    let rhs_cpu = Tensor::from_vec(rhs_vals.clone(), (2, 2, 3, 5, 6), &cpu)?;
+    let lhs = Tensor::from_vec(lhs_vals.clone(), (2, 2, 3, 4, 5), device)?;
+    let rhs = Tensor::from_vec(rhs_vals.clone(), (2, 2, 3, 5, 6), device)?;
+    let expected = lhs_cpu
+        .reshape((12, 4, 5))?
+        .matmul(&rhs_cpu.reshape((12, 5, 6))?)?
+        .reshape((2, 2, 3, 4, 6))?;
+    let actual = lhs.matmul(&rhs)?;
+    assert_eq!(actual.dims(), &[2, 2, 3, 4, 6]);
+    assert_matmul_close(&actual, &expected, 5, "rank5 f32 matmul")?;
+
+    let lhs_strided_cpu =
+        Tensor::from_vec(lhs_vals.clone(), (2, 2, 3, 5, 4), &cpu)?.transpose(3, 4)?;
+    let rhs_strided_cpu =
+        Tensor::from_vec(rhs_vals.clone(), (2, 2, 3, 6, 5), &cpu)?.transpose(3, 4)?;
+    let lhs_strided =
+        Tensor::from_vec(lhs_vals.clone(), (2, 2, 3, 5, 4), device)?.transpose(3, 4)?;
+    let rhs_strided =
+        Tensor::from_vec(rhs_vals.clone(), (2, 2, 3, 6, 5), device)?.transpose(3, 4)?;
+    let expected_strided = lhs_strided_cpu
+        .contiguous()?
+        .reshape((12, 4, 5))?
+        .matmul(&rhs_strided_cpu.contiguous()?.reshape((12, 5, 6))?)?
+        .reshape((2, 2, 3, 4, 6))?;
+    let actual_strided = lhs_strided.matmul(&rhs_strided)?;
+    assert_eq!(actual_strided.dims(), &[2, 2, 3, 4, 6]);
+    assert_matmul_close(
+        &actual_strided,
+        &expected_strided,
+        5,
+        "rank5 strided f32 matmul",
+    )?;
+
+    let lhs_bf16_vals = lhs_vals
+        .iter()
+        .map(|v| bf16::from_f32(*v))
+        .collect::<Vec<_>>();
+    let rhs_bf16_vals = rhs_vals
+        .iter()
+        .map(|v| bf16::from_f32(*v))
+        .collect::<Vec<_>>();
+    let lhs_bf16 = Tensor::from_vec(lhs_bf16_vals.clone(), (2, 2, 3, 4, 5), device)?;
+    let rhs_bf16 = Tensor::from_vec(rhs_bf16_vals.clone(), (2, 2, 3, 5, 6), device)?;
+    let lhs_bf16_cpu = Tensor::from_vec(lhs_bf16_vals.clone(), (2, 2, 3, 4, 5), &cpu)?;
+    let rhs_bf16_cpu = Tensor::from_vec(rhs_bf16_vals.clone(), (2, 2, 3, 5, 6), &cpu)?;
+    let expected_bf16 = lhs_bf16_cpu
+        .reshape((12, 4, 5))?
+        .to_dtype(DType::F32)?
+        .matmul(&rhs_bf16_cpu.reshape((12, 5, 6))?.to_dtype(DType::F32)?)?
+        .to_dtype(DType::BF16)?
+        .to_dtype(DType::F32)?;
+    let actual_bf16_raw = lhs_bf16.matmul(&rhs_bf16)?;
+    assert_eq!(actual_bf16_raw.dims(), &[2, 2, 3, 4, 6]);
+    let actual_bf16 = actual_bf16_raw.reshape((12, 4, 6))?.to_dtype(DType::F32)?;
+    assert_close_vec(
+        &actual_bf16.flatten_all()?.to_vec1::<f32>()?,
+        &expected_bf16.flatten_all()?.to_vec1::<f32>()?,
+        5e-2,
+        "rank5 bf16 matmul",
+    );
+
+    let lhs_bf16_strided_cpu =
+        Tensor::from_vec(lhs_bf16_vals.clone(), (2, 2, 3, 5, 4), &cpu)?.transpose(3, 4)?;
+    let rhs_bf16_strided_cpu =
+        Tensor::from_vec(rhs_bf16_vals.clone(), (2, 2, 3, 6, 5), &cpu)?.transpose(3, 4)?;
+    let lhs_bf16_strided =
+        Tensor::from_vec(lhs_bf16_vals, (2, 2, 3, 5, 4), device)?.transpose(3, 4)?;
+    let rhs_bf16_strided =
+        Tensor::from_vec(rhs_bf16_vals, (2, 2, 3, 6, 5), device)?.transpose(3, 4)?;
+    let expected_bf16_strided = lhs_bf16_strided_cpu
+        .contiguous()?
+        .reshape((12, 4, 5))?
+        .to_dtype(DType::F32)?
+        .matmul(
+            &rhs_bf16_strided_cpu
+                .contiguous()?
+                .reshape((12, 5, 6))?
+                .to_dtype(DType::F32)?,
+        )?
+        .to_dtype(DType::BF16)?
+        .to_dtype(DType::F32)?;
+    let actual_bf16_strided_raw = lhs_bf16_strided.matmul(&rhs_bf16_strided)?;
+    assert_eq!(actual_bf16_strided_raw.dims(), &[2, 2, 3, 4, 6]);
+    let actual_bf16_strided = actual_bf16_strided_raw
+        .reshape((12, 4, 6))?
+        .to_dtype(DType::F32)?;
+    assert_close_vec(
+        &actual_bf16_strided.flatten_all()?.to_vec1::<f32>()?,
+        &expected_bf16_strided.flatten_all()?.to_vec1::<f32>()?,
+        5e-2,
+        "rank5 strided bf16 matmul",
+    );
     Ok(())
 }
 
@@ -1158,23 +1356,91 @@ fn smoke_vulkan_quantized_dequantize_native_only(device: &Device) -> Result<()> 
     smoke_quantized_dequantize_native_only(device, &dtypes, "vulkan-dequantize")
 }
 
-#[cfg(feature = "vulkan")]
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_rank5_unary_binary_native_only(device: &Device) -> Result<()> {
     let xs = Tensor::from_slice(
         &[-2.0f32, -1.0, 0.0, 1.0, 2.0, 3.0],
         (1, 1, 1, 2, 3),
         device,
     )?;
-    let ys = Tensor::from_slice(&[10.0f32, 20.0, 30.0], (1, 1, 1, 1, 3), device)?;
-
-    // Core Vulkan paths are strict: unsupported rank/layout should return errors
-    // instead of silently falling back to CPU.
-    let _ = xs.relu();
-    let _ = xs.broadcast_add(&ys);
+    let relu = xs.relu()?;
+    assert_eq!(relu.dims(), &[1, 1, 1, 2, 3]);
     assert_eq!(
-        backend_fallback_count(TestBackend::Vulkan),
-        0,
-        "vulkan core paths must not trigger silent CPU fallback"
+        relu.flatten_all()?.to_vec1::<f32>()?,
+        [0.0, 0.0, 0.0, 1.0, 2.0, 3.0]
+    );
+
+    let ys = Tensor::from_slice(&[10.0f32, 20.0, 30.0], (1, 1, 1, 1, 3), device)?;
+    let add = xs.broadcast_add(&ys)?;
+    assert_eq!(add.dims(), &[1, 1, 1, 2, 3]);
+    assert_eq!(
+        add.flatten_all()?.to_vec1::<f32>()?,
+        [8.0, 19.0, 30.0, 11.0, 22.0, 33.0]
+    );
+
+    let rank5_values = [
+        -4.0f32, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, -8.0, 8.0, 5.0, -5.0, 4.0, -4.0, 7.0, -7.0,
+    ];
+    let rank5_shape = (2, 1, 1, 2, 4);
+    let rank5 = Tensor::from_slice(&rank5_values, rank5_shape, device)?;
+    let zeros = Tensor::zeros(rank5_shape, DType::F32, device)?;
+    let mask = rank5.gt(&zeros)?;
+    let expected_mask = [0u8, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 0, 1, 0, 1, 0];
+    assert_eq!(mask.dims(), &[2, 1, 1, 2, 4]);
+    assert_eq!(mask.flatten_all()?.to_vec1::<u8>()?, expected_mask);
+
+    let on_true = Tensor::from_slice(
+        &[
+            100.0f32, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0, 110.0, 111.0,
+            112.0, 113.0, 114.0, 115.0,
+        ],
+        rank5_shape,
+        device,
+    )?;
+    let on_false = Tensor::from_slice(
+        &[
+            -100.0f32, -101.0, -102.0, -103.0, -104.0, -105.0, -106.0, -107.0, -108.0, -109.0,
+            -110.0, -111.0, -112.0, -113.0, -114.0, -115.0,
+        ],
+        rank5_shape,
+        device,
+    )?;
+    assert_eq!(
+        mask.where_cond(&on_true, &on_false)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        [
+            -100.0, -101.0, -102.0, -103.0, -104.0, 105.0, 106.0, 107.0, -108.0, 109.0, 110.0,
+            -111.0, 112.0, -113.0, 114.0, -115.0
+        ]
+    );
+
+    let bf_lhs = Tensor::from_slice(
+        &rank5_values
+            .iter()
+            .copied()
+            .map(bf16::from_f32)
+            .collect::<Vec<_>>(),
+        rank5_shape,
+        device,
+    )?;
+    let bf_rhs = Tensor::zeros(rank5_shape, DType::BF16, device)?;
+    assert_eq!(
+        bf_lhs.gt(&bf_rhs)?.flatten_all()?.to_vec1::<u8>()?,
+        expected_mask
+    );
+    assert_eq!(
+        mask.where_cond(
+            &on_true.to_dtype(DType::BF16)?,
+            &on_false.to_dtype(DType::BF16)?
+        )?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?,
+        [
+            -100.0, -101.0, -102.0, -103.0, -104.0, 105.0, 106.0, 107.0, -108.0, 109.0, 110.0,
+            -111.0, 112.0, -113.0, 114.0, -115.0
+        ]
     );
     Ok(())
 }
@@ -1494,6 +1760,126 @@ fn smoke_f16_elementwise_ops(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_bf16_elementwise_ops(device: &Device) -> Result<()> {
+    let xs_values = [
+        bf16::from_f32(0.25),
+        bf16::from_f32(1.0),
+        bf16::from_f32(-2.0),
+        bf16::from_f32(4.0),
+    ];
+    let xs = Tensor::from_slice(&xs_values, (2, 2), device)?;
+    assert_eq!(xs.dtype(), DType::BF16);
+
+    assert_close(
+        &xs.relu()?.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+        &[[0.25, 1.0], [0.0, 4.0]],
+        8e-3,
+    );
+    assert_close(
+        &xs.neg()?.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+        &[[-0.25, -1.0], [2.0, -4.0]],
+        8e-3,
+    );
+    assert_close(
+        &xs.affine(0.5, 1.25)?
+            .to_dtype(DType::F32)?
+            .to_vec2::<f32>()?,
+        &[[1.375, 1.75], [0.25, 3.25]],
+        8e-3,
+    );
+    assert_close(
+        &xs.clamp(-0.5, 2.0)?
+            .to_dtype(DType::F32)?
+            .to_vec2::<f32>()?,
+        &[[0.25, 1.0], [-0.5, 2.0]],
+        8e-3,
+    );
+
+    let ys_values = [
+        bf16::from_f32(1.0),
+        bf16::from_f32(2.0),
+        bf16::from_f32(3.0),
+        bf16::from_f32(4.0),
+    ];
+    let ys = Tensor::from_slice(&ys_values, (2, 2), device)?;
+    assert_close(
+        &xs.add(&ys)?.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+        &[[1.25, 3.0], [1.0, 8.0]],
+        8e-3,
+    );
+    assert_close(
+        &xs.mul(&ys)?.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+        &[[0.25, 2.0], [-6.0, 16.0]],
+        8e-3,
+    );
+    assert_close(
+        &xs.maximum(&ys)?.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+        &[[1.0, 2.0], [3.0, 4.0]],
+        8e-3,
+    );
+    assert_close(
+        &xs.minimum(&ys)?.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+        &[[0.25, 1.0], [-2.0, 4.0]],
+        8e-3,
+    );
+    assert_close(
+        &xs.elu(1.0)?.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+        &[[0.25, 1.0], [std::f32::consts::E.powf(-2.0) - 1.0, 4.0]],
+        8e-3,
+    );
+
+    let positive_values = [
+        bf16::from_f32(0.25),
+        bf16::from_f32(1.0),
+        bf16::from_f32(2.0),
+        bf16::from_f32(4.0),
+    ];
+    let positive = Tensor::from_slice(&positive_values, (2, 2), device)?;
+    assert_close(
+        &positive
+            .log()?
+            .exp()?
+            .to_dtype(DType::F32)?
+            .to_vec2::<f32>()?,
+        &[[0.25, 1.0], [2.0, 4.0]],
+        2e-2,
+    );
+
+    let lhs = Tensor::from_slice(
+        &[
+            bf16::from_f32(1.0),
+            bf16::from_f32(2.0),
+            bf16::from_f32(3.0),
+            bf16::from_f32(4.0),
+            bf16::from_f32(5.0),
+            bf16::from_f32(6.0),
+        ],
+        (2, 3),
+        device,
+    )?;
+    let rhs = Tensor::from_slice(
+        &[
+            bf16::from_f32(10.0),
+            bf16::from_f32(20.0),
+            bf16::from_f32(30.0),
+        ],
+        (1, 3),
+        device,
+    )?;
+    assert_close_vec(
+        &lhs.broadcast_add(&rhs)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &[11.0, 22.0, 33.0, 14.0, 25.0, 36.0],
+        8e-3,
+        "bf16 broadcast_add",
+    );
+
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_f32_binary_broadcast_and_strided_layout(device: &Device) -> Result<()> {
     let lhs = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), device)?;
     let rhs = Tensor::from_slice(&[10.0f32, 20.0, 30.0], (1, 3), device)?;
@@ -1608,6 +1994,102 @@ fn smoke_f32_sum_last_dim(device: &Device) -> Result<()> {
     assert_eq!(
         ys.sum_keepdim(2)?.to_vec3::<f32>()?,
         [[[3.0], [7.0]], [[30.0], [70.0]], [[300.0], [700.0]]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_bf16_reductions(device: &Device) -> Result<()> {
+    let values = [
+        bf16::from_f32(1.0),
+        bf16::from_f32(2.0),
+        bf16::from_f32(3.0),
+        bf16::from_f32(4.0),
+        bf16::from_f32(10.0),
+        bf16::from_f32(20.0),
+        bf16::from_f32(30.0),
+        bf16::from_f32(40.0),
+        bf16::from_f32(-5.0),
+        bf16::from_f32(7.0),
+        bf16::from_f32(-9.0),
+        bf16::from_f32(11.0),
+    ];
+    let xs = Tensor::from_slice(&values, (3, 2, 2), device)?;
+    let cpu = Tensor::from_slice(&values, (3, 2, 2), &Device::Cpu)?;
+
+    assert_close_vec(
+        &xs.sum_keepdim(2)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &cpu.sum_keepdim(2)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        8e-3,
+        "bf16 sum dim2",
+    );
+    assert_close_vec(
+        &xs.sum_keepdim(0)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &cpu.sum_keepdim(0)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        8e-3,
+        "bf16 sum dim0",
+    );
+    assert_close_vec(
+        &xs.sum_keepdim((0, 2))?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &cpu.sum_keepdim((0, 2))?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        8e-3,
+        "bf16 sum dims0_2",
+    );
+    assert_close_vec(
+        &[xs.sum_all()?.to_dtype(DType::F32)?.to_vec0::<f32>()?],
+        &[cpu.sum_all()?.to_dtype(DType::F32)?.to_vec0::<f32>()?],
+        8e-3,
+        "bf16 sum_all",
+    );
+    assert_close_vec(
+        &xs.max_keepdim(2)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &cpu.max_keepdim(2)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        8e-3,
+        "bf16 max dim2",
+    );
+    assert_close_vec(
+        &xs.min_keepdim(2)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &cpu.min_keepdim(2)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        8e-3,
+        "bf16 min dim2",
+    );
+    assert_eq!(
+        xs.argmax_keepdim(2)?.to_vec3::<u32>()?,
+        cpu.argmax_keepdim(2)?.to_vec3::<u32>()?
+    );
+    assert_eq!(
+        xs.argmin_keepdim(2)?.to_vec3::<u32>()?,
+        cpu.argmin_keepdim(2)?.to_vec3::<u32>()?
     );
     Ok(())
 }
@@ -2414,6 +2896,75 @@ fn smoke_f32_matmul(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_bf16_matmul(device: &Device) -> Result<()> {
+    let cpu = Device::Cpu;
+    let bf16_matmul_reference = |lhs: &Tensor, rhs: &Tensor| -> Result<Tensor> {
+        lhs.to_dtype(DType::F32)?
+            .matmul(&rhs.to_dtype(DType::F32)?)?
+            .to_dtype(DType::BF16)?
+            .to_dtype(DType::F32)
+    };
+    let lhs_vals = [1.0f32, -2.0, 3.0, 0.5, 4.0, -1.0];
+    let rhs_vals = [2.0f32, -1.0, 0.25, 3.0, -2.0, 1.5];
+    let lhs = Tensor::from_slice(&lhs_vals, (2, 3), device)?.to_dtype(DType::BF16)?;
+    let rhs = Tensor::from_slice(&rhs_vals, (3, 2), device)?.to_dtype(DType::BF16)?;
+    let lhs_cpu = Tensor::from_slice(&lhs_vals, (2, 3), &cpu)?.to_dtype(DType::BF16)?;
+    let rhs_cpu = Tensor::from_slice(&rhs_vals, (3, 2), &cpu)?.to_dtype(DType::BF16)?;
+    assert_close_vec(
+        &lhs.matmul(&rhs)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &bf16_matmul_reference(&lhs_cpu, &rhs_cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        5e-2,
+        "bf16 matmul",
+    );
+
+    let lhs_b_vals = [
+        1.0f32, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -3.0, 5.0, 1.5, -2.0, 0.25,
+    ];
+    let rhs_b_vals = [
+        0.5f32, -1.0, 2.0, 3.0, -2.0, 4.0, 1.0, 0.25, -0.5, 2.5, 3.0, -1.5,
+    ];
+    let lhs_b = Tensor::from_slice(&lhs_b_vals, (2, 2, 3), device)?.to_dtype(DType::BF16)?;
+    let rhs_b = Tensor::from_slice(&rhs_b_vals, (2, 3, 2), device)?.to_dtype(DType::BF16)?;
+    let lhs_b_cpu = Tensor::from_slice(&lhs_b_vals, (2, 2, 3), &cpu)?.to_dtype(DType::BF16)?;
+    let rhs_b_cpu = Tensor::from_slice(&rhs_b_vals, (2, 3, 2), &cpu)?.to_dtype(DType::BF16)?;
+    assert_close_vec(
+        &lhs_b
+            .matmul(&rhs_b)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &bf16_matmul_reference(&lhs_b_cpu, &rhs_b_cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        5e-2,
+        "bf16 batched matmul",
+    );
+
+    let lhs_tt = lhs_b.t()?.contiguous()?.t()?;
+    let rhs_tt = rhs_b.t()?.contiguous()?.t()?;
+    let lhs_tt_cpu = lhs_b_cpu.t()?.contiguous()?.t()?;
+    let rhs_tt_cpu = rhs_b_cpu.t()?.contiguous()?.t()?;
+    assert_close_vec(
+        &lhs_tt
+            .matmul(&rhs_tt)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &bf16_matmul_reference(&lhs_tt_cpu, &rhs_tt_cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        5e-2,
+        "bf16 strided batched matmul",
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_f32_conv1d(device: &Device) -> Result<()> {
     let input = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, 1, 4), device)?;
     let kernel = Tensor::from_slice(&[1.0f32, 0.0, 1.0], (1, 1, 3), device)?;
@@ -2837,6 +3388,81 @@ fn smoke_f32_cmp_where(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_bf16_cmp_where(device: &Device) -> Result<()> {
+    let lhs_values = [
+        bf16::from_f32(1.0),
+        bf16::from_f32(-2.0),
+        bf16::from_f32(3.5),
+        bf16::from_f32(4.0),
+        bf16::from_f32(-8.0),
+        bf16::from_f32(6.0),
+    ];
+    let rhs_values = [
+        bf16::from_f32(1.0),
+        bf16::from_f32(-3.0),
+        bf16::from_f32(4.0),
+        bf16::from_f32(4.0),
+        bf16::from_f32(-7.0),
+        bf16::from_f32(5.0),
+    ];
+    let lhs = Tensor::from_slice(&lhs_values, (2, 3), device)?;
+    let rhs = Tensor::from_slice(&rhs_values, (2, 3), device)?;
+    assert_eq!(lhs.eq(&rhs)?.to_vec2::<u8>()?, [[1, 0, 0], [1, 0, 0]]);
+    assert_eq!(lhs.gt(&rhs)?.to_vec2::<u8>()?, [[0, 1, 0], [0, 0, 1]]);
+    assert_eq!(
+        lhs.t()?.le(&rhs.t()?)?.to_vec2::<u8>()?,
+        [[1, 1], [0, 1], [1, 0]]
+    );
+
+    let cpu = Device::Cpu;
+    let cond_values = [1u8, 0, 1, 0, 0, 1];
+    let on_true_values = [
+        bf16::from_f32(10.0),
+        bf16::from_f32(20.0),
+        bf16::from_f32(30.0),
+        bf16::from_f32(40.0),
+        bf16::from_f32(50.0),
+        bf16::from_f32(60.0),
+    ];
+    let on_false_values = [
+        bf16::from_f32(1.0),
+        bf16::from_f32(2.0),
+        bf16::from_f32(3.0),
+        bf16::from_f32(4.0),
+        bf16::from_f32(5.0),
+        bf16::from_f32(6.0),
+    ];
+    let cond = Tensor::from_slice(&cond_values, (2, 3), device)?;
+    let on_true = Tensor::from_slice(&on_true_values, (2, 3), device)?;
+    let on_false = Tensor::from_slice(&on_false_values, (2, 3), device)?;
+    let expected = Tensor::from_slice(&cond_values, (2, 3), &cpu)?.where_cond(
+        &Tensor::from_slice(&on_true_values, (2, 3), &cpu)?,
+        &Tensor::from_slice(&on_false_values, (2, 3), &cpu)?,
+    )?;
+    assert_eq!(
+        cond.where_cond(&on_true, &on_false)?
+            .to_dtype(DType::F32)?
+            .to_vec2::<f32>()?,
+        expected.to_dtype(DType::F32)?.to_vec2::<f32>()?
+    );
+
+    let strided_expected = Tensor::from_slice(&cond_values, (2, 3), &cpu)?
+        .t()?
+        .where_cond(
+            &Tensor::from_slice(&on_true_values, (2, 3), &cpu)?.t()?,
+            &Tensor::from_slice(&on_false_values, (2, 3), &cpu)?.t()?,
+        )?;
+    assert_eq!(
+        cond.t()?
+            .where_cond(&on_true.t()?, &on_false.t()?)?
+            .to_dtype(DType::F32)?
+            .to_vec2::<f32>()?,
+        strided_expected.to_dtype(DType::F32)?.to_vec2::<f32>()?
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_f32_scatter_add_and_index_add(device: &Device) -> Result<()> {
     let dst = Tensor::zeros((1, 5), DType::F32, device)?;
     let ids = Tensor::from_slice(&[1u32, 1, 3], (1, 3), device)?;
@@ -2979,31 +3605,6 @@ fn smoke_f32_extended_unary_ops(device: &Device) -> Result<()> {
         &elu_input.elu(1.0)?.to_vec2::<f32>()?,
         &[[std::f32::consts::E.recip() - 1.0, 0.0], [1.0, 2.0]],
         1e-5,
-    );
-
-    Ok(())
-}
-
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
-fn smoke_rank5_unary_binary_fallback(device: &Device) -> Result<()> {
-    let xs = Tensor::from_slice(
-        &[-2.0f32, -1.0, 0.0, 1.0, 2.0, 3.0],
-        (1, 1, 1, 2, 3),
-        device,
-    )?;
-    let relu = xs.relu()?;
-    assert_eq!(relu.dims(), &[1, 1, 1, 2, 3]);
-    assert_eq!(
-        relu.flatten_all()?.to_vec1::<f32>()?,
-        [0.0, 0.0, 0.0, 1.0, 2.0, 3.0]
-    );
-
-    let ys = Tensor::from_slice(&[10.0f32, 20.0, 30.0], (1, 1, 1, 1, 3), device)?;
-    let add = xs.broadcast_add(&ys)?;
-    assert_eq!(add.dims(), &[1, 1, 1, 2, 3]);
-    assert_eq!(
-        add.flatten_all()?.to_vec1::<f32>()?,
-        [8.0, 19.0, 30.0, 11.0, 22.0, 33.0]
     );
 
     Ok(())

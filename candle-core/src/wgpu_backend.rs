@@ -2780,6 +2780,25 @@ impl WgpuStorage {
                 }
                 .bt()
             })?;
+        if lhs_layout.dims().len() > 4 || rhs_layout.dims().len() > 4 {
+            let (lhs, lhs_l) = if lhs_layout.dims().len() > 4 {
+                self.materialize_rank_gt4_compact(lhs_layout)?
+            } else {
+                (
+                    self.try_clone(lhs_layout)?,
+                    Layout::contiguous(lhs_layout.shape()),
+                )
+            };
+            let (rhs, rhs_l) = if rhs_layout.dims().len() > 4 {
+                rhs.materialize_rank_gt4_compact(rhs_layout)?
+            } else {
+                (
+                    rhs.try_clone(rhs_layout)?,
+                    Layout::contiguous(rhs_layout.shape()),
+                )
+            };
+            return lhs.run_cmp_u8(&rhs, &lhs_l, &rhs_l, op);
+        }
         let (lhs_dims, lhs_strides) = dims4(lhs_layout)?;
         let (rhs_dims, rhs_strides) = dims4(rhs_layout)?;
         let count = lhs_layout.shape().elem_count();
@@ -2889,6 +2908,24 @@ impl WgpuStorage {
                 }
                 .bt()
             })?;
+        if layout.dims().len() > 4 || t_l.dims().len() > 4 || f_l.dims().len() > 4 {
+            let (cond, cond_l) = if layout.dims().len() > 4 {
+                self.materialize_rank_gt4_compact(layout)?
+            } else {
+                (self.try_clone(layout)?, Layout::contiguous(layout.shape()))
+            };
+            let (t, t_l) = if t_l.dims().len() > 4 {
+                t.materialize_rank_gt4_compact(t_l)?
+            } else {
+                (t.try_clone(t_l)?, Layout::contiguous(t_l.shape()))
+            };
+            let (f, f_l) = if f_l.dims().len() > 4 {
+                f.materialize_rank_gt4_compact(f_l)?
+            } else {
+                (f.try_clone(f_l)?, Layout::contiguous(f_l.shape()))
+            };
+            return cond.run_where_u8_cond(&cond_l, &t, &t_l, &f, &f_l);
+        }
         let (dims, cond_strides) = dims4(layout)?;
         let (_, true_strides) = dims4(t_l)?;
         let (_, false_strides) = dims4(f_l)?;
@@ -3234,15 +3271,281 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
+    fn materialize_to_f32(&self, layout: &Layout) -> Result<Self> {
+        if self.dtype == DType::F32 {
+            if layout.is_contiguous() && layout.start_offset() == 0 {
+                self.try_clone(layout)
+            } else if layout.dims().len() > 4 {
+                let (materialized, _) = self.materialize_rank_gt4_compact(layout)?;
+                Ok(materialized)
+            } else {
+                let mut materialized =
+                    unsafe { self.device.alloc_uninit(layout.shape(), DType::F32)? };
+                self.copy_strided_src(&mut materialized, 0, layout)?;
+                Ok(materialized)
+            }
+        } else if layout.dims().len() > 4 {
+            let (materialized, compact_l) = self.materialize_rank_gt4_compact(layout)?;
+            materialized.to_dtype(&compact_l, DType::F32)
+        } else {
+            let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            self.copy_strided_src(&mut materialized, 0, layout)?;
+            let contiguous = Layout::contiguous(layout.shape());
+            materialized.to_dtype(&contiguous, DType::F32)
+        }
+    }
+
+    fn rank_gt4_batch_start_offset(layout: &Layout, mut batch_idx: usize) -> usize {
+        let rank = layout.dims().len();
+        let mut offset = layout.start_offset();
+        for dim in (0..rank - 2).rev() {
+            let idx = batch_idx % layout.dims()[dim];
+            batch_idx /= layout.dims()[dim];
+            offset += idx * layout.stride()[dim];
+        }
+        offset
+    }
+
+    fn compact_rank_gt4_shape(layout: &Layout) -> Shape {
+        let rank = layout.dims().len();
+        let prefix = layout.dims()[..rank - 3].iter().product::<usize>();
+        Shape::from(vec![
+            prefix,
+            layout.dims()[rank - 3],
+            layout.dims()[rank - 2],
+            layout.dims()[rank - 1],
+        ])
+    }
+
+    fn compact_rank_gt4_start_offset(layout: &Layout, mut prefix_idx: usize) -> usize {
+        let rank = layout.dims().len();
+        let mut offset = layout.start_offset();
+        for dim in (0..rank - 3).rev() {
+            let idx = prefix_idx % layout.dims()[dim];
+            prefix_idx /= layout.dims()[dim];
+            offset += idx * layout.stride()[dim];
+        }
+        offset
+    }
+
+    fn materialize_rank_gt4_compact(&self, layout: &Layout) -> Result<(Self, Layout)> {
+        let compact_shape = Self::compact_rank_gt4_shape(layout);
+        let compact_layout = Layout::contiguous(compact_shape.clone());
+        let mut out = unsafe { self.device.alloc_uninit(&compact_shape, self.dtype)? };
+        let rank = layout.dims().len();
+        let slice_shape = Shape::from(vec![
+            layout.dims()[rank - 3],
+            layout.dims()[rank - 2],
+            layout.dims()[rank - 1],
+        ]);
+        let slice_stride = vec![
+            layout.stride()[rank - 3],
+            layout.stride()[rank - 2],
+            layout.stride()[rank - 1],
+        ];
+        let slice_len = slice_shape.elem_count();
+        let prefix = compact_shape.dims()[0];
+        for prefix_idx in 0..prefix {
+            let slice_layout = Layout::new(
+                slice_shape.clone(),
+                slice_stride.clone(),
+                Self::compact_rank_gt4_start_offset(layout, prefix_idx),
+            );
+            self.copy_strided_src(&mut out, prefix_idx * slice_len, &slice_layout)?;
+        }
+        Ok((out, compact_layout))
+    }
+
+    fn materialize_rank_gt4_matmul_operand(
+        &self,
+        layout: &Layout,
+        batch: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        let out_shape = Shape::from(vec![batch, rows, cols]);
+        let mut out = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
+        let matrix_shape = Shape::from(vec![rows, cols]);
+        let rank = layout.dims().len();
+        let matrix_stride = vec![layout.stride()[rank - 2], layout.stride()[rank - 1]];
+        for batch_idx in 0..batch {
+            let matrix_layout = Layout::new(
+                matrix_shape.clone(),
+                matrix_stride.clone(),
+                Self::rank_gt4_batch_start_offset(layout, batch_idx),
+            );
+            self.copy_strided_src(&mut out, batch_idx * rows * cols, &matrix_layout)?;
+        }
+        Ok(out)
+    }
+
+    fn materialize_rank_gt4_matmul_operand_to_f32(
+        &self,
+        layout: &Layout,
+        batch: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        if self.dtype == DType::F32 {
+            return self.materialize_rank_gt4_matmul_operand(layout, batch, rows, cols);
+        }
+        let out_shape = Shape::from(vec![batch, rows, cols]);
+        let mut out = unsafe { self.device.alloc_uninit(&out_shape, DType::F32)? };
+        let matrix_shape = Shape::from(vec![rows, cols]);
+        let matrix_contiguous = Layout::contiguous(matrix_shape.clone());
+        let rank = layout.dims().len();
+        let matrix_stride = vec![layout.stride()[rank - 2], layout.stride()[rank - 1]];
+        for batch_idx in 0..batch {
+            let matrix_layout = Layout::new(
+                matrix_shape.clone(),
+                matrix_stride.clone(),
+                Self::rank_gt4_batch_start_offset(layout, batch_idx),
+            );
+            let mut matrix = unsafe { self.device.alloc_uninit(&matrix_shape, self.dtype)? };
+            self.copy_strided_src(&mut matrix, 0, &matrix_layout)?;
+            let matrix_f32 = matrix.to_dtype(&matrix_contiguous, DType::F32)?;
+            matrix_f32.copy_strided_src(&mut out, batch_idx * rows * cols, &matrix_contiguous)?;
+        }
+        Ok(out)
+    }
+
+    fn bf16_unary_via_f32(
+        &self,
+        layout: &Layout,
+        f: impl FnOnce(&Self, &Layout) -> Result<Self>,
+    ) -> Result<Self> {
+        let f32_storage = self.materialize_to_f32(layout)?;
+        let contiguous = if layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+        } else {
+            Layout::contiguous(layout.shape())
+        };
+        let out_f32 = f(&f32_storage, &contiguous)?;
+        out_f32.to_dtype(&contiguous, DType::BF16)
+    }
+
+    fn bf16_binary_via_f32(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        f: impl FnOnce(&Self, &Self, &Layout, &Layout) -> Result<Self>,
+    ) -> Result<Self> {
+        if rhs.dtype != DType::BF16 {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "wgpu bf16 binary").bt());
+        }
+        self.device
+            .same_device(&rhs.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: rhs.device.location(),
+                    op: "bf16 binary",
+                }
+                .bt()
+            })?;
+        let lhs_f32 = self.materialize_to_f32(lhs_layout)?;
+        let rhs_f32 = rhs.materialize_to_f32(rhs_layout)?;
+        let lhs_contiguous = if lhs_layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(lhs_layout))
+        } else {
+            Layout::contiguous(lhs_layout.shape())
+        };
+        let rhs_contiguous = if rhs_layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(rhs_layout))
+        } else {
+            Layout::contiguous(rhs_layout.shape())
+        };
+        let out_f32 = f(&lhs_f32, &rhs_f32, &lhs_contiguous, &rhs_contiguous)?;
+        out_f32.to_dtype(&lhs_contiguous, DType::BF16)
+    }
+
+    fn bf16_cmp_via_f32(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        op: CmpOp,
+    ) -> Result<Self> {
+        if rhs.dtype != DType::BF16 {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "wgpu bf16 cmp").bt());
+        }
+        self.device
+            .same_device(&rhs.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: rhs.device.location(),
+                    op: "bf16 cmp",
+                }
+                .bt()
+            })?;
+        let lhs_f32 = self.materialize_to_f32(lhs_layout)?;
+        let rhs_f32 = rhs.materialize_to_f32(rhs_layout)?;
+        let lhs_contiguous = if lhs_layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(lhs_layout))
+        } else {
+            Layout::contiguous(lhs_layout.shape())
+        };
+        let rhs_contiguous = if rhs_layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(rhs_layout))
+        } else {
+            Layout::contiguous(rhs_layout.shape())
+        };
+        lhs_f32.run_cmp_u8(&rhs_f32, &lhs_contiguous, &rhs_contiguous, op)
+    }
+
+    fn bf16_where_via_f32(
+        &self,
+        layout: &Layout,
+        t: &Self,
+        t_l: &Layout,
+        f: &Self,
+        f_l: &Layout,
+    ) -> Result<Self> {
+        if t.dtype != DType::BF16 {
+            return Err(Error::UnsupportedDTypeForOp(t.dtype, "wgpu bf16 where_cond").bt());
+        }
+        if f.dtype != DType::BF16 {
+            return Err(Error::UnsupportedDTypeForOp(f.dtype, "wgpu bf16 where_cond").bt());
+        }
+        let t_f32 = t.materialize_to_f32(t_l)?;
+        let f_f32 = f.materialize_to_f32(f_l)?;
+        let t_contiguous = if t_l.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(t_l))
+        } else {
+            Layout::contiguous(t_l.shape())
+        };
+        let f_contiguous = if f_l.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(f_l))
+        } else {
+            Layout::contiguous(f_l.shape())
+        };
+        let out_f32 =
+            self.run_where_u8_cond(layout, &t_f32, &t_contiguous, &f_f32, &f_contiguous)?;
+        let out_layout = if layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+        } else {
+            Layout::contiguous(layout.shape())
+        };
+        out_f32.to_dtype(&out_layout, DType::BF16)
+    }
+
     // Strided same-dtype copy for dtypes WGSL cannot address as scalars:
-    // U8 elements are packed four-per-u32-word, I64 elements are lo/hi word
-    // pairs. The destination is written contiguously starting at dst_offset.
+    // U8 elements are packed four-per-u32-word, BF16 two-per-u32-word, and
+    // I64 elements are lo/hi word pairs. The destination is written
+    // contiguously starting at dst_offset.
     fn run_emulated_strided_copy_into(
         &self,
         layout: &Layout,
         dst: &Self,
         dst_offset: usize,
     ) -> Result<()> {
+        if self.dtype == DType::BF16 && !dst_offset.is_multiple_of(2) {
+            return Err(unsupported("bf16 strided copy odd destination offset"));
+        }
         let count = layout.shape().elem_count();
         if count == 0 {
             return Ok(());
@@ -3268,6 +3571,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             dst_ne2: src_dims[2],
         };
         let body = match self.dtype {
+            DType::BF16 => {
+                // One thread per packed BF16 output word: gathers two strided
+                // source halfwords, so concurrent threads never share a word.
+                r#"
+    let base = gid.x * 2u;
+    if (base >= params.ne) { return; }
+    let word_idx = params.offset_dst / 2u + gid.x;
+    var w: u32 = 0u;
+    for (var lane: u32 = 0u; lane < 2u; lane = lane + 1u) {
+        let logical_idx = base + lane;
+        var bits: u32;
+        if (logical_idx < params.ne) {
+            let e = params.offset_src + src_index(logical_idx);
+            bits = (src[e / 2u] >> (16u * (e % 2u))) & 0xffffu;
+        } else {
+            bits = (dst[word_idx] >> (16u * lane)) & 0xffffu;
+        }
+        w = w | (bits << (16u * lane));
+    }
+    dst[word_idx] = w;
+"#
+            }
             DType::U8 => {
                 // One thread per packed output word: gathers four strided
                 // source bytes, so concurrent threads never share a word.
@@ -3355,6 +3680,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{{body}}}
             return Err(unsupported("emulated u8 copy with sub-word offset"));
         }
         let work_items = match self.dtype {
+            DType::BF16 => count.div_ceil(2),
             DType::U8 => count.div_ceil(4),
             _ => count,
         };
@@ -4669,26 +4995,52 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{{body}}}
         if self.dtype != rhs.dtype {
             return Err(unsupported("matmul mixed dtype"));
         }
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 && self.dtype != DType::BF16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu matmul").bt());
         }
         let rank = lhs_l.dims().len();
+        if rank == rhs_l.dims().len() && rank > 4 {
+            if b != lhs_l.dims()[..rank - 2].iter().product::<usize>()
+                || b != rhs_l.dims()[..rank - 2].iter().product::<usize>()
+            {
+                return Err(unsupported("matmul batch"));
+            }
+            if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
+                let lhs_flat_l = Layout::contiguous_with_offset((b, m, k), lhs_l.start_offset());
+                let rhs_flat_l = Layout::contiguous_with_offset((b, k, n), rhs_l.start_offset());
+                return self.run_matmul_f32(rhs, (b, m, n, k), &lhs_flat_l, &rhs_flat_l);
+            }
+            let lhs_l = if matches!(self.dtype, DType::F16 | DType::BF16) {
+                let lhs = self.materialize_rank_gt4_matmul_operand_to_f32(lhs_l, b, m, k)?;
+                let rhs = rhs.materialize_rank_gt4_matmul_operand_to_f32(rhs_l, b, k, n)?;
+                let lhs_l = Layout::contiguous(Shape::from(vec![b, m, k]));
+                let rhs_l = Layout::contiguous(Shape::from(vec![b, k, n]));
+                let out = lhs.run_matmul_f32(&rhs, (b, m, n, k), &lhs_l, &rhs_l)?;
+                let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
+                return out.to_dtype(&out_l, self.dtype);
+            } else {
+                self.materialize_rank_gt4_matmul_operand(lhs_l, b, m, k)?
+            };
+            let rhs = rhs.materialize_rank_gt4_matmul_operand(rhs_l, b, k, n)?;
+            let lhs_flat_l = Layout::contiguous(Shape::from(vec![b, m, k]));
+            let rhs_flat_l = Layout::contiguous(Shape::from(vec![b, k, n]));
+            return lhs_l.run_matmul_f32(&rhs, (b, m, n, k), &lhs_flat_l, &rhs_flat_l);
+        }
         if rank != rhs_l.dims().len() || !(2..=4).contains(&rank) {
             return Err(unsupported("matmul rank"));
         }
         if b != lhs_l.dims()[..rank - 2].iter().product::<usize>() {
             return Err(unsupported("matmul batch"));
         }
-        if self.dtype == DType::F16 {
-            // Keep f16 storage compatibility while executing numerically stable f32 matmul.
-            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
-            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
+        if matches!(self.dtype, DType::F16 | DType::BF16) {
+            // Keep low-precision storage compatibility while executing numerically stable f32 matmul.
+            let lhs_f32 = self.materialize_to_f32(lhs_l)?;
+            let rhs_f32 = rhs.materialize_to_f32(rhs_l)?;
             let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
             let rhs_f32_l = Layout::contiguous(rhs_l.shape().clone());
             let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
             let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
-            let copy = copy_shader(DType::F32, DType::F16)?;
-            return out_f32.run_copy_to_dtype(&out_l, DType::F16, &copy);
+            return out_f32.to_dtype(&out_l, self.dtype);
         }
 
         let mut lhs_contiguous = None;
@@ -5971,6 +6323,9 @@ impl BackendStorage for WgpuStorage {
                 let scaled = src_f32.run_scale(layout, mul as f32, add as f32)?;
                 scaled.to_dtype(layout, DType::F16)
             }
+            DType::BF16 => self.bf16_unary_via_f32(layout, |src, src_l| {
+                src.run_scale(src_l, mul as f32, add as f32)
+            }),
             _ => Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu affine").bt()),
         };
         match gpu {
@@ -5984,6 +6339,17 @@ impl BackendStorage for WgpuStorage {
         }
     }
     fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
+        if self.dtype == DType::BF16 {
+            return match self.bf16_unary_via_f32(layout, |src, src_l| src.powf(src_l, e)) {
+                Ok(out) => Ok(out),
+                Err(err) if should_cpu_fallback(&err) => {
+                    let src_cpu = self.to_cpu_storage()?;
+                    let out_cpu = <CpuStorage as BackendStorage>::powf(&src_cpu, layout, e)?;
+                    self.device.storage_from_cpu_storage(&out_cpu)
+                }
+                Err(err) => Err(err),
+            };
+        }
         let shader = custom_unary_wgsl(&format!("pow(x, {:?})", e as f32));
         match self.run_unary_like(layout, &shader, "candle-wgpu-powf") {
             Ok(out) => Ok(out),
@@ -6013,6 +6379,13 @@ impl BackendStorage for WgpuStorage {
             return cpu_fallback();
         }
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
+            if self.dtype == DType::BF16 && alpha == 1.0 {
+                return match self.bf16_unary_via_f32(layout, |src, src_l| src.elu(src_l, alpha)) {
+                    Ok(out) => Ok(out),
+                    Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+                    Err(err) => Err(err),
+                };
+            }
             return cpu_fallback();
         }
         if alpha != 1.0 {
@@ -6034,6 +6407,26 @@ impl BackendStorage for WgpuStorage {
         };
         if matches!(self.dtype, DType::U8 | DType::U32 | DType::I64) {
             return match self.run_int_reduce(op, layout, reduce_dims) {
+                Ok(out) => Ok(out),
+                Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+                Err(err) => Err(err),
+            };
+        }
+        if self.dtype == DType::BF16 {
+            return match self.materialize_to_f32(layout).and_then(|src_f32| {
+                let contiguous = Layout::contiguous(layout.shape());
+                let reduced = src_f32.reduce_op(op, &contiguous, reduce_dims)?;
+                if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
+                    Ok(reduced)
+                } else {
+                    let mut out_dims = layout.dims().to_vec();
+                    for &dim in reduce_dims {
+                        out_dims[dim] = 1;
+                    }
+                    let out_layout = Layout::contiguous(Shape::from(out_dims));
+                    reduced.to_dtype(&out_layout, DType::BF16)
+                }
+            }) {
                 Ok(out) => Ok(out),
                 Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
                 Err(err) => Err(err),
@@ -6145,6 +6538,20 @@ impl BackendStorage for WgpuStorage {
         }
     }
     fn clamp(&self, layout: &Layout, min: f32, max: f32) -> Result<Self> {
+        if self.dtype == DType::BF16 {
+            return match self
+                .bf16_unary_via_f32(layout, |src, src_l| src.run_clamp(src_l, min, max))
+            {
+                Ok(out) => Ok(out),
+                Err(err) if should_cpu_fallback(&err) => {
+                    let src_cpu = self.to_cpu_storage()?;
+                    let out_cpu =
+                        <CpuStorage as BackendStorage>::clamp(&src_cpu, layout, min, max)?;
+                    self.device.storage_from_cpu_storage(&out_cpu)
+                }
+                Err(err) => Err(err),
+            };
+        }
         match self.run_clamp(layout, min, max) {
             Ok(out) => Ok(out),
             Err(err) if should_cpu_fallback(&err) => {
@@ -6163,6 +6570,13 @@ impl BackendStorage for WgpuStorage {
                 <CpuStorage as BackendStorage>::cmp(&lhs_cpu, op, &rhs_cpu, lhs_l, rhs_l)?;
             self.device.storage_from_cpu_storage(&out_cpu)
         };
+        if self.dtype == DType::BF16 {
+            return match self.bf16_cmp_via_f32(rhs, lhs_l, rhs_l, op) {
+                Ok(out) => Ok(out),
+                Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+                Err(err) => Err(err),
+            };
+        }
         match self.run_cmp_u8(rhs, lhs_l, rhs_l, op) {
             Ok(out) => Ok(out),
             Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
@@ -6211,7 +6625,20 @@ impl BackendStorage for WgpuStorage {
             return cpu_fallback();
         }
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
+            if self.dtype == DType::BF16 {
+                return match self
+                    .bf16_unary_via_f32(layout, |src, src_l| src.unary_impl::<B>(src_l))
+                {
+                    Ok(out) => Ok(out),
+                    Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+                    Err(err) => Err(err),
+                };
+            }
             return cpu_fallback();
+        }
+        if layout.dims().len() > 4 {
+            let (src, src_l) = self.materialize_rank_gt4_compact(layout)?;
+            return src.unary_impl::<B>(&src_l);
         }
         let shader = unary_shader(B::NAME, self.dtype)?;
         match self.run_unary_like(layout, &shader, "candle-wgpu-unary") {
@@ -6247,6 +6674,18 @@ impl BackendStorage for WgpuStorage {
             self.dtype,
             DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64
         ) {
+            if self.dtype == DType::BF16 {
+                return match self.bf16_binary_via_f32(
+                    rhs,
+                    lhs_layout,
+                    rhs_layout,
+                    |lhs, rhs, lhs_l, rhs_l| lhs.binary_impl::<B>(rhs, lhs_l, rhs_l),
+                ) {
+                    Ok(out) => Ok(out),
+                    Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+                    Err(err) => Err(err),
+                };
+            }
             return cpu_fallback();
         }
         if rhs.dtype != self.dtype {
@@ -6263,6 +6702,25 @@ impl BackendStorage for WgpuStorage {
                 }
                 .bt()
             })?;
+        if lhs_layout.dims().len() > 4 || rhs_layout.dims().len() > 4 {
+            let (lhs, lhs_l) = if lhs_layout.dims().len() > 4 {
+                self.materialize_rank_gt4_compact(lhs_layout)?
+            } else {
+                (
+                    self.try_clone(lhs_layout)?,
+                    Layout::contiguous(lhs_layout.shape()),
+                )
+            };
+            let (rhs, rhs_l) = if rhs_layout.dims().len() > 4 {
+                rhs.materialize_rank_gt4_compact(rhs_layout)?
+            } else {
+                (
+                    rhs.try_clone(rhs_layout)?,
+                    Layout::contiguous(rhs_layout.shape()),
+                )
+            };
+            return lhs.binary_impl::<B>(&rhs, &lhs_l, &rhs_l);
+        }
         let (lhs_dims, lhs_strides) = dims4(lhs_layout)?;
         let (rhs_dims, rhs_strides) = dims4(rhs_layout)?;
         let count = lhs_layout.shape().elem_count();
@@ -6350,6 +6808,13 @@ impl BackendStorage for WgpuStorage {
             )?;
             self.device.storage_from_cpu_storage(&out_cpu)
         };
+        if t.dtype == DType::BF16 {
+            return match self.bf16_where_via_f32(layout, t, t_l, f, f_l) {
+                Ok(out) => Ok(out),
+                Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+                Err(err) => Err(err),
+            };
+        }
         match self.run_where_u8_cond(layout, t, t_l, f, f_l) {
             Ok(out) => Ok(out),
             Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
@@ -6730,7 +7195,7 @@ impl BackendStorage for WgpuStorage {
                         Err(err) => return Err(err),
                     }
                 }
-                DType::U8 | DType::I64 => {
+                DType::BF16 | DType::U8 | DType::I64 => {
                     match self.run_emulated_strided_copy_into(src_l, dst, dst_offset) {
                         Ok(()) => return Ok(()),
                         Err(err) if should_cpu_fallback(&err) => {

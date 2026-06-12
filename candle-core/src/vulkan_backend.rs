@@ -2657,6 +2657,7 @@ fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
         (DType::F16, DType::U32) => "convert_f16_u32",
         (DType::F16, DType::I64) => "convert_f16_i64",
         (DType::F16, DType::BF16) => "convert_f16_bf16",
+        (DType::BF16, DType::BF16) => "convert_bf16_bf16",
         (DType::U8, DType::F32) => "convert_u8_f32",
         (DType::U8, DType::F16) => "convert_u8_f16",
         (DType::U8, DType::U32) => "convert_u8_u32",
@@ -3022,7 +3023,273 @@ impl VulkanStorage {
         Ok(dst)
     }
 
+    fn materialize_to_f32(&self, layout: &Layout) -> Result<Self> {
+        if self.dtype == DType::F32 {
+            if layout.is_contiguous() && layout.start_offset() == 0 {
+                self.try_clone(layout)
+            } else if layout.dims().len() > 4 {
+                let (materialized, _) = self.materialize_rank_gt4_compact(layout)?;
+                Ok(materialized)
+            } else {
+                let mut materialized =
+                    unsafe { self.device.alloc_uninit(layout.shape(), DType::F32)? };
+                <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
+                Ok(materialized)
+            }
+        } else if layout.dims().len() > 4 {
+            let (materialized, compact_l) = self.materialize_rank_gt4_compact(layout)?;
+            materialized.to_dtype(&compact_l, DType::F32)
+        } else {
+            let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
+            let contiguous_layout = Layout::contiguous(layout.shape());
+            materialized.to_dtype(&contiguous_layout, DType::F32)
+        }
+    }
+
+    fn rank_gt4_batch_start_offset(layout: &Layout, mut batch_idx: usize) -> usize {
+        let rank = layout.dims().len();
+        let mut offset = layout.start_offset();
+        for dim in (0..rank - 2).rev() {
+            let idx = batch_idx % layout.dims()[dim];
+            batch_idx /= layout.dims()[dim];
+            offset += idx * layout.stride()[dim];
+        }
+        offset
+    }
+
+    fn compact_rank_gt4_shape(layout: &Layout) -> Shape {
+        let rank = layout.dims().len();
+        let prefix = layout.dims()[..rank - 3].iter().product::<usize>();
+        Shape::from(vec![
+            prefix,
+            layout.dims()[rank - 3],
+            layout.dims()[rank - 2],
+            layout.dims()[rank - 1],
+        ])
+    }
+
+    fn compact_rank_gt4_start_offset(layout: &Layout, mut prefix_idx: usize) -> usize {
+        let rank = layout.dims().len();
+        let mut offset = layout.start_offset();
+        for dim in (0..rank - 3).rev() {
+            let idx = prefix_idx % layout.dims()[dim];
+            prefix_idx /= layout.dims()[dim];
+            offset += idx * layout.stride()[dim];
+        }
+        offset
+    }
+
+    fn materialize_rank_gt4_compact(&self, layout: &Layout) -> Result<(Self, Layout)> {
+        let compact_shape = Self::compact_rank_gt4_shape(layout);
+        let compact_layout = Layout::contiguous(compact_shape.clone());
+        let mut out = unsafe { self.device.alloc_uninit(&compact_shape, self.dtype)? };
+        let rank = layout.dims().len();
+        let slice_shape = Shape::from(vec![
+            layout.dims()[rank - 3],
+            layout.dims()[rank - 2],
+            layout.dims()[rank - 1],
+        ]);
+        let slice_stride = vec![
+            layout.stride()[rank - 3],
+            layout.stride()[rank - 2],
+            layout.stride()[rank - 1],
+        ];
+        let slice_len = slice_shape.elem_count();
+        let prefix = compact_shape.dims()[0];
+        for prefix_idx in 0..prefix {
+            let slice_layout = Layout::new(
+                slice_shape.clone(),
+                slice_stride.clone(),
+                Self::compact_rank_gt4_start_offset(layout, prefix_idx),
+            );
+            self.copy_strided_src(&mut out, prefix_idx * slice_len, &slice_layout)?;
+        }
+        Ok((out, compact_layout))
+    }
+
+    fn materialize_rank_gt4_matmul_operand(
+        &self,
+        layout: &Layout,
+        batch: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        let out_shape = Shape::from(vec![batch, rows, cols]);
+        let mut out = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
+        let matrix_shape = Shape::from(vec![rows, cols]);
+        let rank = layout.dims().len();
+        let matrix_stride = vec![layout.stride()[rank - 2], layout.stride()[rank - 1]];
+        for batch_idx in 0..batch {
+            let matrix_layout = Layout::new(
+                matrix_shape.clone(),
+                matrix_stride.clone(),
+                Self::rank_gt4_batch_start_offset(layout, batch_idx),
+            );
+            self.copy_strided_src(&mut out, batch_idx * rows * cols, &matrix_layout)?;
+        }
+        Ok(out)
+    }
+
+    fn materialize_rank_gt4_matmul_operand_to_f32(
+        &self,
+        layout: &Layout,
+        batch: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        if self.dtype == DType::F32 {
+            return self.materialize_rank_gt4_matmul_operand(layout, batch, rows, cols);
+        }
+        let out_shape = Shape::from(vec![batch, rows, cols]);
+        let mut out = unsafe { self.device.alloc_uninit(&out_shape, DType::F32)? };
+        let matrix_shape = Shape::from(vec![rows, cols]);
+        let matrix_contiguous = Layout::contiguous(matrix_shape.clone());
+        let rank = layout.dims().len();
+        let matrix_stride = vec![layout.stride()[rank - 2], layout.stride()[rank - 1]];
+        for batch_idx in 0..batch {
+            let matrix_layout = Layout::new(
+                matrix_shape.clone(),
+                matrix_stride.clone(),
+                Self::rank_gt4_batch_start_offset(layout, batch_idx),
+            );
+            let mut matrix = unsafe { self.device.alloc_uninit(&matrix_shape, self.dtype)? };
+            self.copy_strided_src(&mut matrix, 0, &matrix_layout)?;
+            let matrix_f32 = matrix.to_dtype(&matrix_contiguous, DType::F32)?;
+            matrix_f32.copy_strided_src(&mut out, batch_idx * rows * cols, &matrix_contiguous)?;
+        }
+        Ok(out)
+    }
+
+    fn bf16_unary_via_f32(
+        &self,
+        layout: &Layout,
+        f: impl FnOnce(&Self, &Layout) -> Result<Self>,
+    ) -> Result<Self> {
+        let f32_storage = self.materialize_to_f32(layout)?;
+        let contiguous = if layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+        } else {
+            Layout::contiguous(layout.shape())
+        };
+        let out_f32 = f(&f32_storage, &contiguous)?;
+        out_f32.to_dtype(&contiguous, DType::BF16)
+    }
+
+    fn bf16_binary_via_f32(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        f: impl FnOnce(&Self, &Self, &Layout, &Layout) -> Result<Self>,
+    ) -> Result<Self> {
+        if rhs.dtype != DType::BF16 {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan bf16 binary").bt());
+        }
+        self.device
+            .same_device(&rhs.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: rhs.device.location(),
+                    op: "bf16 binary",
+                }
+                .bt()
+            })?;
+        let lhs_f32 = self.materialize_to_f32(lhs_layout)?;
+        let rhs_f32 = rhs.materialize_to_f32(rhs_layout)?;
+        let lhs_contiguous = if lhs_layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(lhs_layout))
+        } else {
+            Layout::contiguous(lhs_layout.shape())
+        };
+        let rhs_contiguous = if rhs_layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(rhs_layout))
+        } else {
+            Layout::contiguous(rhs_layout.shape())
+        };
+        let out_f32 = f(&lhs_f32, &rhs_f32, &lhs_contiguous, &rhs_contiguous)?;
+        out_f32.to_dtype(&lhs_contiguous, DType::BF16)
+    }
+
+    fn bf16_cmp_via_f32(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        op: CmpOp,
+    ) -> Result<Self> {
+        if rhs.dtype != DType::BF16 {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan bf16 cmp").bt());
+        }
+        self.device
+            .same_device(&rhs.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: rhs.device.location(),
+                    op: "bf16 cmp",
+                }
+                .bt()
+            })?;
+        let lhs_f32 = self.materialize_to_f32(lhs_layout)?;
+        let rhs_f32 = rhs.materialize_to_f32(rhs_layout)?;
+        let lhs_contiguous = if lhs_layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(lhs_layout))
+        } else {
+            Layout::contiguous(lhs_layout.shape())
+        };
+        let rhs_contiguous = if rhs_layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(rhs_layout))
+        } else {
+            Layout::contiguous(rhs_layout.shape())
+        };
+        lhs_f32.run_cmp_u8(&rhs_f32, &lhs_contiguous, &rhs_contiguous, op)
+    }
+
+    fn bf16_where_via_f32(
+        &self,
+        layout: &Layout,
+        t: &Self,
+        t_l: &Layout,
+        f: &Self,
+        f_l: &Layout,
+    ) -> Result<Self> {
+        if t.dtype != DType::BF16 {
+            return Err(Error::UnsupportedDTypeForOp(t.dtype, "vulkan bf16 where_cond").bt());
+        }
+        if f.dtype != DType::BF16 {
+            return Err(Error::UnsupportedDTypeForOp(f.dtype, "vulkan bf16 where_cond").bt());
+        }
+        let t_f32 = t.materialize_to_f32(t_l)?;
+        let f_f32 = f.materialize_to_f32(f_l)?;
+        let t_contiguous = if t_l.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(t_l))
+        } else {
+            Layout::contiguous(t_l.shape())
+        };
+        let f_contiguous = if f_l.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(f_l))
+        } else {
+            Layout::contiguous(f_l.shape())
+        };
+        let out_f32 =
+            self.run_where_u8_cond(layout, &t_f32, &t_contiguous, &f_f32, &f_contiguous)?;
+        let out_layout = if layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+        } else {
+            Layout::contiguous(layout.shape())
+        };
+        out_f32.to_dtype(&out_layout, DType::BF16)
+    }
+
     fn run_unary_head(&self, layout: &Layout, spirv: &[u32]) -> Result<Self> {
+        if layout.dims().len() > 4 {
+            let (materialized, compact_l) = self.materialize_rank_gt4_compact(layout)?;
+            return materialized.run_unary_head(&compact_l, spirv);
+        }
         if !layout.is_contiguous() || layout.start_offset() != 0 {
             let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
             <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
@@ -3067,6 +3334,11 @@ impl VulkanStorage {
         param2: f32,
         dst_dtype: DType,
     ) -> Result<Self> {
+        if layout.dims().len() > 4 {
+            let (tmp, compact_l) = self.materialize_rank_gt4_compact(layout)?;
+            return tmp
+                .run_unary_generic_with_params_dtype(&compact_l, spirv, param1, param2, dst_dtype);
+        }
         if !layout.is_contiguous() || layout.start_offset() != 0 {
             // Several shaders dispatched through this helper (scale, powf,
             // clamp) index linearly, and the ggml unary header only carries
@@ -3170,6 +3442,27 @@ impl VulkanStorage {
                 }
                 .bt()
             })?;
+        if lhs_layout.dims().len() > 4 || rhs_layout.dims().len() > 4 {
+            let (lhs, lhs_layout) = if lhs_layout.dims().len() > 4 {
+                self.materialize_rank_gt4_compact(lhs_layout)?
+            } else if lhs_layout.start_offset() == 0 {
+                (self.try_clone(lhs_layout)?, lhs_layout.clone())
+            } else {
+                let mut tmp = unsafe { self.device.alloc_uninit(lhs_layout.shape(), self.dtype)? };
+                <Self as BackendStorage>::copy_strided_src(self, &mut tmp, 0, lhs_layout)?;
+                (tmp, Layout::contiguous(lhs_layout.shape().clone()))
+            };
+            let (rhs, rhs_layout) = if rhs_layout.dims().len() > 4 {
+                rhs.materialize_rank_gt4_compact(rhs_layout)?
+            } else if rhs_layout.start_offset() == 0 {
+                (rhs.try_clone(rhs_layout)?, rhs_layout.clone())
+            } else {
+                let mut tmp = unsafe { rhs.device.alloc_uninit(rhs_layout.shape(), rhs.dtype)? };
+                <Self as BackendStorage>::copy_strided_src(rhs, &mut tmp, 0, rhs_layout)?;
+                (tmp, Layout::contiguous(rhs_layout.shape().clone()))
+            };
+            return lhs.run_cmp_u8(&rhs, &lhs_layout, &rhs_layout, op);
+        }
         let (lhs_tmp, lhs_layout) = if lhs_layout.start_offset() == 0 {
             (None, lhs_layout.clone())
         } else {
@@ -3284,6 +3577,24 @@ impl VulkanStorage {
                 }
                 .bt()
             })?;
+        if layout.dims().len() > 4 || t_l.dims().len() > 4 || f_l.dims().len() > 4 {
+            let (cond, cond_l) = if layout.dims().len() > 4 {
+                self.materialize_rank_gt4_compact(layout)?
+            } else {
+                (self.try_clone(layout)?, layout.clone())
+            };
+            let (t, t_l) = if t_l.dims().len() > 4 {
+                t.materialize_rank_gt4_compact(t_l)?
+            } else {
+                (t.try_clone(t_l)?, t_l.clone())
+            };
+            let (f, f_l) = if f_l.dims().len() > 4 {
+                f.materialize_rank_gt4_compact(f_l)?
+            } else {
+                (f.try_clone(f_l)?, f_l.clone())
+            };
+            return cond.run_where_u8_cond(&cond_l, &t, &t_l, &f, &f_l);
+        }
         let (dims, cond_strides) = dims4_ggml(layout)?;
         let (_, true_strides) = dims4_ggml(t_l)?;
         let (_, false_strides) = dims4_ggml(f_l)?;
@@ -4843,25 +5154,52 @@ impl VulkanStorage {
         if self.dtype != rhs.dtype {
             return Err(unsupported("matmul mixed dtype"));
         }
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 && self.dtype != DType::BF16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan matmul").bt());
         }
         let rank = lhs_l.dims().len();
+        if rank == rhs_l.dims().len() && rank > 4 {
+            if b != lhs_l.dims()[..rank - 2].iter().product::<usize>()
+                || b != rhs_l.dims()[..rank - 2].iter().product::<usize>()
+            {
+                return Err(unsupported("matmul batch"));
+            }
+            if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
+                let lhs_flat_l = Layout::contiguous_with_offset((b, m, k), lhs_l.start_offset());
+                let rhs_flat_l = Layout::contiguous_with_offset((b, k, n), rhs_l.start_offset());
+                return self.run_matmul_f32(rhs, (b, m, n, k), &lhs_flat_l, &rhs_flat_l);
+            }
+            let lhs = if matches!(self.dtype, DType::F16 | DType::BF16) {
+                let lhs = self.materialize_rank_gt4_matmul_operand_to_f32(lhs_l, b, m, k)?;
+                let rhs = rhs.materialize_rank_gt4_matmul_operand_to_f32(rhs_l, b, k, n)?;
+                let lhs_l = Layout::contiguous(Shape::from(vec![b, m, k]));
+                let rhs_l = Layout::contiguous(Shape::from(vec![b, k, n]));
+                let out = lhs.run_matmul_f32(&rhs, (b, m, n, k), &lhs_l, &rhs_l)?;
+                let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
+                return out.to_dtype(&out_l, self.dtype);
+            } else {
+                self.materialize_rank_gt4_matmul_operand(lhs_l, b, m, k)?
+            };
+            let rhs = rhs.materialize_rank_gt4_matmul_operand(rhs_l, b, k, n)?;
+            let lhs_flat_l = Layout::contiguous(Shape::from(vec![b, m, k]));
+            let rhs_flat_l = Layout::contiguous(Shape::from(vec![b, k, n]));
+            return lhs.run_matmul_f32(&rhs, (b, m, n, k), &lhs_flat_l, &rhs_flat_l);
+        }
         if rank != rhs_l.dims().len() || !(2..=4).contains(&rank) {
             return Err(unsupported("matmul rank"));
         }
         if b != lhs_l.dims()[..rank - 2].iter().product::<usize>() {
             return Err(unsupported("matmul batch"));
         }
-        if self.dtype == DType::F16 {
-            // Keep f16 storage compatibility while executing numerically stable f32 matmul.
-            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
-            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
+        if matches!(self.dtype, DType::F16 | DType::BF16) {
+            // Keep low-precision storage compatibility while executing numerically stable f32 matmul.
+            let lhs_f32 = self.materialize_to_f32(lhs_l)?;
+            let rhs_f32 = rhs.materialize_to_f32(rhs_l)?;
             let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
             let rhs_f32_l = Layout::contiguous(rhs_l.shape().clone());
             let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
             let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
-            return out_f32.to_dtype(&out_l, DType::F16);
+            return out_f32.to_dtype(&out_l, self.dtype);
         }
 
         let mut lhs_contiguous = None;
@@ -6484,6 +6822,9 @@ impl BackendStorage for VulkanStorage {
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
         let gpu = || -> Result<Self> {
+            if self.dtype == DType::BF16 {
+                return self.bf16_unary_via_f32(layout, |src, src_l| src.affine(src_l, mul, add));
+            }
             if self.dtype != DType::F32 {
                 return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan affine").bt());
             }
@@ -6507,6 +6848,9 @@ impl BackendStorage for VulkanStorage {
     }
     fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
         let gpu = || -> Result<Self> {
+            if self.dtype == DType::BF16 {
+                return self.bf16_unary_via_f32(layout, |src, src_l| src.powf(src_l, e));
+            }
             if self.dtype != DType::F32 {
                 return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan powf").bt());
             }
@@ -6532,6 +6876,13 @@ impl BackendStorage for VulkanStorage {
             let out_cpu = <CpuStorage as BackendStorage>::elu(&src_cpu, layout, alpha)?;
             self.device.storage_from_cpu_storage(&out_cpu)
         };
+        if self.dtype == DType::BF16 && alpha == 1.0 {
+            return match self.bf16_unary_via_f32(layout, |src, src_l| src.elu(src_l, alpha)) {
+                Ok(out) => Ok(out),
+                Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+                Err(err) => Err(err),
+            };
+        }
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return cpu_fallback();
         }
@@ -6554,7 +6905,11 @@ impl BackendStorage for VulkanStorage {
     }
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
         let int_dtype = matches!(self.dtype, DType::U8 | DType::U32 | DType::I64);
-        if self.dtype != DType::F32 && self.dtype != DType::F16 && !int_dtype {
+        if self.dtype != DType::F32
+            && self.dtype != DType::F16
+            && self.dtype != DType::BF16
+            && !int_dtype
+        {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan reduce").bt());
         }
         let rank = layout.dims().len();
@@ -6572,11 +6927,9 @@ impl BackendStorage for VulkanStorage {
         if int_dtype {
             return self.run_int_reduce(op, layout, reduce_dims);
         }
-        if self.dtype == DType::F16 {
-            let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), DType::F16)? };
-            <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
+        if matches!(self.dtype, DType::F16 | DType::BF16) {
+            let materialized_f32 = self.materialize_to_f32(layout)?;
             let contiguous_layout = Layout::contiguous(layout.shape());
-            let materialized_f32 = materialized.to_dtype(&contiguous_layout, DType::F32)?;
             let reduced = materialized_f32.reduce_op(op, &contiguous_layout, reduce_dims)?;
             if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
                 return Ok(reduced);
@@ -6586,7 +6939,7 @@ impl BackendStorage for VulkanStorage {
                 out_dims[dim] = 1;
             }
             let out_layout = Layout::contiguous(Shape::from(out_dims));
-            return reduced.to_dtype(&out_layout, DType::F16);
+            return reduced.to_dtype(&out_layout, self.dtype);
         }
 
         if reduce_dims.len() > 1 {
@@ -6617,6 +6970,9 @@ impl BackendStorage for VulkanStorage {
     }
     fn clamp(&self, layout: &Layout, min: f32, max: f32) -> Result<Self> {
         let gpu = || -> Result<Self> {
+            if self.dtype == DType::BF16 {
+                return self.bf16_unary_via_f32(layout, |src, src_l| src.clamp(src_l, min, max));
+            }
             if self.dtype != DType::F32 {
                 return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan clamp").bt());
             }
@@ -6637,6 +6993,22 @@ impl BackendStorage for VulkanStorage {
         }
     }
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        if self.dtype == DType::BF16 {
+            return match self.bf16_cmp_via_f32(rhs, lhs_l, rhs_l, op) {
+                Ok(out) => Ok(out),
+                Err(err)
+                    if should_cpu_fallback(&err)
+                        || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
+                {
+                    let lhs_cpu = self.to_cpu_storage()?;
+                    let rhs_cpu = rhs.to_cpu_storage()?;
+                    let out_cpu =
+                        <CpuStorage as BackendStorage>::cmp(&lhs_cpu, op, &rhs_cpu, lhs_l, rhs_l)?;
+                    self.device.storage_from_cpu_storage(&out_cpu)
+                }
+                Err(err) => Err(err),
+            };
+        }
         match self.run_cmp_u8(rhs, lhs_l, rhs_l, op) {
             Ok(out) => Ok(out),
             Err(err)
@@ -6684,6 +7056,9 @@ impl BackendStorage for VulkanStorage {
         }
     }
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+        if self.dtype == DType::BF16 {
+            return self.bf16_unary_via_f32(layout, |src, src_l| src.unary_impl::<B>(src_l));
+        }
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan unary").bt());
         }
@@ -6716,6 +7091,33 @@ impl BackendStorage for VulkanStorage {
         lhs_layout: &Layout,
         rhs_layout: &Layout,
     ) -> Result<Self> {
+        if self.dtype == DType::BF16 {
+            return self.bf16_binary_via_f32(
+                rhs,
+                lhs_layout,
+                rhs_layout,
+                |lhs, rhs, lhs_l, rhs_l| lhs.binary_impl::<B>(rhs, lhs_l, rhs_l),
+            );
+        }
+        if lhs_layout.dims().len() > 4 || rhs_layout.dims().len() > 4 {
+            let (lhs, lhs_l) = if lhs_layout.dims().len() > 4 {
+                self.materialize_rank_gt4_compact(lhs_layout)?
+            } else {
+                (
+                    self.try_clone(lhs_layout)?,
+                    Layout::contiguous(lhs_layout.shape()),
+                )
+            };
+            let (rhs, rhs_l) = if rhs_layout.dims().len() > 4 {
+                rhs.materialize_rank_gt4_compact(rhs_layout)?
+            } else {
+                (
+                    rhs.try_clone(rhs_layout)?,
+                    Layout::contiguous(rhs_layout.shape()),
+                )
+            };
+            return lhs.binary_impl::<B>(&rhs, &lhs_l, &rhs_l);
+        }
         match match B::NAME {
             "maximum" | "minimum" if matches!(self.dtype, DType::U8 | DType::U32 | DType::I64) => {
                 self.run_binary_named(rhs, lhs_layout, rhs_layout, B::NAME)
@@ -6759,6 +7161,24 @@ impl BackendStorage for VulkanStorage {
         f: &Self,
         f_l: &Layout,
     ) -> Result<Self> {
+        if t.dtype == DType::BF16 {
+            return match self.bf16_where_via_f32(layout, t, t_l, f, f_l) {
+                Ok(out) => Ok(out),
+                Err(err)
+                    if should_cpu_fallback(&err)
+                        || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
+                {
+                    let cond_cpu = self.to_cpu_storage()?;
+                    let t_cpu = t.to_cpu_storage()?;
+                    let f_cpu = f.to_cpu_storage()?;
+                    let out_cpu = <CpuStorage as BackendStorage>::where_cond(
+                        &cond_cpu, layout, &t_cpu, t_l, &f_cpu, f_l,
+                    )?;
+                    self.device.storage_from_cpu_storage(&out_cpu)
+                }
+                Err(err) => Err(err),
+            };
+        }
         match self.run_where_u8_cond(layout, t, t_l, f, f_l) {
             Ok(out) => Ok(out),
             Err(err)
@@ -7121,7 +7541,7 @@ impl BackendStorage for VulkanStorage {
         }
         if !src_l.is_contiguous() {
             match self.dtype {
-                DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64 => {
+                DType::F32 | DType::F16 | DType::BF16 | DType::U8 | DType::U32 | DType::I64 => {
                     let spirv = copy_spirv(self.dtype, self.dtype)?;
                     return self.run_copy_into(src_l, dst, dst_offset, spirv);
                 }
