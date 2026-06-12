@@ -947,6 +947,9 @@ fn unary_shader(op: &str, dtype: DType) -> Result<String> {
 }
 
 fn binary_shader(op: &str, dtype: DType) -> Result<String> {
+    if matches!(dtype, DType::U8 | DType::U32 | DType::I64) {
+        return custom_int_binary_wgsl(op, dtype);
+    }
     if op == "maximum" {
         if dtype != DType::F32 {
             return Err(unsupported("binary maximum f16"));
@@ -971,6 +974,198 @@ fn binary_shader(op: &str, dtype: DType) -> Result<String> {
         wgpu_kernel_dtype(dtype)?,
         WG_SIZE,
     ))
+}
+
+// Integer binary ops for the dtypes the stock binary.wgsl cannot express.
+// U32 is native; U8 packs four bytes per u32 word (one thread per output
+// word); I64 is emulated with lo/hi u32 word pairs and carry arithmetic.
+fn custom_int_binary_wgsl(op: &str, dtype: DType) -> Result<String> {
+    let indexing = r#"
+fn src0_index(_i: u32) -> u32 {
+    var i = _i;
+    let a_i3 = i / (params.a_ne2 * params.a_ne1 * params.a_ne0);
+    i = i % (params.a_ne2 * params.a_ne1 * params.a_ne0);
+    let a_i2 = i / (params.a_ne1 * params.a_ne0);
+    i = i % (params.a_ne1 * params.a_ne0);
+    let a_i1 = i / params.a_ne0;
+    let a_i0 = i % params.a_ne0;
+    return a_i0 * params.stride_src0_0 + a_i1 * params.stride_src0_1 +
+           a_i2 * params.stride_src0_2 + a_i3 * params.stride_src0_3;
+}
+
+fn src1_index(_i: u32) -> u32 {
+    var i = _i;
+    let a_i3 = i / (params.a_ne2 * params.a_ne1 * params.a_ne0);
+    i = i % (params.a_ne2 * params.a_ne1 * params.a_ne0);
+    let a_i2 = i / (params.a_ne1 * params.a_ne0);
+    i = i % (params.a_ne1 * params.a_ne0);
+    let a_i1 = i / params.a_ne0;
+    let a_i0 = i % params.a_ne0;
+    let b_i0 = a_i0 % params.b_ne0;
+    let b_i1 = a_i1 % params.b_ne1;
+    let b_i2 = a_i2 % params.b_ne2;
+    let b_i3 = a_i3 % params.b_ne3;
+    return b_i0 * params.stride_src1_0 + b_i1 * params.stride_src1_1 +
+           b_i2 * params.stride_src1_2 + b_i3 * params.stride_src1_3;
+}
+"#;
+    let params_struct = r#"
+struct Params {
+    ne: u32,
+    offset_src0: u32,
+    offset_src1: u32,
+    offset_dst: u32,
+    stride_src0_0: u32,
+    stride_src0_1: u32,
+    stride_src0_2: u32,
+    stride_src0_3: u32,
+    stride_src1_0: u32,
+    stride_src1_1: u32,
+    stride_src1_2: u32,
+    stride_src1_3: u32,
+    a_ne0: u32,
+    a_ne1: u32,
+    a_ne2: u32,
+    b_ne0: u32,
+    b_ne1: u32,
+    b_ne2: u32,
+    b_ne3: u32,
+    _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read_write> src0: array<u32>;
+@group(0) @binding(1) var<storage, read_write> src1: array<u32>;
+@group(0) @binding(2) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(3) var<uniform> params: Params;
+"#;
+    let main = match dtype {
+        DType::U32 => {
+            let expr = match op {
+                "add" => "a + b",
+                "sub" => "a - b",
+                "mul" => "a * b",
+                "div" => "select(a / max(b, 1u), 0u, b == 0u)",
+                "maximum" => "max(a, b)",
+                "minimum" => "min(a, b)",
+                _ => return Err(unsupported("binary int op")),
+            };
+            format!(
+                r#"@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    if (gid.x >= params.ne) {{ return; }}
+    let a = src0[params.offset_src0 + src0_index(gid.x)];
+    let b = src1[params.offset_src1 + src1_index(gid.x)];
+    dst[params.offset_dst + gid.x] = {expr};
+}}"#
+            )
+        }
+        DType::U8 => {
+            let expr = match op {
+                "add" => "(a + b) & 0xffu",
+                "sub" => "(a - b) & 0xffu",
+                "mul" => "(a * b) & 0xffu",
+                "div" => "select(a / max(b, 1u), 0u, b == 0u)",
+                "maximum" => "max(a, b)",
+                "minimum" => "min(a, b)",
+                _ => return Err(unsupported("binary int op")),
+            };
+            format!(
+                r#"@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let base = gid.x * 4u;
+    if (base >= params.ne) {{ return; }}
+    var w: u32 = 0u;
+    for (var lane: u32 = 0u; lane < 4u; lane = lane + 1u) {{
+        let idx = base + lane;
+        if (idx >= params.ne) {{ break; }}
+        let ea = params.offset_src0 + src0_index(idx);
+        let a = (src0[ea / 4u] >> (8u * (ea % 4u))) & 0xffu;
+        let eb = params.offset_src1 + src1_index(idx);
+        let b = (src1[eb / 4u] >> (8u * (eb % 4u))) & 0xffu;
+        let r = ({expr}) & 0xffu;
+        w = w | (r << (8u * lane));
+    }}
+    dst[params.offset_dst / 4u + gid.x] = w;
+}}"#
+            )
+        }
+        DType::I64 => {
+            let compute = match op {
+                "add" => {
+                    r#"
+    let lo = a_lo + b_lo;
+    let carry = select(0u, 1u, lo < a_lo);
+    let hi = a_hi + b_hi + carry;
+"#
+                }
+                "sub" => {
+                    r#"
+    let lo = a_lo - b_lo;
+    let borrow = select(0u, 1u, a_lo < b_lo);
+    let hi = a_hi - b_hi - borrow;
+"#
+                }
+                "mul" => {
+                    // 64-bit low product from 32-bit limbs: hi limb cross
+                    // products only contribute to the high word.
+                    r#"
+    let a0 = a_lo & 0xffffu; let a1 = a_lo >> 16u;
+    let b0 = b_lo & 0xffffu; let b1 = b_lo >> 16u;
+    let p00 = a0 * b0;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let p11 = a1 * b1;
+    let mid = p01 + p10;
+    let mid_carry = select(0u, 0x10000u, mid < p01);
+    let lo = p00 + (mid << 16u);
+    let lo_carry = select(0u, 1u, lo < p00);
+    let hi = p11 + (mid >> 16u) + mid_carry + lo_carry + a_lo * b_hi + a_hi * b_lo;
+"#
+                }
+                "maximum" | "minimum" => {
+                    let pick_a = if op == "maximum" { "a_gt_b" } else { "!a_gt_b" };
+                    return Ok(format!(
+                        r#"{params_struct}
+{indexing}
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    if (gid.x >= params.ne) {{ return; }}
+    let ea = params.offset_src0 + src0_index(gid.x);
+    let a_lo = src0[2u * ea]; let a_hi = src0[2u * ea + 1u];
+    let eb = params.offset_src1 + src1_index(gid.x);
+    let b_lo = src1[2u * eb]; let b_hi = src1[2u * eb + 1u];
+    let a_gt_b = (bitcast<i32>(a_hi) > bitcast<i32>(b_hi)) || ((a_hi == b_hi) && (a_lo > b_lo));
+    let lo = select(b_lo, a_lo, {pick_a});
+    let hi = select(b_hi, a_hi, {pick_a});
+    let d = params.offset_dst + gid.x;
+    dst[2u * d] = lo;
+    dst[2u * d + 1u] = hi;
+}}
+"#
+                    ));
+                }
+                // i64 division needs a full software divider; no model path
+                // exercises it, so keep it explicit instead of silently wrong.
+                _ => return Err(unsupported("binary int op")),
+            };
+            format!(
+                r#"@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    if (gid.x >= params.ne) {{ return; }}
+    let ea = params.offset_src0 + src0_index(gid.x);
+    let a_lo = src0[2u * ea]; let a_hi = src0[2u * ea + 1u];
+    let eb = params.offset_src1 + src1_index(gid.x);
+    let b_lo = src1[2u * eb]; let b_hi = src1[2u * eb + 1u];
+    {compute}
+    let d = params.offset_dst + gid.x;
+    dst[2u * d] = lo;
+    dst[2u * d + 1u] = hi;
+}}"#
+            )
+        }
+        other => return Err(Error::UnsupportedDTypeForOp(other, "wgpu binary int").bt()),
+    };
+    Ok(format!("{params_struct}\n{indexing}\n{main}\n"))
 }
 
 fn copy_shader(src: DType, dst: DType) -> Result<String> {
@@ -4881,7 +5076,10 @@ impl BackendStorage for WgpuStorage {
         {
             return cpu_fallback();
         }
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+        if !matches!(
+            self.dtype,
+            DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64
+        ) {
             return cpu_fallback();
         }
         if rhs.dtype != self.dtype {
@@ -4950,7 +5148,12 @@ impl BackendStorage for WgpuStorage {
             buffer_binding(2, &dst.buffer),
             buffer_binding(3, &param_buffer),
         ];
-        let workgroups = (count as u32).div_ceil(WG_SIZE);
+        let work_items = match self.dtype {
+            // One thread per packed four-byte output word.
+            DType::U8 => count.div_ceil(4),
+            _ => count,
+        };
+        let workgroups = (work_items as u32).div_ceil(WG_SIZE);
         match self.device.run_compute(
             &binary_shader(B::NAME, self.dtype)?,
             &entries,

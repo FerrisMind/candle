@@ -183,6 +183,36 @@ fn generate_candle_spirv_modules(
             ],
         ),
         (
+            "binary_int_u8",
+            candle_shaders_dir.join("binary_int.comp"),
+            &[
+                "A_TYPE=uint8_t",
+                "B_TYPE=uint8_t",
+                "D_TYPE=uint8_t",
+                "FLOAT_TYPE=float",
+            ],
+        ),
+        (
+            "binary_int_u32",
+            candle_shaders_dir.join("binary_int.comp"),
+            &[
+                "A_TYPE=uint",
+                "B_TYPE=uint",
+                "D_TYPE=uint",
+                "FLOAT_TYPE=float",
+            ],
+        ),
+        (
+            "binary_int_i64",
+            candle_shaders_dir.join("binary_int.comp"),
+            &[
+                "A_TYPE=int64_t",
+                "B_TYPE=int64_t",
+                "D_TYPE=int64_t",
+                "FLOAT_TYPE=float",
+            ],
+        ),
+        (
             "cmp_u8",
             candle_shaders_dir.join("cmp.comp"),
             &[

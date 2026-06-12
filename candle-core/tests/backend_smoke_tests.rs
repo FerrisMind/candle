@@ -474,6 +474,27 @@ fn backend_smoke_vulkan_int_cmp_where_native_only() -> Result<()> {
 #[test]
 #[cfg(feature = "wgpu")]
 #[ignore = "requires a usable wgpu adapter and driver"]
+fn backend_smoke_wgpu_int_binary_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_wgpu_int_binary_native_only",
+        TestBackend::Wgpu,
+        smoke_int_binary_ops,
+    )
+}
+
+#[test]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_int_binary_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_vulkan_int_binary_native_only",
+        TestBackend::Vulkan,
+        smoke_int_binary_ops,
+    )
+}
+
+#[test]
+#[cfg(feature = "wgpu")]
+#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_scatter_add_index_add_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_scatter_add_index_add_native_only",
@@ -2138,6 +2159,78 @@ fn smoke_int_cmp_where(device: &Device) -> Result<()> {
     assert_eq!(
         u32_src.t()?.contiguous()?.to_vec2::<u32>()?,
         [[16_777_217, 4], [2, 5], [3, 6]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_int_binary_ops(device: &Device) -> Result<()> {
+    let cpu = Device::Cpu;
+
+    // u32: includes values past the f32 mantissa; operands are chosen so no
+    // op overflows (CPU reference uses checked arithmetic in debug builds).
+    let a_u32 = [16_777_217u32, 100, 7, 4_000_000_000, 13, 6];
+    let b_u32 = [255u32, 7, 3, 1, 13, 5];
+    let ga = Tensor::from_slice(&a_u32, (2, 3), device)?;
+    let gb = Tensor::from_slice(&b_u32, (2, 3), device)?;
+    let ca = Tensor::from_slice(&a_u32, (2, 3), &cpu)?;
+    let cb = Tensor::from_slice(&b_u32, (2, 3), &cpu)?;
+    for (gop, cop) in [
+        ((&ga + &gb)?, (&ca + &cb)?),
+        ((&ga - &gb)?, (&ca - &cb)?),
+        ((&ga * &gb)?, (&ca * &cb)?),
+        ((&ga / &gb)?, (&ca / &cb)?),
+        (ga.maximum(&gb)?, ca.maximum(&cb)?),
+        (ga.minimum(&gb)?, ca.minimum(&cb)?),
+    ] {
+        assert_eq!(gop.to_vec2::<u32>()?, cop.to_vec2::<u32>()?);
+    }
+
+    // u8: operands stay within range for every op (no overflow/underflow,
+    // results above 127 still exercise the high bit).
+    let a_u8 = [20u8, 15, 50, 12, 13, 5];
+    let b_u8 = [10u8, 7, 4, 1, 13, 5];
+    let ga = Tensor::from_slice(&a_u8, (2, 3), device)?;
+    let gb = Tensor::from_slice(&b_u8, (2, 3), device)?;
+    let ca = Tensor::from_slice(&a_u8, (2, 3), &cpu)?;
+    let cb = Tensor::from_slice(&b_u8, (2, 3), &cpu)?;
+    for (gop, cop) in [
+        ((&ga + &gb)?, (&ca + &cb)?),
+        ((&ga - &gb)?, (&ca - &cb)?),
+        ((&ga * &gb)?, (&ca * &cb)?),
+        ((&ga / &gb)?, (&ca / &cb)?),
+        (ga.maximum(&gb)?, ca.maximum(&cb)?),
+        (ga.minimum(&gb)?, ca.minimum(&cb)?),
+    ] {
+        assert_eq!(gop.to_vec2::<u8>()?, cop.to_vec2::<u8>()?);
+    }
+
+    // i64: sign handling, magnitudes past 2^32, and 64-bit multiply carries;
+    // every pair stays inside i64 for every op (CPU is checked in debug).
+    let a_i64 = [-3_000_000_000i64, 3_000_000_000, -7, 42, -1, 6_700_417];
+    let b_i64 = [3_000_000_000i64, 3_000_000_000, 100, -42, -1, 641];
+    let ga = Tensor::from_slice(&a_i64, (2, 3), device)?;
+    let gb = Tensor::from_slice(&b_i64, (2, 3), device)?;
+    let ca = Tensor::from_slice(&a_i64, (2, 3), &cpu)?;
+    let cb = Tensor::from_slice(&b_i64, (2, 3), &cpu)?;
+    for (gop, cop) in [
+        ((&ga + &gb)?, (&ca + &cb)?),
+        ((&ga - &gb)?, (&ca - &cb)?),
+        ((&ga * &gb)?, (&ca * &cb)?),
+        (ga.maximum(&gb)?, ca.maximum(&cb)?),
+        (ga.minimum(&gb)?, ca.minimum(&cb)?),
+    ] {
+        assert_eq!(gop.to_vec2::<i64>()?, cop.to_vec2::<i64>()?);
+    }
+
+    // Broadcast: scalar-row rhs against a full matrix.
+    let row = Tensor::from_slice(&[1u32, 2, 3], (1, 3), device)?;
+    let row_cpu = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cpu)?;
+    let m = Tensor::from_slice(&[10u32, 20, 30, 40, 50, 60], (2, 3), device)?;
+    let m_cpu = Tensor::from_slice(&[10u32, 20, 30, 40, 50, 60], (2, 3), &cpu)?;
+    assert_eq!(
+        m.broadcast_add(&row)?.to_vec2::<u32>()?,
+        m_cpu.broadcast_add(&row_cpu)?.to_vec2::<u32>()?
     );
     Ok(())
 }

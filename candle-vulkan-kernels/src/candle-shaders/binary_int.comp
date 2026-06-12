@@ -1,0 +1,48 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Integer binary ops in the source type; CUDA-equivalent wrapping arithmetic
+// (uint wraps naturally, int64 wraps in two's complement). p.param3 selects
+// the operation so one SPIR-V variant per dtype covers the whole family.
+A_TYPE binary_result(A_TYPE a, A_TYPE b) {
+    switch (p.param3) {
+        case 0: return a + b;
+        case 1: return a - b;
+        case 2: return a * b;
+        case 3: return b == A_TYPE(0) ? A_TYPE(0) : a / b;
+        // Explicit compares: GLSL max/min builtins are not defined for the
+        // explicit-arithmetic types (uint8_t/int64_t).
+        case 4: return a > b ? a : b;
+        case 5: return a < b ? a : b;
+        default: return A_TYPE(0);
+    }
+}
+
+void main() {
+    uint idx = get_idx();
+
+    const uint num_threads = 256;
+    // num_threads * num_iter must equal 512 to match get_idx's workgroup math.
+    const uint num_iter = 2;
+
+    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
+        if (idx >= p.ne) {
+            continue;
+        }
+
+        uint i00, i01, i02, i03;
+        get_indices(idx, i00, i01, i02, i03);
+
+        const A_TYPE a = data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)];
+        const A_TYPE b = A_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]);
+        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(binary_result(a, b));
+
+        idx += num_threads;
+    }
+}

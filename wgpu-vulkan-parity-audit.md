@@ -757,3 +757,13 @@ The highest-value next Vulkan performance step is now concrete:
 - WGPU closure: `run_emulated_strided_copy_into` generates a WGSL kernel for the dtypes WGSL cannot address as scalars — U8 gathers four strided bytes per packed output word (with read-merge of trailing bytes in the final word so neighbors are never clobbered), I64 copies lo/hi word pairs; U32/I32 reuse the existing `cpy.wgsl` matrix.
 - Test closure folded into `backend_smoke_{wgpu,vulkan}_int_cmp_where_native_only`: `t().contiguous()` round-trips for u8 (>127 values), u32 (mantissa-overflow 16_777_217), and i64 (negative sub-2^33) all asserted against exact expected values under native-required accounting.
 - Regression state on RTX 3060: 31 Vulkan + 21 wgpu smoke tests, `gpu_property_tests` (both backends), `gpu_metamorphic_tests` (both backends) all pass.
+
+## Progress Update: Integer Binary Op Closure (u8/u32/i64 add/sub/mul/div/max/min)
+
+- CUDA reference (`candle-kernels/src/binary.cu`) instantiates the full binary family for `u8`/`u32`/`i64`; both GPU backends previously fell back to CPU for every non-float dtype.
+- Vulkan closure: new Candle-owned `binary_int.comp` (strided-aware ggml `generic_binary_head.glsl`), one opcode-switched SPIR-V variant per dtype (`binary_int_u8/u32/i64`, `p.param3` selects add/sub/mul/div/max/min). Max/min use explicit compares because GLSL builtins are undefined for the explicit-arithmetic types. `binary_impl` routes integer maximum/minimum straight to the integer kernel instead of the float decomposition.
+- WGPU closure: `custom_int_binary_wgsl` generates per-dtype kernels — `u32` native, `u8` packs four bytes per output word (one thread per word), `i64` emulated as lo/hi u32 pairs with carry/borrow arithmetic and a 16-bit-limb low-product multiplier; i64 max/min compare signed-high/unsigned-low. i64 division stays an explicit unsupported error (needs a software divider; no CUDA-visible model path exercises it) rather than a silently wrong result.
+- Division-by-zero semantics: both backends return 0 for integer x/0 (matches wrapping GPU semantics; CPU reference panics in debug, so fixtures avoid zero divisors).
+- Test closure on RTX 3060 (native-required, fallback 0): `backend_smoke_{wgpu,vulkan}_int_binary_native_only` — mantissa-overflow u32 values, >2^32 i64 magnitudes with carry-sensitive multiplies, u8 high-bit results, broadcast rhs, all compared against the CPU reference.
+- Note: an earlier test-run failure ("vulkan allocation retry failed ... Out of memory") was caused by an unrelated process holding ~6.7 GB VRAM on the RTX 3060, not by backend code; with normal VRAM the suite passes repeatedly.
+- Regression state: 32 Vulkan + 22 wgpu smoke tests pass on RTX 3060.

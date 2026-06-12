@@ -2562,6 +2562,17 @@ fn binary_spirv(op: &str, dtype: DType) -> Result<&'static [u32]> {
     let suffix = match dtype {
         DType::F32 => "f32_f32_f32",
         DType::F16 => "f16_f16_f16",
+        DType::U8 | DType::U32 | DType::I64 => {
+            // One opcode-switched Candle-owned shader per integer dtype.
+            let name = match dtype {
+                DType::U8 => "binary_int_u8",
+                DType::U32 => "binary_int_u32",
+                _ => "binary_int_i64",
+            };
+            binary_int_opcode(op)?;
+            return candle_vulkan_kernels::spirv(name)
+                .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated")).bt());
+        }
         _ => return Err(Error::UnsupportedDTypeForOp(dtype, "vulkan binary").bt()),
     };
     let stem = match op {
@@ -2574,6 +2585,18 @@ fn binary_spirv(op: &str, dtype: DType) -> Result<&'static [u32]> {
     let name = format!("{stem}_{suffix}");
     candle_vulkan_kernels::spirv(&name)
         .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated")).bt())
+}
+
+fn binary_int_opcode(op: &str) -> Result<i32> {
+    match op {
+        "add" => Ok(0),
+        "sub" => Ok(1),
+        "mul" => Ok(2),
+        "div" => Ok(3),
+        "maximum" => Ok(4),
+        "minimum" => Ok(5),
+        _ => Err(unsupported("binary int")),
+    }
 }
 
 fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
@@ -3276,7 +3299,8 @@ impl VulkanStorage {
         rhs_layout: &Layout,
         op: &'static str,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+        let int_dtype = matches!(self.dtype, DType::U8 | DType::U32 | DType::I64);
+        if self.dtype != DType::F32 && self.dtype != DType::F16 && !int_dtype {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan binary").bt());
         }
         if rhs.dtype != self.dtype {
@@ -3329,7 +3353,7 @@ impl VulkanStorage {
             misalign_offsets: 0,
             param1: 0.0,
             param2: 0.0,
-            param3: 0,
+            param3: if int_dtype { binary_int_opcode(op)? } else { 0 },
         };
         let bindings = [
             VulkanBinding::Storage(&self.buffer),
@@ -6373,6 +6397,9 @@ impl BackendStorage for VulkanStorage {
         rhs_layout: &Layout,
     ) -> Result<Self> {
         match match B::NAME {
+            "maximum" | "minimum" if matches!(self.dtype, DType::U8 | DType::U32 | DType::I64) => {
+                self.run_binary_named(rhs, lhs_layout, rhs_layout, B::NAME)
+            }
             "maximum" | "minimum" => {
                 if self.dtype == DType::F16 && rhs.dtype == DType::F16 {
                     let mut lhs_mat =
