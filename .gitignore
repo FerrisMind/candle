@@ -53,3 +53,8 @@ bench_results/
 AGENTS.md
 .agent/
 .codex/
+
+# Local GPU parity notes and profiling artifacts.
+cuda-wgpu-vulkan-parity-matrix.md
+wgpu-vulkan-parity-audit.md
+profiling/
