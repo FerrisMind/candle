@@ -5,6 +5,12 @@ use crate::{CpuStorage, DType, Error, Layout, Result, Shape};
 #[derive(Debug, Clone)]
 pub struct WgpuDevice;
 
+impl WgpuDevice {
+    pub fn transfer_to_device(&self, _: &WgpuStorage) -> Result<WgpuStorage> {
+        Err(Error::NotCompiledWithWgpuSupport)
+    }
+}
+
 #[derive(Debug)]
 pub struct WgpuStorage;
 

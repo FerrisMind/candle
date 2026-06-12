@@ -2563,22 +2563,59 @@ impl Tensor {
                 (Storage::Cpu(storage), Device::Metal(metal)) => {
                     Storage::Metal(metal.storage_from_cpu_storage(storage)?)
                 }
+                (Storage::Cpu(storage), Device::Wgpu(wgpu)) => {
+                    Storage::Wgpu(wgpu.storage_from_cpu_storage(storage)?)
+                }
+                (Storage::Cpu(storage), Device::Vulkan(vulkan)) => {
+                    Storage::Vulkan(vulkan.storage_from_cpu_storage(storage)?)
+                }
                 (Storage::Cuda(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
                 (Storage::Metal(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
+                (Storage::Wgpu(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
+                (Storage::Vulkan(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
                 (Storage::Cuda(storage), Device::Cuda(cuda)) => {
                     // can't clone storage if it's the same device because of the underlying device ptr
                     let dst_storage = storage.transfer_to_device(cuda)?;
                     Storage::Cuda(dst_storage)
                 }
+                (Storage::Wgpu(storage), Device::Wgpu(wgpu)) => {
+                    Storage::Wgpu(wgpu.transfer_to_device(storage)?)
+                }
+                (Storage::Vulkan(storage), Device::Vulkan(vulkan)) => {
+                    Storage::Vulkan(vulkan.transfer_to_device(storage)?)
+                }
                 (Storage::Cpu(storage), Device::Cpu) => Storage::Cpu(storage.clone()),
-                _ => {
-                    bail!(
-                        "not implemented yet, self.device: {:?}, device: {:?}",
-                        self.device(),
-                        device
-                    )
+                // Cross-backend transfers (e.g. Cuda <-> Vulkan) stage through
+                // host memory: download from the source device, upload to the
+                // destination device.
+                (storage, device) => {
+                    let cpu_storage = match storage {
+                        Storage::Cpu(storage) => storage.clone(),
+                        Storage::Cuda(storage) => storage.to_cpu_storage()?,
+                        Storage::Metal(storage) => storage.to_cpu_storage()?,
+                        Storage::Wgpu(storage) => storage.to_cpu_storage()?,
+                        Storage::Vulkan(storage) => storage.to_cpu_storage()?,
+                    };
+                    match device {
+                        Device::Cpu => Storage::Cpu(cpu_storage),
+                        Device::Cuda(cuda) => {
+                            Storage::Cuda(cuda.storage_from_cpu_storage_owned(cpu_storage)?)
+                        }
+                        Device::Metal(metal) => {
+                            Storage::Metal(metal.storage_from_cpu_storage_owned(cpu_storage)?)
+                        }
+                        Device::Wgpu(wgpu) => {
+                            Storage::Wgpu(wgpu.storage_from_cpu_storage_owned(cpu_storage)?)
+                        }
+                        Device::Vulkan(vulkan) => {
+                            Storage::Vulkan(vulkan.storage_from_cpu_storage_owned(cpu_storage)?)
+                        }
+                    }
                 }
             };
+            // wgpu/Vulkan storage normalizes BF16 to F16 on upload, so derive
+            // the tensor dtype from the destination storage rather than `self`.
+            let dtype = storage.dtype();
             let op = BackpropOp::new1(self, Op::ToDevice);
             let tensor_ = Tensor_ {
                 id: TensorId::new(),
@@ -2586,7 +2623,7 @@ impl Tensor {
                 layout: self.layout.clone(),
                 op,
                 is_variable: false,
-                dtype: self.dtype,
+                dtype,
                 device: device.clone(),
             };
             Ok(Tensor(Arc::new(tensor_)))

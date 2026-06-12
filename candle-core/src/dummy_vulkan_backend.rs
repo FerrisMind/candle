@@ -9,6 +9,10 @@ impl VulkanDevice {
     pub fn vendor_id(&self) -> u32 {
         0
     }
+
+    pub fn transfer_to_device(&self, _: &VulkanStorage) -> Result<VulkanStorage> {
+        Err(Error::NotCompiledWithVulkanSupport)
+    }
 }
 
 #[derive(Debug)]

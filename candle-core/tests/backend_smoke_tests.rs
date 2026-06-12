@@ -205,6 +205,21 @@ backend_family_test!(
 backend_family_test!(
     #[cfg(feature = "wgpu")]
     #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_to_device_transfers_native_only,
+    TestBackend::Wgpu,
+    native_required,
+    smoke_to_device_transfers
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_to_device_transfers_native_only,
+    TestBackend::Vulkan,
+    native_required,
+    smoke_to_device_transfers
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_dtype_conversion_matrix_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -1114,6 +1129,81 @@ fn smoke_f32_large_linear_elementwise(device: &Device) -> Result<()> {
         1e-4,
         "large linear affine",
     );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_to_device_transfers(device: &Device) -> Result<()> {
+    let cpu = Device::Cpu;
+    let values = support::deterministic_f32_data(24, 7);
+    let cpu_tensor = Tensor::from_vec(values.clone(), (4, 6), &cpu)?;
+
+    // CPU -> GPU via Tensor::to_device (not just from_vec upload).
+    let gpu_tensor = cpu_tensor.to_device(device)?;
+    assert!(gpu_tensor.device().same_device(device));
+    assert_eq!(gpu_tensor.flatten_all()?.to_vec1::<f32>()?, values);
+
+    // GPU -> CPU via Tensor::to_device (not just to_vec download).
+    let back = gpu_tensor.to_device(&cpu)?;
+    assert!(back.device().is_cpu());
+    assert_eq!(back.flatten_all()?.to_vec1::<f32>()?, values);
+
+    // Same-device transfer takes the shallow-clone early return.
+    let same = gpu_tensor.to_device(device)?;
+    assert!(same.device().same_device(device));
+    assert_eq!(same.flatten_all()?.to_vec1::<f32>()?, values);
+
+    // Roundtrip on a strided view keeps layout semantics.
+    let view = gpu_tensor.t()?;
+    let view_back = view.to_device(&cpu)?;
+    assert_eq!(
+        view_back.contiguous()?.flatten_all()?.to_vec1::<f32>()?,
+        cpu_tensor
+            .t()?
+            .contiguous()?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+    );
+
+    // Integer and half dtypes must transfer unchanged.
+    let u32_cpu = Tensor::from_slice(&[1u32, 2, 3, 4000], (2, 2), &cpu)?;
+    let u32_back = u32_cpu.to_device(device)?.to_device(&cpu)?;
+    assert_eq!(u32_back.to_vec2::<u32>()?, [[1, 2], [3, 4000]]);
+
+    let f16_cpu = Tensor::from_slice(
+        &[
+            f16::from_f32(0.5),
+            f16::from_f32(-1.5),
+            f16::from_f32(2.0),
+            f16::from_f32(-4.0),
+        ],
+        (2, 2),
+        &cpu,
+    )?;
+    let f16_back = f16_cpu.to_device(device)?.to_device(&cpu)?;
+    assert_eq!(
+        f16_back.to_vec2::<f16>()?,
+        [
+            [f16::from_f32(0.5), f16::from_f32(-1.5)],
+            [f16::from_f32(2.0), f16::from_f32(-4.0)]
+        ]
+    );
+
+    // BF16 normalizes to F16 on wgpu/Vulkan; dtype must follow the storage.
+    let bf16_cpu = Tensor::from_slice(
+        &[
+            bf16::from_f32(0.25),
+            bf16::from_f32(-1.0),
+            bf16::from_f32(3.0),
+            bf16::from_f32(-8.0),
+        ],
+        (2, 2),
+        &cpu,
+    )?;
+    let bf16_gpu = bf16_cpu.to_device(device)?;
+    assert_eq!(bf16_gpu.dtype(), DType::F16);
+    let bf16_back = bf16_gpu.to_device(&cpu)?.to_dtype(DType::F32)?;
+    assert_eq!(bf16_back.to_vec2::<f32>()?, [[0.25, -1.0], [3.0, -8.0]]);
     Ok(())
 }
 
