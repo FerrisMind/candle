@@ -767,3 +767,12 @@ The highest-value next Vulkan performance step is now concrete:
 - Test closure on RTX 3060 (native-required, fallback 0): `backend_smoke_{wgpu,vulkan}_int_binary_native_only` — mantissa-overflow u32 values, >2^32 i64 magnitudes with carry-sensitive multiplies, u8 high-bit results, broadcast rhs, all compared against the CPU reference.
 - Note: an earlier test-run failure ("vulkan allocation retry failed ... Out of memory") was caused by an unrelated process holding ~6.7 GB VRAM on the RTX 3060, not by backend code; with normal VRAM the suite passes repeatedly.
 - Regression state: 32 Vulkan + 22 wgpu smoke tests pass on RTX 3060.
+
+## Progress Update: Integer Reduction Closure (sum/max/min/argmax/argmin for u8/u32/i64)
+
+- CUDA reference (`candle-kernels/src/reduce.cu`, `FAST_OP`/`SUM_OP` instantiations) reduces `u8`/`u32`/`i64` exactly; both GPU backends were F32/F16-only and fell back to CPU for every integer reduction.
+- Vulkan closure: three Candle-owned shaders — `sum_rows_int.comp` (integer accumulator, wrapping cast on store), `reduce_extrema_int.comp` (max/min in source type), `argextrema_int.comp` (index output, first-index tie-break). Compiled to per-dtype SPIR-V (u8/u32/i64). `run_int_reduce` mirrors the float dispatch: multi-dim folds one dim at a time, non-last-dim permutes the reduced dim to the end via GPU strided copy, last-dim materializes contiguous then dispatches.
+- WGPU closure: generated per-dtype WGSL via `int_reduce_wgsl` — u32 native; u8 reads packed bytes and (for value reductions) writes one packed word per four rows; i64 accumulates lo/hi word pairs with carry for sum and signed-high/unsigned-low compares for extrema/argextrema. Same multi-dim/permute/last-dim structure as Vulkan, fully GPU-resident.
+- Tie-break and sign semantics verified against the CPU reference: first-index argmax/argmin, exact i64 sums with magnitudes past 2^32, negative-value extrema.
+- Test closure on RTX 3060 (native-required, fallback 0): `backend_smoke_{wgpu,vulkan}_int_reductions_native_only` — last-dim sum/max/min/argmax/argmin across u8/u32/i64, non-last-dim sum (permute path), multi-dim `sum_all`, and a negative/large-magnitude i64 block.
+- Regression + lint: `cargo clippy` clean on candle-core (vulkan,wgpu); 33 Vulkan + 23 wgpu smoke tests pass.

@@ -493,6 +493,27 @@ fn backend_smoke_vulkan_int_binary_native_only() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_int_reductions_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_vulkan_int_reductions_native_only",
+        TestBackend::Vulkan,
+        smoke_int_reductions,
+    )
+}
+
+#[test]
+#[cfg(feature = "wgpu")]
+#[ignore = "requires a usable wgpu adapter and driver"]
+fn backend_smoke_wgpu_int_reductions_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_wgpu_int_reductions_native_only",
+        TestBackend::Wgpu,
+        smoke_int_reductions,
+    )
+}
+
+#[test]
 #[cfg(feature = "wgpu")]
 #[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_scatter_add_index_add_native_only() -> Result<()> {
@@ -2159,6 +2180,103 @@ fn smoke_int_cmp_where(device: &Device) -> Result<()> {
     assert_eq!(
         u32_src.t()?.contiguous()?.to_vec2::<u32>()?,
         [[16_777_217, 4], [2, 5], [3, 6]]
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_int_reductions(device: &Device) -> Result<()> {
+    let cpu = Device::Cpu;
+
+    for &dtype in &[DType::U32, DType::U8, DType::I64] {
+        // Values chosen so u8 row sums stay < 256 (no CPU overflow panic).
+        let base: Vec<i64> = vec![5, 1, 9, 3, 2, 7, 4, 8, 6, 0, 11, 10];
+        let gpu_i64 = Tensor::from_vec(base.clone(), (3, 4), device)?;
+        let cpu_i64 = Tensor::from_vec(base.clone(), (3, 4), &cpu)?;
+        let g = gpu_i64.to_dtype(dtype)?;
+        let c = cpu_i64.to_dtype(dtype)?;
+
+        // Last-dim sum.
+        assert_eq!(
+            g.sum(1)?
+                .to_dtype(DType::I64)?
+                .flatten_all()?
+                .to_vec1::<i64>()?,
+            c.sum(1)?
+                .to_dtype(DType::I64)?
+                .flatten_all()?
+                .to_vec1::<i64>()?,
+            "sum last-dim {dtype:?}"
+        );
+        // Non-last-dim sum (exercises the permute path).
+        assert_eq!(
+            g.sum(0)?
+                .to_dtype(DType::I64)?
+                .flatten_all()?
+                .to_vec1::<i64>()?,
+            c.sum(0)?
+                .to_dtype(DType::I64)?
+                .flatten_all()?
+                .to_vec1::<i64>()?,
+            "sum dim0 {dtype:?}"
+        );
+        // Multi-dim sum (sum_all).
+        assert_eq!(
+            g.sum_all()?.to_dtype(DType::I64)?.to_vec0::<i64>()?,
+            c.sum_all()?.to_dtype(DType::I64)?.to_vec0::<i64>()?,
+            "sum_all {dtype:?}"
+        );
+        // Max / min along last dim.
+        assert_eq!(
+            g.max(1)?
+                .to_dtype(DType::I64)?
+                .flatten_all()?
+                .to_vec1::<i64>()?,
+            c.max(1)?
+                .to_dtype(DType::I64)?
+                .flatten_all()?
+                .to_vec1::<i64>()?,
+            "max last-dim {dtype:?}"
+        );
+        assert_eq!(
+            g.min(1)?
+                .to_dtype(DType::I64)?
+                .flatten_all()?
+                .to_vec1::<i64>()?,
+            c.min(1)?
+                .to_dtype(DType::I64)?
+                .flatten_all()?
+                .to_vec1::<i64>()?,
+            "min last-dim {dtype:?}"
+        );
+        // Argmax / argmin along last dim.
+        assert_eq!(
+            g.argmax(1)?.flatten_all()?.to_vec1::<u32>()?,
+            c.argmax(1)?.flatten_all()?.to_vec1::<u32>()?,
+            "argmax last-dim {dtype:?}"
+        );
+        assert_eq!(
+            g.argmin(1)?.flatten_all()?.to_vec1::<u32>()?,
+            c.argmin(1)?.flatten_all()?.to_vec1::<u32>()?,
+            "argmin last-dim {dtype:?}"
+        );
+    }
+
+    // i64 with negative values and magnitudes past 2^32.
+    let neg = vec![-5_000_000_000i64, 7, -3, 2_000_000_000, -1, 4];
+    let g = Tensor::from_vec(neg.clone(), (2, 3), device)?;
+    let c = Tensor::from_vec(neg, (2, 3), &cpu)?;
+    assert_eq!(
+        g.sum(1)?.flatten_all()?.to_vec1::<i64>()?,
+        c.sum(1)?.flatten_all()?.to_vec1::<i64>()?
+    );
+    assert_eq!(
+        g.max(1)?.flatten_all()?.to_vec1::<i64>()?,
+        c.max(1)?.flatten_all()?.to_vec1::<i64>()?
+    );
+    assert_eq!(
+        g.argmin(1)?.flatten_all()?.to_vec1::<u32>()?,
+        c.argmin(1)?.flatten_all()?.to_vec1::<u32>()?
     );
     Ok(())
 }

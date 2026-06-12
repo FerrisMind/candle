@@ -183,6 +183,51 @@ fn generate_candle_spirv_modules(
             ],
         ),
         (
+            "sum_rows_int_u32",
+            candle_shaders_dir.join("sum_rows_int.comp"),
+            &["A_TYPE=uint", "D_TYPE=uint", "ACC_TYPE=uint"],
+        ),
+        (
+            "sum_rows_int_u8",
+            candle_shaders_dir.join("sum_rows_int.comp"),
+            &["A_TYPE=uint8_t", "D_TYPE=uint8_t", "ACC_TYPE=uint"],
+        ),
+        (
+            "sum_rows_int_i64",
+            candle_shaders_dir.join("sum_rows_int.comp"),
+            &["A_TYPE=int64_t", "D_TYPE=int64_t", "ACC_TYPE=int64_t"],
+        ),
+        (
+            "reduce_extrema_int_u32",
+            candle_shaders_dir.join("reduce_extrema_int.comp"),
+            &["A_TYPE=uint", "D_TYPE=uint"],
+        ),
+        (
+            "reduce_extrema_int_u8",
+            candle_shaders_dir.join("reduce_extrema_int.comp"),
+            &["A_TYPE=uint8_t", "D_TYPE=uint8_t"],
+        ),
+        (
+            "reduce_extrema_int_i64",
+            candle_shaders_dir.join("reduce_extrema_int.comp"),
+            &["A_TYPE=int64_t", "D_TYPE=int64_t"],
+        ),
+        (
+            "argextrema_int_u32",
+            candle_shaders_dir.join("argextrema_int.comp"),
+            &["A_TYPE=uint"],
+        ),
+        (
+            "argextrema_int_u8",
+            candle_shaders_dir.join("argextrema_int.comp"),
+            &["A_TYPE=uint8_t"],
+        ),
+        (
+            "argextrema_int_i64",
+            candle_shaders_dir.join("argextrema_int.comp"),
+            &["A_TYPE=int64_t"],
+        ),
+        (
             "binary_int_u8",
             candle_shaders_dir.join("binary_int.comp"),
             &[

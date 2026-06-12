@@ -171,6 +171,34 @@ struct GgmlSumRowsParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct IntSumRowsParams {
+    n_cols: u32,
+    ne01: u32,
+    ne02: u32,
+    nb01: u32,
+    nb02: u32,
+    nb03: u32,
+    nb11: u32,
+    nb12: u32,
+    nb13: u32,
+    misalign_offsets: u32,
+    ne0_12mp: u32,
+    ne0_12l: u32,
+    ne0_1mp: u32,
+    ne0_1l: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IntExtremaParams {
+    kx: u32,
+    ky: u32,
+    mode: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct GgmlSoftmaxParams {
     kx: u32,
     ky: u32,
@@ -3530,6 +3558,207 @@ impl VulkanStorage {
         Ok(())
     }
 
+    // Integer reductions (u8/u32/i64). Mirrors the float reduce structure:
+    // multi-dim folds one dim at a time, non-last-dim permutes the reduced
+    // dim to the end, last-dim dispatches the Candle-owned integer kernels.
+    fn run_int_reduce(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
+        let rank = layout.dims().len();
+        if reduce_dims.len() > 1 {
+            if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
+                return Err(unsupported("int reduce multi-dim arg"));
+            }
+            let mut current_layout = layout.clone();
+            let mut current_shape = layout.dims().to_vec();
+            let mut current: Option<Self> = None;
+            for &dim in reduce_dims {
+                let src = current.as_ref().unwrap_or(self);
+                let reduced = src.run_int_reduce(op, &current_layout, &[dim])?;
+                current_shape[dim] = 1;
+                current_layout = Layout::contiguous(Shape::from(current_shape.clone()));
+                current = Some(reduced);
+            }
+            return current.ok_or_else(|| unsupported("int reduce multi-dim empty"));
+        }
+        let dim = reduce_dims[0];
+        if dim != rank - 1 {
+            // Permute the reduced dim to the last position, materialize
+            // contiguously on the GPU, then reduce the last dim.
+            let perm = (0..rank)
+                .filter(|&i| i != dim)
+                .chain(std::iter::once(dim))
+                .collect::<Vec<_>>();
+            let perm_shape = perm.iter().map(|&i| layout.dims()[i]).collect::<Vec<_>>();
+            let perm_stride = perm.iter().map(|&i| layout.stride()[i]).collect::<Vec<_>>();
+            let perm_layout = Layout::new(
+                Shape::from(perm_shape.clone()),
+                perm_stride,
+                layout.start_offset(),
+            );
+            let mut permuted = unsafe {
+                self.device
+                    .alloc_uninit(&Shape::from(perm_shape.clone()), self.dtype)?
+            };
+            <Self as BackendStorage>::copy_strided_src(self, &mut permuted, 0, &perm_layout)?;
+            let permuted_layout = Layout::contiguous(Shape::from(perm_shape));
+            return permuted.run_int_reduce(op, &permuted_layout, &[rank - 1]);
+        }
+        // Last-dim reduction. Materialize contiguously if needed.
+        let mut materialized_storage;
+        let src;
+        let src_layout;
+        let contiguous_layout;
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            src = self;
+            src_layout = layout;
+        } else {
+            materialized_storage = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized_storage, 0, layout)?;
+            contiguous_layout = Layout::contiguous(layout.shape());
+            src = &materialized_storage;
+            src_layout = &contiguous_layout;
+        }
+        match op {
+            ReduceOp::Sum => src.run_int_sum_rows(src_layout),
+            ReduceOp::Max => src.run_int_extrema_last_dim(src_layout, 0),
+            ReduceOp::Min => src.run_int_extrema_last_dim(src_layout, 1),
+            ReduceOp::ArgMax => src.run_int_argextrema_last_dim(src_layout, 0),
+            ReduceOp::ArgMin => src.run_int_argextrema_last_dim(src_layout, 1),
+        }
+    }
+
+    fn run_int_sum_rows(&self, layout: &Layout) -> Result<Self> {
+        if layout.start_offset() > u16::MAX as usize {
+            return Err(unsupported("int sum_rows offset"));
+        }
+        let rank = layout.dims().len();
+        let (src_dims, src_strides) = dims4_ggml(layout)?;
+        let mut dst_dims_candle = layout.dims().to_vec();
+        dst_dims_candle[rank - 1] = 1;
+        let dst_shape = Shape::from(dst_dims_candle);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
+
+        let mut dst_dims = src_dims;
+        dst_dims[0] = 1;
+        let dst_strides = contiguous_strides_ggml(dst_dims);
+        let rows = src_dims[1] * src_dims[2] * src_dims[3];
+        let (ne0_12mp, ne0_12l) = fastdiv_values(src_dims[1] * src_dims[2]);
+        let (ne0_1mp, ne0_1l) = fastdiv_values(src_dims[1]);
+        let params = IntSumRowsParams {
+            n_cols: src_dims[0],
+            ne01: src_dims[1],
+            ne02: src_dims[2],
+            nb01: src_strides[1],
+            nb02: src_strides[2],
+            nb03: src_strides[3],
+            nb11: dst_strides[1],
+            nb12: dst_strides[2],
+            nb13: dst_strides[3],
+            misalign_offsets: (layout.start_offset() as u32) << 16,
+            ne0_12mp,
+            ne0_12l,
+            ne0_1mp,
+            ne0_1l,
+        };
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let name = match self.dtype {
+            DType::U8 => "sum_rows_int_u8",
+            DType::U32 => "sum_rows_int_u32",
+            DType::I64 => "sum_rows_int_i64",
+            _ => return Err(Error::UnsupportedDTypeForOp(self.dtype, "int sum_rows").bt()),
+        };
+        let spirv = candle_vulkan_kernels::spirv(name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated")).bt())?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (rows, 1, 1),
+            Some(&[(0, self.device.inner.subgroup_size)]),
+        )?;
+        Ok(dst)
+    }
+
+    fn run_int_extrema_last_dim(&self, layout: &Layout, mode: u32) -> Result<Self> {
+        let rank = layout.dims().len();
+        let kx = *layout
+            .dims()
+            .last()
+            .ok_or_else(|| unsupported("int extrema scalar"))?;
+        let mut dst_dims = layout.dims().to_vec();
+        dst_dims[rank - 1] = 1;
+        let dst_shape = Shape::from(dst_dims);
+        let rows = dst_shape.elem_count();
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
+        let params = IntExtremaParams {
+            kx: kx.try_into()?,
+            ky: rows.try_into()?,
+            mode,
+            pad: 0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let name = match self.dtype {
+            DType::U8 => "reduce_extrema_int_u8",
+            DType::U32 => "reduce_extrema_int_u32",
+            DType::I64 => "reduce_extrema_int_i64",
+            _ => return Err(Error::UnsupportedDTypeForOp(self.dtype, "int extrema").bt()),
+        };
+        let spirv = candle_vulkan_kernels::spirv(name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated")).bt())?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (rows.try_into()?, 1, 1),
+            Some(&[(0, self.device.inner.subgroup_size)]),
+        )?;
+        Ok(dst)
+    }
+
+    fn run_int_argextrema_last_dim(&self, layout: &Layout, mode: u32) -> Result<Self> {
+        let rank = layout.dims().len();
+        let kx = *layout
+            .dims()
+            .last()
+            .ok_or_else(|| unsupported("int argextrema scalar"))?;
+        let mut dst_dims = layout.dims().to_vec();
+        dst_dims[rank - 1] = 1;
+        let dst_shape = Shape::from(dst_dims);
+        let rows = dst_shape.elem_count();
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::U32)? };
+        let params = IntExtremaParams {
+            kx: kx.try_into()?,
+            ky: rows.try_into()?,
+            mode,
+            pad: 0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let name = match self.dtype {
+            DType::U8 => "argextrema_int_u8",
+            DType::U32 => "argextrema_int_u32",
+            DType::I64 => "argextrema_int_i64",
+            _ => return Err(Error::UnsupportedDTypeForOp(self.dtype, "int argextrema").bt()),
+        };
+        let spirv = candle_vulkan_kernels::spirv(name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated")).bt())?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (rows.try_into()?, 1, 1),
+            Some(&[(0, self.device.inner.subgroup_size)]),
+        )?;
+        Ok(dst)
+    }
+
     fn run_sum_rows(&self, layout: &Layout) -> Result<Self> {
         if layout.start_offset() > u16::MAX as usize {
             return Err(unsupported("sum_rows offset"));
@@ -6237,7 +6466,8 @@ impl BackendStorage for VulkanStorage {
         }
     }
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+        let int_dtype = matches!(self.dtype, DType::U8 | DType::U32 | DType::I64);
+        if self.dtype != DType::F32 && self.dtype != DType::F16 && !int_dtype {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan reduce").bt());
         }
         let rank = layout.dims().len();
@@ -6251,6 +6481,9 @@ impl BackendStorage for VulkanStorage {
             if dim >= rank {
                 crate::bail!("vulkan backend op reduce got out-of-range dim {dim} for rank {rank}")
             }
+        }
+        if int_dtype {
+            return self.run_int_reduce(op, layout, reduce_dims);
         }
         if self.dtype == DType::F16 {
             let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), DType::F16)? };

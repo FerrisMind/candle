@@ -1,0 +1,66 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Candle-owned integer last-dim arg-extrema reduction. Returns the index of
+// the max (mode 0) or min (mode 1) element of each contiguous row, matching
+// the CUDA fast_argmax/fast_argmin integer kernels (first index on ties).
+// Input is assumed contiguous (Rust materializes strided views first).
+
+layout (push_constant) uniform parameter {
+    uint kx;     // row length (reduced dimension)
+    uint ky;     // number of rows
+    uint mode;   // 0 = argmax, 1 = argmin
+    uint pad;
+} p;
+
+layout (binding = 0) readonly buffer A { A_TYPE data_a[]; };
+layout (binding = 1) writeonly buffer D { uint data_d[]; };
+
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+
+shared A_TYPE tmpval[BLOCK_SIZE];
+shared uint tmpidx[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint col = gl_LocalInvocationID.x;
+    if (row >= p.ky) {
+        return;
+    }
+
+    A_TYPE best = (col < p.kx) ? data_a[row * p.kx + col] : data_a[row * p.kx];
+    uint bestidx = col;
+
+    for (uint i = col + BLOCK_SIZE; i < p.kx; i += BLOCK_SIZE) {
+        A_TYPE v = data_a[row * p.kx + i];
+        if (p.mode == 0u ? (v > best) : (v < best)) {
+            best = v;
+            bestidx = i;
+        }
+    }
+
+    tmpval[col] = best;
+    tmpidx[col] = bestidx;
+
+    barrier();
+    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+        if (col < uint(s) && (col + uint(s)) < p.kx) {
+            A_TYPE other = tmpval[col + uint(s)];
+            uint otheridx = tmpidx[col + uint(s)];
+            bool take = p.mode == 0u ? (other > tmpval[col]) : (other < tmpval[col]);
+            // Tie-break toward the lower index to match CUDA/CPU semantics.
+            if (take || (other == tmpval[col] && otheridx < tmpidx[col])) {
+                tmpval[col] = other;
+                tmpidx[col] = otheridx;
+            }
+        }
+        barrier();
+    }
+
+    if (col == 0) {
+        data_d[row] = tmpidx[0];
+    }
+}

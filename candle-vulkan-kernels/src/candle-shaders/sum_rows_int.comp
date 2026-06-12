@@ -1,0 +1,74 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Candle-owned integer last-dim sum reduction. The ggml sum_rows.comp uses a
+// float accumulator and a `weight` multiply, which loses precision for the
+// integer dtypes CUDA reduces exactly (u8/u32/i64). This variant accumulates
+// in the destination type with wrapping semantics matching the CPU reference.
+
+layout (push_constant) uniform parameter {
+    uint n_cols;
+    uint ne01;
+    uint ne02;
+    uint nb01;
+    uint nb02;
+    uint nb03;
+    uint nb11;
+    uint nb12;
+    uint nb13;
+    uint misalign_offsets;
+    uint ne0_12mp;
+    uint ne0_12L;
+    uint ne0_1mp;
+    uint ne0_1L;
+} p;
+
+layout (binding = 0) readonly buffer A { A_TYPE data_a[]; };
+layout (binding = 1) writeonly buffer D { D_TYPE data_d[]; };
+
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+
+shared ACC_TYPE tmp[BLOCK_SIZE];
+
+uint get_aoffset() { return p.misalign_offsets >> 16; }
+uint get_doffset() { return p.misalign_offsets & 0xFFFF; }
+
+uint fastdiv(uint n, uint mp, uint L) {
+    uint msbs, lsbs;
+    umulExtended(n, mp, msbs, lsbs);
+    return (msbs + n) >> L;
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint col = gl_LocalInvocationID.x;
+
+    const uint i03 = fastdiv(row, p.ne0_12mp, p.ne0_12L);
+    const uint i03_offset = i03 * p.ne01 * p.ne02;
+    const uint i02 = fastdiv(row - i03_offset, p.ne0_1mp, p.ne0_1L);
+    const uint i01 = row - i03_offset - i02 * p.ne01;
+
+    const uint src_idx = get_aoffset() + i01 * p.nb01 + i02 * p.nb02 + i03 * p.nb03;
+    const uint dst_idx = get_doffset() + i01 * p.nb11 + i02 * p.nb12 + i03 * p.nb13;
+
+    ACC_TYPE acc = ACC_TYPE(0);
+    for (uint i = col; i < p.n_cols; i += BLOCK_SIZE) {
+        acc += ACC_TYPE(data_a[src_idx + i]);
+    }
+    tmp[col] = acc;
+
+    barrier();
+    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+        if (col < uint(s)) {
+            tmp[col] += tmp[col + uint(s)];
+        }
+        barrier();
+    }
+
+    if (col == 0) {
+        data_d[dst_idx] = D_TYPE(tmp[0]);
+    }
+}

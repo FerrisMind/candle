@@ -1,0 +1,62 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Candle-owned integer last-dim extrema reduction. Computes the max (mode 0)
+// or min (mode 1) value of each contiguous row in the source type, matching
+// the CUDA fast_max/fast_min integer kernels. Input is assumed contiguous
+// (the Rust side materializes strided/offset views before dispatch).
+
+layout (push_constant) uniform parameter {
+    uint kx;     // row length (reduced dimension)
+    uint ky;     // number of rows
+    uint mode;   // 0 = max, 1 = min
+    uint pad;
+} p;
+
+layout (binding = 0) readonly buffer A { A_TYPE data_a[]; };
+layout (binding = 1) writeonly buffer D { D_TYPE data_d[]; };
+
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+
+shared A_TYPE tmp[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint col = gl_LocalInvocationID.x;
+    if (row >= p.ky) {
+        return;
+    }
+
+    bool seen = false;
+    A_TYPE acc = A_TYPE(0);
+    for (uint i = col; i < p.kx; i += BLOCK_SIZE) {
+        A_TYPE v = data_a[row * p.kx + i];
+        if (!seen) {
+            acc = v;
+            seen = true;
+        } else if (p.mode == 0u ? (v > acc) : (v < acc)) {
+            acc = v;
+        }
+    }
+    // Lanes past kx contribute the identity by copying the first valid lane's
+    // value; guard with kx so empty lanes never overwrite real extrema.
+    tmp[col] = (col < p.kx) ? acc : data_a[row * p.kx];
+
+    barrier();
+    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+        if (col < uint(s) && (col + uint(s)) < p.kx) {
+            A_TYPE other = tmp[col + uint(s)];
+            if (p.mode == 0u ? (other > tmp[col]) : (other < tmp[col])) {
+                tmp[col] = other;
+            }
+        }
+        barrier();
+    }
+
+    if (col == 0) {
+        data_d[row] = D_TYPE(tmp[0]);
+    }
+}

@@ -979,6 +979,208 @@ fn binary_shader(op: &str, dtype: DType) -> Result<String> {
 // Integer binary ops for the dtypes the stock binary.wgsl cannot express.
 // U32 is native; U8 packs four bytes per u32 word (one thread per output
 // word); I64 is emulated with lo/hi u32 word pairs and carry arithmetic.
+// Generated last-dim integer reduction kernel, one invocation per output row.
+// U32 is native; U8 elements are unpacked from packed bytes and the result is
+// repacked four-per-word; I64 elements are lo/hi u32 word pairs with carry
+// arithmetic for sum and signed compares for extrema. Argmax/argmin return a
+// contiguous u32 index buffer (first index on ties, matching CPU/CUDA).
+fn int_reduce_wgsl(op: ReduceOp, dtype: DType) -> Result<String> {
+    let is_arg = matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin);
+    let want_max = matches!(op, ReduceOp::Max | ReduceOp::ArgMax);
+
+    // All integer buffers are addressed as u32 words (U8 packed, I64 lo/hi).
+    let src_decl = "@group(0) @binding(0) var<storage, read> src: array<u32>;";
+    let dst_decl = "@group(0) @binding(1) var<storage, read_write> dst: array<u32>;";
+
+    // Body computes one output element for row `r` over columns [0, kx).
+    let body = match dtype {
+        DType::U32 => {
+            if is_arg {
+                let cmp = if want_max { ">" } else { "<" };
+                format!(
+                    r#"
+    var best = src[r * params.kx];
+    var bidx: u32 = 0u;
+    for (var c: u32 = 1u; c < params.kx; c = c + 1u) {{
+        let v = src[r * params.kx + c];
+        if (v {cmp} best) {{ best = v; bidx = c; }}
+    }}
+    dst[r] = bidx;
+"#
+                )
+            } else {
+                match op {
+                    ReduceOp::Sum => r#"
+    var acc: u32 = 0u;
+    for (var c: u32 = 0u; c < params.kx; c = c + 1u) {
+        acc = acc + src[r * params.kx + c];
+    }
+    dst[r] = acc;
+"#
+                    .to_string(),
+                    _ => {
+                        let cmp = if want_max { ">" } else { "<" };
+                        format!(
+                            r#"
+    var acc = src[r * params.kx];
+    for (var c: u32 = 1u; c < params.kx; c = c + 1u) {{
+        let v = src[r * params.kx + c];
+        if (v {cmp} acc) {{ acc = v; }}
+    }}
+    dst[r] = acc;
+"#
+                        )
+                    }
+                }
+            }
+        }
+        DType::U8 => {
+            if is_arg {
+                // Source byte at logical index i: src[i/4] >> (8*(i%4)) & 0xff.
+                let cmp = if want_max { ">" } else { "<" };
+                format!(
+                    r#"
+    let bi0 = r * params.kx; var best = (src[bi0 / 4u] >> (8u * (bi0 % 4u))) & 0xffu;
+    var bidx: u32 = 0u;
+    for (var c: u32 = 1u; c < params.kx; c = c + 1u) {{
+        let bi = r * params.kx + c; let bv = (src[bi / 4u] >> (8u * (bi % 4u))) & 0xffu;
+        if (bv {cmp} best) {{ best = bv; bidx = c; }}
+    }}
+    dst[r] = bidx;
+"#
+                )
+            } else {
+                // Value result is one byte per row; pack four rows per output
+                // word so concurrent invocations never share a destination word.
+                return Ok(int_reduce_u8_packed_wgsl(want_max, op));
+            }
+        }
+        DType::I64 => {
+            if is_arg {
+                let take = if want_max {
+                    "(hi_v > bitcast<i32>(best_hi)) || (hi_v == bitcast<i32>(best_hi) && lo_v > best_lo)"
+                } else {
+                    "(hi_v < bitcast<i32>(best_hi)) || (hi_v == bitcast<i32>(best_hi) && lo_v < best_lo)"
+                };
+                format!(
+                    r#"
+    var best_lo = src[2u * (r * params.kx)];
+    var best_hi = src[2u * (r * params.kx) + 1u];
+    var bidx: u32 = 0u;
+    for (var c: u32 = 1u; c < params.kx; c = c + 1u) {{
+        let e = r * params.kx + c;
+        let lo_v = src[2u * e]; let hi_v = bitcast<i32>(src[2u * e + 1u]);
+        if ({take}) {{ best_lo = lo_v; best_hi = src[2u * e + 1u]; bidx = c; }}
+    }}
+    dst[r] = bidx;
+"#
+                )
+            } else {
+                match op {
+                    ReduceOp::Sum => r#"
+    var lo: u32 = 0u; var hi: u32 = 0u;
+    for (var c: u32 = 0u; c < params.kx; c = c + 1u) {
+        let e = r * params.kx + c;
+        let a_lo = src[2u * e]; let a_hi = src[2u * e + 1u];
+        let nlo = lo + a_lo;
+        let carry = select(0u, 1u, nlo < lo);
+        lo = nlo; hi = hi + a_hi + carry;
+    }
+    dst[2u * r] = lo; dst[2u * r + 1u] = hi;
+"#
+                    .to_string(),
+                    _ => {
+                        let take = if want_max {
+                            "(hi_v > bitcast<i32>(acc_hi)) || (hi_v == bitcast<i32>(acc_hi) && lo_v > acc_lo)"
+                        } else {
+                            "(hi_v < bitcast<i32>(acc_hi)) || (hi_v == bitcast<i32>(acc_hi) && lo_v < acc_lo)"
+                        };
+                        format!(
+                            r#"
+    var acc_lo = src[2u * (r * params.kx)];
+    var acc_hi = src[2u * (r * params.kx) + 1u];
+    for (var c: u32 = 1u; c < params.kx; c = c + 1u) {{
+        let e = r * params.kx + c;
+        let lo_v = src[2u * e]; let hi_v = bitcast<i32>(src[2u * e + 1u]);
+        if ({take}) {{ acc_lo = lo_v; acc_hi = src[2u * e + 1u]; }}
+    }}
+    dst[2u * r] = acc_lo; dst[2u * r + 1u] = acc_hi;
+"#
+                        )
+                    }
+                }
+            }
+        }
+        other => return Err(Error::UnsupportedDTypeForOp(other, "wgpu int reduce").bt()),
+    };
+
+    Ok(format!(
+        r#"
+struct Params {{ rows: u32, kx: u32, }};
+{src_decl}
+{dst_decl}
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let r = gid.x;
+    if (r >= params.rows) {{ return; }}
+{body}
+}}
+"#
+    ))
+}
+
+// U8 sum/extrema: one invocation per output WORD (four rows) so packed byte
+// writes never race on a shared destination word.
+fn int_reduce_u8_packed_wgsl(want_max: bool, op: ReduceOp) -> String {
+    let per_row = match op {
+        ReduceOp::Sum => r#"
+        var acc: u32 = 0u;
+        for (var c: u32 = 0u; c < params.kx; c = c + 1u) {
+            let bi = rr * params.kx + c; let bv = (src[bi / 4u] >> (8u * (bi % 4u))) & 0xffu;
+            acc = (acc + bv) & 0xffu;
+        }
+"#
+        .to_string(),
+        _ => {
+            let cmp = if want_max { ">" } else { "<" };
+            format!(
+                r#"
+        let bi0 = rr * params.kx; var acc = (src[bi0 / 4u] >> (8u * (bi0 % 4u))) & 0xffu;
+        for (var c: u32 = 1u; c < params.kx; c = c + 1u) {{
+            let bi = rr * params.kx + c; let bv = (src[bi / 4u] >> (8u * (bi % 4u))) & 0xffu;
+            if (bv {cmp} acc) {{ acc = bv; }}
+        }}
+"#
+            )
+        }
+    };
+    format!(
+        r#"
+struct Params {{ rows: u32, kx: u32, }};
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let word = gid.x;
+    let base = word * 4u;
+    if (base >= params.rows) {{ return; }}
+    var out: u32 = 0u;
+    for (var lane: u32 = 0u; lane < 4u; lane = lane + 1u) {{
+        let rr = base + lane;
+        if (rr >= params.rows) {{ break; }}
+        {per_row}
+        out = out | ((acc & 0xffu) << (8u * lane));
+    }}
+    dst[word] = out;
+}}
+"#
+    )
+}
+
 fn custom_int_binary_wgsl(op: &str, dtype: DType) -> Result<String> {
     let indexing = r#"
 fn src0_index(_i: u32) -> u32 {
@@ -4753,6 +4955,144 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         drop(src_contiguous);
         Ok((dst, dst_shape))
     }
+
+    // Integer reductions (u8/u32/i64), fully GPU-resident. Mirrors the float
+    // structure: multi-dim folds one dim at a time, non-last-dim permutes via
+    // the GPU strided copy, last-dim runs a generated per-dtype WGSL kernel.
+    fn run_int_reduce(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
+        let rank = layout.dims().len();
+        if rank == 0 {
+            return Err(unsupported("int reduce rank-0"));
+        }
+        if reduce_dims.is_empty() {
+            return self.try_clone(layout);
+        }
+        for &dim in reduce_dims {
+            if dim >= rank {
+                return Err(unsupported("int reduce dim out of range"));
+            }
+        }
+        if reduce_dims.len() > 1 {
+            if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
+                return Err(unsupported("int reduce multi-dim arg"));
+            }
+            let mut current_layout = layout.clone();
+            let mut current_shape = layout.dims().to_vec();
+            let mut current: Option<Self> = None;
+            for &dim in reduce_dims {
+                let src = current.as_ref().map_or(self, |s| s);
+                let reduced = src.run_int_reduce(op, &current_layout, &[dim])?;
+                current_shape[dim] = 1;
+                current_layout = Layout::contiguous(Shape::from(current_shape.clone()));
+                current = Some(reduced);
+            }
+            return current.ok_or_else(|| unsupported("int reduce multi-dim empty"));
+        }
+        let dim = reduce_dims[0];
+        if dim != rank - 1 {
+            let perm = (0..rank)
+                .filter(|&i| i != dim)
+                .chain(std::iter::once(dim))
+                .collect::<Vec<_>>();
+            let perm_shape = perm.iter().map(|&i| layout.dims()[i]).collect::<Vec<_>>();
+            let perm_stride = perm.iter().map(|&i| layout.stride()[i]).collect::<Vec<_>>();
+            let perm_layout = Layout::new(
+                Shape::from(perm_shape.clone()),
+                perm_stride,
+                layout.start_offset(),
+            );
+            let mut permuted = unsafe {
+                self.device
+                    .alloc_uninit(&Shape::from(perm_shape.clone()), self.dtype)?
+            };
+            self.copy_strided_src(&mut permuted, 0, &perm_layout)?;
+            let permuted_layout = Layout::contiguous(Shape::from(perm_shape));
+            return permuted.run_int_reduce(op, &permuted_layout, &[rank - 1]);
+        }
+        // Last-dim reduction: materialize contiguous, then dispatch.
+        let mut materialized;
+        let src;
+        let src_layout;
+        let contiguous_layout;
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            src = self;
+            src_layout = layout;
+        } else {
+            materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            self.copy_strided_src(&mut materialized, 0, layout)?;
+            contiguous_layout = Layout::contiguous(layout.shape());
+            src = &materialized;
+            src_layout = &contiguous_layout;
+        }
+        src.run_int_reduce_last_dim(op, src_layout)
+    }
+
+    fn run_int_reduce_last_dim(&self, op: ReduceOp, layout: &Layout) -> Result<Self> {
+        let rank = layout.dims().len();
+        let kx = *layout
+            .dims()
+            .last()
+            .ok_or_else(|| unsupported("int reduce scalar"))?;
+        let mut dst_dims = layout.dims().to_vec();
+        dst_dims[rank - 1] = 1;
+        let dst_shape = Shape::from(dst_dims);
+        let rows = dst_shape.elem_count();
+        let is_arg = matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin);
+        let dst_dtype = if is_arg { DType::U32 } else { self.dtype };
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, dst_dtype)? };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct IntReduceParams {
+            rows: u32,
+            kx: u32,
+        }
+        let params = IntReduceParams {
+            rows: rows.try_into()?,
+            kx: kx.try_into()?,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-int-reduce-params"),
+                size: std::mem::size_of::<IntReduceParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+        let shader = int_reduce_wgsl(op, self.dtype)?;
+        // The U8 value-reduce kernel runs one invocation per packed output
+        // word (four rows); everything else runs one invocation per row.
+        let work_items = if self.dtype == DType::U8 && !is_arg {
+            (rows as u32).div_ceil(4)
+        } else {
+            rows as u32
+        };
+        let workgroups = work_items.div_ceil(WG_SIZE);
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-int-reduce",
+        )?;
+        Ok(dst)
+    }
 }
 
 impl BackendStorage for WgpuStorage {
@@ -4874,6 +5214,13 @@ impl BackendStorage for WgpuStorage {
                 <CpuStorage as BackendStorage>::reduce_op(&src_cpu, op, layout, reduce_dims)?;
             self.device.storage_from_cpu_storage(&out_cpu)
         };
+        if matches!(self.dtype, DType::U8 | DType::U32 | DType::I64) {
+            return match self.run_int_reduce(op, layout, reduce_dims) {
+                Ok(out) => Ok(out),
+                Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
+                Err(err) => Err(err),
+            };
+        }
         if self.dtype != DType::F32 {
             return cpu_fallback();
         }
