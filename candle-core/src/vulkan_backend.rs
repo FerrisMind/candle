@@ -2587,6 +2587,9 @@ fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
         (DType::F16, DType::F16) => "cpy_f16_f16",
         // Candle-owned integer cast family; the copied ggml generator only
         // covers the float pairs above.
+        (DType::U8, DType::U8) => "convert_u8_u8",
+        (DType::U32, DType::U32) => "convert_u32_u32",
+        (DType::I64, DType::I64) => "convert_i64_i64",
         (DType::F32, DType::U8) => "convert_f32_u8",
         (DType::F32, DType::U32) => "convert_f32_u32",
         (DType::F32, DType::I64) => "convert_f32_i64",
@@ -6771,7 +6774,7 @@ impl BackendStorage for VulkanStorage {
         }
         if !src_l.is_contiguous() {
             match self.dtype {
-                DType::F32 | DType::F16 => {
+                DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64 => {
                     let spirv = copy_spirv(self.dtype, self.dtype)?;
                     return self.run_copy_into(src_l, dst, dst_offset, spirv);
                 }

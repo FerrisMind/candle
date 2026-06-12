@@ -2122,6 +2122,23 @@ fn smoke_int_cmp_where(device: &Device) -> Result<()> {
         cond.t()?.where_cond(&got_t, &alt_t)?.to_vec2::<i64>()?,
         strided_expected.to_vec2::<i64>()?
     );
+
+    // Strided integer copy: transpose + contiguous must stay on the GPU.
+    let u8_src = Tensor::from_slice(&[1u8, 2, 3, 4, 250, 6], (2, 3), device)?;
+    assert_eq!(
+        u8_src.t()?.contiguous()?.to_vec2::<u8>()?,
+        [[1, 4], [2, 250], [3, 6]]
+    );
+    let i64_src = Tensor::from_slice(&[-8_589_934_593i64, 2, 3, 4, -5, 6], (2, 3), device)?;
+    assert_eq!(
+        i64_src.t()?.contiguous()?.to_vec2::<i64>()?,
+        [[-8_589_934_593, 4], [2, -5], [3, 6]]
+    );
+    let u32_src = Tensor::from_slice(&[16_777_217u32, 2, 3, 4, 5, 6], (2, 3), device)?;
+    assert_eq!(
+        u32_src.t()?.contiguous()?.to_vec2::<u32>()?,
+        [[16_777_217, 4], [2, 5], [3, 6]]
+    );
     Ok(())
 }
 

@@ -2087,6 +2087,163 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
+    // Strided same-dtype copy for dtypes WGSL cannot address as scalars:
+    // U8 elements are packed four-per-u32-word, I64 elements are lo/hi word
+    // pairs. The destination is written contiguously starting at dst_offset.
+    fn run_emulated_strided_copy_into(
+        &self,
+        layout: &Layout,
+        dst: &Self,
+        dst_offset: usize,
+    ) -> Result<()> {
+        let count = layout.shape().elem_count();
+        if count == 0 {
+            return Ok(());
+        }
+        let (src_dims, src_strides) = dims4(layout)?;
+        let params = CopyParams {
+            ne: count.try_into()?,
+            offset_src: layout.start_offset().try_into()?,
+            offset_dst: dst_offset.try_into()?,
+            stride_src0: src_strides[0],
+            stride_src1: src_strides[1],
+            stride_src2: src_strides[2],
+            stride_src3: src_strides[3],
+            stride_dst0: 1,
+            stride_dst1: 0,
+            stride_dst2: 0,
+            stride_dst3: 0,
+            src_ne0: src_dims[0],
+            src_ne1: src_dims[1],
+            src_ne2: src_dims[2],
+            dst_ne0: src_dims[0],
+            dst_ne1: src_dims[1],
+            dst_ne2: src_dims[2],
+        };
+        let body = match self.dtype {
+            DType::U8 => {
+                // One thread per packed output word: gathers four strided
+                // source bytes, so concurrent threads never share a word.
+                // Bytes past params.ne in the final word are merged from the
+                // existing destination so neighbors in dst are not clobbered.
+                r#"
+    let base = gid.x * 4u;
+    if (base >= params.ne) { return; }
+    let word_idx = params.offset_dst / 4u + gid.x;
+    var w: u32 = 0u;
+    for (var lane: u32 = 0u; lane < 4u; lane = lane + 1u) {
+        let logical_idx = base + lane;
+        var b: u32;
+        if (logical_idx < params.ne) {
+            let e = params.offset_src + src_index(logical_idx);
+            b = (src[e / 4u] >> (8u * (e % 4u))) & 0xffu;
+        } else {
+            b = (dst[word_idx] >> (8u * lane)) & 0xffu;
+        }
+        w = w | (b << (8u * lane));
+    }
+    dst[word_idx] = w;
+"#
+            }
+            DType::I64 => {
+                r#"
+    if (gid.x >= params.ne) { return; }
+    let e = params.offset_src + src_index(gid.x);
+    let d = params.offset_dst + gid.x;
+    dst[2u * d] = src[2u * e];
+    dst[2u * d + 1u] = src[2u * e + 1u];
+"#
+            }
+            other => {
+                return Err(Error::UnsupportedDTypeForOp(other, "wgpu emulated strided copy").bt())
+            }
+        };
+        let shader = format!(
+            r#"
+struct Params {{
+    ne: u32,
+    offset_src: u32,
+    offset_dst: u32,
+    stride_src0: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    stride_dst0: u32,
+    stride_dst1: u32,
+    stride_dst2: u32,
+    stride_dst3: u32,
+    src_ne0: u32,
+    src_ne1: u32,
+    src_ne2: u32,
+    dst_ne0: u32,
+    dst_ne1: u32,
+    dst_ne2: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+fn src_index(_i: u32) -> u32 {{
+    var i = _i;
+    let i3 = i / (params.src_ne2 * params.src_ne1 * params.src_ne0);
+    i = i % (params.src_ne2 * params.src_ne1 * params.src_ne0);
+    let i2 = i / (params.src_ne1 * params.src_ne0);
+    i = i % (params.src_ne1 * params.src_ne0);
+    let i1 = i / params.src_ne0;
+    let i0 = i % params.src_ne0;
+    return i0 * params.stride_src0 + i1 * params.stride_src1 +
+           i2 * params.stride_src2 + i3 * params.stride_src3;
+}}
+
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{{body}}}
+"#
+        );
+        if self.dtype == DType::U8 && (layout.start_offset() % 4 != 0 || dst_offset % 4 != 0) {
+            // Byte-level sub-word offsets would force read-modify-write on
+            // shared destination words; keep that case on the safe path.
+            return Err(unsupported("emulated u8 copy with sub-word offset"));
+        }
+        let work_items = match self.dtype {
+            DType::U8 => count.div_ceil(4),
+            _ => count,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-emulated-copy-params"),
+                size: std::mem::size_of::<CopyParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+        let workgroups: u32 = work_items.try_into().map(|v: u32| v.div_ceil(WG_SIZE))?;
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-emulated-copy",
+        )?;
+        Ok(())
+    }
+
     fn run_copy_into(
         &self,
         layout: &Layout,
@@ -5184,9 +5341,27 @@ impl BackendStorage for WgpuStorage {
                 return Ok(());
             }
             match self.dtype {
-                DType::F32 | DType::F16 => {
+                DType::F32 | DType::F16 | DType::U32 | DType::I32 => {
                     let shader = copy_shader(self.dtype, self.dtype)?;
                     match self.run_copy_into(src_l, dst, dst_offset, &shader) {
+                        Ok(()) => return Ok(()),
+                        Err(err) if should_cpu_fallback(&err) => {
+                            let src_cpu = self.to_cpu_storage()?;
+                            let mut dst_cpu = dst.to_cpu_storage()?;
+                            <CpuStorage as BackendStorage>::copy_strided_src(
+                                &src_cpu,
+                                &mut dst_cpu,
+                                dst_offset,
+                                src_l,
+                            )?;
+                            *dst = dst.device.storage_from_cpu_storage(&dst_cpu)?;
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                DType::U8 | DType::I64 => {
+                    match self.run_emulated_strided_copy_into(src_l, dst, dst_offset) {
                         Ok(()) => return Ok(()),
                         Err(err) if should_cpu_fallback(&err) => {
                             let src_cpu = self.to_cpu_storage()?;

@@ -749,3 +749,11 @@ The highest-value next Vulkan performance step is now concrete:
   - `backend_smoke_wgpu_int_cmp_where_native_only`
   - cases include mantissa-overflow values (`16_777_217u32`), sign boundaries, > 2^33 i64 magnitudes, strided/transposed views, and CPU-reference comparison for where_cond over all three integer dtypes.
 - Full regression state: 31 Vulkan + 21 wgpu backend smoke tests pass on RTX 3060.
+
+## Progress Update: Integer Strided Copy Closure (`contiguous` on u8/u32/i64 views)
+
+- `copy_strided_src` for non-contiguous layouts previously routed every non-float dtype through a CPU download/upload roundtrip on both backends. This is the path behind `Tensor::contiguous()` on transposed/sliced integer tensors (token-id manipulation, masks, KV-cache bookkeeping).
+- Vulkan closure: new same-dtype `convert_u8_u8` / `convert_u32_u32` / `convert_i64_i64` SPIR-V variants compiled from the existing Candle-owned `convert.comp` (strided-aware ggml unary header); `copy_spirv` routes the identity pairs and `copy_strided_src` accepts `U8/U32/I64` on the shader path.
+- WGPU closure: `run_emulated_strided_copy_into` generates a WGSL kernel for the dtypes WGSL cannot address as scalars — U8 gathers four strided bytes per packed output word (with read-merge of trailing bytes in the final word so neighbors are never clobbered), I64 copies lo/hi word pairs; U32/I32 reuse the existing `cpy.wgsl` matrix.
+- Test closure folded into `backend_smoke_{wgpu,vulkan}_int_cmp_where_native_only`: `t().contiguous()` round-trips for u8 (>127 values), u32 (mantissa-overflow 16_777_217), and i64 (negative sub-2^33) all asserted against exact expected values under native-required accounting.
+- Regression state on RTX 3060: 31 Vulkan + 21 wgpu smoke tests, `gpu_property_tests` (both backends), `gpu_metamorphic_tests` (both backends) all pass.

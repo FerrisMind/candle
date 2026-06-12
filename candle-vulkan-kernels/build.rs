@@ -279,6 +279,21 @@ fn generate_candle_spirv_modules(
             &["A_TYPE=float16_t", "D_TYPE=int64_t", "DST_SAT_I64"],
         ),
         (
+            "convert_u8_u8",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=uint8_t", "D_TYPE=uint8_t"],
+        ),
+        (
+            "convert_u32_u32",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=uint", "D_TYPE=uint"],
+        ),
+        (
+            "convert_i64_i64",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=int64_t", "D_TYPE=int64_t"],
+        ),
+        (
             "convert_u8_f32",
             candle_shaders_dir.join("convert.comp"),
             &["A_TYPE=uint8_t", "D_TYPE=float"],
