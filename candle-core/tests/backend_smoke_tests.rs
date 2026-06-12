@@ -1672,6 +1672,14 @@ fn smoke_f32_argsort_last_dim(device: &Device) -> Result<()> {
         [[1.0, 2.0, 3.0], [5.0, 7.0, 10.0]]
     );
 
+    // Top-k composition (arg_sort + narrow + contiguous + gather), the chain
+    // used by MoE expert routing. Must stay GPU-resident end to end.
+    let desc_idx = xs.arg_sort_last_dim(false)?;
+    let topk_idx = desc_idx.narrow(1, 0, 2)?.contiguous()?;
+    let topk_vals = xs.gather(&topk_idx, 1)?;
+    assert_eq!(topk_idx.to_vec2::<u32>()?, [[0, 2], [0, 2]]);
+    assert_eq!(topk_vals.to_vec2::<f32>()?, [[3.0, 2.0], [10.0, 7.0]]);
+
     let large_values = (0..300).rev().map(|v| v as f32).collect::<Vec<_>>();
     let large = Tensor::from_vec(large_values, (1, 300), device)?;
     let asc = large.arg_sort_last_dim(true)?.to_vec2::<u32>()?;
