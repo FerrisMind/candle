@@ -796,3 +796,20 @@ CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX
 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' \
   cargo test --release -p candle-transformers --features wgpu gpu_model_matrix_wgpu -- --ignored --exact --nocapture
 ```
+
+## Session Summary: Integer DType Parity Closure (wgpu + Vulkan, RTX 3060)
+
+This session closed the largest remaining cluster of `partial`/`fallback` parity rows: the integer dtype paths (`u8`/`u32`/`i64`) that CUDA supports natively but both GPU backends previously routed through CPU. All work is native-required-verified on the RTX 3060 (fallback count 0) and leaves the five-model release matrix green on both backends.
+
+Closed this session (each a separate commit, with native-required smoke tests on both backends):
+1. `Tensor::to_device` transfer parity (CPU<->GPU, same-device, cross-backend host staging; BF16->F16 dtype honesty).
+2. Integer `cmp` / `where_cond` (u8/u32/i64) — source-typed compares, packed-byte U8 and lo/hi-word I64 WGSL paths.
+3. Integer strided copy (`contiguous()` on transposed/sliced u8/u32/i64 views) — Vulkan identity convert variants, wgpu emulated strided copy.
+4. Integer binary ops (u8/u32/i64 add/sub/mul/div/max/min) — Vulkan opcode-switched `binary_int.comp`, wgpu generated WGSL with i64 carry/limb-multiply.
+5. Integer reductions (u8/u32/i64 sum/max/min/argmax/argmin) — Vulkan `sum_rows_int`/`reduce_extrema_int`/`argextrema_int` shaders, wgpu generated WGSL; multi-dim + non-last-dim permute paths.
+
+New Candle-owned Vulkan shaders: `binary_int.comp`, `sum_rows_int.comp`, `reduce_extrema_int.comp`, `argextrema_int.comp`, plus integer variants of `cmp.comp`/`where_u8.comp`/`convert.comp`.
+
+Parity matrix rows moved from `partial`/`gap` to `closed for core dtypes`: binary/compare/select, reductions. The cross-cutting "Error behavior and CPU fallback policy" row advances correspondingly (fewer silent CPU recoveries; all five real-model cases remain fallback 0).
+
+Remaining open (tracked, not final): bf16-native arithmetic (currently F16-remapped), F64/I16 compute dtypes (no CUDA-visible model path exercises them yet), native f16 reduction accumulation (avoids an f32 materialization), full sort/top-k beyond argsort.
