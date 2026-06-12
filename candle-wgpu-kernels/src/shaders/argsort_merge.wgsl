@@ -1,11 +1,11 @@
 @group(0) @binding(0)
-var<storage, read_write> src: array<f32>;
+var<storage, read_write> src: array<SRC_TYPE>;
 
 @group(0) @binding(1)
-var<storage, read_write> idx_in: array<i32>;
+var<storage, read_write> idx_in: array<u32>;
 
 @group(0) @binding(2)
-var<storage, read_write> idx_out: array<i32>;
+var<storage, read_write> idx_out: array<u32>;
 
 struct Params {
     offset_src: u32, // in elements
@@ -38,9 +38,9 @@ struct Params {
 @group(0) @binding(3)
 var<uniform> params: Params;
 
-fn take_left(a_idx: i32, b_idx: i32, row_base: u32) -> bool {
-    let a_val = src[row_base + u32(a_idx)];
-    let b_val = src[row_base + u32(b_idx)];
+fn take_left(a_idx: u32, b_idx: u32, row_base: u32) -> bool {
+    let a_val = src[row_base + a_idx];
+    let b_val = src[row_base + b_idx];
 #if ORDER == 0
     return a_val <= b_val;
 #else

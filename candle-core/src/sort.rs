@@ -247,7 +247,7 @@ impl crate::CustomOp1 for ArgSort {
         storage: &crate::WgpuStorage,
         layout: &crate::Layout,
     ) -> Result<(crate::WgpuStorage, crate::Shape)> {
-        let dst = storage.argsort_last_dim_f32(layout, self.asc, self.last_dim)?;
+        let dst = storage.argsort_last_dim(layout, self.asc, self.last_dim)?;
         Ok((dst, layout.shape().clone()))
     }
 
@@ -257,7 +257,7 @@ impl crate::CustomOp1 for ArgSort {
         storage: &crate::VulkanStorage,
         layout: &crate::Layout,
     ) -> Result<(crate::VulkanStorage, crate::Shape)> {
-        let dst = storage.argsort_last_dim_f32(layout, self.asc, self.last_dim)?;
+        let dst = storage.argsort_last_dim(layout, self.asc, self.last_dim)?;
         Ok((dst, layout.shape().clone()))
     }
 }

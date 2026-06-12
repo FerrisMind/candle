@@ -1,7 +1,6 @@
 use crate::backend::BackendDevice;
 use crate::cpu_backend::CpuDevice;
 use crate::{CpuStorage, DType, Result, Shape, Storage, WithDType};
-use half::f16;
 
 /// A `DeviceLocation` represents a physical device whereas multiple `Device`
 /// can live on the same location (typically for cuda devices).
@@ -237,25 +236,11 @@ impl<S: WithDType> NdArray for Vec<Vec<Vec<Vec<S>>>> {
 
 impl Device {
     pub(crate) fn normalize_dtype_for_device(&self, dtype: DType) -> DType {
-        if dtype == DType::BF16 && matches!(self, Self::Wgpu(_) | Self::Vulkan(_)) {
-            DType::F16
-        } else {
-            dtype
-        }
+        dtype
     }
 
     pub(crate) fn normalize_cpu_storage_for_device(&self, storage: CpuStorage) -> CpuStorage {
-        match storage {
-            CpuStorage::BF16(values) if matches!(self, Self::Wgpu(_) | Self::Vulkan(_)) => {
-                CpuStorage::F16(
-                    values
-                        .into_iter()
-                        .map(|value| f16::from_f32(value.to_f32()))
-                        .collect(),
-                )
-            }
-            storage => storage,
-        }
+        storage
     }
 
     pub fn new_cuda(ordinal: usize) -> Result<Self> {
@@ -574,18 +559,6 @@ impl Device {
     }
 
     pub(crate) fn storage_from_slice<D: WithDType>(&self, data: &[D]) -> Result<Storage> {
-        if D::DTYPE == DType::BF16 && matches!(self, Device::Wgpu(_) | Device::Vulkan(_)) {
-            let storage = self.normalize_cpu_storage_for_device(D::to_cpu_storage(data));
-            return match self {
-                Device::Wgpu(device) => Ok(Storage::Wgpu(
-                    device.storage_from_cpu_storage_owned(storage)?,
-                )),
-                Device::Vulkan(device) => Ok(Storage::Vulkan(
-                    device.storage_from_cpu_storage_owned(storage)?,
-                )),
-                _ => unreachable!(),
-            };
-        }
         match self {
             Device::Cpu => Ok(Storage::Cpu(data.to_cpu_storage())),
             Device::Cuda(device) => {

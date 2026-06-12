@@ -468,10 +468,6 @@ impl Storage {
     }
 
     pub(crate) fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
-        let dtype = match self {
-            Self::Wgpu(_) | Self::Vulkan(_) if dtype == DType::BF16 => DType::F16,
-            _ => dtype,
-        };
         match self {
             Storage::Cpu(storage) => {
                 let storage = storage.to_dtype(layout, dtype)?;

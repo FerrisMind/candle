@@ -1,0 +1,91 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const int BLOCK_SIZE = 1024;
+layout(constant_id = 1) const int NCOLS_PADDED_LOG2 = 10;
+#define ASC 0
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer A { int64_t data_a[]; };
+layout(binding = 2) writeonly buffer D { uint data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint ncols;
+    uint ncols_padded;
+    uint ncols_padded_log2;
+    uint nrows;
+    uint order;
+    uint outer_start;
+    uint outer_end;
+    uint inner_start;
+    uint inner_end;
+} p;
+
+struct SortPair {
+    uint idx;
+    int64_t val;
+};
+
+shared SortPair dst_row[BLOCK_SIZE];
+
+bool should_swap(const SortPair a, const SortPair b, const bool needs_bounds_check) {
+    const bool a_oob = needs_bounds_check ? a.idx >= p.ncols : false;
+    const bool b_oob = needs_bounds_check ? b.idx >= p.ncols : false;
+    return a_oob || (!b_oob && a.val > b.val);
+}
+
+void argsort(bool needs_bounds_check, const uint row) {
+    const int col = int(gl_LocalInvocationID.x);
+    const uint row_offset = row * p.ncols;
+
+    dst_row[col].idx = uint(col);
+    dst_row[col].val = col < p.ncols ? data_a[row_offset + uint(col)] : int64_t(0);
+    barrier();
+
+    uint num_outer_loop_iters = NCOLS_PADDED_LOG2;
+    [[unroll]] for (uint k = 2, outer_idx = 0; outer_idx < num_outer_loop_iters; k *= 2, outer_idx++) {
+        uint num_inner_loop_iters = outer_idx + 1;
+        [[unroll]] for (uint j = k / 2, inner_idx = 0; inner_idx < num_inner_loop_iters; j /= 2, inner_idx++) {
+            const int ixj = int(col ^ j);
+
+            int idx_0 = (col & k) == 0 ? col : ixj;
+            int idx_1 = (col & k) == 0 ? ixj : col;
+
+            SortPair sh_idx_0 = dst_row[idx_0];
+            SortPair sh_idx_1 = dst_row[idx_1];
+
+            if (should_swap(sh_idx_0, sh_idx_1, needs_bounds_check) && ixj > col) {
+                dst_row[idx_0] = sh_idx_1;
+                dst_row[idx_1] = sh_idx_0;
+            }
+
+            barrier();
+        }
+    }
+
+    if (col < p.ncols) {
+        if (p.order == ASC) {
+            data_d[row_offset + uint(col)] = dst_row[col].idx;
+        } else {
+            data_d[row_offset + p.ncols - uint(col) - 1] = dst_row[col].idx;
+        }
+    }
+}
+
+void main() {
+    if (p.ncols == BLOCK_SIZE) {
+        uint row = gl_WorkGroupID.y;
+        while (row < p.nrows) {
+            argsort(false, row);
+            row += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
+        }
+    } else {
+        uint row = gl_WorkGroupID.y;
+        while (row < p.nrows) {
+            argsort(true, row);
+            row += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
+        }
+    }
+}

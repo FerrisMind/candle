@@ -1,0 +1,145 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#pragma use_vulkan_memory_model
+
+layout(constant_id = 0) const int BLOCK_SIZE = 1024;
+layout(constant_id = 1) const int WG_UNROLL_FACTOR = 2;
+#define ASC 0
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+struct SortPair {
+    uint idx;
+    uint lo;
+    uint hi;
+};
+
+layout(binding = 0) readonly buffer A { uint data_a[]; };
+layout(binding = 1) workgroupcoherent buffer B { SortPair tmp_idx[]; };
+layout(binding = 2) workgroupcoherent buffer D { uint data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint ncols;
+    uint ncols_padded;
+    uint ncols_padded_log2;
+    uint nrows;
+    uint order;
+    uint outer_start;
+    uint outer_end;
+    uint inner_start;
+    uint inner_end;
+} p;
+
+bool f64_lt(const SortPair a, const SortPair b) {
+    const bool a_neg = (a.hi & 0x80000000u) != 0;
+    const bool b_neg = (b.hi & 0x80000000u) != 0;
+    if (a_neg != b_neg) {
+        return a_neg;
+    }
+    if (a.hi == b.hi) {
+        if (a.lo == b.lo) {
+            return false;
+        }
+        return a_neg ? a.lo > b.lo : a.lo < b.lo;
+    }
+    return a_neg ? a.hi > b.hi : a.hi < b.hi;
+}
+
+bool f64_gt(const SortPair a, const SortPair b) {
+    return f64_lt(b, a);
+}
+
+bool should_swap(const SortPair a, const SortPair b, const bool needs_bounds_check) {
+    const bool a_oob = needs_bounds_check ? a.idx >= p.ncols : false;
+    const bool b_oob = needs_bounds_check ? b.idx >= p.ncols : false;
+    return a_oob || (!b_oob && f64_gt(a, b));
+}
+
+void argsort(bool needs_bounds_check, const uint row) {
+    int col = int(gl_GlobalInvocationID.x);
+    col = (col % BLOCK_SIZE) + (col / BLOCK_SIZE) * BLOCK_SIZE * WG_UNROLL_FACTOR;
+
+    const uint row_offset = row * p.ncols;
+    uint idx_offset = row * p.ncols_padded;
+
+    bool need_barrier = false;
+
+    if (p.outer_start == 0 && p.inner_start == 0) {
+        [[unroll]] for (int u = 0; u < WG_UNROLL_FACTOR; ++u) {
+            uint c = uint(u * BLOCK_SIZE + col);
+            if (c < p.ncols_padded) {
+                tmp_idx[idx_offset + c].idx = c;
+                if (c < p.ncols) {
+                    const uint pos = 2u * (row_offset + c);
+                    tmp_idx[idx_offset + c].lo = data_a[pos];
+                    tmp_idx[idx_offset + c].hi = data_a[pos + 1u];
+                } else {
+                    tmp_idx[idx_offset + c].lo = 0u;
+                    tmp_idx[idx_offset + c].hi = 0u;
+                }
+            }
+        }
+        need_barrier = true;
+    }
+
+    [[unroll]] for (uint outer_idx = p.outer_start, k = (2 << outer_idx); outer_idx < p.outer_end; k *= 2, outer_idx++) {
+        uint inner_end = min(p.inner_end, outer_idx + 1);
+        for (uint j = k >> (p.inner_start + 1), inner_idx = p.inner_start; inner_idx < inner_end; j /= 2, inner_idx++) {
+            if (need_barrier) {
+                controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
+            }
+            need_barrier = true;
+            [[unroll]] for (int u = 0; u < WG_UNROLL_FACTOR; ++u) {
+                int c = u * BLOCK_SIZE + col;
+                const int ixj = int(c ^ int(j));
+
+                if (ixj < c) {
+                    continue;
+                }
+
+                int idx_0 = (c & int(k)) == 0 ? c : ixj;
+                int idx_1 = (c & int(k)) == 0 ? ixj : c;
+
+                SortPair sh_idx_0 = tmp_idx[idx_offset + uint(idx_0)];
+                SortPair sh_idx_1 = tmp_idx[idx_offset + uint(idx_1)];
+
+                if (should_swap(sh_idx_0, sh_idx_1, needs_bounds_check)) {
+                    tmp_idx[idx_offset + uint(idx_0)] = sh_idx_1;
+                    tmp_idx[idx_offset + uint(idx_1)] = sh_idx_0;
+                }
+            }
+        }
+    }
+
+    if (p.outer_end == p.ncols_padded_log2 &&
+        p.inner_end >= p.ncols_padded_log2 + 1) {
+        controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
+        [[unroll]] for (int u = 0; u < WG_UNROLL_FACTOR; ++u) {
+            uint c = uint(u * BLOCK_SIZE + col);
+            if (c < p.ncols) {
+                if (p.order == ASC) {
+                    data_d[row_offset + c] = tmp_idx[idx_offset + c].idx;
+                } else {
+                    data_d[row_offset + p.ncols - c - 1] = tmp_idx[idx_offset + c].idx;
+                }
+            }
+        }
+    }
+}
+
+void main() {
+    if (p.ncols == p.ncols_padded) {
+        uint row = gl_WorkGroupID.y;
+        while (row < p.nrows) {
+            argsort(false, row);
+            row += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
+        }
+    } else {
+        uint row = gl_WorkGroupID.y;
+        while (row < p.nrows) {
+            argsort(true, row);
+            row += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
+        }
+    }
+}

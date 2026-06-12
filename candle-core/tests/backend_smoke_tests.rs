@@ -36,6 +36,18 @@ fn assert_expected_backend_name(actual: &str, backend: &str, env_var: &str) {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn assert_permutation(indices: &[u32], len: usize) {
+    assert_eq!(indices.len(), len);
+    let mut seen = vec![false; len];
+    for &idx in indices {
+        let idx = idx as usize;
+        assert!(idx < len, "index {idx} is out of bounds for length {len}");
+        assert!(!seen[idx], "index {idx} appears more than once");
+        seen[idx] = true;
+    }
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 macro_rules! backend_family_test {
     ($(#[$meta:meta])* $name:ident, $backend:expr, $runner:ident, $family:ident) => {
         $(#[$meta])*
@@ -933,8 +945,7 @@ fn smoke_f32_matmul_shape_sweep(device: &Device) -> Result<()> {
 
 /// Full dtype-conversion matrix over the CUDA-parity dtype set. Each pair must
 /// run natively (no recorded CPU fallback) and match the CPU `as`-cast
-/// semantics. BF16 destinations are remapped to F16 by the storage layer on
-/// these backends, which the CPU reference mirrors here.
+/// semantics, including BF16-preserving destination storage.
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_dtype_conversion_matrix_native_only(device: &Device) -> Result<()> {
     let cpu = Device::Cpu;
@@ -951,14 +962,13 @@ fn smoke_dtype_conversion_matrix_native_only(device: &Device) -> Result<()> {
         for dst in dtypes {
             let dev_t = Tensor::from_vec(vals.clone(), 64, device)?.to_dtype(src)?;
             let cpu_t = Tensor::from_vec(vals.clone(), 64, &cpu)?.to_dtype(src)?;
-            let dst_cpu = if dst == DType::BF16 { DType::F16 } else { dst };
             let got = dev_t
                 .to_dtype(dst)?
                 .to_dtype(DType::F32)?
                 .flatten_all()?
                 .to_vec1::<f32>()?;
             let want = cpu_t
-                .to_dtype(dst_cpu)?
+                .to_dtype(dst)?
                 .to_dtype(DType::F32)?
                 .flatten_all()?
                 .to_vec1::<f32>()?;
@@ -1252,7 +1262,7 @@ fn smoke_to_device_transfers(device: &Device) -> Result<()> {
         ]
     );
 
-    // BF16 normalizes to F16 on wgpu/Vulkan; dtype must follow the storage.
+    // BF16 upload/download preserves the dtype and raw 16-bit payload.
     let bf16_cpu = Tensor::from_slice(
         &[
             bf16::from_f32(0.25),
@@ -1264,9 +1274,15 @@ fn smoke_to_device_transfers(device: &Device) -> Result<()> {
         &cpu,
     )?;
     let bf16_gpu = bf16_cpu.to_device(device)?;
-    assert_eq!(bf16_gpu.dtype(), DType::F16);
-    let bf16_back = bf16_gpu.to_device(&cpu)?.to_dtype(DType::F32)?;
-    assert_eq!(bf16_back.to_vec2::<f32>()?, [[0.25, -1.0], [3.0, -8.0]]);
+    assert_eq!(bf16_gpu.dtype(), DType::BF16);
+    let bf16_back = bf16_gpu.to_device(&cpu)?;
+    assert_eq!(
+        bf16_back.to_vec2::<bf16>()?,
+        [
+            [bf16::from_f32(0.25), bf16::from_f32(-1.0)],
+            [bf16::from_f32(3.0), bf16::from_f32(-8.0)]
+        ]
+    );
     Ok(())
 }
 
@@ -1328,31 +1344,31 @@ fn smoke_non_f32_upload_download(device: &Device) -> Result<()> {
         (2, 2),
         device,
     )?;
-    assert_eq!(bf16s.dtype(), DType::F16);
+    assert_eq!(bf16s.dtype(), DType::BF16);
     assert_eq!(
-        bf16s.to_vec2::<f16>()?,
+        bf16s.to_vec2::<bf16>()?,
         [
-            [f16::from_f32(0.5), f16::from_f32(1.5)],
-            [f16::from_f32(-2.0), f16::from_f32(4.0)]
+            [bf16::from_f32(0.5), bf16::from_f32(1.5)],
+            [bf16::from_f32(-2.0), bf16::from_f32(4.0)]
         ]
     );
     let bf16_zeros = Tensor::zeros((2, 2), DType::BF16, device)?;
-    assert_eq!(bf16_zeros.dtype(), DType::F16);
+    assert_eq!(bf16_zeros.dtype(), DType::BF16);
     assert_eq!(
-        bf16_zeros.to_vec2::<f16>()?,
+        bf16_zeros.to_vec2::<bf16>()?,
         [
-            [f16::from_f32(0.0), f16::from_f32(0.0)],
-            [f16::from_f32(0.0), f16::from_f32(0.0)]
+            [bf16::from_f32(0.0), bf16::from_f32(0.0)],
+            [bf16::from_f32(0.0), bf16::from_f32(0.0)]
         ]
     );
     let f32_to_bf16 =
         Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (2, 2), device)?.to_dtype(DType::BF16)?;
-    assert_eq!(f32_to_bf16.dtype(), DType::F16);
+    assert_eq!(f32_to_bf16.dtype(), DType::BF16);
     assert_eq!(
-        f32_to_bf16.to_vec2::<f16>()?,
+        f32_to_bf16.to_vec2::<bf16>()?,
         [
-            [f16::from_f32(1.0), f16::from_f32(2.0)],
-            [f16::from_f32(3.0), f16::from_f32(4.0)]
+            [bf16::from_f32(1.0), bf16::from_f32(2.0)],
+            [bf16::from_f32(3.0), bf16::from_f32(4.0)]
         ]
     );
     Ok(())
@@ -1680,6 +1696,302 @@ fn smoke_f32_argsort_last_dim(device: &Device) -> Result<()> {
     assert_eq!(topk_idx.to_vec2::<u32>()?, [[0, 2], [0, 2]]);
     assert_eq!(topk_vals.to_vec2::<f32>()?, [[3.0, 2.0], [10.0, 7.0]]);
 
+    let f16_values = [
+        f16::from_f32(0.5),
+        f16::from_f32(-2.0),
+        f16::from_f32(4.0),
+        f16::from_f32(1.25),
+        f16::from_f32(3.5),
+        f16::from_f32(-0.75),
+        f16::from_f32(7.0),
+        f16::from_f32(2.25),
+    ];
+    let f16s = Tensor::from_slice(&f16_values, (2, 4), device)?;
+    let f16s_cpu = Tensor::from_slice(&f16_values, (2, 4), &Device::Cpu)?;
+    let expected_asc = f16s_cpu.arg_sort_last_dim(true)?.to_vec2::<u32>()?;
+    let expected_desc = f16s_cpu.arg_sort_last_dim(false)?.to_vec2::<u32>()?;
+    assert_eq!(
+        f16s.arg_sort_last_dim(true)?.to_vec2::<u32>()?,
+        expected_asc
+    );
+    assert_eq!(
+        f16s.arg_sort_last_dim(false)?.to_vec2::<u32>()?,
+        expected_desc
+    );
+    let (sorted_f16, sorted_idx) = f16s.sort_last_dim(true)?;
+    let (expected_sorted_f16, expected_sorted_idx) = f16s_cpu.sort_last_dim(true)?;
+    assert_eq!(
+        sorted_idx.to_vec2::<u32>()?,
+        expected_sorted_idx.to_vec2::<u32>()?
+    );
+    assert_eq!(
+        sorted_f16.to_vec2::<f16>()?,
+        expected_sorted_f16.to_vec2::<f16>()?
+    );
+
+    let bf16_values = [
+        bf16::from_f32(0.5),
+        bf16::from_f32(-2.0),
+        bf16::from_f32(4.0),
+        bf16::from_f32(1.25),
+        bf16::from_f32(3.5),
+        bf16::from_f32(-0.75),
+        bf16::from_f32(7.0),
+        bf16::from_f32(2.25),
+    ];
+    let bf16s = Tensor::from_slice(&bf16_values, (2, 4), device)?;
+    let bf16s_cpu = Tensor::from_slice(&bf16_values, (2, 4), &Device::Cpu)?;
+    let expected_asc = bf16s_cpu.arg_sort_last_dim(true)?.to_vec2::<u32>()?;
+    let expected_desc = bf16s_cpu.arg_sort_last_dim(false)?.to_vec2::<u32>()?;
+    assert_eq!(
+        bf16s.arg_sort_last_dim(true)?.to_vec2::<u32>()?,
+        expected_asc
+    );
+    assert_eq!(
+        bf16s.arg_sort_last_dim(false)?.to_vec2::<u32>()?,
+        expected_desc
+    );
+    let (sorted_bf16, sorted_idx) = bf16s.sort_last_dim(true)?;
+    let (expected_sorted_bf16, expected_sorted_idx) = bf16s_cpu.sort_last_dim(true)?;
+    assert_eq!(
+        sorted_idx.to_vec2::<u32>()?,
+        expected_sorted_idx.to_vec2::<u32>()?
+    );
+    assert_eq!(
+        sorted_bf16.to_vec2::<bf16>()?,
+        expected_sorted_bf16.to_vec2::<bf16>()?
+    );
+
+    let u8_values = [255u8, 3, 128, 0, 42, 41, 200, 7];
+    let u8s = Tensor::from_slice(&u8_values, (2, 4), device)?;
+    let u8s_cpu = Tensor::from_slice(&u8_values, (2, 4), &Device::Cpu)?;
+    let expected_asc = u8s_cpu.arg_sort_last_dim(true)?.to_vec2::<u32>()?;
+    let expected_desc = u8s_cpu.arg_sort_last_dim(false)?.to_vec2::<u32>()?;
+    assert_eq!(u8s.arg_sort_last_dim(true)?.to_vec2::<u32>()?, expected_asc);
+    assert_eq!(
+        u8s.arg_sort_last_dim(false)?.to_vec2::<u32>()?,
+        expected_desc
+    );
+    let (sorted_u8, sorted_idx) = u8s.sort_last_dim(true)?;
+    let (expected_sorted_u8, expected_sorted_idx) = u8s_cpu.sort_last_dim(true)?;
+    assert_eq!(
+        sorted_idx.to_vec2::<u32>()?,
+        expected_sorted_idx.to_vec2::<u32>()?
+    );
+    assert_eq!(
+        sorted_u8.to_vec2::<u8>()?,
+        expected_sorted_u8.to_vec2::<u8>()?
+    );
+
+    let u32_values = [
+        16_777_217u32,
+        16_777_216,
+        4_000_000_000,
+        3,
+        3_000_000_001,
+        3_000_000_000,
+        42,
+        u32::MAX,
+    ];
+    let u32s = Tensor::from_slice(&u32_values, (2, 4), device)?;
+    let u32s_cpu = Tensor::from_slice(&u32_values, (2, 4), &Device::Cpu)?;
+    let expected_asc = u32s_cpu.arg_sort_last_dim(true)?.to_vec2::<u32>()?;
+    let expected_desc = u32s_cpu.arg_sort_last_dim(false)?.to_vec2::<u32>()?;
+    assert_eq!(
+        u32s.arg_sort_last_dim(true)?.to_vec2::<u32>()?,
+        expected_asc
+    );
+    assert_eq!(
+        u32s.arg_sort_last_dim(false)?.to_vec2::<u32>()?,
+        expected_desc
+    );
+    let (sorted_u32, sorted_idx) = u32s.sort_last_dim(true)?;
+    let (expected_sorted_u32, expected_sorted_idx) = u32s_cpu.sort_last_dim(true)?;
+    assert_eq!(
+        sorted_idx.to_vec2::<u32>()?,
+        expected_sorted_idx.to_vec2::<u32>()?
+    );
+    assert_eq!(
+        sorted_u32.to_vec2::<u32>()?,
+        expected_sorted_u32.to_vec2::<u32>()?
+    );
+
+    let large_u32_values = (0..300)
+        .rev()
+        .map(|v| 3_000_000_000u32 + v as u32)
+        .collect::<Vec<_>>();
+    let large_u32 = Tensor::from_vec(large_u32_values.clone(), (1, 300), device)?;
+    let large_u32_cpu = Tensor::from_vec(large_u32_values, (1, 300), &Device::Cpu)?;
+    assert_eq!(
+        large_u32.arg_sort_last_dim(true)?.to_vec2::<u32>()?,
+        large_u32_cpu.arg_sort_last_dim(true)?.to_vec2::<u32>()?
+    );
+    let (large_sorted_u32, large_sorted_idx) = large_u32.sort_last_dim(true)?;
+    let (expected_large_sorted_u32, expected_large_sorted_idx) =
+        large_u32_cpu.sort_last_dim(true)?;
+    assert_eq!(
+        large_sorted_idx.to_vec2::<u32>()?,
+        expected_large_sorted_idx.to_vec2::<u32>()?
+    );
+    assert_eq!(
+        large_sorted_u32.to_vec2::<u32>()?,
+        expected_large_sorted_u32.to_vec2::<u32>()?
+    );
+
+    let i64_values = [
+        i64::MIN + 7,
+        -9_007_199_254_740_993,
+        0,
+        i64::MAX,
+        -1,
+        9_007_199_254_740_993,
+        42,
+        -42,
+    ];
+    let i64s = Tensor::from_slice(&i64_values, (2, 4), device)?;
+    let i64s_cpu = Tensor::from_slice(&i64_values, (2, 4), &Device::Cpu)?;
+    let expected_asc = i64s_cpu.arg_sort_last_dim(true)?.to_vec2::<u32>()?;
+    let expected_desc = i64s_cpu.arg_sort_last_dim(false)?.to_vec2::<u32>()?;
+    assert_eq!(
+        i64s.arg_sort_last_dim(true)?.to_vec2::<u32>()?,
+        expected_asc
+    );
+    assert_eq!(
+        i64s.arg_sort_last_dim(false)?.to_vec2::<u32>()?,
+        expected_desc
+    );
+    let (sorted_i64, sorted_idx) = i64s.sort_last_dim(true)?;
+    let (expected_sorted_i64, expected_sorted_idx) = i64s_cpu.sort_last_dim(true)?;
+    assert_eq!(
+        sorted_idx.to_vec2::<u32>()?,
+        expected_sorted_idx.to_vec2::<u32>()?
+    );
+    assert_eq!(
+        sorted_i64.to_vec2::<i64>()?,
+        expected_sorted_i64.to_vec2::<i64>()?
+    );
+
+    let large_i64_values = (0..300)
+        .rev()
+        .map(|v| {
+            let v = v as i64;
+            if v % 2 == 0 {
+                -4_500_000_000 - v
+            } else {
+                4_500_000_000 + v
+            }
+        })
+        .collect::<Vec<_>>();
+    let large_i64 = Tensor::from_vec(large_i64_values.clone(), (1, 300), device)?;
+    let large_i64_cpu = Tensor::from_vec(large_i64_values, (1, 300), &Device::Cpu)?;
+    assert_eq!(
+        large_i64.arg_sort_last_dim(true)?.to_vec2::<u32>()?,
+        large_i64_cpu.arg_sort_last_dim(true)?.to_vec2::<u32>()?
+    );
+    let (large_sorted_i64, large_sorted_idx) = large_i64.sort_last_dim(true)?;
+    let (expected_large_sorted_i64, expected_large_sorted_idx) =
+        large_i64_cpu.sort_last_dim(true)?;
+    assert_eq!(
+        large_sorted_idx.to_vec2::<u32>()?,
+        expected_large_sorted_idx.to_vec2::<u32>()?
+    );
+    assert_eq!(
+        large_sorted_i64.to_vec2::<i64>()?,
+        expected_large_sorted_i64.to_vec2::<i64>()?
+    );
+
+    let f64_values = [
+        -9_007_199_254_740_993.0f64,
+        -0.25,
+        1.0 / 3.0,
+        9_007_199_254_740_992.0,
+        -42.5,
+        42.25,
+        f64::MIN_POSITIVE,
+        -f64::MIN_POSITIVE,
+    ];
+    let f64s = Tensor::from_slice(&f64_values, (2, 4), device)?;
+    let f64s_cpu = Tensor::from_slice(&f64_values, (2, 4), &Device::Cpu)?;
+    let expected_asc = f64s_cpu.arg_sort_last_dim(true)?.to_vec2::<u32>()?;
+    let expected_desc = f64s_cpu.arg_sort_last_dim(false)?.to_vec2::<u32>()?;
+    assert_eq!(
+        f64s.arg_sort_last_dim(true)?.to_vec2::<u32>()?,
+        expected_asc
+    );
+    assert_eq!(
+        f64s.arg_sort_last_dim(false)?.to_vec2::<u32>()?,
+        expected_desc
+    );
+    let (sorted_f64, sorted_idx) = f64s.sort_last_dim(true)?;
+    let (expected_sorted_f64, expected_sorted_idx) = f64s_cpu.sort_last_dim(true)?;
+    assert_eq!(
+        sorted_idx.to_vec2::<u32>()?,
+        expected_sorted_idx.to_vec2::<u32>()?
+    );
+    assert_eq!(
+        sorted_f64.to_vec2::<f64>()?,
+        expected_sorted_f64.to_vec2::<f64>()?
+    );
+
+    let large_f64_values = (0..300)
+        .rev()
+        .map(|v| {
+            let v = v as f64;
+            if (v as u64).is_multiple_of(2) {
+                -4_500_000_000.0 - v - 0.25
+            } else {
+                4_500_000_000.0 + v + 0.5
+            }
+        })
+        .collect::<Vec<_>>();
+    let large_f64 = Tensor::from_vec(large_f64_values.clone(), (1, 300), device)?;
+    let large_f64_cpu = Tensor::from_vec(large_f64_values, (1, 300), &Device::Cpu)?;
+    assert_eq!(
+        large_f64.arg_sort_last_dim(true)?.to_vec2::<u32>()?,
+        large_f64_cpu.arg_sort_last_dim(true)?.to_vec2::<u32>()?
+    );
+    let (large_sorted_f64, large_sorted_idx) = large_f64.sort_last_dim(true)?;
+    let (expected_large_sorted_f64, expected_large_sorted_idx) =
+        large_f64_cpu.sort_last_dim(true)?;
+    assert_eq!(
+        large_sorted_idx.to_vec2::<u32>()?,
+        expected_large_sorted_idx.to_vec2::<u32>()?
+    );
+    assert_eq!(
+        large_sorted_f64.to_vec2::<f64>()?,
+        expected_large_sorted_f64.to_vec2::<f64>()?
+    );
+
+    let large_bf16_values = (0..300)
+        .rev()
+        .map(|v| {
+            let v = v as f32;
+            if (v as u32).is_multiple_of(2) {
+                bf16::from_f32(-1024.0 - v * 0.5)
+            } else {
+                bf16::from_f32(1024.0 + v * 0.25)
+            }
+        })
+        .collect::<Vec<_>>();
+    let large_bf16 = Tensor::from_vec(large_bf16_values.clone(), (1, 300), device)?;
+    let large_bf16_cpu = Tensor::from_vec(large_bf16_values.clone(), (1, 300), &Device::Cpu)?;
+    let (expected_large_sorted_bf16, _) = large_bf16_cpu.sort_last_dim(true)?;
+    let expected_large_sorted_bf16 = expected_large_sorted_bf16.to_vec2::<bf16>()?;
+    let large_bf16_indices = large_bf16.arg_sort_last_dim(true)?.to_vec2::<u32>()?;
+    assert_permutation(&large_bf16_indices[0], 300);
+    let indexed_large_bf16 = large_bf16_indices[0]
+        .iter()
+        .map(|&idx| large_bf16_values[idx as usize])
+        .collect::<Vec<_>>();
+    assert_eq!(indexed_large_bf16, expected_large_sorted_bf16[0]);
+    let (large_sorted_bf16, large_sorted_idx) = large_bf16.sort_last_dim(true)?;
+    let large_sorted_idx = large_sorted_idx.to_vec2::<u32>()?;
+    assert_permutation(&large_sorted_idx[0], 300);
+    assert_eq!(
+        large_sorted_bf16.to_vec2::<bf16>()?,
+        expected_large_sorted_bf16
+    );
+
     let large_values = (0..300).rev().map(|v| v as f32).collect::<Vec<_>>();
     let large = Tensor::from_vec(large_values, (1, 300), device)?;
     let asc = large.arg_sort_last_dim(true)?.to_vec2::<u32>()?;
@@ -1698,6 +2010,140 @@ fn smoke_f32_argsort_last_dim(device: &Device) -> Result<()> {
         let desc = vulkan_large.arg_sort_last_dim(false)?.to_vec2::<u32>()?;
         assert_eq!(&desc[0][..5], &[0, 1, 2, 3, 4]);
         assert_eq!(&desc[0][1095..], &[1095, 1096, 1097, 1098, 1099]);
+
+        let vulkan_large_u32_values = (0..1100)
+            .rev()
+            .map(|v| 3_000_000_000u32 + v as u32)
+            .collect::<Vec<_>>();
+        let vulkan_large_u32 =
+            Tensor::from_vec(vulkan_large_u32_values.clone(), (1, 1100), device)?;
+        let vulkan_large_u32_cpu =
+            Tensor::from_vec(vulkan_large_u32_values, (1, 1100), &Device::Cpu)?;
+        assert_eq!(
+            vulkan_large_u32.arg_sort_last_dim(true)?.to_vec2::<u32>()?,
+            vulkan_large_u32_cpu
+                .arg_sort_last_dim(true)?
+                .to_vec2::<u32>()?
+        );
+        let (vulkan_large_sorted_u32, vulkan_large_sorted_idx) =
+            vulkan_large_u32.sort_last_dim(true)?;
+        let (expected_vulkan_large_sorted_u32, expected_vulkan_large_sorted_idx) =
+            vulkan_large_u32_cpu.sort_last_dim(true)?;
+        assert_eq!(
+            vulkan_large_sorted_idx.to_vec2::<u32>()?,
+            expected_vulkan_large_sorted_idx.to_vec2::<u32>()?
+        );
+        assert_eq!(
+            vulkan_large_sorted_u32.to_vec2::<u32>()?,
+            expected_vulkan_large_sorted_u32.to_vec2::<u32>()?
+        );
+
+        let vulkan_large_i64_values = (0..1100)
+            .rev()
+            .map(|v| {
+                let v = v as i64;
+                if v % 2 == 0 {
+                    -4_500_000_000 - v
+                } else {
+                    4_500_000_000 + v
+                }
+            })
+            .collect::<Vec<_>>();
+        let vulkan_large_i64 =
+            Tensor::from_vec(vulkan_large_i64_values.clone(), (1, 1100), device)?;
+        let vulkan_large_i64_cpu =
+            Tensor::from_vec(vulkan_large_i64_values, (1, 1100), &Device::Cpu)?;
+        assert_eq!(
+            vulkan_large_i64.arg_sort_last_dim(true)?.to_vec2::<u32>()?,
+            vulkan_large_i64_cpu
+                .arg_sort_last_dim(true)?
+                .to_vec2::<u32>()?
+        );
+        let (vulkan_large_sorted_i64, vulkan_large_sorted_idx) =
+            vulkan_large_i64.sort_last_dim(true)?;
+        let (expected_vulkan_large_sorted_i64, expected_vulkan_large_sorted_idx) =
+            vulkan_large_i64_cpu.sort_last_dim(true)?;
+        assert_eq!(
+            vulkan_large_sorted_idx.to_vec2::<u32>()?,
+            expected_vulkan_large_sorted_idx.to_vec2::<u32>()?
+        );
+        assert_eq!(
+            vulkan_large_sorted_i64.to_vec2::<i64>()?,
+            expected_vulkan_large_sorted_i64.to_vec2::<i64>()?
+        );
+
+        let vulkan_large_f64_values = (0..1100)
+            .rev()
+            .map(|v| {
+                let v = v as f64;
+                if (v as u64).is_multiple_of(2) {
+                    -4_500_000_000.0 - v - 0.25
+                } else {
+                    4_500_000_000.0 + v + 0.5
+                }
+            })
+            .collect::<Vec<_>>();
+        let vulkan_large_f64 =
+            Tensor::from_vec(vulkan_large_f64_values.clone(), (1, 1100), device)?;
+        let vulkan_large_f64_cpu =
+            Tensor::from_vec(vulkan_large_f64_values, (1, 1100), &Device::Cpu)?;
+        assert_eq!(
+            vulkan_large_f64.arg_sort_last_dim(true)?.to_vec2::<u32>()?,
+            vulkan_large_f64_cpu
+                .arg_sort_last_dim(true)?
+                .to_vec2::<u32>()?
+        );
+        let (vulkan_large_sorted_f64, vulkan_large_sorted_idx) =
+            vulkan_large_f64.sort_last_dim(true)?;
+        let (expected_vulkan_large_sorted_f64, expected_vulkan_large_sorted_idx) =
+            vulkan_large_f64_cpu.sort_last_dim(true)?;
+        assert_eq!(
+            vulkan_large_sorted_idx.to_vec2::<u32>()?,
+            expected_vulkan_large_sorted_idx.to_vec2::<u32>()?
+        );
+        assert_eq!(
+            vulkan_large_sorted_f64.to_vec2::<f64>()?,
+            expected_vulkan_large_sorted_f64.to_vec2::<f64>()?
+        );
+
+        let vulkan_large_bf16_values = (0..1100)
+            .rev()
+            .map(|v| {
+                let v = v as f32;
+                if (v as u32).is_multiple_of(2) {
+                    bf16::from_f32(-2048.0 - v * 0.5)
+                } else {
+                    bf16::from_f32(2048.0 + v * 0.25)
+                }
+            })
+            .collect::<Vec<_>>();
+        let vulkan_large_bf16 =
+            Tensor::from_vec(vulkan_large_bf16_values.clone(), (1, 1100), device)?;
+        let vulkan_large_bf16_cpu =
+            Tensor::from_vec(vulkan_large_bf16_values.clone(), (1, 1100), &Device::Cpu)?;
+        let (expected_vulkan_large_sorted_bf16, _) = vulkan_large_bf16_cpu.sort_last_dim(true)?;
+        let expected_vulkan_large_sorted_bf16 =
+            expected_vulkan_large_sorted_bf16.to_vec2::<bf16>()?;
+        let vulkan_large_bf16_indices = vulkan_large_bf16
+            .arg_sort_last_dim(true)?
+            .to_vec2::<u32>()?;
+        assert_permutation(&vulkan_large_bf16_indices[0], 1100);
+        let indexed_vulkan_large_bf16 = vulkan_large_bf16_indices[0]
+            .iter()
+            .map(|&idx| vulkan_large_bf16_values[idx as usize])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            indexed_vulkan_large_bf16,
+            expected_vulkan_large_sorted_bf16[0]
+        );
+        let (vulkan_large_sorted_bf16, vulkan_large_sorted_idx) =
+            vulkan_large_bf16.sort_last_dim(true)?;
+        let vulkan_large_sorted_idx = vulkan_large_sorted_idx.to_vec2::<u32>()?;
+        assert_permutation(&vulkan_large_sorted_idx[0], 1100);
+        assert_eq!(
+            vulkan_large_sorted_bf16.to_vec2::<bf16>()?,
+            expected_vulkan_large_sorted_bf16
+        );
     }
     Ok(())
 }

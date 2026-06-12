@@ -709,7 +709,7 @@ The highest-value next Vulkan performance step is now concrete:
   - new `run_emulated_cast` builder handles the dtypes WGSL cannot express: `U8` as four packed bytes per `u32` word (one thread packs each output word) and `I64` as lo/hi `u32` pairs with two's-complement splitting; same Rust `as` conversion semantics.
 - Result (verified by release probe and new native-required tests on RTX 3060): **both backends now pass all 36 ordered conversion pairs natively with CPU-matching numerics**.
 - New permanent coverage: `backend_smoke_{wgpu,vulkan}_dtype_conversion_matrix_native_only` runs the full 36-pair matrix under `native_required` with numeric comparison against the CPU reference.
-- Known intentional divergence (tracked, not final): the storage layer remaps BF16 *destinations* to F16 on wgpu/Vulkan (`storage.rs:471-474`); BF16 sources convert natively. Removing this remap requires BF16-native op coverage and is a separate parity row.
+- Superseded by the later BF16 storage closure: BF16 destinations are no longer remapped to F16 on wgpu/Vulkan; BF16 destination casts now preserve BF16 storage on both backends, while BF16 sources continue to convert natively.
 - Found during this slice (not yet fixed): `Tensor::to_device` Vulkan -> CPU errors with "not implemented yet"; transfer parity is a separate row to close.
 
 ## Progress Update: GPU Test Concurrency Hardening
@@ -727,12 +727,12 @@ The highest-value next Vulkan performance step is now concrete:
   - `Wgpu/Vulkan -> Cpu` via `to_cpu_storage` (device download)
   - `Wgpu -> Wgpu`, `Vulkan -> Vulkan` via the backend `transfer_to_device`
   - any remaining cross-backend pair (Cuda <-> Vulkan, Metal <-> wgpu, ...) by staging through host memory with `storage_from_cpu_storage_owned`
-- BF16 dtype honesty: wgpu/Vulkan storage normalizes BF16 uploads to F16, so the resulting tensor dtype is now derived from the destination storage instead of copied from the source tensor; a CPU BF16 tensor moved to Vulkan reports `DType::F16` instead of lying about its storage.
+- BF16 dtype honesty is now storage-preserving: wgpu/Vulkan uploads, downloads, and same-device copies keep BF16 storage and report `DType::BF16`; the earlier BF16->F16 normalization was removed in the later BF16 storage closure.
 - `dummy_wgpu_backend.rs`/`dummy_vulkan_backend.rs` gained `transfer_to_device` stubs so non-GPU builds keep compiling; all four feature combos (`none`, `wgpu`, `vulkan`, `wgpu,vulkan`) checked.
 - New native-required coverage on RTX 3060 (both passing, fallback count 0):
   - `backend_smoke_vulkan_to_device_transfers_native_only`
   - `backend_smoke_wgpu_to_device_transfers_native_only`
-  - covers CPU->GPU, GPU->CPU, same-device copy, strided-view roundtrip, u32/f16 dtype integrity, and the BF16->F16 normalization contract.
+  - covers CPU->GPU, GPU->CPU, same-device copy, strided-view roundtrip, u32/f16 dtype integrity, and the BF16 storage-preservation contract.
 - Full regression state after the change: 30 Vulkan + 20 wgpu backend smoke tests pass on RTX 3060.
 
 ## Progress Update: Integer DType Closure For `cmp` / `where_cond` (u8/u32/i64)
@@ -802,7 +802,7 @@ CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3
 This session closed the largest remaining cluster of `partial`/`fallback` parity rows: the integer dtype paths (`u8`/`u32`/`i64`) that CUDA supports natively but both GPU backends previously routed through CPU. All work is native-required-verified on the RTX 3060 (fallback count 0) and leaves the five-model release matrix green on both backends.
 
 Closed this session (each a separate commit, with native-required smoke tests on both backends):
-1. `Tensor::to_device` transfer parity (CPU<->GPU, same-device, cross-backend host staging; BF16->F16 dtype honesty).
+1. `Tensor::to_device` transfer parity (CPU<->GPU, same-device, cross-backend host staging; BF16 storage-preserving dtype honesty).
 2. Integer `cmp` / `where_cond` (u8/u32/i64) — source-typed compares, packed-byte U8 and lo/hi-word I64 WGSL paths.
 3. Integer strided copy (`contiguous()` on transposed/sliced u8/u32/i64 views) — Vulkan identity convert variants, wgpu emulated strided copy.
 4. Integer binary ops (u8/u32/i64 add/sub/mul/div/max/min) — Vulkan opcode-switched `binary_int.comp`, wgpu generated WGSL with i64 carry/limb-multiply.
@@ -812,4 +812,246 @@ New Candle-owned Vulkan shaders: `binary_int.comp`, `sum_rows_int.comp`, `reduce
 
 Parity matrix rows moved from `partial`/`gap` to `closed for core dtypes`: binary/compare/select, reductions. The cross-cutting "Error behavior and CPU fallback policy" row advances correspondingly (fewer silent CPU recoveries; all five real-model cases remain fallback 0).
 
-Remaining open (tracked, not final): bf16-native arithmetic (currently F16-remapped), F64/I16 compute dtypes (no CUDA-visible model path exercises them yet), native f16 reduction accumulation (avoids an f32 materialization), full sort/top-k beyond argsort.
+Remaining open (tracked, not final): bf16-native arithmetic/reductions/matmul beyond storage-preserving casts and argsort, I16 compute dtype, native f16 reduction accumulation (avoids an f32 materialization), and dedicated/profiling-backed top-k beyond the currently certified f32/f16/bf16/u8/u32/i64/f64 argsort slice.
+
+## Progress Update: F16 Argsort / Sort Native Slice (wgpu + Vulkan)
+
+- CUDA reference:
+  - `candle-kernels/src/sort.cu` instantiates argsort for `f16`, `bf16`, `f32`, `f64`, `u8`, `u32`, and `i64`.
+- CPU semantic reference:
+  - `candle-core/src/sort.rs::ArgSort::asort` already covers `F16` and all CPU sortable dtypes.
+- llama.cpp / ggml reference:
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/argsort.comp`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/argsort_large.comp`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-webgpu/wgsl-shaders/argsort.wgsl`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-webgpu/wgsl-shaders/argsort_merge.wgsl`
+- Implementation:
+  - `candle-core/src/sort.rs` now calls the backend-neutral `argsort_last_dim` entry on `wgpu` and Vulkan.
+  - `candle-core/src/wgpu_backend.rs` and `candle-core/src/vulkan_backend.rs` now accept `F16` for `arg_sort_last_dim` by converting the input to `F32` on the same GPU and then reusing the existing native `F32` argsort kernels.
+  - `sort_last_dim` then gathers from the original `F16` tensor, so sorted values preserve `F16` storage while indices are produced by the native GPU argsort chain.
+  - No copied llama.cpp shader generator source was modified; this is a reuse-first closure over existing wgpu/Vulkan argsort kernels and already-closed native GPU dtype conversion / gather paths.
+- Test closure:
+  - `backend_smoke_{wgpu,vulkan}_argsort_native_only` now includes:
+    - `F16` ascending and descending `arg_sort_last_dim` compared against CPU reference indices;
+    - `F16 sort_last_dim` compared against CPU reference indices and sorted `F16` values;
+    - the existing `F32` argsort, `sort_last_dim`, top-k composition, and large-row coverage.
+- Targeted verification on the RTX 3060:
+  - `cargo fmt --check`
+    - passed
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_argsort_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_argsort_native_only -- --ignored --exact --nocapture`
+    - passed
+- Remaining in this row:
+  - BF16 argsort was closed later after backend storage started preserving BF16 instead of normalizing to F16;
+  - dedicated top-k beyond the current `arg_sort + narrow + contiguous + gather` composition;
+  - sort/top-k throughput benchmarking.
+
+## Progress Update: U8 Argsort / Sort Native Extension (wgpu + Vulkan)
+
+- CUDA reference:
+  - `candle-kernels/src/sort.cu` instantiates argsort for `u8`, and CUDA `sort_last_dim` gathers sorted values from the original storage.
+- CPU semantic reference:
+  - `candle-core/src/sort.rs::ArgSort::asort` covers `U8`; CPU sort remains the reference for ascending/descending indices and sorted values.
+- llama.cpp / ggml reference:
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/argsort.comp`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/argsort_large.comp`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-webgpu/wgsl-shaders/argsort.wgsl`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-webgpu/wgsl-shaders/argsort_merge.wgsl`
+- Implementation:
+  - `candle-core/src/wgpu_backend.rs` and `candle-core/src/vulkan_backend.rs` now accept `U8` in the backend-neutral `argsort_last_dim` entry by casting the input to `F32` on the same GPU, then reusing the existing native `F32` argsort kernels.
+  - `sort_last_dim` preserves original `U8` values by gathering from the original tensor, not from the temporary `F32` sort key tensor.
+  - `wgpu` now has a backend-local packed-byte `u8_gather_last_dim_wgsl()` helper so `U8` sorted values stay on GPU.
+  - Vulkan now has a Candle-owned `candle-vulkan-kernels/src/candle-shaders/get_rows_u8.comp` shader wired through `candle-vulkan-kernels/build.rs`, and `VulkanStorage::run_gather_last_dim_f32` routes `DType::U8` to `get_rows_u8`.
+  - No copied llama.cpp generator source was modified; this is a reuse-first closure over existing argsort kernels plus a minimal native `U8` gather gap fix.
+- Test closure:
+  - `backend_smoke_{wgpu,vulkan}_argsort_native_only` now includes:
+    - `U8` ascending and descending `arg_sort_last_dim` compared against CPU reference indices;
+    - `U8 sort_last_dim` compared against CPU reference indices and sorted `U8` values;
+    - unique `U8` fixture values to avoid unstable-sort tie ambiguity across CPU/GPU implementations.
+- Targeted verification on the RTX 3060:
+  - `cargo fmt --check`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_argsort_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_argsort_native_only -- --ignored --exact --nocapture`
+    - passed
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-vulkan-kernels --all-targets -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-wgpu-kernels --all-targets -- -D warnings`
+    - passed
+- Remaining in this row:
+  - BF16 argsort was closed later after backend storage started preserving BF16 instead of normalizing to F16;
+  - dedicated top-k beyond the current `arg_sort + narrow + contiguous + gather` composition;
+  - sort/top-k throughput benchmarking and real-graph attribution beyond the current synthetic/API-level `F16`/`U8` coverage.
+
+## Progress Update: Exact U32 Argsort / Sort Native Extension (wgpu + Vulkan)
+
+- CUDA reference:
+  - `candle-kernels/src/sort.cu` instantiates argsort for `uint32_t`; the CUDA kernel compares source values in their native integer type and writes `u32` indices.
+- CPU semantic reference:
+  - `candle-core/src/sort.rs::ArgSort::asort` covers `U32`; CPU sort remains the reference for ascending/descending indices and sorted values.
+- llama.cpp / ggml reference:
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/argsort.comp`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/argsort_large.comp`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-webgpu/wgsl-shaders/argsort.wgsl`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-webgpu/wgsl-shaders/argsort_merge.wgsl`
+- Implementation:
+  - `candle-wgpu-kernels/src/shaders/argsort.wgsl` and `argsort_merge.wgsl` now use a generated `SRC_TYPE`, so `F32` keeps the existing path while `U32` compares exact integer values in both initial tile sort and merge passes.
+  - The `wgpu` gather path now accepts `U32` and reuses a typed `get_rows.wgsl` variant to return sorted `U32` values from the original tensor.
+  - Vulkan now routes `DType::U32` through Candle-owned `argsort_u32.comp` / `argsort_large_u32.comp` shaders instead of a lossy `U32 -> F32` key conversion. The large path stores `(index, u32 value)` pairs in a `uvec2` scratch buffer.
+  - Vulkan `sort_last_dim` for `U32` reuses the existing generated `get_rows_i32` SPIR-V, which is a `uint -> uint` row gather despite its historical name.
+  - No copied llama.cpp generator source was modified; the Vulkan additions are Candle-owned shaders wired through `candle-vulkan-kernels/build.rs`.
+- Test closure:
+  - `backend_smoke_{wgpu,vulkan}_argsort_native_only` now includes:
+    - exact `U32` ascending and descending `arg_sort_last_dim` compared against CPU reference indices;
+    - `U32 sort_last_dim` compared against CPU reference indices and sorted `U32` values;
+    - large `U32` rows on both backends, with a larger `1x1100` Vulkan row to exercise `argsort_large_u32`;
+    - values such as `16_777_216`, `16_777_217`, `3_000_000_000`, and `3_000_000_001` so a lossy `F32` key path cannot pass by accident.
+- Targeted verification on the RTX 3060:
+  - `cargo fmt --check`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_argsort_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_argsort_native_only -- --ignored --exact --nocapture`
+    - passed
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-vulkan-kernels --all-targets -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-wgpu-kernels --all-targets -- -D warnings`
+    - passed
+- Remaining in this row:
+  - BF16 argsort was closed later after backend storage started preserving BF16;
+  - dedicated top-k beyond the current `arg_sort + narrow + contiguous + gather` composition;
+  - sort/top-k throughput benchmarking and real-graph attribution beyond current synthetic/API-level non-`F32` coverage.
+
+## Progress Update: Exact I64 Argsort / Sort Native Extension (wgpu + Vulkan)
+
+- CUDA reference:
+  - `candle-kernels/src/sort.cu` instantiates argsort for `int64_t`; the CUDA kernel compares signed 64-bit source values and writes `u32` indices.
+- CPU semantic reference:
+  - `candle-core/src/sort.rs::ArgSort::asort` covers `I64`; CPU sort remains the reference for ascending/descending indices and sorted values.
+- llama.cpp / ggml reference:
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/argsort.comp`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/argsort_large.comp`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-webgpu/wgsl-shaders/argsort.wgsl`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-webgpu/wgsl-shaders/argsort_merge.wgsl`
+- Implementation:
+  - `candle-core/src/wgpu_backend.rs` now routes `DType::I64` through backend-local WGSL argsort and merge generators. WGSL storage is represented as lo/hi `u32` words, with two's-complement signed-high / unsigned-low comparisons so large signed values are sorted exactly without `F32` key loss.
+  - `wgpu` `sort_last_dim` for `I64` uses a backend-local lo/hi-word gather shader to return sorted original `I64` values on GPU.
+  - Vulkan now routes `DType::I64` through Candle-owned `argsort_i64.comp` / `argsort_large_i64.comp` shaders. The large path stores `(index, int64 value)` pairs in scratch storage and keeps signed comparison semantics.
+  - Vulkan `sort_last_dim` for `I64` uses the new Candle-owned `get_rows_i64.comp`; the matching `get_rows_u8.comp` was corrected to the same 3D row-gather indexing pattern so long last-dim gathers do not truncate after the first workgroup.
+  - No copied llama.cpp generator source was modified; the Vulkan additions are Candle-owned shaders wired through `candle-vulkan-kernels/build.rs`.
+- Test closure:
+  - `backend_smoke_{wgpu,vulkan}_argsort_native_only` now includes:
+    - exact `I64` ascending and descending `arg_sort_last_dim` compared against CPU reference indices;
+    - `I64 sort_last_dim` compared against CPU reference indices and sorted `I64` values;
+    - signed-extreme values such as `i64::MIN + 7`, `i64::MAX`, and `+/-9_007_199_254_740_993` so a lossy `F32` key path cannot pass by accident;
+    - large `I64` rows on both backends, with a larger `1x1100` Vulkan row to exercise `argsort_large_i64` and long `get_rows_i64`.
+- Targeted verification on the RTX 3060:
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_argsort_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_argsort_native_only -- --ignored --exact --nocapture`
+    - passed
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-vulkan-kernels --all-targets -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-wgpu-kernels --all-targets -- -D warnings`
+    - passed
+- Remaining in this row:
+  - BF16 argsort was closed later after backend storage started preserving BF16;
+  - dedicated top-k beyond the current `arg_sort + narrow + contiguous + gather` composition;
+  - sort/top-k throughput benchmarking and real-graph attribution beyond current synthetic/API-level non-`F32` coverage.
+
+## Progress Update: Exact F64 Argsort / Sort Native Extension (wgpu + Vulkan)
+
+- CUDA reference:
+  - `candle-kernels/src/sort.cu` instantiates argsort for `double`; CUDA compares source values in double precision and writes `u32` indices.
+- CPU semantic reference:
+  - `candle-core/src/sort.rs::ArgSort::asort` covers `F64`; CPU sort remains the reference for ascending/descending indices and sorted values.
+- llama.cpp / ggml reference:
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/argsort.comp`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/argsort_large.comp`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-webgpu/wgsl-shaders/argsort.wgsl`
+  - `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-webgpu/wgsl-shaders/argsort_merge.wgsl`
+- Implementation:
+  - `candle-core/src/wgpu_backend.rs` now routes `DType::F64` through backend-local WGSL argsort and merge generators. WGSL cannot express `f64`, so the implementation reads each double as lo/hi `u32` words and compares IEEE-754 finite values by sign bit and magnitude without a lossy `F32` key cast.
+  - `wgpu` `sort_last_dim` for `F64` uses a lo/hi-word gather shader to return sorted original `F64` values on GPU.
+  - Vulkan now routes `DType::F64` through Candle-owned `argsort_f64.comp` / `argsort_large_f64.comp` shaders. These also compare raw IEEE-754 double words, avoiding a dependency on the Vulkan `shaderFloat64` feature.
+  - Vulkan `sort_last_dim` for `F64` uses the new Candle-owned `get_rows_f64.comp` sorted-value gather shader.
+  - No copied llama.cpp generator source was modified; the Vulkan additions are Candle-owned shaders wired through `candle-vulkan-kernels/build.rs`.
+- Test closure:
+  - `backend_smoke_{wgpu,vulkan}_argsort_native_only` now includes:
+    - exact `F64` ascending and descending `arg_sort_last_dim` compared against CPU reference indices;
+    - `F64 sort_last_dim` compared against CPU reference indices and sorted `F64` values;
+    - fractional and large-magnitude finite values beyond useful `F32` precision, plus large rows on both backends and a `1x1100` Vulkan row to exercise `argsort_large_f64` and long `get_rows_f64`.
+- Targeted verification on the RTX 3060:
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_argsort_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_argsort_native_only -- --ignored --exact --nocapture`
+    - passed
+  - `cargo fmt --check`
+    - passed
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-vulkan-kernels --all-targets -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-wgpu-kernels --all-targets -- -D warnings`
+    - passed
+- Remaining in this row:
+  - BF16 argsort is now closed for the native-required synthetic/API slice after wgpu/Vulkan storage stopped normalizing BF16 uploads/destinations to F16;
+  - dedicated top-k beyond the current `arg_sort + narrow + contiguous + gather` composition;
+  - sort/top-k throughput benchmarking and real-graph attribution beyond current synthetic/API-level non-`F32` coverage.
+
+## Progress Update: BF16 Storage Preservation, BF16 Cast Destination, and BF16 Argsort Closure (wgpu + Vulkan)
+
+- Scope:
+  - removes the historical wgpu/Vulkan BF16->F16 storage normalization;
+  - closes BF16 destination casts for the existing {F32,F16,U8,U32,I64}->BF16 conversion matrix;
+  - widens the already-native argsort/sort slice to BF16 values.
+- Storage / dtype honesty:
+  - `candle-core/src/device.rs` no longer rewrites `DType::BF16` or `CpuStorage::BF16` to F16 for wgpu/Vulkan upload paths.
+  - `candle-core/src/storage.rs` no longer rewrites `to_dtype(BF16)` to `to_dtype(F16)` for wgpu/Vulkan storage.
+  - `candle-core/src/wgpu_backend.rs` and `candle-core/src/vulkan_backend.rs` now upload/download `CpuStorage::BF16` as `DType::BF16`; smoke coverage now expects BF16 roundtrips from CPU->GPU->CPU, zeros, and `to_dtype(BF16)`.
+- BF16 destination casts:
+  - WGPU `run_emulated_cast` now supports BF16 destinations and packs two rounded BF16 payloads per `u32` storage word using round-to-nearest-even BF16 bit conversion.
+  - Vulkan `copy_spirv` now routes F32/F16/U8/U32/I64 -> BF16 into new `convert_*_bf16` variants.
+  - `candle-vulkan-kernels/src/candle-shaders/convert.comp` stores BF16 destination values as BF16 bits (`fp32_to_bf16(float(v))`), not as numeric `uint16_t(float(v))`.
+- BF16 argsort / sort:
+  - `candle-core/src/wgpu_backend.rs` and `candle-core/src/vulkan_backend.rs` route `DType::BF16` argsort through same-GPU BF16->F32 key conversion, then reuse the native F32 argsort kernels.
+  - WGPU `sort_last_dim` preserves original BF16 values through a new raw BF16 gather WGSL path (`bf16_gather_last_dim_wgsl`) that packs two destination BF16 values per `u32`.
+  - Vulkan `sort_last_dim` preserves original BF16 values through a new Candle-owned raw gather shader, `candle-vulkan-kernels/src/candle-shaders/get_rows_bf16.comp`, wired as `get_rows_bf16_raw`; this deliberately avoids the existing BF16->F16 conversion gather.
+- Test closure:
+  - `backend_smoke_{wgpu,vulkan}_upload_and_dtype` now expects BF16 storage-preserving transfer behavior.
+  - `backend_smoke_{wgpu,vulkan}_dtype_conversion_matrix_native_only` now covers BF16 destination casts without remapping the CPU reference to F16.
+  - `backend_smoke_{wgpu,vulkan}_argsort_native_only` now includes BF16 ascending/descending argsort, BF16 `sort_last_dim`, and large BF16 rows. Large BF16 fixtures compare sorted values and validate index permutations because BF16 quantization creates duplicate keys where stable index order is not a portability contract.
+- Targeted verification on the RTX 3060:
+  - `cargo fmt --check`
+    - passed
+  - `cargo clippy -p candle-vulkan-kernels --all-targets -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-wgpu-kernels --all-targets -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_upload_and_dtype -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_upload_and_dtype -- --ignored --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_dtype_conversion_matrix_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_dtype_conversion_matrix_native_only -- --ignored --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_argsort_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_argsort_native_only -- --ignored --exact --nocapture`
+    - passed
+- Remaining open after this closure:
+  - BF16-native arithmetic/reductions/matmul still need dedicated parity work; this update only preserves BF16 storage, closes BF16 destination casts, and closes BF16 argsort/sort via BF16->F32 sort keys plus raw BF16 sorted-value gather.
+  - Dedicated top-k kernels and sort/top-k throughput profiling remain open; current top-k coverage is still the `arg_sort + narrow + contiguous + gather` composition.

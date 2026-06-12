@@ -1,8 +1,8 @@
 @group(0) @binding(0)
-var<storage, read_write> src: array<f32>;
+var<storage, read_write> src: array<SRC_TYPE>;
 
 @group(0) @binding(1)
-var<storage, read_write> dst: array<i32>;
+var<storage, read_write> dst: array<u32>;
 
 struct Params {
     offset_src: u32, // in elements
@@ -34,14 +34,36 @@ var<uniform> params: Params;
 var<workgroup> shmem_idx: array<u32, WG_SIZE>;
 
 #if ORDER == 0
-#define EXTREME_VALUE 1e30
 #define SWAP_COMPARE_UP >
 #define SWAP_COMPARE_DOWN <
 #else
-#define EXTREME_VALUE -1e30
 #define SWAP_COMPARE_UP <
 #define SWAP_COMPARE_DOWN >
 #endif
+
+fn should_swap_up(a_idx: u32, b_idx: u32, row_base: u32) -> bool {
+    let a_oob = a_idx >= params.src_ne0;
+    let b_oob = b_idx >= params.src_ne0;
+    if (a_oob) {
+        return !b_oob;
+    }
+    if (b_oob) {
+        return false;
+    }
+    return src[row_base + a_idx] SWAP_COMPARE_UP src[row_base + b_idx];
+}
+
+fn should_swap_down(a_idx: u32, b_idx: u32, row_base: u32) -> bool {
+    let a_oob = a_idx >= params.src_ne0;
+    let b_oob = b_idx >= params.src_ne0;
+    if (a_oob) {
+        return false;
+    }
+    if (b_oob) {
+        return true;
+    }
+    return src[row_base + a_idx] SWAP_COMPARE_DOWN src[row_base + b_idx];
+}
 
 @compute @workgroup_size(WG_SIZE)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
@@ -78,11 +100,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
                 let dir_up = (lid.x & k) == 0;
                 let a_idx = shmem_idx[lid.x];
                 let b_idx = shmem_idx[ixj];
-                let a_val = select(EXTREME_VALUE, src[row_base + a_idx], a_idx < params.src_ne0);
-                let b_val = select(EXTREME_VALUE, src[row_base + b_idx], b_idx < params.src_ne0);
                 let should_swap = select(
-                    (a_val SWAP_COMPARE_DOWN b_val),
-                    (a_val SWAP_COMPARE_UP b_val),
+                    should_swap_down(a_idx, b_idx, row_base),
+                    should_swap_up(a_idx, b_idx, row_base),
                     dir_up);
                 if (should_swap) {
                     shmem_idx[lid.x] = b_idx;
@@ -101,6 +121,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             i1 * params.stride_dst1 +
             i2 * params.stride_dst2 +
             i3 * params.stride_dst3;
-        dst[row_dst + out_idx] = i32(shmem_idx[lid.x]);
+        dst[row_dst + out_idx] = shmem_idx[lid.x];
     }
 }

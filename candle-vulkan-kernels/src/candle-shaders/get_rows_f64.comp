@@ -1,0 +1,73 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer A { uint data_a[]; };
+layout(binding = 1) readonly buffer B { uint data_b[]; };
+layout(binding = 2) writeonly buffer D { uint data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint ne;
+    uint ne00;
+    uint ne01;
+    uint ne02;
+    uint ne03;
+    uint nb00;
+    uint nb01;
+    uint nb02;
+    uint nb03;
+    uint ne10;
+    uint ne11;
+    uint ne12;
+    uint ne13;
+    uint nb10;
+    uint nb11;
+    uint nb12;
+    uint nb13;
+    uint ne20;
+    uint ne21;
+    uint ne22;
+    uint ne23;
+    uint nb20;
+    uint nb21;
+    uint nb22;
+    uint nb23;
+    uint misalign_offsets;
+    float param1;
+    float param2;
+    int param3;
+} p;
+
+uint get_aoffset() { return p.misalign_offsets >> 16; }
+uint get_boffset() { return (p.misalign_offsets >> 8) & 0xFF; }
+uint get_doffset() { return p.misalign_offsets & 0xFF; }
+
+void main() {
+    const uint i00 = gl_GlobalInvocationID.x;
+
+    if (i00 >= p.ne00) {
+        return;
+    }
+
+    uint gid_z = gl_GlobalInvocationID.z;
+    while (gid_z < p.ne11 * p.ne12) {
+        uint gid_y = gl_GlobalInvocationID.y;
+        while (gid_y < p.ne10) {
+            const uint i10 = gid_y;
+            const uint i11 = gid_z / p.ne12;
+            const uint i12 = gid_z % p.ne12;
+
+            const uint src_col =
+                data_b[get_boffset() + i10 * p.nb10 + i11 * p.nb11 + i12 * p.nb12];
+            const uint src_offset =
+                get_aoffset() + src_col * p.nb01 + i11 * p.nb02 + i12 * p.nb03;
+            const uint dst_offset =
+                get_doffset() + i10 * p.nb21 + i11 * p.nb22 + i12 * p.nb23;
+            data_d[2u * (dst_offset + i00)] = data_a[2u * (src_offset + i00)];
+            data_d[2u * (dst_offset + i00) + 1u] = data_a[2u * (src_offset + i00) + 1u];
+
+            gid_y += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
+        }
+        gid_z += gl_WorkGroupSize.z * gl_NumWorkGroups.z;
+    }
+}

@@ -174,6 +174,14 @@ struct ArgsortMergeParams {
     _pad0: u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WgpuArgsortDType {
+    F32,
+    U32,
+    I64,
+    F64,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CumsumParams {
@@ -1176,6 +1184,726 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         out = out | ((acc & 0xffu) << (8u * lane));
     }}
     dst[word] = out;
+}}
+"#
+    )
+}
+
+fn u8_gather_last_dim_wgsl() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read_write> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> idx: array<u32>;
+@group(0) @binding(2) var<storage, read_write> dst: array<u32>;
+
+struct Params {{
+    offset_src: u32,
+    offset_idx: u32,
+    offset_dst: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    stride_idx0: u32,
+    stride_idx1: u32,
+    stride_idx2: u32,
+    stride_dst1: u32,
+    stride_dst2: u32,
+    stride_dst3: u32,
+    ne0: u32,
+    n_rows: u32,
+    ne2: u32,
+    ne3: u32,
+    idx1: u32,
+    idx2: u32,
+}};
+
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let base = gid.x * 4u;
+    let ne = params.n_rows * params.ne2;
+    if (base >= ne) {{
+        return;
+    }}
+
+    var w: u32 = 0u;
+    for (var lane: u32 = 0u; lane < 4u; lane = lane + 1u) {{
+        let logical = base + lane;
+        var b = 0u;
+        if (logical < ne) {{
+            let left = logical / params.n_rows;
+            let pos = logical - left * params.n_rows;
+            let idx_pos = params.offset_idx + pos * params.stride_idx0 + left * params.stride_idx1;
+            let src_col = idx[idx_pos];
+            let src_pos = params.offset_src + src_col * params.stride_src1 + left * params.stride_src2;
+            b = (src[src_pos / 4u] >> (8u * (src_pos % 4u))) & 0xffu;
+        }}
+        w = w | (b << (8u * lane));
+    }}
+    dst[params.offset_dst / 4u + gid.x] = w;
+}}
+"#
+    )
+}
+
+fn bf16_gather_last_dim_wgsl() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read_write> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> idx: array<u32>;
+@group(0) @binding(2) var<storage, read_write> dst: array<u32>;
+
+struct Params {{
+    offset_src: u32,
+    offset_idx: u32,
+    offset_dst: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    stride_idx0: u32,
+    stride_idx1: u32,
+    stride_idx2: u32,
+    stride_dst1: u32,
+    stride_dst2: u32,
+    stride_dst3: u32,
+    ne0: u32,
+    n_rows: u32,
+    ne2: u32,
+    ne3: u32,
+    idx1: u32,
+    idx2: u32,
+}};
+
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let base = gid.x * 2u;
+    let ne = params.n_rows * params.ne2;
+    if (base >= ne) {{
+        return;
+    }}
+
+    var w: u32 = 0u;
+    for (var lane: u32 = 0u; lane < 2u; lane = lane + 1u) {{
+        let logical = base + lane;
+        var h = 0u;
+        if (logical < ne) {{
+            let left = logical / params.n_rows;
+            let pos = logical - left * params.n_rows;
+            let idx_pos = params.offset_idx + pos * params.stride_idx0 + left * params.stride_idx1;
+            let src_col = idx[idx_pos];
+            let src_pos = params.offset_src + src_col * params.stride_src1 + left * params.stride_src2;
+            h = (src[src_pos / 2u] >> (16u * (src_pos % 2u))) & 0xffffu;
+        }}
+        w = w | (h << (16u * lane));
+    }}
+    dst[params.offset_dst / 2u + gid.x] = w;
+}}
+"#
+    )
+}
+
+fn i64_gather_last_dim_wgsl() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read_write> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> idx: array<u32>;
+@group(0) @binding(2) var<storage, read_write> dst: array<u32>;
+
+struct Params {{
+    offset_src: u32,
+    offset_idx: u32,
+    offset_dst: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    stride_idx0: u32,
+    stride_idx1: u32,
+    stride_idx2: u32,
+    stride_dst1: u32,
+    stride_dst2: u32,
+    stride_dst3: u32,
+    ne0: u32,
+    n_rows: u32,
+    ne2: u32,
+    ne3: u32,
+    idx1: u32,
+    idx2: u32,
+}};
+
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let logical = gid.x;
+    let ne = params.n_rows * params.ne2;
+    if (logical >= ne) {{
+        return;
+    }}
+
+    let left = logical / params.n_rows;
+    let pos = logical - left * params.n_rows;
+    let idx_pos = params.offset_idx + pos * params.stride_idx0 + left * params.stride_idx1;
+    let src_col = idx[idx_pos];
+    let src_pos = params.offset_src + src_col * params.stride_src1 + left * params.stride_src2;
+    let dst_pos = params.offset_dst + pos * params.stride_dst1 + left * params.stride_dst2;
+    dst[2u * dst_pos] = src[2u * src_pos];
+    dst[2u * dst_pos + 1u] = src[2u * src_pos + 1u];
+}}
+"#
+    )
+}
+
+fn f64_gather_last_dim_wgsl() -> String {
+    i64_gather_last_dim_wgsl()
+}
+
+fn f64_cmp_helpers_wgsl() -> &'static str {
+    r#"
+fn f64_lt(a_lo: u32, a_hi: u32, b_lo: u32, b_hi: u32) -> bool {
+    let a_neg = (a_hi & 0x80000000u) != 0u;
+    let b_neg = (b_hi & 0x80000000u) != 0u;
+    if (a_neg != b_neg) {
+        return a_neg;
+    }
+    if (a_hi == b_hi) {
+        if (a_lo == b_lo) {
+            return false;
+        }
+        return select((a_lo < b_lo), (a_lo > b_lo), a_neg);
+    }
+    return select((a_hi < b_hi), (a_hi > b_hi), a_neg);
+}
+
+fn f64_gt(a_lo: u32, a_hi: u32, b_lo: u32, b_hi: u32) -> bool {
+    return f64_lt(b_lo, b_hi, a_lo, a_hi);
+}
+
+fn f64_le(a_lo: u32, a_hi: u32, b_lo: u32, b_hi: u32) -> bool {
+    return !f64_lt(b_lo, b_hi, a_lo, a_hi);
+}
+
+fn f64_ge(a_lo: u32, a_hi: u32, b_lo: u32, b_hi: u32) -> bool {
+    return !f64_lt(a_lo, a_hi, b_lo, b_hi);
+}
+"#
+}
+
+fn i64_argsort_wgsl(workgroup_size: u32, asc: bool) -> String {
+    let swap_compare_up = if asc { "i64_gt" } else { "i64_lt" };
+    let swap_compare_down = if asc { "i64_lt" } else { "i64_gt" };
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read_write> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+
+struct Params {{
+    offset_src: u32,
+    offset_dst: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    stride_dst1: u32,
+    stride_dst2: u32,
+    stride_dst3: u32,
+    src_ne0: u32,
+    ne1: u32,
+    ne2: u32,
+    ne0: u32,
+    top_k: u32,
+    npr: u32,
+    nrows: u32
+}};
+
+@group(0) @binding(2) var<uniform> params: Params;
+
+var<workgroup> shmem_idx: array<u32, {workgroup_size}>;
+
+fn i64_lt(a_lo: u32, a_hi: u32, b_lo: u32, b_hi: u32) -> bool {{
+    let ahi = bitcast<i32>(a_hi);
+    let bhi = bitcast<i32>(b_hi);
+    return (ahi < bhi) || ((ahi == bhi) && (a_lo < b_lo));
+}}
+
+fn i64_gt(a_lo: u32, a_hi: u32, b_lo: u32, b_hi: u32) -> bool {{
+    let ahi = bitcast<i32>(a_hi);
+    let bhi = bitcast<i32>(b_hi);
+    return (ahi > bhi) || ((ahi == bhi) && (a_lo > b_lo));
+}}
+
+fn should_swap_up(a_idx: u32, b_idx: u32, row_base: u32) -> bool {{
+    let a_oob = a_idx >= params.src_ne0;
+    let b_oob = b_idx >= params.src_ne0;
+    if (a_oob) {{
+        return !b_oob;
+    }}
+    if (b_oob) {{
+        return false;
+    }}
+    let a_pos = row_base + a_idx;
+    let b_pos = row_base + b_idx;
+    return {swap_compare_up}(src[2u * a_pos], src[2u * a_pos + 1u], src[2u * b_pos], src[2u * b_pos + 1u]);
+}}
+
+fn should_swap_down(a_idx: u32, b_idx: u32, row_base: u32) -> bool {{
+    let a_oob = a_idx >= params.src_ne0;
+    let b_oob = b_idx >= params.src_ne0;
+    if (a_oob) {{
+        return false;
+    }}
+    if (b_oob) {{
+        return true;
+    }}
+    let a_pos = row_base + a_idx;
+    let b_pos = row_base + b_idx;
+    return {swap_compare_down}(src[2u * a_pos], src[2u * a_pos + 1u], src[2u * b_pos], src[2u * b_pos + 1u]);
+}}
+
+@compute @workgroup_size({workgroup_size})
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let linear = wid.x + wid.y * num_wg.x;
+    if (linear >= params.npr * params.nrows) {{
+        return;
+    }}
+    let tile = linear % params.npr;
+    var row = linear / params.npr;
+    let i3 = row / (params.ne2 * params.ne1);
+    row = row % (params.ne2 * params.ne1);
+    let i2 = row / params.ne1;
+    let i1 = row % params.ne1;
+
+    let row_base = params.offset_src +
+        i1 * params.stride_src1 +
+        i2 * params.stride_src2 +
+        i3 * params.stride_src3;
+
+    let tile_base = tile * {workgroup_size}u;
+    let idx = tile_base + lid.x;
+    shmem_idx[lid.x] = select(params.src_ne0, idx, idx < params.src_ne0);
+    workgroupBarrier();
+
+    var k = 2u;
+    while (k <= {workgroup_size}u) {{
+        var j = k >> 1;
+        while (j > 0) {{
+            let ixj = lid.x ^ j;
+            if (ixj > lid.x) {{
+                let dir_up = (lid.x & k) == 0;
+                let a_idx = shmem_idx[lid.x];
+                let b_idx = shmem_idx[ixj];
+                let should_swap = select(
+                    should_swap_down(a_idx, b_idx, row_base),
+                    should_swap_up(a_idx, b_idx, row_base),
+                    dir_up);
+                if (should_swap) {{
+                    shmem_idx[lid.x] = b_idx;
+                    shmem_idx[ixj] = a_idx;
+                }}
+            }}
+            workgroupBarrier();
+            j >>= 1;
+        }}
+        k <<= 1;
+    }}
+
+    let out_idx = tile * params.top_k + lid.x;
+    if (out_idx < params.ne0 && lid.x < params.top_k) {{
+        let row_dst = params.offset_dst +
+            i1 * params.stride_dst1 +
+            i2 * params.stride_dst2 +
+            i3 * params.stride_dst3;
+        dst[row_dst + out_idx] = shmem_idx[lid.x];
+    }}
+}}
+"#
+    )
+}
+
+fn f64_argsort_wgsl(workgroup_size: u32, asc: bool) -> String {
+    let swap_compare_up = if asc { "f64_gt" } else { "f64_lt" };
+    let swap_compare_down = if asc { "f64_lt" } else { "f64_gt" };
+    let cmp_helpers = f64_cmp_helpers_wgsl();
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read_write> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+
+struct Params {{
+    offset_src: u32,
+    offset_dst: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    stride_dst1: u32,
+    stride_dst2: u32,
+    stride_dst3: u32,
+    src_ne0: u32,
+    ne1: u32,
+    ne2: u32,
+    ne0: u32,
+    top_k: u32,
+    npr: u32,
+    nrows: u32
+}};
+
+@group(0) @binding(2) var<uniform> params: Params;
+
+var<workgroup> shmem_idx: array<u32, {workgroup_size}>;
+
+{cmp_helpers}
+
+fn should_swap_up(a_idx: u32, b_idx: u32, row_base: u32) -> bool {{
+    let a_oob = a_idx >= params.src_ne0;
+    let b_oob = b_idx >= params.src_ne0;
+    if (a_oob) {{
+        return !b_oob;
+    }}
+    if (b_oob) {{
+        return false;
+    }}
+    let a_pos = row_base + a_idx;
+    let b_pos = row_base + b_idx;
+    return {swap_compare_up}(src[2u * a_pos], src[2u * a_pos + 1u], src[2u * b_pos], src[2u * b_pos + 1u]);
+}}
+
+fn should_swap_down(a_idx: u32, b_idx: u32, row_base: u32) -> bool {{
+    let a_oob = a_idx >= params.src_ne0;
+    let b_oob = b_idx >= params.src_ne0;
+    if (a_oob) {{
+        return false;
+    }}
+    if (b_oob) {{
+        return true;
+    }}
+    let a_pos = row_base + a_idx;
+    let b_pos = row_base + b_idx;
+    return {swap_compare_down}(src[2u * a_pos], src[2u * a_pos + 1u], src[2u * b_pos], src[2u * b_pos + 1u]);
+}}
+
+@compute @workgroup_size({workgroup_size})
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let linear = wid.x + wid.y * num_wg.x;
+    if (linear >= params.npr * params.nrows) {{
+        return;
+    }}
+    let tile = linear % params.npr;
+    var row = linear / params.npr;
+    let i3 = row / (params.ne2 * params.ne1);
+    row = row % (params.ne2 * params.ne1);
+    let i2 = row / params.ne1;
+    let i1 = row % params.ne1;
+
+    let row_base = params.offset_src +
+        i1 * params.stride_src1 +
+        i2 * params.stride_src2 +
+        i3 * params.stride_src3;
+
+    let tile_base = tile * {workgroup_size}u;
+    let idx = tile_base + lid.x;
+    shmem_idx[lid.x] = select(params.src_ne0, idx, idx < params.src_ne0);
+    workgroupBarrier();
+
+    var k = 2u;
+    while (k <= {workgroup_size}u) {{
+        var j = k >> 1;
+        while (j > 0) {{
+            let ixj = lid.x ^ j;
+            if (ixj > lid.x) {{
+                let dir_up = (lid.x & k) == 0;
+                let a_idx = shmem_idx[lid.x];
+                let b_idx = shmem_idx[ixj];
+                let should_swap = select(
+                    should_swap_down(a_idx, b_idx, row_base),
+                    should_swap_up(a_idx, b_idx, row_base),
+                    dir_up);
+                if (should_swap) {{
+                    shmem_idx[lid.x] = b_idx;
+                    shmem_idx[ixj] = a_idx;
+                }}
+            }}
+            workgroupBarrier();
+            j >>= 1;
+        }}
+        k <<= 1;
+    }}
+
+    let out_idx = tile * params.top_k + lid.x;
+    if (out_idx < params.ne0 && lid.x < params.top_k) {{
+        let row_dst = params.offset_dst +
+            i1 * params.stride_dst1 +
+            i2 * params.stride_dst2 +
+            i3 * params.stride_dst3;
+        dst[row_dst + out_idx] = shmem_idx[lid.x];
+    }}
+}}
+"#
+    )
+}
+
+fn i64_argsort_merge_wgsl(asc: bool) -> String {
+    let cmp = if asc { "i64_le" } else { "i64_ge" };
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read_write> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> idx_in: array<u32>;
+@group(0) @binding(2) var<storage, read_write> idx_out: array<u32>;
+
+struct Params {{
+    offset_src: u32,
+    offset_in: u32,
+    offset_out: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    stride_idx1: u32,
+    stride_idx2: u32,
+    stride_idx3: u32,
+    stride_out1: u32,
+    stride_out2: u32,
+    stride_out3: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
+    top_k: u32,
+    len: u32,
+    nm: u32,
+    nrows: u32
+}};
+
+@group(0) @binding(3) var<uniform> params: Params;
+
+fn i64_lt(a_lo: u32, a_hi: u32, b_lo: u32, b_hi: u32) -> bool {{
+    let ahi = bitcast<i32>(a_hi);
+    let bhi = bitcast<i32>(b_hi);
+    return (ahi < bhi) || ((ahi == bhi) && (a_lo < b_lo));
+}}
+
+fn i64_le(a_lo: u32, a_hi: u32, b_lo: u32, b_hi: u32) -> bool {{
+    return i64_lt(a_lo, a_hi, b_lo, b_hi) || ((a_lo == b_lo) && (a_hi == b_hi));
+}}
+
+fn i64_ge(a_lo: u32, a_hi: u32, b_lo: u32, b_hi: u32) -> bool {{
+    return !i64_lt(a_lo, a_hi, b_lo, b_hi);
+}}
+
+fn take_left(a_idx: u32, b_idx: u32, row_base: u32) -> bool {{
+    let a_pos = row_base + a_idx;
+    let b_pos = row_base + b_idx;
+    return {cmp}(src[2u * a_pos], src[2u * a_pos + 1u], src[2u * b_pos], src[2u * b_pos + 1u]);
+}}
+
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let linear = wid.x + wid.y * num_wg.x;
+    if (linear >= params.nm * params.nrows) {{
+        return;
+    }}
+
+    let start = (linear % params.nm) * params.len * 2u;
+    let len0 = min(params.len, params.ne0 - start);
+    let rem1 = select(0u, params.ne0 - (start + params.len), params.ne0 > (start + params.len));
+    let len1 = min(params.len, rem1);
+    let total = len0 + len1;
+    let chunk = (total + {WG_SIZE}u - 1u) / {WG_SIZE}u;
+    let k0 = lid.x * chunk;
+    let k1 = min(min(k0 + chunk, total), params.top_k);
+    if (k0 >= params.top_k || k0 >= total) {{
+        return;
+    }}
+
+    var row = linear / params.nm;
+    let i3 = row / (params.ne2 * params.ne1);
+    row = row % (params.ne2 * params.ne1);
+    let i2 = row / params.ne1;
+    let i1 = row % params.ne1;
+
+    let row_src = params.offset_src +
+        i1 * params.stride_src1 +
+        i2 * params.stride_src2 +
+        i3 * params.stride_src3;
+
+    let row_in = params.offset_in +
+        i1 * params.stride_idx1 +
+        i2 * params.stride_idx2 +
+        i3 * params.stride_idx3;
+
+    let row_out = params.offset_out +
+        i1 * params.stride_out1 +
+        i2 * params.stride_out2 +
+        i3 * params.stride_out3;
+
+    var low: u32 = select(0u, k0 - len1, k0 > len1);
+    var high: u32 = min(k0, len0);
+
+    while (low < high) {{
+        let mid = (low + high) >> 1u;
+        let idx0 = idx_in[row_in + start + mid];
+        let idx1 = idx_in[row_in + start + params.len + (k0 - mid - 1u)];
+        if (take_left(idx0, idx1, row_src)) {{
+            low = mid + 1u;
+        }} else {{
+            high = mid;
+        }}
+    }}
+
+    var i = low;
+    var j = k0 - i;
+    var k = k0;
+    while (k < k1) {{
+        var take_l = false;
+        if (i >= len0) {{
+            take_l = false;
+        }} else if (j >= len1) {{
+            take_l = true;
+        }} else {{
+            let idx0 = idx_in[row_in + start + i];
+            let idx1 = idx_in[row_in + start + params.len + j];
+            take_l = take_left(idx0, idx1, row_src);
+        }}
+
+        let out_idx = select(
+            idx_in[row_in + start + params.len + j],
+            idx_in[row_in + start + i],
+            take_l);
+        idx_out[row_out + start + k] = out_idx;
+        i = select(i, i + 1u, take_l);
+        j = select(j + 1u, j, take_l);
+        k += 1u;
+    }}
+}}
+"#
+    )
+}
+
+fn f64_argsort_merge_wgsl(asc: bool) -> String {
+    let cmp = if asc { "f64_le" } else { "f64_ge" };
+    let cmp_helpers = f64_cmp_helpers_wgsl();
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read_write> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> idx_in: array<u32>;
+@group(0) @binding(2) var<storage, read_write> idx_out: array<u32>;
+
+struct Params {{
+    offset_src: u32,
+    offset_in: u32,
+    offset_out: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    stride_idx1: u32,
+    stride_idx2: u32,
+    stride_idx3: u32,
+    stride_out1: u32,
+    stride_out2: u32,
+    stride_out3: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
+    top_k: u32,
+    len: u32,
+    nm: u32,
+    nrows: u32
+}};
+
+@group(0) @binding(3) var<uniform> params: Params;
+
+{cmp_helpers}
+
+fn take_left(a_idx: u32, b_idx: u32, row_base: u32) -> bool {{
+    let a_pos = row_base + a_idx;
+    let b_pos = row_base + b_idx;
+    return {cmp}(src[2u * a_pos], src[2u * a_pos + 1u], src[2u * b_pos], src[2u * b_pos + 1u]);
+}}
+
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let linear = wid.x + wid.y * num_wg.x;
+    if (linear >= params.nm * params.nrows) {{
+        return;
+    }}
+
+    let start = (linear % params.nm) * params.len * 2u;
+    let len0 = min(params.len, params.ne0 - start);
+    let rem1 = select(0u, params.ne0 - (start + params.len), params.ne0 > (start + params.len));
+    let len1 = min(params.len, rem1);
+    let total = len0 + len1;
+    let chunk = (total + {WG_SIZE}u - 1u) / {WG_SIZE}u;
+    let k0 = lid.x * chunk;
+    let k1 = min(min(k0 + chunk, total), params.top_k);
+    if (k0 >= params.top_k || k0 >= total) {{
+        return;
+    }}
+
+    var row = linear / params.nm;
+    let i3 = row / (params.ne2 * params.ne1);
+    row = row % (params.ne2 * params.ne1);
+    let i2 = row / params.ne1;
+    let i1 = row % params.ne1;
+
+    let row_src = params.offset_src +
+        i1 * params.stride_src1 +
+        i2 * params.stride_src2 +
+        i3 * params.stride_src3;
+
+    let row_in = params.offset_in +
+        i1 * params.stride_idx1 +
+        i2 * params.stride_idx2 +
+        i3 * params.stride_idx3;
+
+    let row_out = params.offset_out +
+        i1 * params.stride_out1 +
+        i2 * params.stride_out2 +
+        i3 * params.stride_out3;
+
+    var low: u32 = select(0u, k0 - len1, k0 > len1);
+    var high: u32 = min(k0, len0);
+
+    while (low < high) {{
+        let mid = (low + high) >> 1u;
+        let idx0 = idx_in[row_in + start + mid];
+        let idx1 = idx_in[row_in + start + params.len + (k0 - mid - 1u)];
+        if (take_left(idx0, idx1, row_src)) {{
+            low = mid + 1u;
+        }} else {{
+            high = mid;
+        }}
+    }}
+
+    var i = low;
+    var j = k0 - i;
+    var k = k0;
+    while (k < k1) {{
+        var take_l = false;
+        if (i >= len0) {{
+            take_l = false;
+        }} else if (j >= len1) {{
+            take_l = true;
+        }} else {{
+            let idx0 = idx_in[row_in + start + i];
+            let idx1 = idx_in[row_in + start + params.len + j];
+            take_l = take_left(idx0, idx1, row_src);
+        }}
+
+        let out_idx = select(
+            idx_in[row_in + start + params.len + j],
+            idx_in[row_in + start + i],
+            take_l);
+        idx_out[row_out + start + k] = out_idx;
+        i = select(i, i + 1u, take_l);
+        j = select(j + 1u, j, take_l);
+        k += 1u;
+    }}
 }}
 "#
     )
@@ -2317,6 +3045,8 @@ impl WgpuStorage {
             "lo"
         };
         let conv_f32 = "v";
+        let conv_bf16 =
+            "((bitcast<u32>(v) + (0x7fffu + ((bitcast<u32>(v) >> 16u) & 1u))) >> 16u) & 0xffffu";
         let body = match dst_dtype {
             DType::U8 => format!(
                 r#"
@@ -2351,6 +3081,26 @@ impl WgpuStorage {
         v1 = {conv_f32};
     }}
     dst[gid.x] = pack2x16float(vec2<f32>(v0, v1));
+"#
+            ),
+            DType::BF16 => format!(
+                r#"
+    let base = gid.x * 2u;
+    if (base >= params.ne) {{ return; }}
+    var w: u32 = 0u;
+    {{
+        let i = base;
+        {load}
+        let bf = {conv_bf16};
+        w = w | bf;
+    }}
+    if (base + 1u < params.ne) {{
+        let i = base + 1u;
+        {load}
+        let bf = {conv_bf16};
+        w = w | (bf << 16u);
+    }}
+    dst[gid.x] = w;
 "#
             ),
             DType::F32 => format!(
@@ -2463,7 +3213,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         ];
         let groups_of = match dst_dtype {
             DType::U8 => 4,
-            DType::F16 => 2,
+            DType::F16 | DType::BF16 => 2,
             _ => 1,
         };
         let work_items = ne.div_ceil(groups_of);
@@ -2892,13 +3642,44 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{{body}}}
         current_storage.ok_or_else(|| unsupported("reduce multi-dim empty"))
     }
 
-    pub(crate) fn argsort_last_dim_f32(
+    pub(crate) fn argsort_last_dim(
         &self,
         layout: &Layout,
         asc: bool,
         last_dim: usize,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 {
+        if matches!(self.dtype, DType::F16 | DType::BF16 | DType::U8) {
+            let src_f32 = self.to_dtype(layout, DType::F32)?;
+            let src_f32_layout = Layout::contiguous(layout.shape());
+            return src_f32.argsort_last_dim_f32(&src_f32_layout, asc, last_dim);
+        }
+        match self.dtype {
+            DType::F32 => self.argsort_last_dim_typed(layout, asc, last_dim, WgpuArgsortDType::F32),
+            DType::U32 => self.argsort_last_dim_typed(layout, asc, last_dim, WgpuArgsortDType::U32),
+            DType::I64 => self.argsort_last_dim_typed(layout, asc, last_dim, WgpuArgsortDType::I64),
+            DType::F64 => self.argsort_last_dim_typed(layout, asc, last_dim, WgpuArgsortDType::F64),
+            _ => Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu argsort").bt()),
+        }
+    }
+
+    fn argsort_last_dim_f32(&self, layout: &Layout, asc: bool, last_dim: usize) -> Result<Self> {
+        self.argsort_last_dim_typed(layout, asc, last_dim, WgpuArgsortDType::F32)
+    }
+
+    fn argsort_last_dim_typed(
+        &self,
+        layout: &Layout,
+        asc: bool,
+        last_dim: usize,
+        sort_dtype: WgpuArgsortDType,
+    ) -> Result<Self> {
+        let expected = match sort_dtype {
+            WgpuArgsortDType::F32 => DType::F32,
+            WgpuArgsortDType::U32 => DType::U32,
+            WgpuArgsortDType::I64 => DType::I64,
+            WgpuArgsortDType::F64 => DType::F64,
+        };
+        if self.dtype != expected {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu argsort").bt());
         }
         if !layout.is_contiguous() {
@@ -2960,8 +3741,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{{body}}}
             buffer_binding(1, &dst.buffer),
             buffer_binding(2, &param_buffer),
         ];
-        let shader = candle_wgpu_kernels::argsort_shader(workgroup_size, asc)
-            .ok_or_else(|| Error::Msg("wgpu shader argsort.wgsl not embedded".into()).bt())?;
+        let shader = match sort_dtype {
+            WgpuArgsortDType::F32 => candle_wgpu_kernels::argsort_shader(workgroup_size, asc)
+                .ok_or_else(|| Error::Msg("wgpu shader argsort.wgsl not embedded".into()).bt())?,
+            WgpuArgsortDType::U32 => candle_wgpu_kernels::argsort_u32_shader(workgroup_size, asc)
+                .ok_or_else(|| {
+                Error::Msg("wgpu shader argsort.wgsl not embedded".into()).bt()
+            })?,
+            WgpuArgsortDType::I64 => i64_argsort_wgsl(workgroup_size, asc),
+            WgpuArgsortDType::F64 => f64_argsort_wgsl(workgroup_size, asc),
+        };
         self.device.run_compute(
             &shader,
             &entries,
@@ -3057,8 +3846,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{{body}}}
             buffer_binding(2, &idx_out.buffer),
             buffer_binding(3, &param_buffer),
         ];
-        let shader = candle_wgpu_kernels::argsort_merge_shader(WG_SIZE, asc)
-            .ok_or_else(|| Error::Msg("wgpu shader argsort_merge.wgsl not embedded".into()).bt())?;
+        let shader = match self.dtype {
+            DType::U32 => {
+                candle_wgpu_kernels::argsort_u32_merge_shader(WG_SIZE, asc).ok_or_else(|| {
+                    Error::Msg("wgpu shader argsort_merge.wgsl not embedded".into()).bt()
+                })?
+            }
+            DType::I64 => i64_argsort_merge_wgsl(asc),
+            DType::F64 => f64_argsort_merge_wgsl(asc),
+            _ => candle_wgpu_kernels::argsort_merge_shader(WG_SIZE, asc).ok_or_else(|| {
+                Error::Msg("wgpu shader argsort_merge.wgsl not embedded".into()).bt()
+            })?,
+        };
         self.device.run_compute(
             &shader,
             &entries,
@@ -3533,7 +4332,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{{body}}}
     }
 
     fn run_gather_last_dim_f32(&self, ids: &Self, src_l: &Layout, ids_l: &Layout) -> Result<Self> {
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+        if !matches!(
+            self.dtype,
+            DType::F32
+                | DType::F16
+                | DType::U8
+                | DType::U32
+                | DType::I64
+                | DType::F64
+                | DType::BF16
+        ) {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu gather").bt());
         }
         if self.dtype == DType::F16
@@ -3617,15 +4425,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{{body}}}
         let shader = match self.dtype {
             DType::F32 => candle_wgpu_kernels::get_rows_f32_shader(WG_SIZE),
             DType::F16 => candle_wgpu_kernels::get_rows_f16_shader(WG_SIZE),
+            DType::BF16 => Some(bf16_gather_last_dim_wgsl()),
+            DType::U8 => Some(u8_gather_last_dim_wgsl()),
+            DType::U32 => candle_wgpu_kernels::get_rows_u32_shader(WG_SIZE),
+            DType::I64 => Some(i64_gather_last_dim_wgsl()),
+            DType::F64 => Some(f64_gather_last_dim_wgsl()),
             _ => None,
         }
         .ok_or_else(|| Error::Msg("wgpu shader get_rows.wgsl not embedded".into()).bt())?;
         let rows: u32 = (left_size * ids_dim).try_into()?;
+        let work_items = match self.dtype {
+            DType::U8 => rows.div_ceil(4),
+            DType::BF16 => rows.div_ceil(2),
+            _ => rows,
+        };
         self.device.run_compute(
             &shader,
             &entries,
             &bindings,
-            rows.div_ceil(WG_SIZE),
+            work_items.div_ceil(WG_SIZE),
             "candle-wgpu-gather",
         )?;
         if self.dtype == DType::F16 {
@@ -6180,19 +6998,6 @@ impl BackendDevice for WgpuDevice {
     }
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
-        let normalized_storage;
-        let storage = match storage {
-            CpuStorage::BF16(values) => {
-                normalized_storage = CpuStorage::F16(
-                    values
-                        .iter()
-                        .map(|value| half::f16::from_f32(value.to_f32()))
-                        .collect(),
-                );
-                &normalized_storage
-            }
-            _ => storage,
-        };
         let (dtype, count, bytes) = cpu_storage_to_bytes(storage)?;
         let buffer = self.create_storage_buffer(bytes.len(), "candle-wgpu-upload");
         self.inner

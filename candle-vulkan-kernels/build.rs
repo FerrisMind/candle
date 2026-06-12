@@ -313,6 +313,56 @@ fn generate_candle_spirv_modules(
             &["T_TYPE=int64_t", "D_TYPE=int64_t"],
         ),
         (
+            "get_rows_u8",
+            candle_shaders_dir.join("get_rows_u8.comp"),
+            &[],
+        ),
+        (
+            "get_rows_bf16_raw",
+            candle_shaders_dir.join("get_rows_bf16.comp"),
+            &[],
+        ),
+        (
+            "argsort_u32",
+            candle_shaders_dir.join("argsort_u32.comp"),
+            &[],
+        ),
+        (
+            "argsort_large_u32",
+            candle_shaders_dir.join("argsort_large_u32.comp"),
+            &[],
+        ),
+        (
+            "argsort_i64",
+            candle_shaders_dir.join("argsort_i64.comp"),
+            &[],
+        ),
+        (
+            "argsort_large_i64",
+            candle_shaders_dir.join("argsort_large_i64.comp"),
+            &[],
+        ),
+        (
+            "argsort_f64",
+            candle_shaders_dir.join("argsort_f64.comp"),
+            &[],
+        ),
+        (
+            "argsort_large_f64",
+            candle_shaders_dir.join("argsort_large_f64.comp"),
+            &[],
+        ),
+        (
+            "get_rows_i64",
+            candle_shaders_dir.join("get_rows_i64.comp"),
+            &[],
+        ),
+        (
+            "get_rows_f64",
+            candle_shaders_dir.join("get_rows_f64.comp"),
+            &[],
+        ),
+        (
             "set_rows_add_f32_i32",
             candle_shaders_dir.join("set_rows_add.comp"),
             &[
@@ -339,6 +389,16 @@ fn generate_candle_spirv_modules(
             &["A_TYPE=float", "D_TYPE=int64_t", "DST_SAT_I64"],
         ),
         (
+            "convert_f32_bf16",
+            candle_shaders_dir.join("convert.comp"),
+            &[
+                "A_TYPE=float",
+                "D_TYPE=uint16_t",
+                "DST_VIA_F32",
+                "DATA_D_BF16",
+            ],
+        ),
+        (
             "convert_f16_u8",
             candle_shaders_dir.join("convert.comp"),
             &["A_TYPE=float16_t", "D_TYPE=uint8_t", "DST_SAT_U8"],
@@ -352,6 +412,16 @@ fn generate_candle_spirv_modules(
             "convert_f16_i64",
             candle_shaders_dir.join("convert.comp"),
             &["A_TYPE=float16_t", "D_TYPE=int64_t", "DST_SAT_I64"],
+        ),
+        (
+            "convert_f16_bf16",
+            candle_shaders_dir.join("convert.comp"),
+            &[
+                "A_TYPE=float16_t",
+                "D_TYPE=uint16_t",
+                "DST_VIA_F32",
+                "DATA_D_BF16",
+            ],
         ),
         (
             "convert_u8_u8",
@@ -389,6 +459,16 @@ fn generate_candle_spirv_modules(
             &["A_TYPE=uint8_t", "D_TYPE=int64_t"],
         ),
         (
+            "convert_u8_bf16",
+            candle_shaders_dir.join("convert.comp"),
+            &[
+                "A_TYPE=uint8_t",
+                "D_TYPE=uint16_t",
+                "DST_VIA_F32",
+                "DATA_D_BF16",
+            ],
+        ),
+        (
             "convert_u32_f16",
             candle_shaders_dir.join("convert.comp"),
             &["A_TYPE=uint", "D_TYPE=float16_t", "DST_VIA_F32"],
@@ -402,6 +482,16 @@ fn generate_candle_spirv_modules(
             "convert_u32_i64",
             candle_shaders_dir.join("convert.comp"),
             &["A_TYPE=uint", "D_TYPE=int64_t"],
+        ),
+        (
+            "convert_u32_bf16",
+            candle_shaders_dir.join("convert.comp"),
+            &[
+                "A_TYPE=uint",
+                "D_TYPE=uint16_t",
+                "DST_VIA_F32",
+                "DATA_D_BF16",
+            ],
         ),
         (
             "convert_i64_f32",
@@ -422,6 +512,16 @@ fn generate_candle_spirv_modules(
             "convert_i64_u32",
             candle_shaders_dir.join("convert.comp"),
             &["A_TYPE=int64_t", "D_TYPE=uint"],
+        ),
+        (
+            "convert_i64_bf16",
+            candle_shaders_dir.join("convert.comp"),
+            &[
+                "A_TYPE=int64_t",
+                "D_TYPE=uint16_t",
+                "DST_VIA_F32",
+                "DATA_D_BF16",
+            ],
         ),
         (
             "repack_q8_1_to_q8_0",

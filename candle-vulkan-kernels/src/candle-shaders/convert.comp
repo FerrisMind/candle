@@ -12,7 +12,9 @@ layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 // follow Rust `as` semantics (saturating, NaN -> 0) to match the Candle CPU
 // reference; integer -> integer conversions truncate like Rust `as`.
 D_TYPE convert_value(A_TYPE v) {
-#if defined(DST_SAT_U8)
+#if defined(DATA_D_BF16)
+    return D_TYPE(fp32_to_bf16(float(v)));
+#elif defined(DST_SAT_U8)
     const float f = float(v);
     if (isnan(f)) {
         return D_TYPE(0);

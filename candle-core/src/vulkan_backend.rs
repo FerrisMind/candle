@@ -43,6 +43,14 @@ const VULKAN_ARGSORT_WG_UNROLL_FACTOR: u32 = 2;
 const VULKAN_MUL_MAT_VEC_MAX_COLS: usize = 8;
 const VULKAN_DENSE_MUL_MAT_VEC_MAX_ROWS: usize = 8;
 
+#[derive(Clone, Copy)]
+enum VulkanArgsortDType {
+    F32,
+    U32,
+    I64,
+    F64,
+}
+
 /// Mirror of llama.cpp's `ggml-vulkan.cpp` dense-GEMM dispatch rule: the
 /// row-looped `mul_mat_vec` family is only profitable while the number of
 /// output rows stays at or below `mul_mat_vec_max_cols` (8). Larger dense
@@ -2644,20 +2652,25 @@ fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
         (DType::F32, DType::U8) => "convert_f32_u8",
         (DType::F32, DType::U32) => "convert_f32_u32",
         (DType::F32, DType::I64) => "convert_f32_i64",
+        (DType::F32, DType::BF16) => "convert_f32_bf16",
         (DType::F16, DType::U8) => "convert_f16_u8",
         (DType::F16, DType::U32) => "convert_f16_u32",
         (DType::F16, DType::I64) => "convert_f16_i64",
+        (DType::F16, DType::BF16) => "convert_f16_bf16",
         (DType::U8, DType::F32) => "convert_u8_f32",
         (DType::U8, DType::F16) => "convert_u8_f16",
         (DType::U8, DType::U32) => "convert_u8_u32",
         (DType::U8, DType::I64) => "convert_u8_i64",
+        (DType::U8, DType::BF16) => "convert_u8_bf16",
         (DType::U32, DType::F16) => "convert_u32_f16",
         (DType::U32, DType::U8) => "convert_u32_u8",
         (DType::U32, DType::I64) => "convert_u32_i64",
+        (DType::U32, DType::BF16) => "convert_u32_bf16",
         (DType::I64, DType::F32) => "convert_i64_f32",
         (DType::I64, DType::F16) => "convert_i64_f16",
         (DType::I64, DType::U8) => "convert_i64_u8",
         (DType::I64, DType::U32) => "convert_i64_u32",
+        (DType::I64, DType::BF16) => "convert_i64_bf16",
         _ => {
             return Err(Error::Msg(format!(
                 "vulkan backend op to_dtype {src:?}->{dst:?} not implemented"
@@ -3934,13 +3947,52 @@ impl VulkanStorage {
         current_storage.ok_or_else(|| unsupported("reduce multi-dim empty"))
     }
 
-    pub(crate) fn argsort_last_dim_f32(
+    pub(crate) fn argsort_last_dim(
         &self,
         layout: &Layout,
         asc: bool,
         last_dim: usize,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 {
+        if matches!(self.dtype, DType::F16 | DType::BF16 | DType::U8) {
+            let src_f32 = self.to_dtype(layout, DType::F32)?;
+            let src_f32_layout = Layout::contiguous(layout.shape());
+            return src_f32.argsort_last_dim_f32(&src_f32_layout, asc, last_dim);
+        }
+        match self.dtype {
+            DType::F32 => {
+                self.argsort_last_dim_typed(layout, asc, last_dim, VulkanArgsortDType::F32)
+            }
+            DType::U32 => {
+                self.argsort_last_dim_typed(layout, asc, last_dim, VulkanArgsortDType::U32)
+            }
+            DType::I64 => {
+                self.argsort_last_dim_typed(layout, asc, last_dim, VulkanArgsortDType::I64)
+            }
+            DType::F64 => {
+                self.argsort_last_dim_typed(layout, asc, last_dim, VulkanArgsortDType::F64)
+            }
+            _ => Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan argsort").bt()),
+        }
+    }
+
+    fn argsort_last_dim_f32(&self, layout: &Layout, asc: bool, last_dim: usize) -> Result<Self> {
+        self.argsort_last_dim_typed(layout, asc, last_dim, VulkanArgsortDType::F32)
+    }
+
+    fn argsort_last_dim_typed(
+        &self,
+        layout: &Layout,
+        asc: bool,
+        last_dim: usize,
+        sort_dtype: VulkanArgsortDType,
+    ) -> Result<Self> {
+        let expected = match sort_dtype {
+            VulkanArgsortDType::F32 => DType::F32,
+            VulkanArgsortDType::U32 => DType::U32,
+            VulkanArgsortDType::I64 => DType::I64,
+            VulkanArgsortDType::F64 => DType::F64,
+        };
+        if self.dtype != expected {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan argsort").bt());
         }
         if !layout.is_contiguous() || layout.start_offset() != 0 {
@@ -3989,8 +4041,15 @@ impl VulkanStorage {
                 VulkanBinding::Storage(&dst.buffer),
                 VulkanBinding::Storage(&dst.buffer),
             ];
-            let spirv = candle_vulkan_kernels::spirv("argsort_f32")
-                .ok_or_else(|| Error::Msg("vulkan shader argsort_f32 not generated".into()).bt())?;
+            let spirv_name = match sort_dtype {
+                VulkanArgsortDType::F32 => "argsort_f32",
+                VulkanArgsortDType::U32 => "argsort_u32",
+                VulkanArgsortDType::I64 => "argsort_i64",
+                VulkanArgsortDType::F64 => "argsort_f64",
+            };
+            let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
+                Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
+            })?;
             self.device.run_compute_specialized(
                 spirv,
                 &bindings,
@@ -4005,7 +4064,13 @@ impl VulkanStorage {
             .checked_mul(nrows)
             .and_then(|v| v.checked_mul(2))
             .ok_or_else(|| Error::Msg("vulkan backend op argsort tmp overflow".into()).bt())?;
-        let tmp_size = byte_len(DType::I32, tmp_count, "vulkan argsort tmp")?;
+        let tmp_dtype = match sort_dtype {
+            VulkanArgsortDType::F32 => DType::I32,
+            VulkanArgsortDType::U32 => DType::U32,
+            VulkanArgsortDType::I64 => DType::I64,
+            VulkanArgsortDType::F64 => DType::F64,
+        };
+        let tmp_size = byte_len(tmp_dtype, tmp_count, "vulkan argsort tmp")?;
         let tmp = self
             .device
             .create_buffer(tmp_size, "candle-vulkan-argsort-large-tmp")?;
@@ -4016,6 +4081,7 @@ impl VulkanStorage {
             base_params,
             workgroups_y,
             pipeline_idx,
+            sort_dtype,
             0,
             ncols_padded_log2.min(self.device.inner.max_workgroup_size_log2),
             0,
@@ -4039,6 +4105,7 @@ impl VulkanStorage {
                     base_params,
                     workgroups_y,
                     pass_idx,
+                    sort_dtype,
                     outer,
                     outer + 1,
                     inner_start,
@@ -4058,6 +4125,7 @@ impl VulkanStorage {
         base_params: VulkanArgsortParams,
         workgroups_y: u32,
         pass_idx: u32,
+        sort_dtype: VulkanArgsortDType,
         outer_start: u32,
         outer_end: u32,
         inner_start: u32,
@@ -4082,9 +4150,14 @@ impl VulkanStorage {
             VulkanBinding::Storage(tmp),
             VulkanBinding::Storage(dst),
         ];
-        let spirv = candle_vulkan_kernels::spirv("argsort_large_f32").ok_or_else(|| {
-            Error::Msg("vulkan shader argsort_large_f32 not generated".into()).bt()
-        })?;
+        let spirv_name = match sort_dtype {
+            VulkanArgsortDType::F32 => "argsort_large_f32",
+            VulkanArgsortDType::U32 => "argsort_large_u32",
+            VulkanArgsortDType::I64 => "argsort_large_i64",
+            VulkanArgsortDType::F64 => "argsort_large_f64",
+        };
+        let spirv = candle_vulkan_kernels::spirv(spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         self.device.run_compute_specialized(
             spirv,
             &bindings,
@@ -4466,7 +4539,16 @@ impl VulkanStorage {
     }
 
     fn run_gather_last_dim_f32(&self, ids: &Self, src_l: &Layout, ids_l: &Layout) -> Result<Self> {
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+        if !matches!(
+            self.dtype,
+            DType::F32
+                | DType::F16
+                | DType::BF16
+                | DType::U8
+                | DType::U32
+                | DType::I64
+                | DType::F64
+        ) {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan gather").bt());
         }
         if ids.dtype != DType::U32 {
@@ -4530,6 +4612,11 @@ impl VulkanStorage {
         let spirv_name = match self.dtype {
             DType::F32 => "get_rows_f32_f32",
             DType::F16 => "get_rows_f16",
+            DType::BF16 => "get_rows_bf16_raw",
+            DType::U8 => "get_rows_u8",
+            DType::U32 => "get_rows_i32",
+            DType::I64 => "get_rows_i64",
+            DType::F64 => "get_rows_f64",
             _ => unreachable!(),
         };
         let spirv = candle_vulkan_kernels::spirv(spirv_name)
@@ -7508,19 +7595,6 @@ impl BackendDevice for VulkanDevice {
     }
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
-        let normalized_storage;
-        let storage = match storage {
-            CpuStorage::BF16(values) => {
-                normalized_storage = CpuStorage::F16(
-                    values
-                        .iter()
-                        .map(|value| half::f16::from_f32(value.to_f32()))
-                        .collect(),
-                );
-                &normalized_storage
-            }
-            _ => storage,
-        };
         let (dtype, count, bytes) = cpu_storage_to_bytes(storage)?;
         let buffer = self.create_buffer(bytes.len(), "candle-vulkan-upload")?;
         self.write_buffer(&buffer, &bytes)?;

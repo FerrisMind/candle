@@ -210,7 +210,7 @@ pub fn rope_shader(dtype: DType, workgroup_size: u32) -> Option<String> {
     Some(preprocess(source, &defines, &replacements, dtype))
 }
 
-pub fn argsort_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+fn argsort_shader_for_type(workgroup_size: u32, asc: bool, src_type: &str) -> Option<String> {
     let source = get("argsort.wgsl")?.source();
     let mut defines = vec!["WG_SIZE".to_string()];
     if asc {
@@ -227,10 +227,20 @@ pub fn argsort_shader(workgroup_size: u32, asc: bool) -> Option<String> {
             },
         ),
     ];
+    let mut replacements = replacements;
+    replacements.push(("SRC_TYPE".to_string(), src_type.to_string()));
     Some(preprocess(source, &defines, &replacements, DType::F32))
 }
 
-pub fn argsort_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+pub fn argsort_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    argsort_shader_for_type(workgroup_size, asc, "f32")
+}
+
+pub fn argsort_u32_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    argsort_shader_for_type(workgroup_size, asc, "u32")
+}
+
+fn argsort_merge_shader_for_type(workgroup_size: u32, asc: bool, src_type: &str) -> Option<String> {
     let source = get("argsort_merge.wgsl")?.source();
     let mut defines = vec!["WG_SIZE".to_string()];
     if asc {
@@ -247,7 +257,17 @@ pub fn argsort_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
             },
         ),
     ];
+    let mut replacements = replacements;
+    replacements.push(("SRC_TYPE".to_string(), src_type.to_string()));
     Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
+pub fn argsort_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    argsort_merge_shader_for_type(workgroup_size, asc, "f32")
+}
+
+pub fn argsort_u32_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    argsort_merge_shader_for_type(workgroup_size, asc, "u32")
 }
 
 pub fn cumsum_shader(workgroup_size: u32) -> Option<String> {
@@ -299,6 +319,21 @@ pub fn get_rows_f16_shader(workgroup_size: u32) -> Option<String> {
         ("DST_TYPE".to_string(), "f32".to_string()),
     ];
     Some(preprocess(&source, &defines, &replacements, DType::F16))
+}
+
+pub fn get_rows_u32_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("get_rows.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let defines = vec!["U32".to_string()];
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        ("BLOCK_SIZE".to_string(), "1".to_string()),
+        ("SRC_TYPE".to_string(), "u32".to_string()),
+        ("DST_TYPE".to_string(), "u32".to_string()),
+    ];
+    Some(preprocess(&source, &defines, &replacements, DType::F32))
 }
 
 pub fn set_rows_f32_shader(workgroup_size: u32) -> Option<String> {
