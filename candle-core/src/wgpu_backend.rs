@@ -359,6 +359,15 @@ struct CopyParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct F64CastParams {
+    ne: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct MulMatParams {
     offset_src0: u32,
     offset_src1: u32,
@@ -3435,11 +3444,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 "#
         );
         let dst = unsafe { self.device.alloc_uninit(layout.shape(), dst_dtype)? };
-        let params = ArgMaxParams {
-            offset_src: ne.try_into()?,
-            offset_dst: 0,
-            ne0: 0,
+        let params = F64CastParams {
+            ne: ne.try_into()?,
             _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         let param_buffer = self
             .device
@@ -3752,7 +3761,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
     // Strided same-dtype copy for dtypes WGSL cannot address as scalars:
     // U8 elements are packed four-per-u32-word, BF16/I16 two-per-u32-word,
-    // and I64 elements are lo/hi word pairs. The destination is written
+    // and I64/F64 elements are lo/hi word pairs. The destination is written
     // contiguously starting at dst_offset.
     fn run_emulated_strided_copy_into(
         &self,
@@ -3832,7 +3841,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     dst[word_idx] = w;
 "#
             }
-            DType::I64 => {
+            DType::I64 | DType::F64 => {
                 r#"
     if (gid.x >= params.ne) { return; }
     let e = params.offset_src + src_index(gid.x);
@@ -3932,6 +3941,212 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{{body}}}
             "candle-wgpu-emulated-copy",
         )?;
         Ok(())
+    }
+
+    fn run_f64_f32_cast(&self, layout: &Layout, dst_dtype: DType) -> Result<Self> {
+        if !matches!(
+            (self.dtype, dst_dtype),
+            (DType::F32, DType::F64) | (DType::F64, DType::F32) | (DType::F64, DType::F64)
+        ) {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu f64 cast").bt());
+        }
+        if !layout.is_contiguous() || layout.start_offset() != 0 {
+            let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            self.copy_strided_src(&mut materialized, 0, layout)?;
+            let contiguous = Layout::contiguous(layout.shape());
+            return materialized.run_f64_f32_cast(&contiguous, dst_dtype);
+        }
+        let ne = layout.shape().elem_count();
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), dst_dtype)? };
+        let body = match (self.dtype, dst_dtype) {
+            (DType::F32, DType::F64) => {
+                r#"
+    if (gid.x >= params.ne) { return; }
+    let words = f32_to_f64_words(src[gid.x]);
+    dst[2u * gid.x] = words.x;
+    dst[2u * gid.x + 1u] = words.y;
+"#
+            }
+            (DType::F64, DType::F32) => {
+                r#"
+    if (gid.x >= params.ne) { return; }
+    dst[gid.x] = f64_to_f32_bits(src[2u * gid.x], src[2u * gid.x + 1u]);
+"#
+            }
+            (DType::F64, DType::F64) => {
+                r#"
+    if (gid.x >= params.ne) { return; }
+    dst[2u * gid.x] = src[2u * gid.x];
+    dst[2u * gid.x + 1u] = src[2u * gid.x + 1u];
+"#
+            }
+            _ => unreachable!(),
+        };
+        let shader = format!(
+            r#"
+struct Params {{
+    ne: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+fn highest_bit(v: u32) -> u32 {{
+    var out = 0u;
+    for (var bit = 0u; bit < 23u; bit = bit + 1u) {{
+        if ((v & (1u << bit)) != 0u) {{
+            out = bit;
+        }}
+    }}
+    return out;
+}}
+
+fn shift_left_words(v: u32, shift: u32) -> vec2<u32> {{
+    if (shift >= 32u) {{
+        return vec2<u32>(0u, v << (shift - 32u));
+    }}
+    return vec2<u32>(v << shift, v >> (32u - shift));
+}}
+
+fn f32_to_f64_words(bits: u32) -> vec2<u32> {{
+    let sign = bits >> 31u;
+    let exp = (bits >> 23u) & 0xffu;
+    let frac = bits & 0x7fffffu;
+    if (exp == 0xffu) {{
+        let nan_hi = select(0u, 0x80000u | (frac >> 3u), frac != 0u);
+        return vec2<u32>(frac << 29u, (sign << 31u) | (0x7ffu << 20u) | nan_hi);
+    }}
+    if (exp == 0u) {{
+        if (frac == 0u) {{
+            return vec2<u32>(0u, sign << 31u);
+        }}
+        let h = highest_bit(frac);
+        let exp64 = h + 874u;
+        let rem = frac ^ (1u << h);
+        let words = shift_left_words(rem, 52u - h);
+        return vec2<u32>(words.x, (sign << 31u) | (exp64 << 20u) | (words.y & 0xfffffu));
+    }}
+    let exp64 = exp + 896u;
+    return vec2<u32>(frac << 29u, (sign << 31u) | (exp64 << 20u) | (frac >> 3u));
+}}
+
+fn round_shift_right_words(hi: u32, lo: u32, shift: u32) -> u32 {{
+    var base = 0u;
+    var guard = false;
+    var sticky = false;
+    if (shift < 32u) {{
+        base = (hi << (32u - shift)) | (lo >> shift);
+        guard = ((lo >> (shift - 1u)) & 1u) != 0u;
+        sticky = (lo & ((1u << (shift - 1u)) - 1u)) != 0u;
+    }} else if (shift == 32u) {{
+        base = hi;
+        guard = (lo & 0x80000000u) != 0u;
+        sticky = (lo & 0x7fffffffu) != 0u;
+    }} else {{
+        let s = shift - 32u;
+        base = hi >> s;
+        guard = ((hi >> (s - 1u)) & 1u) != 0u;
+        sticky = ((hi & ((1u << (s - 1u)) - 1u)) != 0u) || (lo != 0u);
+    }}
+    if (guard && (sticky || ((base & 1u) != 0u))) {{
+        base = base + 1u;
+    }}
+    return base;
+}}
+
+fn f64_to_f32_bits(lo: u32, hi: u32) -> u32 {{
+    let sign = hi >> 31u;
+    let exp = (hi >> 20u) & 0x7ffu;
+    let frac_hi = hi & 0xfffffu;
+    if (exp == 0x7ffu) {{
+        let is_nan = (frac_hi != 0u) || (lo != 0u);
+        let payload = select(0u, 0x400000u | ((frac_hi << 3u) | (lo >> 29u)), is_nan);
+        return (sign << 31u) | 0x7f800000u | payload;
+    }}
+    if (exp == 0u) {{
+        return sign << 31u;
+    }}
+    let exp32_signed = i32(exp) - 1023 + 127;
+    let sig_hi = (1u << 20u) | frac_hi;
+    if (exp32_signed >= 255) {{
+        return (sign << 31u) | 0x7f800000u;
+    }}
+    if (exp32_signed <= 0) {{
+        if (exp32_signed < -23) {{
+            return sign << 31u;
+        }}
+        let shift = u32(30 - exp32_signed);
+        let mant = round_shift_right_words(sig_hi, lo, shift);
+        if (mant >= (1u << 23u)) {{
+            return (sign << 31u) | (1u << 23u);
+        }}
+        return (sign << 31u) | mant;
+    }}
+    var mant24 = (1u << 23u) | (frac_hi << 3u) | (lo >> 29u);
+    let rem = lo & 0x1fffffffu;
+    if ((rem > 0x10000000u) || (rem == 0x10000000u && ((mant24 & 1u) != 0u))) {{
+        mant24 = mant24 + 1u;
+    }}
+    var exp32 = u32(exp32_signed);
+    if (mant24 == (1u << 24u)) {{
+        mant24 = 1u << 23u;
+        exp32 = exp32 + 1u;
+        if (exp32 >= 255u) {{
+            return (sign << 31u) | 0x7f800000u;
+        }}
+    }}
+    return (sign << 31u) | (exp32 << 23u) | (mant24 & 0x7fffffu);
+}}
+
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+{body}
+}}
+"#
+        );
+        let params = F64CastParams {
+            ne: ne.try_into()?,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-f64-cast-params"),
+                size: std::mem::size_of::<F64CastParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+        let workgroups: u32 = ne.try_into().map(|v: u32| v.div_ceil(WG_SIZE))?;
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-f64-cast",
+        )?;
+        Ok(dst)
     }
 
     fn run_copy_into(
@@ -6861,9 +7076,16 @@ impl BackendStorage for WgpuStorage {
         {
             Err(unsupported("to_dtype f16"))
         } else {
-            match copy_shader(self.dtype, dtype) {
-                Ok(shader) => self.run_copy_to_dtype(layout, dtype, &shader),
-                Err(_) => self.run_emulated_cast(layout, dtype),
+            if matches!(
+                (self.dtype, dtype),
+                (DType::F32, DType::F64) | (DType::F64, DType::F32) | (DType::F64, DType::F64)
+            ) {
+                self.run_f64_f32_cast(layout, dtype)
+            } else {
+                match copy_shader(self.dtype, dtype) {
+                    Ok(shader) => self.run_copy_to_dtype(layout, dtype, &shader),
+                    Err(_) => self.run_emulated_cast(layout, dtype),
+                }
             }
         };
         match gpu {
@@ -7480,7 +7702,7 @@ impl BackendStorage for WgpuStorage {
                         Err(err) => return Err(err),
                     }
                 }
-                DType::BF16 | DType::U8 | DType::I16 | DType::I64 => {
+                DType::BF16 | DType::U8 | DType::I16 | DType::I64 | DType::F64 => {
                     match self.run_emulated_strided_copy_into(src_l, dst, dst_offset) {
                         Ok(()) => return Ok(()),
                         Err(err) if should_cpu_fallback(&err) => {
@@ -7528,7 +7750,7 @@ impl BackendStorage for WgpuStorage {
                     let shader = copy_shader(self.dtype, self.dtype)?;
                     self.run_copy_into(src_l, dst, dst_offset, &shader)
                 }
-                DType::BF16 | DType::U8 | DType::I16 | DType::I64 => {
+                DType::BF16 | DType::U8 | DType::I16 | DType::I64 | DType::F64 => {
                     self.run_emulated_strided_copy_into(src_l, dst, dst_offset)
                 }
                 _ => {

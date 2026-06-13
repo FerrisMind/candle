@@ -2677,6 +2677,9 @@ fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
         (DType::F32, DType::F16) => "cpy_f32_f16",
         (DType::F16, DType::F32) => "cpy_f16_f32",
         (DType::F16, DType::F16) => "cpy_f16_f16",
+        (DType::F32, DType::F64) => "convert_f32_f64",
+        (DType::F64, DType::F32) => "convert_f64_f32",
+        (DType::F64, DType::F64) => "convert_f64_f64",
         // Candle-owned integer cast family; the copied ggml generator only
         // covers the float pairs above.
         (DType::U8, DType::U8) => "convert_u8_u8",
@@ -8001,6 +8004,7 @@ impl BackendDevice for VulkanDevice {
             .filter(|idx| *idx != queue_family_index);
         let robust_buffer_access = physical_features2.features.robust_buffer_access == vk::TRUE;
         let shader_int64 = physical_features2.features.shader_int64 == vk::TRUE;
+        let shader_float64 = physical_features2.features.shader_float64 == vk::TRUE;
         let vulkan_memory_model = vulkan12_features.vulkan_memory_model == vk::TRUE;
         let integer_dot_product = integer_dot_features.shader_integer_dot_product == vk::TRUE
             && integer_dot_properties.integer_dot_product4x8_bit_packed_signed_accelerated
@@ -8018,6 +8022,9 @@ impl BackendDevice for VulkanDevice {
         // 64-bit integers are needed by the Candle-owned I64 cast kernels.
         if shader_int64 {
             enabled_features.shader_int64 = vk::TRUE;
+        }
+        if shader_float64 {
+            enabled_features.shader_float64 = vk::TRUE;
         }
         let mut enabled_vulkan11 = vk::PhysicalDeviceVulkan11Features::default();
         // The ggml shader corpus reads 16-bit storage buffers throughout.

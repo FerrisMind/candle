@@ -261,6 +261,21 @@ backend_family_test!(
 backend_family_test!(
     #[cfg(feature = "wgpu")]
     #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_f64_cuda_cast_native_only,
+    TestBackend::Wgpu,
+    native_required,
+    smoke_f64_cuda_cast_native_only
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_f64_cuda_cast_native_only,
+    TestBackend::Vulkan,
+    native_required,
+    smoke_f64_cuda_cast_native_only
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_strided_const_set_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -1368,6 +1383,49 @@ fn smoke_strided_dtype_conversion_native_only(device: &Device) -> Result<()> {
         2e-2,
         "rank5 f32->bf16->f32 dtype conversion",
     );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f64_cuda_cast_native_only(device: &Device) -> Result<()> {
+    let cpu = Device::Cpu;
+
+    let f32_vals = vec![-1024.5f32, -0.0, 0.0, 0.125, 1.5, 65_504.0, 16_777_216.0];
+    let dev_f32 = Tensor::from_vec(f32_vals.clone(), (1, f32_vals.len()), device)?;
+    let cpu_f32 = Tensor::from_vec(f32_vals, (1, 7), &cpu)?;
+    assert_eq!(
+        dev_f32.to_dtype(DType::F64)?.to_vec2::<f64>()?,
+        cpu_f32.to_dtype(DType::F64)?.to_vec2::<f64>()?,
+        "cuda-supported f32->f64 cast"
+    );
+
+    let f64_vals = vec![
+        -4096.25f64,
+        -0.0,
+        0.0,
+        f32::MIN_POSITIVE as f64 * 0.5,
+        -(f32::MIN_POSITIVE as f64 * 0.5),
+        0.5,
+        1.25,
+        65_504.0,
+        16_777_216.0,
+    ];
+    let dev_f64 = Tensor::from_vec(f64_vals.clone(), (1, f64_vals.len()), device)?;
+    let cpu_f64 = Tensor::from_vec(f64_vals.clone(), (1, f64_vals.len()), &cpu)?;
+    assert_eq!(
+        dev_f64.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+        cpu_f64.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+        "cuda-supported f64->f32 cast"
+    );
+
+    let strided_dev = dev_f64.reshape((f64_vals.len(), 1))?.t()?;
+    let strided_cpu = cpu_f64.reshape((f64_vals.len(), 1))?.t()?;
+    assert_eq!(
+        strided_dev.to_dtype(DType::F64)?.to_vec2::<f64>()?,
+        strided_cpu.to_dtype(DType::F64)?.to_vec2::<f64>()?,
+        "cuda-supported strided f64->f64 cast"
+    );
+
     Ok(())
 }
 

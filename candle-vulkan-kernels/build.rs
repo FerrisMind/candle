@@ -454,6 +454,11 @@ fn generate_candle_spirv_modules(
             ],
         ),
         (
+            "convert_f32_f64",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=float", "D_TYPE=double", "USE_F64"],
+        ),
+        (
             "convert_f16_u8",
             candle_shaders_dir.join("convert.comp"),
             &["A_TYPE=float16_t", "D_TYPE=uint8_t", "DST_SAT_U8"],
@@ -587,6 +592,16 @@ fn generate_candle_spirv_modules(
                 "DST_VIA_F32",
                 "DATA_D_BF16",
             ],
+        ),
+        (
+            "convert_f64_f32",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=double", "D_TYPE=float", "USE_F64"],
+        ),
+        (
+            "convert_f64_f64",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=double", "D_TYPE=double", "USE_F64"],
         ),
         (
             "repack_q8_1_to_q8_0",

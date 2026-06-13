@@ -1384,7 +1384,49 @@ Remaining open (tracked, not final): optimized BF16-specialized arithmetic/reduc
   - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' CANDLE_EXPECTED_WGPU_BACKEND=Vulkan cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_strided_dtype_conversion_native_only -- --ignored --exact --nocapture`
     - passed
 - Remaining open after this closure:
-  - F64/I16 cast pairs, broader I32 destination/source coverage, model attribution, and dtype conversion profiling remain tracked by the parity matrix.
+  - CUDA-supported F64 cast pairs, model attribution, and dtype conversion profiling remain tracked by the parity matrix.
+  - CPU-only `I16`/`I32` destination casts are not claimed as CUDA parity because current CUDA rejects those outputs.
+
+## Progress Update: CUDA-Supported F64 Cast Closure (wgpu + Vulkan)
+
+- Scope:
+  - closes CUDA-supported `F32->F64`, `F64->F32`, and `F64->F64` `to_dtype` pairs for WGPU and Vulkan under native-required fallback accounting.
+  - keeps claim narrow: this is synthetic/API-level cast closure, not model attribution or profiling.
+  - explicitly does not count CPU-only `I16`/`I32` destination casts as CUDA parity; current CUDA `to_dtype` rejects those outputs in `candle-core/src/cuda_backend/mod.rs`.
+- WGPU implementation:
+  - `candle-core/src/wgpu_backend.rs::run_f64_f32_cast` added WGSL raw-word IEEE-754 conversion because WGSL has no storage `f64`.
+  - `F32->F64` expands f32 bits into double lo/hi `u32` words, preserving sign, zeros, infinities, and NaN payload class.
+  - `F64->F32` rounds raw double words to f32 bits, including subnormal boundary coverage.
+  - same-dtype F64 strided copy now reuses the existing lo/hi-word emulated copy path, so non-contiguous `F64->F64` materialization stays GPU-resident.
+- Vulkan implementation:
+  - `candle-vulkan-kernels/build.rs` now emits `convert_f32_f64`, `convert_f64_f32`, and `convert_f64_f64` from `candle-vulkan-kernels/src/candle-shaders/convert.comp`.
+  - `convert.comp` enables `GL_EXT_shader_explicit_arithmetic_types_float64` for those variants.
+  - `candle-core/src/vulkan_backend.rs::copy_spirv` routes the F64 pairs to the generated SPIR-V, and device creation enables `shaderFloat64` when supported by the physical device.
+- Reference / source checks used for this slice:
+  - CUDA behavior: `candle-core/src/cuda_backend/mod.rs::to_dtype`; `candle-kernels/src/cast.cu::{cast_f32_f64,cast_f64_f32,cast_f64_f64}`.
+  - CPU semantics: `candle-core/src/cpu_backend/mod.rs::to_dtype` only as value oracle for finite cases and subnormal rounding.
+  - WGPU refs: `candle-core/src/wgpu_backend.rs` existing lo/hi-word I64/F64 argsort handling; WebGPU has no native f64 storage, so raw-word conversion is backend-local.
+  - Vulkan refs: `candle-vulkan-kernels/src/candle-shaders/convert.comp`, `generic_unary_head.glsl`; llama.cpp Vulkan/WebGPU copy routes do not provide F64 tensor casts, so Candle keeps this path local.
+- Test closure:
+  - Added `backend_smoke_{wgpu,vulkan}_f64_cuda_cast_native_only`.
+  - Coverage: `F32->F64`, `F64->F32`, finite values, signed zero, f32 subnormal boundary via f64 source, and strided `F64->F64`.
+  - Tests compare against CPU value oracle and run with fallback counter enforcement.
+- Targeted verification on the RTX 3060:
+  - `cargo fmt --check`
+    - passed
+  - `git diff --check`
+    - passed
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-vulkan-kernels --all-targets -- -D warnings`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' CANDLE_EXPECTED_WGPU_BACKEND=Vulkan cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_f64_cuda_cast_native_only -- --ignored --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_f64_cuda_cast_native_only -- --exact --nocapture`
+    - passed
+- Remaining open after this closure:
+  - model attribution and profiling for F64 casts remain tracked by the dtype row.
+  - CPU-only `I16`/`I32` destination casts remain outside CUDA parity unless CUDA backend support is added first.
 
 ## Progress Update: I16 Layout Copy Materialization (wgpu + Vulkan)
 
