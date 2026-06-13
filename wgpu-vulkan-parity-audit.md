@@ -1320,17 +1320,21 @@ Remaining open (tracked, not final): optimized BF16-specialized arithmetic/reduc
 - Remaining open after this closure:
   - This closes the native-required synthetic/API half-cumsum slice only. Dedicated half cumsum shaders, broader layout/rank sweeps, model attribution, and cumsum profiling remain governed by the parity matrix.
 
-## Progress Update: Rank>4 Last-Dim Cumsum Compact Materialization (wgpu + Vulkan)
+## Progress Update: Rank>4 Cumsum Compact Materialization (wgpu + Vulkan)
 
 - Scope:
-  - closes rank-5 last-dim `cumsum` for `F32`, `F16`, and `BF16` on both WGPU and Vulkan under native-required fallback accounting.
-  - keeps the claim intentionally narrow: non-last-dim rank>4 public `Tensor::cumsum` still needs broader rank>4 `contiguous` / layout materialization closure.
+  - closes rank-5 `cumsum` for `F32`, `F16`, and `BF16` on both WGPU and Vulkan under native-required fallback accounting.
+  - includes non-last-dim public `Tensor::cumsum`, avoiding the old `transpose(...).contiguous()` rank>4 CPU fallback path.
+- Public API / dispatch:
+  - WGPU/Vulkan `Tensor::cumsum(dim != last)` now calls backend `cumsum_last_dim` directly on the transposed layout, then transposes the result back, instead of forcing `contiguous()` before cumsum.
 - WGPU implementation:
   - `candle-core/src/wgpu_backend.rs::cumsum_last_dim` now materializes non-contiguous `F32` layouts to contiguous GPU `F32` before dispatching the existing `cumsum.wgsl` kernel.
   - Rank>4 `F16`/`BF16` reuse the same compact-rank materialization and F32 cumsum decomposition introduced for the half-cumsum route.
+  - rank>4 `copy_strided_src` to a full contiguous destination now uses compact GPU materialization for the certified dtype slice, so assertion/readback and public reshapes do not silently fall back.
 - Vulkan implementation:
   - `candle-core/src/vulkan_backend.rs::cumsum_last_dim` now routes rank>4 or non-contiguous `F32` layouts through GPU materialization before dispatching the existing `cumsum_f32` SPIR-V kernel.
   - Rank>4 `F16`/`BF16` use the same GPU-resident F32 decomposition and castback path.
+  - rank>4 `copy_strided_src` to a full contiguous destination uses the same compact GPU materialization path.
 - Reference / source checks used for this slice:
   - CUDA behavior: Candle CUDA unary/reduction semantics in `candle-core/src/cuda_backend/mod.rs`.
   - CPU semantics: public `Tensor::cumsum` contract in `candle-core/src/tensor.rs`; the test uses an explicit small rank-5 prefix-sum oracle because current CPU rank-5 cumsum can hit `MatMulUnexpectedStriding`.
@@ -1338,7 +1342,7 @@ Remaining open (tracked, not final): optimized BF16-specialized arithmetic/reduc
   - Vulkan refs: `candle-vulkan-kernels/src/shaders/cumsum.comp`; llama.cpp Vulkan `ggml_vk_cumsum` F32 pipeline route in `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp`.
 - Test closure:
   - Added `backend_smoke_{wgpu,vulkan}_rank5_cumsum_native_only`.
-  - Coverage: rank-5 last-dim `F32` cumsum, rank-5 last-dim `F16` cumsum with dtype preservation, and rank-5 last-dim `BF16` cumsum with dtype preservation.
+  - Coverage: rank-5 last-dim `F32` cumsum, rank-5 non-last-dim `F32` cumsum, rank-5 last-dim `F16` cumsum with dtype preservation, and rank-5 last-dim `BF16` cumsum with dtype preservation.
   - Test readback flattens before half-to-F32 conversion so the assertion path itself does not trigger the still-open rank>4 cast fallback.
 - Targeted verification on the RTX 3060:
   - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_rank5_cumsum_native_only -- --exact --nocapture`
@@ -1346,4 +1350,105 @@ Remaining open (tracked, not final): optimized BF16-specialized arithmetic/reduc
   - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' CANDLE_EXPECTED_WGPU_BACKEND=Vulkan cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_rank5_cumsum_native_only -- --ignored --exact --nocapture`
     - passed
 - Remaining open after this closure:
-  - Non-last-dim rank>4 public `Tensor::cumsum` still goes through `transpose(...).contiguous()` and can trigger the broader rank>4 layout fallback. That stays tracked under the shape/layout and unary/cumsum matrix rows.
+  - This is still a synthetic/API slice, not full model attribution or profiling closure. Broader rank>4 layout parity for other ops remains tracked under the shape/layout matrix row.
+
+## Progress Update: Strided / Rank>4 DType Conversion Materialization (wgpu + Vulkan)
+
+- Scope:
+  - closes the native-required synthetic/API slice for strided `to_dtype` on the core cast set exercised by model-critical paths.
+  - WGPU coverage includes strided `BF16->F32`, `U8->F32`, `I64->F32`, plus rank-5 `F32->I32` and `F32->BF16->F32`.
+  - Vulkan coverage includes the same public cases, with the fix aimed at the private `BF16->F16/F32` get-rows route that previously rejected strided layouts before generic GPU materialization could run.
+- WGPU implementation:
+  - `candle-core/src/wgpu_backend.rs::to_dtype` now first compact-materializes rank>4 layouts on GPU, then dispatches the existing cast path on the compact contiguous layout.
+  - `candle-core/src/wgpu_backend.rs::run_emulated_cast` no longer rejects strided or offset layouts. It materializes the logical view into contiguous GPU storage with `copy_strided_src`, then runs the existing packed `U8` / packed `BF16` / lo-hi `I64` cast shader.
+- Vulkan implementation:
+  - `candle-core/src/vulkan_backend.rs::run_bf16_to_dtype_via_get_rows` now materializes strided or offset BF16 views on GPU before dispatching `get_rows_bf16` / `get_rows_bf16_f32`.
+  - The existing `run_unary_generic_with_params_dtype` path already handled generic strided/rank>4 casts by GPU materialization, so this closes the BF16 special-case hole.
+- Reference / source checks used for this slice:
+  - CUDA behavior: `candle-core/src/cuda_backend/mod.rs::to_dtype` and `candle-kernels/src/cast.cu`, especially strided index handling in `cast_`.
+  - CPU semantics: `candle-core/src/cpu_backend/mod.rs::to_dtype`, using CPU `as`-cast behavior as numeric oracle.
+  - WGPU refs: `candle-wgpu-kernels/src/shaders/cpy.wgsl` and existing WGPU packed-copy/materialization helpers.
+  - Vulkan refs: `candle-vulkan-kernels/src/candle-shaders/convert.comp`, `get_rows_bf16`, and generic unary/copy helpers.
+  - llama.cpp refs: `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp` copy pipeline selection around `F32<->I32` and `BF16<->F32`; `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-webgpu/ggml-webgpu.cpp` WebGPU op support for `I32`/copy routes.
+- Test closure:
+  - Added `backend_smoke_{wgpu,vulkan}_strided_dtype_conversion_native_only`.
+  - Coverage: strided/transposed `BF16->F32`, `U8->F32`, `I64->F32`, rank-5 transposed `F32->I32->F32`, and rank-5 transposed `F32->BF16->F32`.
+  - Tests compare against CPU results and run under native-required fallback accounting.
+- Targeted verification on the RTX 3060:
+  - `cargo fmt --check`
+    - passed
+  - `git diff --check`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_strided_dtype_conversion_native_only -- --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' CANDLE_EXPECTED_WGPU_BACKEND=Vulkan cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_strided_dtype_conversion_native_only -- --ignored --exact --nocapture`
+    - passed
+- Remaining open after this closure:
+  - F64/I16 cast pairs, broader I32 destination/source coverage, model attribution, and dtype conversion profiling remain tracked by the parity matrix.
+
+## Progress Update: I16 Layout Copy Materialization (wgpu + Vulkan)
+
+- Scope:
+  - closes same-dtype `I16` upload/download plus non-contiguous and rank>4 layout copy for WGPU and Vulkan under native-required fallback accounting.
+  - keeps claim narrow: this is not full `I16` cast-matrix closure.
+- WGPU implementation:
+  - `candle-core/src/wgpu_backend.rs::run_emulated_strided_copy_into` now treats `I16` like the existing packed 16-bit BF16 copy path, using `u32` storage words and halfword extraction/insertion.
+  - odd destination offsets are handled by preserving the neighboring halfword in the destination word, so `slice_scatter0` / offset copies do not fall back to CPU.
+  - `copy_strided_src` and rank>4 compact materialization now include `DType::I16`.
+- Vulkan implementation:
+  - added `convert_i16_i16` to `candle-vulkan-kernels/build.rs` using the existing `convert.comp` shader with `int16_t` source/destination.
+  - `copy_spirv` and `copy_strided_src` now route same-dtype `I16` layout copies through that native SPIR-V path.
+  - rank>4 compact materialization now includes `DType::I16`.
+- Reference / source checks used for this slice:
+  - CUDA behavior: `candle-core/src/cuda_backend/mod.rs::copy_strided_src`, especially `ucopy_i16`; CUDA allocation/upload/download support in `candle-core/src/cuda_backend/device.rs`.
+  - CPU semantics: `candle-core/src/cpu_backend/mod.rs::copy_strided_src` for `I16`.
+  - WGPU refs: existing packed 16-bit BF16 copy helper in `candle-core/src/wgpu_backend.rs`; WebGPU lacks direct storage `i16`, so packed-word copy mirrors the BF16 strategy.
+  - Vulkan refs: `candle-vulkan-kernels/src/candle-shaders/convert.comp` and `generic_unary_head.glsl` 16-bit storage support.
+  - llama.cpp refs: `/home/mod479711/Downloads/candle_refs/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp` / WebGPU sources use native integer/copy routing where supported; Candle keeps the API-level I16 path local because GGML model paths mainly use I32/I64.
+- Test closure:
+  - Added `backend_smoke_{wgpu,vulkan}_i16_layout_copy_native_only`.
+  - Coverage: `I16` upload/download, transposed contiguous materialization, rank-5 transposed compact materialization, and strided copy into an odd destination offset through `slice_scatter0`.
+  - Tests compare exact `i16` values and run under native-required fallback accounting.
+- Targeted verification on the RTX 3060:
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' CANDLE_EXPECTED_WGPU_BACKEND=Vulkan cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_i16_layout_copy_native_only -- --ignored --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_i16_layout_copy_native_only -- --exact --nocapture`
+    - passed
+- Remaining open after this closure:
+  - Full `I16` cast pairs, model attribution, and profiling remain tracked by the dtype and layout rows.
+
+## Progress Update: Strided `const_set` Native Fill (wgpu + Vulkan)
+
+- Scope:
+  - closes `Tensor::const_set` / `Tensor::full`-style scalar fill for strided rank<=4 views and contiguous rank>4 blocks under native-required fallback accounting.
+  - certified dtypes in the smoke slice: `F32`, `F16`, `BF16`, `U8`, `U32`, `I16`, `I32`, `I64`, `F64`.
+  - keeps the claim narrow: this is API/synthetic closure, not model attribution or fill throughput parity.
+- WGPU implementation:
+  - `candle-core/src/wgpu_backend.rs::const_set` now routes scalar bits through `run_raw_fill_inplace` instead of CPU readback/writeback for non-float and non-contiguous cases.
+  - packed dtypes (`U8`, `F8E4M3`, `F8E8M0`, `I16`, `BF16`, `F16`) are written word-wise to preserve neighboring packed lanes and avoid concurrent read-modify-write races.
+  - rank>4 or non-contiguous packed views are decomposed into contiguous storage blocks and filled on GPU, preserving view mutation semantics.
+- Vulkan implementation:
+  - added Candle-owned `candle-vulkan-kernels/src/candle-shaders/fill_raw.comp`.
+  - `candle-vulkan-kernels/build.rs` now emits `fill_raw_*` SPIR-V variants for raw 8-bit, 16-bit, 32-bit, and two-word 64-bit scalar fills.
+  - `candle-core/src/vulkan_backend.rs::const_set` now dispatches `fill_raw_*` instead of reading the whole device buffer to CPU, mutating bytes, and uploading it back.
+- Reference / source checks used for this slice:
+  - CUDA behavior: `candle-core/src/cuda_backend/mod.rs::const_set` and `candle-kernels/src/fill.cu::CONST_SET_OP`.
+  - CPU semantics: `candle-core/src/cpu_backend/mod.rs::const_set`.
+  - WGPU refs: existing packed storage/copy helpers in `candle-core/src/wgpu_backend.rs`; llama.cpp WebGPU `ggml_webgpu_set` / buffer memset patterns.
+  - Vulkan refs: `candle-vulkan-kernels/src/candle-shaders/convert.comp`, `types.glsl`, and llama.cpp Vulkan `ggml_vk_fill`.
+- Test closure:
+  - Added `backend_smoke_{wgpu,vulkan}_strided_const_set_native_only`.
+  - Coverage: strided column/row fills, packed byte/halfword lane preservation, signed integer raw-bit values, BF16/F16 bit-preserving fills, and F64 two-word fills.
+  - Tests compare exact typed readback values and run under native-required fallback accounting.
+- Targeted verification on the RTX 3060:
+  - `cargo clippy -p candle-vulkan-kernels --all-targets -- -D warnings`
+    - passed
+  - `cargo clippy -p candle-core --features wgpu,vulkan --tests -- -D warnings`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_WGPU_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' CANDLE_EXPECTED_WGPU_BACKEND=Vulkan cargo test -p candle-core --features wgpu,vulkan backend_smoke_wgpu_strided_const_set_native_only -- --ignored --exact --nocapture`
+    - passed
+  - `CANDLE_DEBUG_GPU_FALLBACK=1 CANDLE_REQUIRE_VULKAN_TEST_DEVICE=1 CANDLE_EXPECTED_GPU_NAME='NVIDIA GeForce RTX 3060' cargo test -p candle-core --features wgpu,vulkan backend_smoke_vulkan_strided_const_set_native_only -- --exact --nocapture`
+    - passed
+- Remaining open after this closure:
+  - model attribution and profiling for scalar fill remain tracked by the device/layout/unary rows.
+  - broader rank>4 non-contiguous mutation remains block-decomposed, not a single specialized high-rank kernel.

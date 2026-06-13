@@ -374,6 +374,61 @@ fn generate_candle_spirv_modules(
             ],
         ),
         (
+            "fill_raw_u8",
+            candle_shaders_dir.join("fill_raw.comp"),
+            &["D_TYPE=uint8_t", "RAW_CAST=p.value0"],
+        ),
+        (
+            "fill_raw_u32",
+            candle_shaders_dir.join("fill_raw.comp"),
+            &["D_TYPE=uint", "RAW_CAST=p.value0"],
+        ),
+        (
+            "fill_raw_i16",
+            candle_shaders_dir.join("fill_raw.comp"),
+            &["D_TYPE=uint16_t", "RAW_CAST=p.value0"],
+        ),
+        (
+            "fill_raw_i32",
+            candle_shaders_dir.join("fill_raw.comp"),
+            &["D_TYPE=uint", "RAW_CAST=p.value0"],
+        ),
+        (
+            "fill_raw_i64",
+            candle_shaders_dir.join("fill_raw.comp"),
+            &["RAW_U32X2"],
+        ),
+        (
+            "fill_raw_bf16",
+            candle_shaders_dir.join("fill_raw.comp"),
+            &["D_TYPE=uint16_t", "RAW_CAST=p.value0"],
+        ),
+        (
+            "fill_raw_f16",
+            candle_shaders_dir.join("fill_raw.comp"),
+            &["D_TYPE=uint16_t", "RAW_CAST=p.value0"],
+        ),
+        (
+            "fill_raw_f32",
+            candle_shaders_dir.join("fill_raw.comp"),
+            &["D_TYPE=uint", "RAW_CAST=p.value0"],
+        ),
+        (
+            "fill_raw_f64",
+            candle_shaders_dir.join("fill_raw.comp"),
+            &["RAW_U32X2"],
+        ),
+        (
+            "fill_raw_f8e4m3",
+            candle_shaders_dir.join("fill_raw.comp"),
+            &["D_TYPE=uint8_t", "RAW_CAST=p.value0"],
+        ),
+        (
+            "fill_raw_f8e8m0",
+            candle_shaders_dir.join("fill_raw.comp"),
+            &["D_TYPE=uint8_t", "RAW_CAST=p.value0"],
+        ),
+        (
             "convert_f32_u8",
             candle_shaders_dir.join("convert.comp"),
             &["A_TYPE=float", "D_TYPE=uint8_t", "DST_SAT_U8"],
@@ -437,6 +492,11 @@ fn generate_candle_spirv_modules(
             "convert_u32_u32",
             candle_shaders_dir.join("convert.comp"),
             &["A_TYPE=uint", "D_TYPE=uint"],
+        ),
+        (
+            "convert_i16_i16",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=int16_t", "D_TYPE=int16_t"],
         ),
         (
             "convert_i64_i64",

@@ -47,7 +47,6 @@ fn assert_permutation(indices: &[u32], len: usize) {
     }
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 macro_rules! backend_family_test {
     ($(#[$meta:meta])* $name:ident, $backend:expr, $runner:ident, $family:ident) => {
         $(#[$meta])*
@@ -243,6 +242,51 @@ backend_family_test!(
     TestBackend::Vulkan,
     native_required,
     smoke_dtype_conversion_matrix_native_only
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_strided_dtype_conversion_native_only,
+    TestBackend::Wgpu,
+    native_required,
+    smoke_strided_dtype_conversion_native_only
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_strided_dtype_conversion_native_only,
+    TestBackend::Vulkan,
+    native_required,
+    smoke_strided_dtype_conversion_native_only
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_strided_const_set_native_only,
+    TestBackend::Wgpu,
+    native_required,
+    smoke_strided_const_set_native_only
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_strided_const_set_native_only,
+    TestBackend::Vulkan,
+    native_required,
+    smoke_strided_const_set_native_only
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_i16_layout_copy_native_only,
+    TestBackend::Wgpu,
+    native_required,
+    smoke_i16_layout_copy_native_only
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_i16_layout_copy_native_only,
+    TestBackend::Vulkan,
+    native_required,
+    smoke_i16_layout_copy_native_only
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
@@ -1227,6 +1271,244 @@ fn smoke_dtype_conversion_matrix_native_only(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_strided_dtype_conversion_native_only(device: &Device) -> Result<()> {
+    let cpu = Device::Cpu;
+    let shape = (2, 3, 4);
+
+    let vals = (0..24)
+        .map(|idx| (idx as f32 % 13.0) - 6.0)
+        .collect::<Vec<_>>();
+    let dev_f32 = Tensor::from_vec(vals.clone(), shape, device)?;
+    let cpu_f32 = Tensor::from_vec(vals.clone(), shape, &cpu)?;
+
+    let dev_bf16 = dev_f32.to_dtype(DType::BF16)?.transpose(0, 1)?;
+    let cpu_bf16 = cpu_f32.to_dtype(DType::BF16)?.transpose(0, 1)?;
+    assert_close_vec(
+        &dev_bf16
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &cpu_bf16
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        2e-2,
+        "strided bf16->f32 dtype conversion",
+    );
+
+    let byte_vals = (0..24).map(|idx| (idx % 17) as f32).collect::<Vec<_>>();
+    let dev_u8 = Tensor::from_vec(byte_vals.clone(), shape, device)?
+        .to_dtype(DType::U8)?
+        .transpose(0, 1)?;
+    let cpu_u8 = Tensor::from_vec(byte_vals.clone(), shape, &cpu)?
+        .to_dtype(DType::U8)?
+        .transpose(0, 1)?;
+    assert_eq!(
+        dev_u8
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        cpu_u8
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        "strided u8->f32 dtype conversion"
+    );
+
+    let int_vals = (0..24).map(|idx| (idx + 3) as f32).collect::<Vec<_>>();
+    let dev_i64 = Tensor::from_vec(int_vals.clone(), shape, device)?
+        .to_dtype(DType::I64)?
+        .transpose(1, 2)?;
+    let cpu_i64 = Tensor::from_vec(int_vals.clone(), shape, &cpu)?
+        .to_dtype(DType::I64)?
+        .transpose(1, 2)?;
+    assert_eq!(
+        dev_i64
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        cpu_i64
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        "strided i64->f32 dtype conversion"
+    );
+
+    let rank5_shape = (2, 1, 2, 2, 3);
+    let rank5_vals = (0..24)
+        .map(|idx| (idx as f32 % 11.0) - 5.0)
+        .collect::<Vec<_>>();
+    let dev_rank5 = Tensor::from_vec(rank5_vals.clone(), rank5_shape, device)?.transpose(2, 4)?;
+    let cpu_rank5 = Tensor::from_vec(rank5_vals.clone(), rank5_shape, &cpu)?.transpose(2, 4)?;
+    assert_close_vec(
+        &dev_rank5
+            .to_dtype(DType::I32)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &cpu_rank5
+            .to_dtype(DType::I32)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        1e-5,
+        "rank5 f32->i32 dtype conversion",
+    );
+    assert_close_vec(
+        &dev_rank5
+            .to_dtype(DType::BF16)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        &cpu_rank5
+            .to_dtype(DType::BF16)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        2e-2,
+        "rank5 f32->bf16->f32 dtype conversion",
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_strided_const_set_native_only(device: &Device) -> Result<()> {
+    let f32s = Tensor::zeros((2, 3), DType::F32, device)?;
+    f32s.i((.., 1))?.const_set(7.0f32.into())?;
+    assert_eq!(
+        f32s.to_vec2::<f32>()?,
+        vec![vec![0.0, 7.0, 0.0], vec![0.0, 7.0, 0.0]],
+        "strided f32 const_set"
+    );
+
+    let f16s = Tensor::zeros((2, 3), DType::F16, device)?;
+    f16s.i((1, ..))?.const_set(f16::from_f32(2.5).into())?;
+    assert_eq!(
+        f16s.to_vec2::<f16>()?,
+        vec![
+            vec![f16::ZERO, f16::ZERO, f16::ZERO],
+            vec![f16::from_f32(2.5), f16::from_f32(2.5), f16::from_f32(2.5)],
+        ],
+        "strided f16 const_set"
+    );
+
+    let u8s = Tensor::zeros((3, 4), DType::U8, device)?;
+    u8s.i((.., 2))?.const_set(11u8.into())?;
+    u8s.i((1, ..))?.const_set(9u8.into())?;
+    assert_eq!(
+        u8s.to_vec2::<u8>()?,
+        vec![vec![0, 0, 11, 0], vec![9, 9, 9, 9], vec![0, 0, 11, 0]],
+        "strided u8 const_set"
+    );
+
+    let u32s = Tensor::zeros((3, 4), DType::U32, device)?;
+    u32s.i((.., 1))?.const_set(1337u32.into())?;
+    assert_eq!(
+        u32s.to_vec2::<u32>()?,
+        vec![
+            vec![0, 1337, 0, 0],
+            vec![0, 1337, 0, 0],
+            vec![0, 1337, 0, 0],
+        ],
+        "strided u32 const_set"
+    );
+
+    let i16s = Tensor::zeros((3, 4), DType::I16, device)?;
+    i16s.i((.., 3))?.const_set((-12i16).into())?;
+    i16s.i((2, ..))?.const_set(5i16.into())?;
+    assert_eq!(
+        i16s.to_vec2::<i16>()?,
+        vec![vec![0, 0, 0, -12], vec![0, 0, 0, -12], vec![5, 5, 5, 5]],
+        "strided i16 const_set"
+    );
+
+    let i32s = Tensor::zeros((2, 3), DType::I32, device)?;
+    i32s.i((.., 0))?.const_set((-1234i32).into())?;
+    assert_eq!(
+        i32s.to_vec2::<i32>()?,
+        vec![vec![-1234, 0, 0], vec![-1234, 0, 0]],
+        "strided i32 const_set"
+    );
+
+    let i64s = Tensor::zeros((2, 3), DType::I64, device)?;
+    i64s.i((0, ..))?.const_set((-9_000_000_001i64).into())?;
+    assert_eq!(
+        i64s.to_vec2::<i64>()?,
+        vec![
+            vec![-9_000_000_001, -9_000_000_001, -9_000_000_001],
+            vec![0, 0, 0]
+        ],
+        "strided i64 const_set"
+    );
+
+    let f64s = Tensor::zeros((2, 3), DType::F64, device)?;
+    f64s.i((.., 2))?.const_set((-3.25f64).into())?;
+    assert_eq!(
+        f64s.to_vec2::<f64>()?,
+        vec![vec![0.0, 0.0, -3.25], vec![0.0, 0.0, -3.25]],
+        "strided f64 const_set"
+    );
+
+    let bf16s = Tensor::zeros((2, 3), DType::BF16, device)?;
+    bf16s.i((1, ..))?.const_set(bf16::from_f32(-1.5).into())?;
+    assert_eq!(
+        bf16s.to_vec2::<bf16>()?,
+        vec![
+            vec![bf16::ZERO, bf16::ZERO, bf16::ZERO],
+            vec![
+                bf16::from_f32(-1.5),
+                bf16::from_f32(-1.5),
+                bf16::from_f32(-1.5),
+            ],
+        ],
+        "strided bf16 const_set"
+    );
+
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_i16_layout_copy_native_only(device: &Device) -> Result<()> {
+    let vals = (0..24).map(|idx| idx as i16 - 11).collect::<Vec<_>>();
+    let xs = Tensor::from_slice(&vals, (2, 3, 4), device)?;
+    assert_eq!(xs.dtype(), DType::I16);
+    assert_eq!(xs.flatten_all()?.to_vec1::<i16>()?, vals);
+
+    let transposed = xs.transpose(0, 1)?;
+    assert_eq!(
+        transposed.contiguous()?.to_vec3::<i16>()?,
+        vec![
+            vec![vec![-11, -10, -9, -8], vec![1, 2, 3, 4]],
+            vec![vec![-7, -6, -5, -4], vec![5, 6, 7, 8]],
+            vec![vec![-3, -2, -1, 0], vec![9, 10, 11, 12]],
+        ],
+        "strided i16 contiguous copy"
+    );
+
+    let rank5_vals = (0..24).map(|idx| idx as i16 - 7).collect::<Vec<_>>();
+    let rank5 = Tensor::from_slice(&rank5_vals, (2, 1, 2, 2, 3), device)?.transpose(2, 4)?;
+    assert_eq!(
+        rank5.contiguous()?.flatten_all()?.to_vec1::<i16>()?,
+        Tensor::from_slice(&rank5_vals, (2, 1, 2, 2, 3), &Device::Cpu)?
+            .transpose(2, 4)?
+            .contiguous()?
+            .flatten_all()?
+            .to_vec1::<i16>()?,
+        "rank5 i16 compact copy"
+    );
+
+    let dst = Tensor::zeros((4, 3), DType::I16, device)?;
+    let src_base = Tensor::from_slice(&[1i16, 4, 2, 5, 3, 6], (3, 2), device)?;
+    let src = src_base.t()?;
+    assert_eq!(
+        dst.slice_scatter0(&src, 1)?.to_vec2::<i16>()?,
+        vec![vec![0, 0, 0], vec![1, 2, 3], vec![4, 5, 6], vec![0, 0, 0],],
+        "strided i16 copy with odd destination offset"
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn assert_matmul_close(actual: &Tensor, expected: &Tensor, k: usize, case: &str) -> Result<()> {
     assert_eq!(actual.dims(), expected.dims(), "{case}: shape mismatch");
     let actual = actual.flatten_all()?.to_vec1::<f32>()?;
@@ -1497,6 +1779,7 @@ fn smoke_rank5_cumsum(device: &Device) -> Result<()> {
         .map(|idx| (idx as f32 % 7.0) - 3.0)
         .collect::<Vec<_>>();
     let expected_last = rank5_cumsum_reference(&values, [2, 1, 2, 2, 3], 4);
+    let expected_dim2 = rank5_cumsum_reference(&values, [2, 1, 2, 2, 3], 2);
 
     let xs = Tensor::from_vec(values.clone(), shape, device)?;
     assert_close_vec(
@@ -1504,6 +1787,12 @@ fn smoke_rank5_cumsum(device: &Device) -> Result<()> {
         &expected_last,
         1e-5,
         "rank5 f32 cumsum last dim",
+    );
+    assert_close_vec(
+        &xs.cumsum(2)?.flatten_all()?.to_vec1::<f32>()?,
+        &expected_dim2,
+        1e-5,
+        "rank5 f32 cumsum dim2",
     );
 
     let f16_values = values

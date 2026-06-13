@@ -1,0 +1,57 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : require
+
+#include "types.glsl"
+#include "utils.glsl"
+
+layout(push_constant) uniform parameter {
+    uint ne;
+    uint ne0;
+    uint ne1;
+    uint ne2;
+    uint ne3;
+    uint offset_dst;
+    uint dst_nb0;
+    uint dst_nb1;
+    uint dst_nb2;
+    uint dst_nb3;
+    uint value0;
+    uint value1;
+} p;
+
+#if defined(RAW_U32X2)
+layout(binding = 0) buffer Dst { uint data_dst[]; };
+#else
+layout(binding = 0) buffer Dst { D_TYPE data_dst[]; };
+#endif
+
+const uint num_threads = 128;
+
+layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+
+    const uint num_iter = 4;
+    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
+        if (idx >= p.ne) {
+            continue;
+        }
+
+        uint i0, i1, i2, i3;
+        get_indices(idx, i0, i1, i2, i3, p.ne0, p.ne1, p.ne2, p.ne3);
+
+        const uint dst = p.offset_dst + i0 * p.dst_nb0 + i1 * p.dst_nb1 +
+            i2 * p.dst_nb2 + i3 * p.dst_nb3;
+#if defined(RAW_U32X2)
+        data_dst[2u * dst] = p.value0;
+        data_dst[2u * dst + 1u] = p.value1;
+#else
+        data_dst[dst] = D_TYPE(RAW_CAST);
+#endif
+
+        idx += num_threads;
+    }
+}

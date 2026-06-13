@@ -3040,11 +3040,15 @@ impl Tensor {
                 matches!(&*self.storage(), Storage::Wgpu(_) | Storage::Vulkan(_));
             if is_wgpu_or_vulkan {
                 if dim != last {
-                    return self
-                        .transpose(dim, last)?
-                        .contiguous()?
-                        .cumsum(last)?
-                        .transpose(dim, last);
+                    let transposed = self.transpose(dim, last)?;
+                    let storage = transposed.storage().cumsum_last_dim(transposed.layout())?;
+                    return from_storage(
+                        storage,
+                        transposed.shape().clone(),
+                        BackpropOp::none(),
+                        false,
+                    )
+                    .transpose(dim, last);
                 }
                 let storage = self.storage().cumsum_last_dim(self.layout())?;
                 return Ok(from_storage(

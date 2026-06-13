@@ -134,6 +134,23 @@ struct GgmlUnaryParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct VulkanRawFillParams {
+    ne: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
+    ne3: u32,
+    offset_dst: u32,
+    dst_nb0: u32,
+    dst_nb1: u32,
+    dst_nb2: u32,
+    dst_nb3: u32,
+    value0: u32,
+    value1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct VulkanWhereU8Params {
     ne: u32,
     ne0: u32,
@@ -1129,6 +1146,22 @@ fn scalar_bytes(scalar: crate::scalar::Scalar, dtype: DType, op: &'static str) -
     } else {
         Ok(bytes)
     }
+}
+
+fn scalar_raw_words(
+    scalar: crate::scalar::Scalar,
+    dtype: DType,
+    op: &'static str,
+) -> Result<[u32; 2]> {
+    let bytes = scalar_bytes(scalar, dtype, op)?;
+    if bytes.len() > 8 {
+        return Err(Error::UnsupportedDTypeForOp(dtype, op).bt());
+    }
+    let mut words = [0u32; 2];
+    for (idx, byte) in bytes.into_iter().enumerate() {
+        words[idx / 4] |= (byte as u32) << (8 * (idx % 4));
+    }
+    Ok(words)
 }
 
 fn hash_spirv_words(words: &[u32]) -> u64 {
@@ -2648,6 +2681,7 @@ fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
         // covers the float pairs above.
         (DType::U8, DType::U8) => "convert_u8_u8",
         (DType::U32, DType::U32) => "convert_u32_u32",
+        (DType::I16, DType::I16) => "convert_i16_i16",
         (DType::I64, DType::I64) => "convert_i64_i64",
         (DType::F32, DType::U8) => "convert_f32_u8",
         (DType::F32, DType::U32) => "convert_f32_u32",
@@ -2678,6 +2712,25 @@ fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
             ))
             .bt())
         }
+    };
+    candle_vulkan_kernels::spirv(name)
+        .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated")).bt())
+}
+
+fn raw_fill_spirv(dtype: DType) -> Result<&'static [u32]> {
+    let name = match dtype {
+        DType::U8 => "fill_raw_u8",
+        DType::U32 => "fill_raw_u32",
+        DType::I16 => "fill_raw_i16",
+        DType::I32 => "fill_raw_i32",
+        DType::I64 => "fill_raw_i64",
+        DType::BF16 => "fill_raw_bf16",
+        DType::F16 => "fill_raw_f16",
+        DType::F32 => "fill_raw_f32",
+        DType::F64 => "fill_raw_f64",
+        DType::F8E4M3 => "fill_raw_f8e4m3",
+        DType::F8E8M0 => "fill_raw_f8e8m0",
+        dtype => return Err(Error::UnsupportedDTypeForOp(dtype, "vulkan const_set").bt()),
     };
     candle_vulkan_kernels::spirv(name)
         .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated")).bt())
@@ -2955,7 +3008,10 @@ impl VulkanStorage {
             return Err(unsupported("to_dtype bf16"));
         }
         if !layout.is_contiguous() || layout.start_offset() != 0 {
-            return Err(unsupported("to_dtype bf16 strided"));
+            let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            self.copy_strided_src(&mut materialized, 0, layout)?;
+            let contiguous = Layout::contiguous(layout.shape());
+            return materialized.run_bf16_to_dtype_via_get_rows(&contiguous, dtype);
         }
 
         let elem_count = layout.shape().elem_count();
@@ -3880,6 +3936,57 @@ impl VulkanStorage {
             }
         }
         Ok(())
+    }
+
+    fn run_raw_fill_inplace(&self, layout: &Layout, value: [u32; 2]) -> Result<()> {
+        if layout.dims().len() > 4 {
+            match layout.strided_blocks() {
+                crate::StridedBlocks::SingleBlock { start_offset, len } => {
+                    let block_layout =
+                        Layout::contiguous_with_offset(Shape::from(len), start_offset);
+                    return self.run_raw_fill_inplace(&block_layout, value);
+                }
+                crate::StridedBlocks::MultipleBlocks {
+                    block_start_index,
+                    block_len,
+                } => {
+                    if block_len == 0 {
+                        return Ok(());
+                    }
+                    for start_offset in block_start_index {
+                        let block_layout =
+                            Layout::contiguous_with_offset(Shape::from(block_len), start_offset);
+                        self.run_raw_fill_inplace(&block_layout, value)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        let count = layout.shape().elem_count();
+        if count == 0 {
+            return Ok(());
+        }
+        let (dims, strides) = dims4_ggml(layout)?;
+        let params = VulkanRawFillParams {
+            ne: count.try_into()?,
+            ne0: dims[0],
+            ne1: dims[1],
+            ne2: dims[2],
+            ne3: dims[3],
+            offset_dst: layout.start_offset().try_into()?,
+            dst_nb0: strides[0],
+            dst_nb1: strides[1],
+            dst_nb2: strides[2],
+            dst_nb3: strides[3],
+            value0: value[0],
+            value1: value[1],
+        };
+        self.device.run_compute_3d(
+            raw_fill_spirv(self.dtype)?,
+            &[VulkanBinding::Storage(&self.buffer)],
+            Some(any_as_bytes(&params)),
+            ggml_linear_workgroups(count)?,
+        )
     }
 
     // Integer reductions (u8/u32/i64). Mirrors the float reduce structure:
@@ -7593,10 +7700,38 @@ impl BackendStorage for VulkanStorage {
             )
         }
         if !src_l.is_contiguous() {
+            if src_l.dims().len() > 4
+                && dst_offset == 0
+                && dst.count == src_l.shape().elem_count()
+                && matches!(
+                    self.dtype,
+                    DType::F32
+                        | DType::F16
+                        | DType::BF16
+                        | DType::U8
+                        | DType::U32
+                        | DType::I16
+                        | DType::I64
+                )
+            {
+                let (materialized, _) = self.materialize_rank_gt4_compact(src_l)?;
+                *dst = materialized;
+                return Ok(());
+            }
             match self.dtype {
-                DType::F32 | DType::F16 | DType::BF16 | DType::U8 | DType::U32 | DType::I64 => {
-                    let spirv = copy_spirv(self.dtype, self.dtype)?;
-                    return self.run_copy_into(src_l, dst, dst_offset, spirv);
+                DType::F32
+                | DType::F16
+                | DType::BF16
+                | DType::U8
+                | DType::U32
+                | DType::I16
+                | DType::I64 => {
+                    return self.run_copy_into(
+                        src_l,
+                        dst,
+                        dst_offset,
+                        copy_spirv(self.dtype, self.dtype)?,
+                    )
                 }
                 _ => {
                     let src_cpu = self.to_cpu_storage()?;
@@ -7667,24 +7802,8 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn const_set(&mut self, scalar: crate::scalar::Scalar, layout: &Layout) -> Result<()> {
-        let (start, end) = match layout.contiguous_offsets() {
-            Some(v) => v,
-            None => {
-                let mut cpu = self.to_cpu_storage()?;
-                <CpuStorage as BackendStorage>::const_set(&mut cpu, scalar, layout)?;
-                *self = self.device.storage_from_cpu_storage(&cpu)?;
-                return Ok(());
-            }
-        };
-        let scalar = scalar_bytes(scalar, self.dtype, "vulkan const_set")?;
-        let mut bytes = self.device.read_buffer(&self.buffer)?;
-        let start = start * scalar.len();
-        let end = end * scalar.len();
-        for chunk in bytes[start..end].chunks_exact_mut(scalar.len()) {
-            chunk.copy_from_slice(&scalar);
-        }
-        self.device.write_buffer(&self.buffer, &bytes)?;
-        Ok(())
+        let scalar = scalar_raw_words(scalar, self.dtype, "vulkan const_set")?;
+        self.run_raw_fill_inplace(layout, scalar)
     }
 }
 
