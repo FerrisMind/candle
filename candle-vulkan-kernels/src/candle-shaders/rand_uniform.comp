@@ -1,0 +1,51 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#if defined(USE_F64)
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+#endif
+
+layout(push_constant) uniform parameter {
+    uint seed_lo;
+    uint seed_hi;
+    uint ne;
+    float min_val;
+    float max_val;
+} p;
+
+#if defined(USE_F64)
+layout(binding = 0) buffer Dst { float64_t data[]; };
+#else
+layout(binding = 0) buffer Dst { float data[]; };
+#endif
+
+const uint num_threads = 256;
+layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+
+uint64_t splitmix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15UL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9UL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBUL;
+    return x ^ (x >> 31);
+}
+
+float rand01(uint idx) {
+    const uint64_t seed = (uint64_t(p.seed_hi) << 32) | uint64_t(p.seed_lo);
+    const uint64_t state = seed + uint64_t(idx);
+    const uint64_t r = splitmix64(state);
+    return float(r >> 40) * (1.0 / 16777216.0);
+}
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+    const float u = rand01(idx);
+    const float span = p.max_val - p.min_val;
+#if defined(USE_F64)
+    data[idx] = float64_t(p.min_val + u * span);
+#else
+    data[idx] = p.min_val + u * span;
+#endif
+}

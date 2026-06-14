@@ -151,6 +151,26 @@ struct VulkanRawFillParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct VulkanRandParams {
+    seed_lo: u32,
+    seed_hi: u32,
+    ne: u32,
+    min_val: f32,
+    max_val: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VulkanRandNormalParams {
+    seed_lo: u32,
+    seed_hi: u32,
+    ne: u32,
+    mean: f32,
+    std: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct VulkanWhereU8Params {
     ne: u32,
     ne0: u32,
@@ -506,6 +526,110 @@ impl VulkanDevice {
     pub fn subgroup_max_size(&self) -> u32 {
         self.inner.subgroup_max_size
     }
+
+    fn run_rand_kernel(
+        &self,
+        shape: &Shape,
+        kernel_dtype: DType,
+        spirv_name: &str,
+        params_bytes: &[u8],
+    ) -> Result<VulkanStorage> {
+        let count = shape.elem_count();
+        let storage = unsafe { self.alloc_uninit(shape, kernel_dtype)? };
+        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
+            Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
+        })?;
+        let bindings = [VulkanBinding::Storage(&storage.buffer)];
+        let workgroups = (count as u32).div_ceil(256);
+        self.run_compute(spirv, &bindings, Some(params_bytes), workgroups)?;
+        Ok(storage)
+    }
+
+    fn rand_uniform_gpu(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        min: f64,
+        max: f64,
+    ) -> Result<VulkanStorage> {
+        let count = shape.elem_count();
+        if count == 0 {
+            return self.zeros_impl(shape, dtype);
+        }
+        let seed = self.get_current_seed()?;
+        let kernel_dtype = match dtype {
+            DType::F32 => DType::F32,
+            DType::F64 => DType::F64,
+            DType::F16 | DType::BF16 => DType::F32,
+            dt => return Err(Error::UnsupportedDTypeForOp(dt, "rand_uniform").bt()),
+        };
+        let params = VulkanRandParams {
+            seed_lo: seed as u32,
+            seed_hi: (seed >> 32) as u32,
+            ne: count.try_into()?,
+            min_val: min as f32,
+            max_val: max as f32,
+        };
+        let spirv_name = match kernel_dtype {
+            DType::F32 => "rand_uniform_f32",
+            DType::F64 => "rand_uniform_f64",
+            _ => unreachable!(),
+        };
+        let storage = self.run_rand_kernel(
+            shape,
+            kernel_dtype,
+            spirv_name,
+            any_as_bytes(&params),
+        )?;
+        if kernel_dtype == dtype {
+            Ok(storage)
+        } else {
+            storage.to_dtype(&Layout::contiguous(shape), dtype)
+        }
+    }
+
+    fn rand_normal_gpu(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        mean: f64,
+        std: f64,
+    ) -> Result<VulkanStorage> {
+        let count = shape.elem_count();
+        if count == 0 {
+            return self.zeros_impl(shape, dtype);
+        }
+        let seed = self.get_current_seed()?;
+        let kernel_dtype = match dtype {
+            DType::F32 => DType::F32,
+            DType::F64 => DType::F64,
+            DType::F16 | DType::BF16 => DType::F32,
+            dt => return Err(Error::UnsupportedDTypeForOp(dt, "rand_normal").bt()),
+        };
+        let params = VulkanRandNormalParams {
+            seed_lo: seed as u32,
+            seed_hi: (seed >> 32) as u32,
+            ne: count.try_into()?,
+            mean: mean as f32,
+            std: std as f32,
+        };
+        let spirv_name = match kernel_dtype {
+            DType::F32 => "rand_normal_f32",
+            DType::F64 => "rand_normal_f64",
+            _ => unreachable!(),
+        };
+        let storage = self.run_rand_kernel(
+            shape,
+            kernel_dtype,
+            spirv_name,
+            any_as_bytes(&params),
+        )?;
+        if kernel_dtype == dtype {
+            Ok(storage)
+        } else {
+            storage.to_dtype(&Layout::contiguous(shape), dtype)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -669,26 +793,6 @@ fn unsupported(op: &'static str) -> Error {
     Error::Msg(format!("vulkan backend op {op} not implemented")).bt()
 }
 
-fn should_cpu_fallback(err: &Error) -> bool {
-    fn matches_fallback(err: &Error) -> bool {
-        match err {
-            Error::UnsupportedDTypeForOp(..) => true,
-            Error::Msg(msg) => msg.contains("vulkan backend op") && msg.contains("not implemented"),
-            Error::Context { inner, .. }
-            | Error::WithPath { inner, .. }
-            | Error::WithBacktrace { inner, .. } => matches_fallback(inner),
-            _ => false,
-        }
-    }
-    let fallback = matches_fallback(err);
-    if fallback {
-        // Every backend-internal CPU recovery must be visible to the global
-        // fallback counter, otherwise native-required tests pass while work
-        // silently runs on the CPU.
-        crate::storage::record_vulkan_cpu_fallback(err);
-    }
-    fallback
-}
 
 pub fn shader_source(name: &str) -> Option<&'static str> {
     candle_vulkan_kernels::get(name).map(|module| module.source())
@@ -2601,6 +2705,8 @@ fn unary_spirv(op: &str, dtype: DType) -> Result<(&'static [u32], VulkanUnaryKin
         "floor" => "floor",
         "gelu" => "gelu",
         "gelu_erf" => "gelu_erf",
+        "erf" => "erf",
+        "recip" => "recip",
         "gelu_quick" => "gelu_quick",
         "hardsigmoid" => "hardsigmoid",
         "hardswish" => "hardswish",
@@ -2619,7 +2725,7 @@ fn unary_spirv(op: &str, dtype: DType) -> Result<(&'static [u32], VulkanUnaryKin
     };
     let name = format!("{stem}_{suffix}");
     let kind = match op {
-        "cos" | "log" | "sin" | "sqr" | "sqrt" => VulkanUnaryKind::Generic,
+        "cos" | "erf" | "log" | "recip" | "sin" | "sqr" | "sqrt" => VulkanUnaryKind::Generic,
         _ => VulkanUnaryKind::Head,
     };
     let spirv = candle_vulkan_kernels::spirv(&name)
@@ -6895,25 +7001,25 @@ impl BackendStorage for VulkanStorage {
     type Device = VulkanDevice;
 
     fn try_clone(&self, layout: &Layout) -> Result<Self> {
-        if !layout.is_contiguous()
-            || layout.start_offset() != 0
-            || layout.shape().elem_count() != self.count
+        if layout.is_contiguous()
+            && layout.start_offset() == 0
+            && layout.shape().elem_count() == self.count
         {
-            let cpu = self.to_cpu_storage()?;
-            let out_cpu = <CpuStorage as BackendStorage>::try_clone(&cpu, layout)?;
-            return self.device.storage_from_cpu_storage(&out_cpu);
+            let bytes = self.device.read_buffer(&self.buffer)?;
+            let buffer = self
+                .device
+                .create_buffer(bytes.len(), "candle-vulkan-clone")?;
+            self.device.write_buffer(&buffer, &bytes)?;
+            return Ok(Self {
+                buffer,
+                device: self.device.clone(),
+                count: self.count,
+                dtype: self.dtype,
+            });
         }
-        let bytes = self.device.read_buffer(&self.buffer)?;
-        let buffer = self
-            .device
-            .create_buffer(bytes.len(), "candle-vulkan-clone")?;
-        self.device.write_buffer(&buffer, &bytes)?;
-        Ok(Self {
-            buffer,
-            device: self.device.clone(),
-            count: self.count,
-            dtype: self.dtype,
-        })
+        let mut out = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        Self::copy_strided_src(self, &mut out, 0, layout)?;
+        Ok(out)
     }
 
     fn dtype(&self) -> DType {
@@ -6954,17 +7060,7 @@ impl BackendStorage for VulkanStorage {
             // generic unary dispatch helper.
             self.run_unary_generic_with_params(layout, spirv, mul as f32, add as f32)
         };
-        match gpu() {
-            Ok(out) => Ok(out),
-            Err(err)
-                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
-            {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::affine(&src_cpu, layout, mul, add)?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        gpu()
     }
     fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
         let gpu = || -> Result<Self> {
@@ -6978,50 +7074,48 @@ impl BackendStorage for VulkanStorage {
                 .ok_or_else(|| Error::Msg("vulkan shader powf_f32 not generated".into()).bt())?;
             self.run_unary_generic_with_params(layout, spirv, e as f32, 0.0)
         };
-        match gpu() {
-            Ok(out) => Ok(out),
-            Err(err)
-                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
-            {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::powf(&src_cpu, layout, e)?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        gpu()
     }
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
-        let cpu_fallback = || -> Result<Self> {
-            let src_cpu = self.to_cpu_storage()?;
-            let out_cpu = <CpuStorage as BackendStorage>::elu(&src_cpu, layout, alpha)?;
-            self.device.storage_from_cpu_storage(&out_cpu)
-        };
-        if self.dtype == DType::BF16 && alpha == 1.0 {
-            return match self.bf16_unary_via_f32(layout, |src, src_l| src.elu(src_l, alpha)) {
-                Ok(out) => Ok(out),
-                Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
-                Err(err) => Err(err),
+        if alpha == 1.0 {
+            if self.dtype == DType::BF16 {
+                return self.bf16_unary_via_f32(layout, |src, src_l| src.elu(src_l, alpha));
+            }
+            if self.dtype != DType::F32 && self.dtype != DType::F16 {
+                return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan elu").bt());
+            }
+            let suffix = match self.dtype {
+                DType::F32 => "f32",
+                DType::F16 => "f16",
+                _ => unreachable!(),
             };
+            let name = format!("elu_{suffix}");
+            let spirv = candle_vulkan_kernels::spirv(&name)
+                .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated")).bt())?;
+            return self.run_unary_head(layout, spirv);
         }
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
-            return cpu_fallback();
+        if self.dtype == DType::BF16 {
+            return self.bf16_unary_via_f32(layout, |src, src_l| src.elu(src_l, alpha));
         }
-        if alpha != 1.0 {
-            return cpu_fallback();
+        if self.dtype == DType::F16 {
+            let src_f32 = self.materialize_to_f32(layout)?;
+            let contiguous = Layout::contiguous(layout.shape());
+            let out_f32 = src_f32.elu(&contiguous, alpha)?;
+            return out_f32.to_dtype(&contiguous, DType::F16);
         }
-        let suffix = match self.dtype {
-            DType::F32 => "f32",
-            DType::F16 => "f16",
-            _ => unreachable!(),
-        };
-        let name = format!("elu_{suffix}");
-        let spirv = candle_vulkan_kernels::spirv(&name)
-            .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated")).bt())?;
-        match self.run_unary_head(layout, spirv) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
-            Err(err) => Err(err),
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan elu").bt());
         }
+        use crate::op::Exp;
+        let a = alpha as f32;
+        let exp_x = self.unary_impl::<Exp>(layout)?;
+        let elu_neg = exp_x
+            .affine(layout, 1.0, -1.0)?
+            .affine(layout, f64::from(a), 0.0)?;
+        let zero = self.device.zeros_impl(layout.shape(), DType::F32)?;
+        let zero_l = Layout::contiguous(layout.shape());
+        let cond = self.cmp(CmpOp::Gt, &zero, layout, &zero_l)?;
+        cond.where_cond(&zero_l, self, layout, &elu_neg, layout)
     }
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
         let int_dtype = matches!(self.dtype, DType::U8 | DType::U32 | DType::I64);
@@ -7088,16 +7182,7 @@ impl BackendStorage for VulkanStorage {
             return src_f32.run_cumsum_last_dim(&src_f32_layout);
         }
         if self.dtype == DType::BF16 {
-            return match self.bf16_unary_via_f32(layout, |src, src_l| src.cumsum_last_dim(src_l)) {
-                Ok(out) => Ok(out),
-                Err(err) if should_cpu_fallback(&err) => {
-                    let src_cpu = self.to_cpu_storage()?;
-                    let out_cpu =
-                        <CpuStorage as BackendStorage>::cumsum_last_dim(&src_cpu, layout)?;
-                    self.device.storage_from_cpu_storage(&out_cpu)
-                }
-                Err(err) => Err(err),
-            };
+            return self.bf16_unary_via_f32(layout, |src, src_l| src.cumsum_last_dim(src_l));
         }
         if self.dtype == DType::F16 {
             let gpu = || -> Result<Self> {
@@ -7110,26 +7195,9 @@ impl BackendStorage for VulkanStorage {
                 let out_f32 = src_f32.cumsum_last_dim(&src_f32_layout)?;
                 out_f32.to_dtype(&src_f32_layout, DType::F16)
             };
-            return match gpu() {
-                Ok(out) => Ok(out),
-                Err(err) if should_cpu_fallback(&err) => {
-                    let src_cpu = self.to_cpu_storage()?;
-                    let out_cpu =
-                        <CpuStorage as BackendStorage>::cumsum_last_dim(&src_cpu, layout)?;
-                    self.device.storage_from_cpu_storage(&out_cpu)
-                }
-                Err(err) => Err(err),
-            };
+            return gpu();
         }
-        match self.run_cumsum_last_dim(layout) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::cumsum_last_dim(&src_cpu, layout)?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_cumsum_last_dim(layout)
     }
     fn clamp(&self, layout: &Layout, min: f32, max: f32) -> Result<Self> {
         let gpu = || -> Result<Self> {
@@ -7143,61 +7211,17 @@ impl BackendStorage for VulkanStorage {
                 .ok_or_else(|| Error::Msg("vulkan shader clamp_f32 not generated".into()).bt())?;
             self.run_unary_generic_with_params(layout, spirv, min, max)
         };
-        match gpu() {
-            Ok(out) => Ok(out),
-            Err(err)
-                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
-            {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::clamp(&src_cpu, layout, min, max)?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        gpu()
     }
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
         if self.dtype == DType::BF16 {
-            return match self.bf16_cmp_via_f32(rhs, lhs_l, rhs_l, op) {
-                Ok(out) => Ok(out),
-                Err(err)
-                    if should_cpu_fallback(&err)
-                        || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
-                {
-                    let lhs_cpu = self.to_cpu_storage()?;
-                    let rhs_cpu = rhs.to_cpu_storage()?;
-                    let out_cpu =
-                        <CpuStorage as BackendStorage>::cmp(&lhs_cpu, op, &rhs_cpu, lhs_l, rhs_l)?;
-                    self.device.storage_from_cpu_storage(&out_cpu)
-                }
-                Err(err) => Err(err),
-            };
+            return self.bf16_cmp_via_f32(rhs, lhs_l, rhs_l, op);
         }
-        match self.run_cmp_u8(rhs, lhs_l, rhs_l, op) {
-            Ok(out) => Ok(out),
-            Err(err)
-                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
-            {
-                let lhs_cpu = self.to_cpu_storage()?;
-                let rhs_cpu = rhs.to_cpu_storage()?;
-                let out_cpu =
-                    <CpuStorage as BackendStorage>::cmp(&lhs_cpu, op, &rhs_cpu, lhs_l, rhs_l)?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_cmp_u8(rhs, lhs_l, rhs_l, op)
     }
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
         if self.dtype == DType::BF16 && (dtype == DType::F16 || dtype == DType::F32) {
-            return match self.run_bf16_to_dtype_via_get_rows(layout, dtype) {
-                Ok(out) => Ok(out),
-                Err(err) if should_cpu_fallback(&err) => {
-                    let src_cpu = self.to_cpu_storage()?;
-                    let out_cpu =
-                        <CpuStorage as BackendStorage>::to_dtype(&src_cpu, layout, dtype)?;
-                    self.device.storage_from_cpu_storage(&out_cpu)
-                }
-                Err(err) => Err(err),
-            };
+            return self.run_bf16_to_dtype_via_get_rows(layout, dtype);
         }
         if self.dtype == DType::BF16 {
             // No direct bf16 -> integer kernel exists; decompose into the
@@ -7208,15 +7232,7 @@ impl BackendStorage for VulkanStorage {
             return f32_storage.to_dtype(&contiguous, dtype);
         }
         let spirv = copy_spirv(self.dtype, dtype)?;
-        match self.run_unary_generic_with_params_dtype(layout, spirv, 0.0, 0.0, dtype) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::to_dtype(&src_cpu, layout, dtype)?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_unary_generic_with_params_dtype(layout, spirv, 0.0, 0.0, dtype)
     }
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
         if self.dtype == DType::BF16 {
@@ -7225,7 +7241,9 @@ impl BackendStorage for VulkanStorage {
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan unary").bt());
         }
-        if self.dtype == DType::F16 && matches!(B::NAME, "sin" | "cos" | "sqr" | "sqrt") {
+        if self.dtype == DType::F16
+            && matches!(B::NAME, "sin" | "cos" | "sqr" | "sqrt" | "erf" | "recip")
+        {
             let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), DType::F16)? };
             <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
             let contiguous_layout = Layout::contiguous(layout.shape());
@@ -7325,38 +7343,9 @@ impl BackendStorage for VulkanStorage {
         f_l: &Layout,
     ) -> Result<Self> {
         if t.dtype == DType::BF16 {
-            return match self.bf16_where_via_f32(layout, t, t_l, f, f_l) {
-                Ok(out) => Ok(out),
-                Err(err)
-                    if should_cpu_fallback(&err)
-                        || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
-                {
-                    let cond_cpu = self.to_cpu_storage()?;
-                    let t_cpu = t.to_cpu_storage()?;
-                    let f_cpu = f.to_cpu_storage()?;
-                    let out_cpu = <CpuStorage as BackendStorage>::where_cond(
-                        &cond_cpu, layout, &t_cpu, t_l, &f_cpu, f_l,
-                    )?;
-                    self.device.storage_from_cpu_storage(&out_cpu)
-                }
-                Err(err) => Err(err),
-            };
+            return self.bf16_where_via_f32(layout, t, t_l, f, f_l);
         }
-        match self.run_where_u8_cond(layout, t, t_l, f, f_l) {
-            Ok(out) => Ok(out),
-            Err(err)
-                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
-            {
-                let cond_cpu = self.to_cpu_storage()?;
-                let t_cpu = t.to_cpu_storage()?;
-                let f_cpu = f.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::where_cond(
-                    &cond_cpu, layout, &t_cpu, t_l, &f_cpu, f_l,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_where_u8_cond(layout, t, t_l, f, f_l)
     }
     fn conv1d(
         &self,
@@ -7365,22 +7354,7 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
-        match self.run_conv1d_f32(layout, kernel, kernel_l, params) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let kernel_cpu = kernel.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::conv1d(
-                    &src_cpu,
-                    layout,
-                    &kernel_cpu,
-                    kernel_l,
-                    params,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_conv1d_f32(layout, kernel, kernel_l, params)
     }
     fn conv_transpose1d(
         &self,
@@ -7389,24 +7363,25 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose1D,
     ) -> Result<Self> {
-        match self.run_conv_transpose1d_f32(layout, kernel, kernel_l, params) {
-            Ok(out) => Ok(out),
-            Err(err)
-                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
-            {
-                let src_cpu = self.to_cpu_storage()?;
-                let kernel_cpu = kernel.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::conv_transpose1d(
-                    &src_cpu,
-                    layout,
-                    &kernel_cpu,
-                    kernel_l,
-                    params,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
+        let src_dtype = self.dtype;
+        if src_dtype == DType::F16 {
+            if kernel.dtype != DType::F16 {
+                return Err(Error::UnsupportedDTypeForOp(kernel.dtype, "vulkan conv_transpose1d").bt());
             }
-            Err(err) => Err(err),
+            let input_f32 = self.materialize_to_f32(layout)?;
+            let kernel_f32 = kernel.materialize_to_f32(kernel_l)?;
+            let input_l = Layout::contiguous(layout.shape());
+            let kernel_l = if kernel_l.is_contiguous() && kernel_l.start_offset() == 0 {
+                kernel_l.clone()
+            } else {
+                Layout::contiguous(kernel_l.shape())
+            };
+            let out_f32 =
+                input_f32.run_conv_transpose1d_f32(&input_l, &kernel_f32, &kernel_l, params)?;
+            let out_l = Layout::contiguous(params.out_dims());
+            return out_f32.to_dtype(&out_l, DType::F16);
         }
+        self.run_conv_transpose1d_f32(layout, kernel, kernel_l, params)
     }
     fn conv2d(
         &self,
@@ -7415,22 +7390,7 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        match self.run_conv2d_f32(layout, kernel, kernel_l, params) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let kernel_cpu = kernel.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::conv2d(
-                    &src_cpu,
-                    layout,
-                    &kernel_cpu,
-                    kernel_l,
-                    params,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_conv2d_f32(layout, kernel, kernel_l, params)
     }
     fn conv_transpose2d(
         &self,
@@ -7439,24 +7399,25 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self> {
-        match self.run_conv_transpose2d_f32(layout, kernel, kernel_l, params) {
-            Ok(out) => Ok(out),
-            Err(err)
-                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
-            {
-                let src_cpu = self.to_cpu_storage()?;
-                let kernel_cpu = kernel.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::conv_transpose2d(
-                    &src_cpu,
-                    layout,
-                    &kernel_cpu,
-                    kernel_l,
-                    params,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
+        let src_dtype = self.dtype;
+        if src_dtype == DType::F16 {
+            if kernel.dtype != DType::F16 {
+                return Err(Error::UnsupportedDTypeForOp(kernel.dtype, "vulkan conv_transpose2d").bt());
             }
-            Err(err) => Err(err),
+            let input_f32 = self.materialize_to_f32(layout)?;
+            let kernel_f32 = kernel.materialize_to_f32(kernel_l)?;
+            let input_l = Layout::contiguous(layout.shape());
+            let kernel_l = if kernel_l.is_contiguous() && kernel_l.start_offset() == 0 {
+                kernel_l.clone()
+            } else {
+                Layout::contiguous(kernel_l.shape())
+            };
+            let out_f32 =
+                input_f32.run_conv_transpose2d_f32(&input_l, &kernel_f32, &kernel_l, params)?;
+            let out_l = Layout::contiguous(params.out_dims());
+            return out_f32.to_dtype(&out_l, DType::F16);
         }
+        self.run_conv_transpose2d_f32(layout, kernel, kernel_l, params)
     }
     fn avg_pool2d(
         &self,
@@ -7464,20 +7425,7 @@ impl BackendStorage for VulkanStorage {
         kernel_size: (usize, usize),
         stride: (usize, usize),
     ) -> Result<Self> {
-        match self.run_pool2d_f32(layout, kernel_size, stride, false) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::avg_pool2d(
-                    &src_cpu,
-                    layout,
-                    kernel_size,
-                    stride,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_pool2d_f32(layout, kernel_size, stride, false)
     }
     fn max_pool2d(
         &self,
@@ -7485,52 +7433,20 @@ impl BackendStorage for VulkanStorage {
         kernel_size: (usize, usize),
         stride: (usize, usize),
     ) -> Result<Self> {
-        match self.run_pool2d_f32(layout, kernel_size, stride, true) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::max_pool2d(
-                    &src_cpu,
-                    layout,
-                    kernel_size,
-                    stride,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_pool2d_f32(layout, kernel_size, stride, true)
     }
     fn upsample_nearest1d(&self, layout: &Layout, out_l: usize) -> Result<Self> {
-        match self.run_upsample_nearest1d_f32(layout, out_l) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu =
-                    <CpuStorage as BackendStorage>::upsample_nearest1d(&src_cpu, layout, out_l)?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_upsample_nearest1d_f32(layout, out_l)
     }
     fn upsample_nearest2d(&self, layout: &Layout, out_h: usize, out_w: usize) -> Result<Self> {
         let (_, _, h, w) = layout.shape().dims4()?;
-        match self.run_upsample2d_f32(
+        self.run_upsample2d_f32(
             layout,
             out_h,
             out_w,
             nearest_interp_weights(h, out_h),
             nearest_interp_weights(w, out_w),
-        ) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::upsample_nearest2d(
-                    &src_cpu, layout, out_h, out_w,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        )
     }
     fn upsample_bilinear2d(
         &self,
@@ -7542,43 +7458,42 @@ impl BackendStorage for VulkanStorage {
         scale_w: Option<f64>,
     ) -> Result<Self> {
         let (_, _, h, w) = layout.shape().dims4()?;
-        match self.run_upsample2d_f32(
+        self.run_upsample2d_f32(
             layout,
             out_h,
             out_w,
             bilinear_interp_weights(h, out_h, align_corners, scale_h),
             bilinear_interp_weights(w, out_w, align_corners, scale_w),
-        ) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::upsample_bilinear2d(
-                    &src_cpu,
-                    layout,
-                    out_h,
-                    out_w,
-                    align_corners,
-                    scale_h,
-                    scale_w,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        )
     }
     fn gather(&self, src_l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
-        if dim + 1 == src_l.dims().len() {
-            match self.run_gather_last_dim_f32(ids, src_l, ids_l) {
-                Ok(out) => return Ok(out),
-                Err(err) if should_cpu_fallback(&err) => {}
-                Err(err) => return Err(err),
-            }
+        let rank = src_l.dims().len();
+        if dim + 1 == rank {
+            return self.run_gather_last_dim_f32(ids, src_l, ids_l);
         }
-        let src_cpu = self.to_cpu_storage()?;
-        let ids_cpu = ids.to_cpu_storage()?;
-        let out_cpu =
-            <CpuStorage as BackendStorage>::gather(&src_cpu, src_l, &ids_cpu, ids_l, dim)?;
-        self.device.storage_from_cpu_storage(&out_cpu)
+        if rank == 0 {
+            crate::bail!("vulkan gather requires rank >= 1");
+        }
+        let mut perm: Vec<usize> = (0..rank).filter(|&d| d != dim).collect();
+        perm.push(dim);
+        let mut inv_perm = vec![0usize; rank];
+        for (idx, &src_dim) in perm.iter().enumerate() {
+            inv_perm[src_dim] = idx;
+        }
+        let permute_and_gather = |storage: &Self, layout: &Layout| -> Result<(Self, Layout)> {
+            let permuted_l = layout.permute(&perm)?;
+            let mut compact =
+                unsafe { storage.device.alloc_uninit(permuted_l.shape(), storage.dtype)? };
+            storage.copy_strided_src(&mut compact, 0, &permuted_l)?;
+            Ok((compact, Layout::contiguous(permuted_l.shape())))
+        };
+        let (self_p, self_pl) = permute_and_gather(self, src_l)?;
+        let (ids_p, ids_pl) = permute_and_gather(ids, ids_l)?;
+        let out = self_p.run_gather_last_dim_f32(&ids_p, &self_pl, &ids_pl)?;
+        let out_l = Layout::contiguous(ids_pl.shape()).permute(&inv_perm)?;
+        let mut result = unsafe { self.device.alloc_uninit(out_l.shape(), out.dtype)? };
+        out.copy_strided_src(&mut result, 0, &out_l)?;
+        Ok(result)
     }
     fn scatter_set(
         &mut self,
@@ -7589,26 +7504,32 @@ impl BackendStorage for VulkanStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<()> {
-        if dim + 1 == dst_l.dims().len() {
-            match self.run_scatter_set_last_dim_f32(dst_l, ids, ids_l, src, src_l) {
-                Ok(()) => return Ok(()),
-                Err(err) if should_cpu_fallback(&err) => {}
-                Err(err) => return Err(err),
-            }
+        let rank = dst_l.dims().len();
+        if dim + 1 == rank {
+            return self.run_scatter_set_last_dim_f32(dst_l, ids, ids_l, src, src_l);
         }
-        let mut dst_cpu = self.to_cpu_storage()?;
-        let ids_cpu = ids.to_cpu_storage()?;
-        let src_cpu = src.to_cpu_storage()?;
-        <CpuStorage as BackendStorage>::scatter_set(
-            &mut dst_cpu,
-            dst_l,
-            &ids_cpu,
-            ids_l,
-            &src_cpu,
-            src_l,
-            dim,
-        )?;
-        *self = self.device.storage_from_cpu_storage(&dst_cpu)?;
+        let mut perm: Vec<usize> = (0..rank).filter(|&d| d != dim).collect();
+        perm.push(dim);
+        let mut inv_perm = vec![0usize; rank];
+        for (idx, &src_dim) in perm.iter().enumerate() {
+            inv_perm[src_dim] = idx;
+        }
+        let permute_contiguous = |storage: &Self, layout: &Layout| -> Result<(Self, Layout)> {
+            let permuted_l = layout.permute(&perm)?;
+            let mut compact =
+                unsafe { storage.device.alloc_uninit(permuted_l.shape(), storage.dtype)? };
+            storage.copy_strided_src(&mut compact, 0, &permuted_l)?;
+            Ok((compact, Layout::contiguous(permuted_l.shape())))
+        };
+        let dst_perm_l = dst_l.permute(&perm)?;
+        let mut dst_p = unsafe { self.device.alloc_uninit(dst_perm_l.shape(), self.dtype)? };
+        self.copy_strided_src(&mut dst_p, 0, &dst_perm_l)?;
+        let (ids_p, ids_pl) = permute_contiguous(ids, ids_l)?;
+        let (src_p, src_pl) = permute_contiguous(src, src_l)?;
+        let dst_pl = Layout::contiguous(dst_perm_l.shape());
+        dst_p.run_scatter_set_last_dim_f32(&dst_pl, &ids_p, &ids_pl, &src_p, &src_pl)?;
+        let inv_l = dst_pl.permute(&inv_perm)?;
+        dst_p.copy_strided_src(self, dst_l.start_offset(), &inv_l)?;
         Ok(())
     }
     fn scatter_add_set(
@@ -7620,41 +7541,36 @@ impl BackendStorage for VulkanStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<()> {
-        if dim + 1 == dst_l.dims().len() {
-            match self.run_scatter_add_last_dim_f32(dst_l, ids, ids_l, src, src_l) {
-                Ok(()) => return Ok(()),
-                Err(err) if should_cpu_fallback(&err) => {}
-                Err(err) => return Err(err),
-            }
+        let rank = dst_l.dims().len();
+        if dim + 1 == rank {
+            return self.run_scatter_add_last_dim_f32(dst_l, ids, ids_l, src, src_l);
         }
-        let mut dst_cpu = self.to_cpu_storage()?;
-        let ids_cpu = ids.to_cpu_storage()?;
-        let src_cpu = src.to_cpu_storage()?;
-        <CpuStorage as BackendStorage>::scatter_add_set(
-            &mut dst_cpu,
-            dst_l,
-            &ids_cpu,
-            ids_l,
-            &src_cpu,
-            src_l,
-            dim,
-        )?;
-        *self = self.device.storage_from_cpu_storage(&dst_cpu)?;
+        let mut perm: Vec<usize> = (0..rank).filter(|&d| d != dim).collect();
+        perm.push(dim);
+        let mut inv_perm = vec![0usize; rank];
+        for (idx, &src_dim) in perm.iter().enumerate() {
+            inv_perm[src_dim] = idx;
+        }
+        let permute_contiguous = |storage: &Self, layout: &Layout| -> Result<(Self, Layout)> {
+            let permuted_l = layout.permute(&perm)?;
+            let mut compact =
+                unsafe { storage.device.alloc_uninit(permuted_l.shape(), storage.dtype)? };
+            storage.copy_strided_src(&mut compact, 0, &permuted_l)?;
+            Ok((compact, Layout::contiguous(permuted_l.shape())))
+        };
+        let dst_perm_l = dst_l.permute(&perm)?;
+        let mut dst_p = unsafe { self.device.alloc_uninit(dst_perm_l.shape(), self.dtype)? };
+        self.copy_strided_src(&mut dst_p, 0, &dst_perm_l)?;
+        let (ids_p, ids_pl) = permute_contiguous(ids, ids_l)?;
+        let (src_p, src_pl) = permute_contiguous(src, src_l)?;
+        let dst_pl = Layout::contiguous(dst_perm_l.shape());
+        dst_p.run_scatter_add_last_dim_f32(&dst_pl, &ids_p, &ids_pl, &src_p, &src_pl)?;
+        let inv_l = dst_pl.permute(&inv_perm)?;
+        dst_p.copy_strided_src(self, dst_l.start_offset(), &inv_l)?;
         Ok(())
     }
     fn index_select(&self, ids: &Self, src_l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
-        match self.run_index_select_f32(ids, src_l, ids_l, dim) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let ids_cpu = ids.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::index_select(
-                    &src_cpu, &ids_cpu, src_l, ids_l, dim,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_index_select_f32(ids, src_l, ids_l, dim)
     }
     fn index_add(
         &self,
@@ -7667,19 +7583,34 @@ impl BackendStorage for VulkanStorage {
     ) -> Result<Self> {
         if dim + 1 == dst_l.dims().len() {
             let mut out = self.try_clone(dst_l)?;
-            match out.run_scatter_add_last_dim_f32(dst_l, ids, ids_l, src, src_l) {
-                Ok(()) => return Ok(out),
-                Err(err) if should_cpu_fallback(&err) => {}
-                Err(err) => return Err(err),
-            }
+            out.run_scatter_add_last_dim_f32(dst_l, ids, ids_l, src, src_l)?;
+            return Ok(out);
         }
-        let dst_cpu = self.to_cpu_storage()?;
-        let ids_cpu = ids.to_cpu_storage()?;
-        let src_cpu = src.to_cpu_storage()?;
-        let out_cpu = <CpuStorage as BackendStorage>::index_add(
-            &dst_cpu, dst_l, &ids_cpu, ids_l, &src_cpu, src_l, dim,
-        )?;
-        self.device.storage_from_cpu_storage(&out_cpu)
+        let rank = dst_l.dims().len();
+        let mut perm: Vec<usize> = (0..rank).filter(|&d| d != dim).collect();
+        perm.push(dim);
+        let mut inv_perm = vec![0usize; rank];
+        for (idx, &src_dim) in perm.iter().enumerate() {
+            inv_perm[src_dim] = idx;
+        }
+        let permute_contiguous = |storage: &Self, layout: &Layout| -> Result<(Self, Layout)> {
+            let permuted_l = layout.permute(&perm)?;
+            let mut compact =
+                unsafe { storage.device.alloc_uninit(permuted_l.shape(), storage.dtype)? };
+            storage.copy_strided_src(&mut compact, 0, &permuted_l)?;
+            Ok((compact, Layout::contiguous(permuted_l.shape())))
+        };
+        let dst_perm_l = dst_l.permute(&perm)?;
+        let mut dst_p = unsafe { self.device.alloc_uninit(dst_perm_l.shape(), self.dtype)? };
+        self.copy_strided_src(&mut dst_p, 0, &dst_perm_l)?;
+        let (ids_p, ids_pl) = permute_contiguous(ids, ids_l)?;
+        let (src_p, src_pl) = permute_contiguous(src, src_l)?;
+        let dst_pl = Layout::contiguous(dst_perm_l.shape());
+        dst_p.run_scatter_add_last_dim_f32(&dst_pl, &ids_p, &ids_pl, &src_p, &src_pl)?;
+        let inv_l = dst_pl.permute(&inv_perm)?;
+        let mut out = self.try_clone(dst_l)?;
+        dst_p.copy_strided_src(&mut out, dst_l.start_offset(), &inv_l)?;
+        Ok(out)
     }
     fn matmul(
         &self,
@@ -7688,10 +7619,7 @@ impl BackendStorage for VulkanStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        match self.run_matmul_f32(rhs, bmnk, lhs_l, rhs_l) {
-            Ok(out) => Ok(out),
-            Err(err) => Err(err),
-        }
+        self.run_matmul_f32(rhs, bmnk, lhs_l, rhs_l)
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
@@ -7721,29 +7649,21 @@ impl BackendStorage for VulkanStorage {
                 *dst = materialized;
                 return Ok(());
             }
-            match self.dtype {
+            return match self.dtype {
                 DType::F32
                 | DType::F16
                 | DType::BF16
                 | DType::U8
                 | DType::U32
                 | DType::I16
-                | DType::I64 => {
-                    return self.run_copy_into(
-                        src_l,
-                        dst,
-                        dst_offset,
-                        copy_spirv(self.dtype, self.dtype)?,
-                    )
-                }
-                _ => {
-                    let src_cpu = self.to_cpu_storage()?;
-                    let mut dst_cpu = dst.to_cpu_storage()?;
-                    src_cpu.copy_strided_src(&mut dst_cpu, dst_offset, src_l)?;
-                    *dst = dst.device.storage_from_cpu_storage(&dst_cpu)?;
-                    return Ok(());
-                }
-            }
+                | DType::I64 => self.run_copy_into(
+                    src_l,
+                    dst,
+                    dst_offset,
+                    copy_spirv(self.dtype, self.dtype)?,
+                ),
+                _ => Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan copy_strided").bt()),
+            };
         }
         let elem_size = self.dtype.size_in_bytes();
         if elem_size == 0 {
@@ -8216,8 +8136,7 @@ impl BackendDevice for VulkanDevice {
         min: f64,
         max: f64,
     ) -> Result<Self::Storage> {
-        let cpu = crate::cpu_backend::CpuDevice.rand_uniform(shape, dtype, min, max)?;
-        self.storage_from_cpu_storage(&cpu)
+        self.rand_uniform_gpu(shape, dtype, min, max)
     }
 
     fn rand_normal(
@@ -8227,8 +8146,7 @@ impl BackendDevice for VulkanDevice {
         mean: f64,
         std: f64,
     ) -> Result<Self::Storage> {
-        let cpu = crate::cpu_backend::CpuDevice.rand_normal(shape, dtype, mean, std)?;
-        self.storage_from_cpu_storage(&cpu)
+        self.rand_normal_gpu(shape, dtype, mean, std)
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {

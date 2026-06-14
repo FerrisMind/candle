@@ -5,6 +5,24 @@ use std::path::PathBuf;
 
 #[cfg(feature = "vulkan")]
 #[test]
+fn vulkan_rand_shaders_are_generated() {
+    for name in [
+        "rand_uniform_f32",
+        "rand_uniform_f64",
+        "rand_normal_f32",
+        "rand_normal_f64",
+        "erf_f32",
+        "recip_f32",
+    ] {
+        assert!(
+            candle_vulkan_kernels::spirv(name).is_some(),
+            "missing vulkan shader {name}"
+        );
+    }
+}
+
+#[cfg(feature = "vulkan")]
+#[test]
 #[ignore = "utility test for CI SPIR-V materialization"]
 fn vulkan_spirv_modules_can_be_materialized() {
     let out_dir = std::env::var_os("CANDLE_SPIRV_DUMP_DIR")

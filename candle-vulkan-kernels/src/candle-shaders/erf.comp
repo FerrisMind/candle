@@ -1,0 +1,29 @@
+#version 450
+
+#include "types.glsl"
+#include "generic_unary_head.glsl"
+
+const uint num_threads = 128;
+
+layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint idx = get_idx();
+
+    const uint num_iter = 4;
+
+    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
+        if (idx >= p.ne) {
+            continue;
+        }
+
+        const float a = float(FLOAT_TYPE(data_a[get_aoffset() + idx]));
+        const float sign_x = sign(a);
+        const float x = abs(a);
+        const float t = 1.0f / (1.0f + 0.3275911f * x);
+        const float y = 1.0f - (((((1.061405429f * t + -1.453152027f) * t + 1.421413741f) * t +
+            -0.284496736f) * t + 0.254829592f) * t * exp(-x * x));
+        data_d[get_doffset() + idx] = D_TYPE(sign_x * y);
+        idx += num_threads;
+    }
+}

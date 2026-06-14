@@ -186,6 +186,40 @@ pub fn scale_shader(workgroup_size: u32) -> Option<String> {
     Some(preprocess(source, &defines, &replacements, DType::F32))
 }
 
+pub fn rand_uniform_shader(dtype: DType, workgroup_size: u32) -> Option<String> {
+    let source = get("rand_uniform.wgsl")?.source();
+    let mut defines = vec!["WG_SIZE".to_string()];
+    let mut replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    match dtype {
+        DType::F32 => {
+            defines.push("TYPE_F32".to_string());
+            replacements.push(("DataType".to_string(), "f32".to_string()));
+        }
+        DType::F16 => {
+            defines.push("TYPE_F16".to_string());
+            replacements.push(("DataType".to_string(), "f16".to_string()));
+        }
+    }
+    Some(preprocess(source, &defines, &replacements, dtype))
+}
+
+pub fn rand_normal_shader(dtype: DType, workgroup_size: u32) -> Option<String> {
+    let source = get("rand_normal.wgsl")?.source();
+    let mut defines = vec!["WG_SIZE".to_string()];
+    let mut replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    match dtype {
+        DType::F32 => {
+            defines.push("TYPE_F32".to_string());
+            replacements.push(("DataType".to_string(), "f32".to_string()));
+        }
+        DType::F16 => {
+            defines.push("TYPE_F16".to_string());
+            replacements.push(("DataType".to_string(), "f16".to_string()));
+        }
+    }
+    Some(preprocess(source, &defines, &replacements, dtype))
+}
+
 pub fn argmax_shader(workgroup_size: u32) -> Option<String> {
     let source = get("argmax.wgsl")?.source();
     let defines = vec!["WG_SIZE".to_string()];
@@ -1039,6 +1073,20 @@ fn replace_token(line: &str, name: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{shader, BinaryOp, DType, ShaderOp, UnaryOp};
+
+    #[test]
+    fn preprocesses_rand_uniform_wgsl() {
+        let source = super::rand_uniform_shader(DType::F32, 256).expect("rand_uniform f32");
+        assert!(source.contains("splitmix32"));
+        assert!(source.contains("@compute @workgroup_size(256)"));
+    }
+
+    #[test]
+    fn preprocesses_rand_normal_wgsl() {
+        let source = super::rand_normal_shader(DType::F32, 256).expect("rand_normal f32");
+        assert!(source.contains("TWO_PI"));
+        assert!(source.contains("log("));
+    }
 
     #[test]
     fn preprocesses_unary_wgsl() {

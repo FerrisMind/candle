@@ -276,6 +276,21 @@ backend_family_test!(
 backend_family_test!(
     #[cfg(feature = "wgpu")]
     #[ignore = "requires a usable wgpu adapter and driver"]
+    backend_smoke_wgpu_rand_native_only,
+    TestBackend::Wgpu,
+    native_required,
+    smoke_rand_native_only
+);
+backend_family_test!(
+    #[cfg(feature = "vulkan")]
+    backend_smoke_vulkan_rand_native_only,
+    TestBackend::Vulkan,
+    native_required,
+    smoke_rand_native_only
+);
+backend_family_test!(
+    #[cfg(feature = "wgpu")]
+    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_strided_const_set_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -1424,6 +1439,55 @@ fn smoke_f64_cuda_cast_native_only(device: &Device) -> Result<()> {
         strided_dev.to_dtype(DType::F64)?.to_vec2::<f64>()?,
         strided_cpu.to_dtype(DType::F64)?.to_vec2::<f64>()?,
         "cuda-supported strided f64->f64 cast"
+    );
+
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_rand_native_only(device: &Device) -> Result<()> {
+    device.set_seed(42)?;
+    let u1 = Tensor::rand(0.0f32, 1.0f32, (128,), device)?;
+    let n1 = Tensor::randn(0.0f32, 1.0f32, (128,), device)?;
+
+    device.set_seed(42)?;
+    let u2 = Tensor::rand(0.0f32, 1.0f32, (128,), device)?;
+    let n2 = Tensor::randn(0.0f32, 1.0f32, (128,), device)?;
+    assert_eq!(
+        u1.to_vec1::<f32>()?,
+        u2.to_vec1::<f32>()?,
+        "rand_uniform must be deterministic for a fixed seed"
+    );
+    assert_eq!(
+        n1.to_vec1::<f32>()?,
+        n2.to_vec1::<f32>()?,
+        "rand_normal must be deterministic for a fixed seed"
+    );
+
+    device.set_seed(99)?;
+    let u_other = Tensor::rand(0.0f32, 1.0f32, (128,), device)?;
+    assert_ne!(
+        u1.to_vec1::<f32>()?,
+        u_other.to_vec1::<f32>()?,
+        "rand_uniform must change when the seed changes"
+    );
+
+    let ranged = Tensor::rand(2.0f32, 5.0f32, (64,), device)?;
+    for value in ranged.to_vec1::<f32>()? {
+        assert!(
+            (2.0..=5.0).contains(&value),
+            "rand_uniform value {value} outside [2, 5]"
+        );
+    }
+
+    device.set_seed(7)?;
+    let f64_u = Tensor::rand(0.0f64, 1.0f64, (32,), device)?;
+    device.set_seed(7)?;
+    let f64_u2 = Tensor::rand(0.0f64, 1.0f64, (32,), device)?;
+    assert_eq!(
+        f64_u.to_vec1::<f64>()?,
+        f64_u2.to_vec1::<f64>()?,
+        "f64 rand_uniform must be deterministic for a fixed seed"
     );
 
     Ok(())
@@ -4215,6 +4279,11 @@ fn smoke_f32_extended_unary_ops(device: &Device) -> Result<()> {
         &[[std::f32::consts::E.recip() - 1.0, 0.0], [1.0, 2.0]],
         1e-5,
     );
+
+    let erf_input = Tensor::from_slice(&[0.0f32, 1.0, -1.0, 0.5], (2, 2), device)?;
+    let erf_cpu = Tensor::from_slice(&[0.0f32, 1.0, -1.0, 0.5], (2, 2), &Device::Cpu)?;
+    support::assert_tensors_close(&erf_input.erf()?, &erf_cpu.erf()?, DType::F32, "erf f32")?;
+    support::assert_tensors_close(&xs.recip()?, &xs.to_device(&Device::Cpu)?.recip()?, DType::F32, "recip f32")?;
 
     Ok(())
 }

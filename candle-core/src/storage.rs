@@ -1,4 +1,4 @@
-use crate::backend::{BackendDevice, BackendStorage};
+use crate::backend::BackendStorage;
 use crate::op::{self, CmpOp, ReduceOp};
 use crate::scalar::Scalar;
 use crate::{
@@ -23,48 +23,6 @@ pub(crate) fn record_vulkan_cpu_fallback(err: &Error) {
     if std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
         eprintln!("[candle][vulkan][cpu-fallback#{count}] {err:?}");
     }
-}
-
-fn is_backend_not_implemented_msg(msg: &str, backend: &str) -> bool {
-    let backend_rank_limit = msg.contains(backend) && msg.contains("supports up to rank-4 tensors");
-    let backend_overflow = msg.contains(backend)
-        && (msg.contains("dimension overflow")
-            || msg.contains("tmp overflow")
-            || msg.contains("workgroup overflow"));
-    (msg.contains(backend) && msg.contains("backend op") && msg.contains("not implemented"))
-        || msg.contains(&format!("no {backend} implementation for"))
-        || (msg.contains(backend) && msg.contains("shader") && msg.contains("not generated"))
-        || (msg.contains("backend op") && msg.contains("not implemented"))
-        || backend_rank_limit
-        || backend_overflow
-}
-
-fn is_backend_not_implemented(err: &Error, backend: &str) -> bool {
-    match err {
-        Error::UnsupportedDTypeForOp(..) => true,
-        Error::Msg(msg) => is_backend_not_implemented_msg(msg, backend),
-        Error::WithBacktrace { inner, .. }
-        | Error::WithPath { inner, .. }
-        | Error::Context { inner, .. } => is_backend_not_implemented(inner, backend),
-        _ => false,
-    }
-}
-
-fn should_wgpu_cpu_fallback(err: &Error) -> bool {
-    let fallback = is_backend_not_implemented(err, "wgpu");
-    if fallback {
-        record_wgpu_cpu_fallback(err);
-    }
-    fallback
-}
-
-fn should_vulkan_cpu_fallback(err: &Error) -> bool {
-    let fallback = is_backend_not_implemented(err, "vulkan")
-        || matches!(err, Error::UnsupportedDTypeForOp(..));
-    if fallback {
-        record_vulkan_cpu_fallback(err);
-    }
-    fallback
 }
 
 pub fn wgpu_cpu_fallback_count() -> usize {
@@ -174,22 +132,10 @@ impl Storage {
             Storage::Metal(storage) => storage.const_set(v, l),
             Storage::Wgpu(storage) => match storage.const_set(v, l) {
                 Ok(()) => Ok(()),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let mut cpu = storage.to_cpu_storage()?;
-                    cpu.const_set(v, l)?;
-                    *storage = storage.device().storage_from_cpu_storage(&cpu)?;
-                    Ok(())
-                }
                 Err(err) => Err(err),
             },
             Storage::Vulkan(storage) => match storage.const_set(v, l) {
                 Ok(()) => Ok(()),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let mut cpu = storage.to_cpu_storage()?;
-                    cpu.const_set(v, l)?;
-                    *storage = storage.device().storage_from_cpu_storage(&cpu)?;
-                    Ok(())
-                }
                 Err(err) => Err(err),
             },
         }
@@ -209,25 +155,13 @@ impl Storage {
                 let storage = storage.affine(layout, mul, add)?;
                 Ok(Self::Metal(storage))
             }
-            Self::Wgpu(storage) => match storage.affine(layout, mul, add) {
-                Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.affine(layout, mul, add)?;
-                    Ok(Self::Wgpu(storage.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            Self::Wgpu(storage) => {
+                let storage = storage.affine(layout, mul, add)?;
+                Ok(Self::Wgpu(storage))
             },
-            Self::Vulkan(storage) => match storage.affine(layout, mul, add) {
-                Ok(storage) => Ok(Self::Vulkan(storage)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.affine(layout, mul, add)?;
-                    Ok(Self::Vulkan(
-                        storage.device().storage_from_cpu_storage(&cpu)?,
-                    ))
-                }
-                Err(err) => Err(err),
+            Self::Vulkan(storage) => {
+                let storage = storage.affine(layout, mul, add)?;
+                Ok(Self::Vulkan(storage))
             },
         }
     }
@@ -246,25 +180,13 @@ impl Storage {
                 let storage = storage.powf(layout, alpha)?;
                 Ok(Self::Metal(storage))
             }
-            Self::Wgpu(storage) => match storage.powf(layout, alpha) {
-                Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.powf(layout, alpha)?;
-                    Ok(Self::Wgpu(storage.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            Self::Wgpu(storage) => {
+                let storage = storage.powf(layout, alpha)?;
+                Ok(Self::Wgpu(storage))
             },
-            Self::Vulkan(storage) => match storage.powf(layout, alpha) {
-                Ok(storage) => Ok(Self::Vulkan(storage)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.powf(layout, alpha)?;
-                    Ok(Self::Vulkan(
-                        storage.device().storage_from_cpu_storage(&cpu)?,
-                    ))
-                }
-                Err(err) => Err(err),
+            Self::Vulkan(storage) => {
+                let storage = storage.powf(layout, alpha)?;
+                Ok(Self::Vulkan(storage))
             },
         }
     }
@@ -283,25 +205,13 @@ impl Storage {
                 let storage = storage.elu(layout, alpha)?;
                 Ok(Self::Metal(storage))
             }
-            Self::Wgpu(storage) => match storage.elu(layout, alpha) {
-                Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.elu(layout, alpha)?;
-                    Ok(Self::Wgpu(storage.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            Self::Wgpu(storage) => {
+                let storage = storage.elu(layout, alpha)?;
+                Ok(Self::Wgpu(storage))
             },
-            Self::Vulkan(storage) => match storage.elu(layout, alpha) {
-                Ok(storage) => Ok(Self::Vulkan(storage)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.elu(layout, alpha)?;
-                    Ok(Self::Vulkan(
-                        storage.device().storage_from_cpu_storage(&cpu)?,
-                    ))
-                }
-                Err(err) => Err(err),
+            Self::Vulkan(storage) => {
+                let storage = storage.elu(layout, alpha)?;
+                Ok(Self::Vulkan(storage))
             },
         }
     }
@@ -328,25 +238,13 @@ impl Storage {
                 let storage = lhs.cmp(op, rhs, lhs_layout, rhs_layout)?;
                 Ok(Self::Metal(storage))
             }
-            (Self::Wgpu(lhs), Self::Wgpu(rhs)) => match lhs.cmp(op, rhs, lhs_layout, rhs_layout) {
-                Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu_lhs = lhs.to_cpu_storage()?;
-                    let cpu_rhs = rhs.to_cpu_storage()?;
-                    let cpu = cpu_lhs.cmp(op, &cpu_rhs, lhs_layout, rhs_layout)?;
-                    Ok(Self::Wgpu(lhs.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            (Self::Wgpu(lhs), Self::Wgpu(rhs)) => {
+                let storage = lhs.cmp(op, rhs, lhs_layout, rhs_layout)?;
+                Ok(Self::Wgpu(storage))
             },
             (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
                 match lhs.cmp(op, rhs, lhs_layout, rhs_layout) {
                     Ok(storage) => Ok(Self::Vulkan(storage)),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu_lhs = lhs.to_cpu_storage()?;
-                        let cpu_rhs = rhs.to_cpu_storage()?;
-                        let cpu = cpu_lhs.cmp(op, &cpu_rhs, lhs_layout, rhs_layout)?;
-                        Ok(Self::Vulkan(lhs.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -377,18 +275,13 @@ impl Storage {
                 let storage = storage.reduce_op(op, layout, s)?;
                 Ok(Self::Metal(storage))
             }
-            Self::Wgpu(storage) => match storage.reduce_op(op, layout, s) {
-                Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.reduce_op(op, layout, s)?;
-                    Ok(Self::Wgpu(storage.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            Self::Wgpu(storage) => {
+                let storage = storage.reduce_op(op, layout, s)?;
+                Ok(Self::Wgpu(storage))
             },
-            Self::Vulkan(storage) => match storage.reduce_op(op, layout, s) {
-                Ok(storage) => Ok(Self::Vulkan(storage)),
-                Err(err) => Err(err),
+            Self::Vulkan(storage) => {
+                let storage = storage.reduce_op(op, layout, s)?;
+                Ok(Self::Vulkan(storage))
             },
         }
     }
@@ -407,25 +300,13 @@ impl Storage {
                 let storage = storage.cumsum_last_dim(layout)?;
                 Ok(Self::Metal(storage))
             }
-            Self::Wgpu(storage) => match storage.cumsum_last_dim(layout) {
-                Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.cumsum_last_dim(layout)?;
-                    Ok(Self::Wgpu(storage.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            Self::Wgpu(storage) => {
+                let storage = storage.cumsum_last_dim(layout)?;
+                Ok(Self::Wgpu(storage))
             },
-            Self::Vulkan(storage) => match storage.cumsum_last_dim(layout) {
-                Ok(storage) => Ok(Self::Vulkan(storage)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.cumsum_last_dim(layout)?;
-                    Ok(Self::Vulkan(
-                        storage.device().storage_from_cpu_storage(&cpu)?,
-                    ))
-                }
-                Err(err) => Err(err),
+            Self::Vulkan(storage) => {
+                let storage = storage.cumsum_last_dim(layout)?;
+                Ok(Self::Vulkan(storage))
             },
         }
     }
@@ -444,25 +325,13 @@ impl Storage {
                 let storage = storage.clamp(layout, min, max)?;
                 Ok(Self::Metal(storage))
             }
-            Self::Wgpu(storage) => match storage.clamp(layout, min, max) {
-                Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.clamp(layout, min, max)?;
-                    Ok(Self::Wgpu(storage.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            Self::Wgpu(storage) => {
+                let storage = storage.clamp(layout, min, max)?;
+                Ok(Self::Wgpu(storage))
             },
-            Self::Vulkan(storage) => match storage.clamp(layout, min, max) {
-                Ok(storage) => Ok(Self::Vulkan(storage)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.clamp(layout, min, max)?;
-                    Ok(Self::Vulkan(
-                        storage.device().storage_from_cpu_storage(&cpu)?,
-                    ))
-                }
-                Err(err) => Err(err),
+            Self::Vulkan(storage) => {
+                let storage = storage.clamp(layout, min, max)?;
+                Ok(Self::Vulkan(storage))
             },
         }
     }
@@ -481,25 +350,13 @@ impl Storage {
                 let storage = storage.to_dtype(layout, dtype)?;
                 Ok(Self::Metal(storage))
             }
-            Self::Wgpu(storage) => match storage.to_dtype(layout, dtype) {
-                Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.to_dtype(layout, dtype)?;
-                    Ok(Self::Wgpu(storage.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            Self::Wgpu(storage) => {
+                let storage = storage.to_dtype(layout, dtype)?;
+                Ok(Self::Wgpu(storage))
             },
-            Self::Vulkan(storage) => match storage.to_dtype(layout, dtype) {
-                Ok(storage) => Ok(Self::Vulkan(storage)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.to_dtype(layout, dtype)?;
-                    Ok(Self::Vulkan(
-                        storage.device().storage_from_cpu_storage(&cpu)?,
-                    ))
-                }
-                Err(err) => Err(err),
+            Self::Vulkan(storage) => {
+                let storage = storage.to_dtype(layout, dtype)?;
+                Ok(Self::Vulkan(storage))
             },
         }
     }
@@ -518,25 +375,13 @@ impl Storage {
                 let (storage, shape) = c.metal_fwd(storage, l)?;
                 Ok((Self::Metal(storage), shape))
             }
-            Self::Wgpu(storage) => match c.wgpu_fwd(storage, l) {
-                Ok((storage, shape)) => Ok((Self::Wgpu(storage), shape)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let (cpu, shape) = c.cpu_fwd(&cpu, l)?;
-                    let storage = storage.device().storage_from_cpu_storage(&cpu)?;
-                    Ok((Self::Wgpu(storage), shape))
-                }
-                Err(err) => Err(err),
+            Self::Wgpu(storage) => {
+                let (storage, shape) = c.wgpu_fwd(storage, l)?;
+                Ok((Self::Wgpu(storage), shape))
             },
-            Self::Vulkan(storage) => match c.vulkan_fwd(storage, l) {
-                Ok((storage, shape)) => Ok((Self::Vulkan(storage), shape)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let (cpu, shape) = c.cpu_fwd(&cpu, l)?;
-                    let storage = storage.device().storage_from_cpu_storage(&cpu)?;
-                    Ok((Self::Vulkan(storage), shape))
-                }
-                Err(err) => Err(err),
+            Self::Vulkan(storage) => {
+                let (storage, shape) = c.vulkan_fwd(storage, l)?;
+                Ok((Self::Vulkan(storage), shape))
             },
         }
     }
@@ -564,24 +409,10 @@ impl Storage {
             }
             (Self::Wgpu(s1), Self::Wgpu(s2)) => match c.wgpu_fwd(s1, l1, s2, l2) {
                 Ok((s, shape)) => Ok((Self::Wgpu(s), shape)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu1 = s1.to_cpu_storage()?;
-                    let cpu2 = s2.to_cpu_storage()?;
-                    let (cpu, shape) = c.cpu_fwd(&cpu1, l1, &cpu2, l2)?;
-                    let storage = s1.device().storage_from_cpu_storage(&cpu)?;
-                    Ok((Self::Wgpu(storage), shape))
-                }
                 Err(err) => Err(err),
             },
             (Self::Vulkan(s1), Self::Vulkan(s2)) => match c.vulkan_fwd(s1, l1, s2, l2) {
                 Ok((s, shape)) => Ok((Self::Vulkan(s), shape)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu1 = s1.to_cpu_storage()?;
-                    let cpu2 = s2.to_cpu_storage()?;
-                    let (cpu, shape) = c.cpu_fwd(&cpu1, l1, &cpu2, l2)?;
-                    let storage = s1.device().storage_from_cpu_storage(&cpu)?;
-                    Ok((Self::Vulkan(storage), shape))
-                }
                 Err(err) => Err(err),
             },
             _ => unreachable!(),
@@ -615,28 +446,12 @@ impl Storage {
             (Self::Wgpu(s1), Self::Wgpu(s2), Self::Wgpu(s3)) => {
                 match c.wgpu_fwd(s1, l1, s2, l2, s3, l3) {
                     Ok((s, shape)) => Ok((Self::Wgpu(s), shape)),
-                    Err(err) if should_wgpu_cpu_fallback(&err) => {
-                        let cpu1 = s1.to_cpu_storage()?;
-                        let cpu2 = s2.to_cpu_storage()?;
-                        let cpu3 = s3.to_cpu_storage()?;
-                        let (cpu, shape) = c.cpu_fwd(&cpu1, l1, &cpu2, l2, &cpu3, l3)?;
-                        let storage = s1.device().storage_from_cpu_storage(&cpu)?;
-                        Ok((Self::Wgpu(storage), shape))
-                    }
                     Err(err) => Err(err),
                 }
             }
             (Self::Vulkan(s1), Self::Vulkan(s2), Self::Vulkan(s3)) => {
                 match c.vulkan_fwd(s1, l1, s2, l2, s3, l3) {
                     Ok((s, shape)) => Ok((Self::Vulkan(s), shape)),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu1 = s1.to_cpu_storage()?;
-                        let cpu2 = s2.to_cpu_storage()?;
-                        let cpu3 = s3.to_cpu_storage()?;
-                        let (cpu, shape) = c.cpu_fwd(&cpu1, l1, &cpu2, l2, &cpu3, l3)?;
-                        let storage = s1.device().storage_from_cpu_storage(&cpu)?;
-                        Ok((Self::Vulkan(storage), shape))
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -649,18 +464,16 @@ impl Storage {
             Self::Cpu(storage) => c.cpu_fwd(storage, l),
             Self::Cuda(storage) => c.cuda_fwd(storage, l),
             Self::Metal(storage) => c.metal_fwd(storage, l),
-            Self::Wgpu(storage) => {
-                let mut cpu = storage.to_cpu_storage()?;
-                c.cpu_fwd(&mut cpu, l)?;
-                *storage = storage.device().storage_from_cpu_storage(&cpu)?;
-                Ok(())
-            }
-            Self::Vulkan(storage) => {
-                let mut cpu = storage.to_cpu_storage()?;
-                c.cpu_fwd(&mut cpu, l)?;
-                *storage = storage.device().storage_from_cpu_storage(&cpu)?;
-                Ok(())
-            }
+            Self::Wgpu(_) => Err(Error::Msg(format!(
+                "no wgpu implementation for {}",
+                c.name()
+            ))
+            .bt()),
+            Self::Vulkan(_) => Err(Error::Msg(format!(
+                "no vulkan implementation for {}",
+                c.name()
+            ))
+            .bt()),
         }
     }
 
@@ -676,20 +489,16 @@ impl Storage {
             (Self::Cpu(s1), Self::Cpu(s2)) => c.cpu_fwd(s1, l1, s2, l2),
             (Self::Cuda(s1), Self::Cuda(s2)) => c.cuda_fwd(s1, l1, s2, l2),
             (Self::Metal(s1), Self::Metal(s2)) => c.metal_fwd(s1, l1, s2, l2),
-            (Self::Wgpu(s1), Self::Wgpu(s2)) => {
-                let mut cpu1 = s1.to_cpu_storage()?;
-                let cpu2 = s2.to_cpu_storage()?;
-                c.cpu_fwd(&mut cpu1, l1, &cpu2, l2)?;
-                *s1 = s1.device().storage_from_cpu_storage(&cpu1)?;
-                Ok(())
-            }
-            (Self::Vulkan(s1), Self::Vulkan(s2)) => {
-                let mut cpu1 = s1.to_cpu_storage()?;
-                let cpu2 = s2.to_cpu_storage()?;
-                c.cpu_fwd(&mut cpu1, l1, &cpu2, l2)?;
-                *s1 = s1.device().storage_from_cpu_storage(&cpu1)?;
-                Ok(())
-            }
+            (Self::Wgpu(_), Self::Wgpu(_)) => Err(Error::Msg(format!(
+                "no wgpu implementation for {}",
+                c.name()
+            ))
+            .bt()),
+            (Self::Vulkan(_), Self::Vulkan(_)) => Err(Error::Msg(format!(
+                "no vulkan implementation for {}",
+                c.name()
+            ))
+            .bt()),
             _ => unreachable!(),
         }
     }
@@ -711,22 +520,16 @@ impl Storage {
             (Self::Metal(s1), Self::Metal(s2), Self::Metal(s3)) => {
                 c.metal_fwd(s1, l1, s2, l2, s3, l3)
             }
-            (Self::Wgpu(s1), Self::Wgpu(s2), Self::Wgpu(s3)) => {
-                let mut cpu1 = s1.to_cpu_storage()?;
-                let cpu2 = s2.to_cpu_storage()?;
-                let cpu3 = s3.to_cpu_storage()?;
-                c.cpu_fwd(&mut cpu1, l1, &cpu2, l2, &cpu3, l3)?;
-                *s1 = s1.device().storage_from_cpu_storage(&cpu1)?;
-                Ok(())
-            }
-            (Self::Vulkan(s1), Self::Vulkan(s2), Self::Vulkan(s3)) => {
-                let mut cpu1 = s1.to_cpu_storage()?;
-                let cpu2 = s2.to_cpu_storage()?;
-                let cpu3 = s3.to_cpu_storage()?;
-                c.cpu_fwd(&mut cpu1, l1, &cpu2, l2, &cpu3, l3)?;
-                *s1 = s1.device().storage_from_cpu_storage(&cpu1)?;
-                Ok(())
-            }
+            (Self::Wgpu(_), Self::Wgpu(_), Self::Wgpu(_)) => Err(Error::Msg(format!(
+                "no wgpu implementation for {}",
+                c.name()
+            ))
+            .bt()),
+            (Self::Vulkan(_), Self::Vulkan(_), Self::Vulkan(_)) => Err(Error::Msg(format!(
+                "no vulkan implementation for {}",
+                c.name()
+            ))
+            .bt()),
             _ => unreachable!(),
         }
     }
@@ -747,11 +550,6 @@ impl Storage {
             }
             Self::Wgpu(storage) => match storage.unary_impl::<B>(layout) {
                 Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.unary_impl::<B>(layout)?;
-                    Ok(Self::Wgpu(storage.device().storage_from_cpu_storage(&cpu)?))
-                }
                 Err(err) => Err(err),
             },
             Self::Vulkan(storage) => match storage.unary_impl::<B>(layout) {
@@ -785,12 +583,6 @@ impl Storage {
             (Self::Wgpu(lhs), Self::Wgpu(rhs)) => {
                 match lhs.binary_impl::<B>(rhs, lhs_layout, rhs_layout) {
                     Ok(storage) => Ok(Self::Wgpu(storage)),
-                    Err(err) if should_wgpu_cpu_fallback(&err) => {
-                        let cpu_lhs = lhs.to_cpu_storage()?;
-                        let cpu_rhs = rhs.to_cpu_storage()?;
-                        let cpu = cpu_lhs.binary_impl::<B>(&cpu_rhs, lhs_layout, rhs_layout)?;
-                        Ok(Self::Wgpu(lhs.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -838,24 +630,12 @@ impl Storage {
             (Storage::Wgpu(inp), Storage::Wgpu(kernel)) => {
                 match inp.conv1d(l, kernel, kernel_l, params) {
                     Ok(s) => Ok(Self::Wgpu(s)),
-                    Err(err) if should_wgpu_cpu_fallback(&err) => {
-                        let cpu_inp = inp.to_cpu_storage()?;
-                        let cpu_kernel = kernel.to_cpu_storage()?;
-                        let cpu = cpu_inp.conv1d(l, &cpu_kernel, kernel_l, params)?;
-                        Ok(Self::Wgpu(inp.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
             (Storage::Vulkan(inp), Storage::Vulkan(kernel)) => {
                 match inp.conv1d(l, kernel, kernel_l, params) {
                     Ok(s) => Ok(Self::Vulkan(s)),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu_inp = inp.to_cpu_storage()?;
-                        let cpu_kernel = kernel.to_cpu_storage()?;
-                        let cpu = cpu_inp.conv1d(l, &cpu_kernel, kernel_l, params)?;
-                        Ok(Self::Vulkan(inp.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -893,24 +673,12 @@ impl Storage {
             (Storage::Wgpu(inp), Storage::Wgpu(kernel)) => {
                 match inp.conv_transpose1d(l, kernel, kernel_l, params) {
                     Ok(s) => Ok(Self::Wgpu(s)),
-                    Err(err) if should_wgpu_cpu_fallback(&err) => {
-                        let cpu_inp = inp.to_cpu_storage()?;
-                        let cpu_kernel = kernel.to_cpu_storage()?;
-                        let cpu = cpu_inp.conv_transpose1d(l, &cpu_kernel, kernel_l, params)?;
-                        Ok(Self::Wgpu(inp.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
             (Storage::Vulkan(inp), Storage::Vulkan(kernel)) => {
                 match inp.conv_transpose1d(l, kernel, kernel_l, params) {
                     Ok(s) => Ok(Self::Vulkan(s)),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu_inp = inp.to_cpu_storage()?;
-                        let cpu_kernel = kernel.to_cpu_storage()?;
-                        let cpu = cpu_inp.conv_transpose1d(l, &cpu_kernel, kernel_l, params)?;
-                        Ok(Self::Vulkan(inp.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -948,24 +716,12 @@ impl Storage {
             (Storage::Wgpu(inp), Storage::Wgpu(kernel)) => {
                 match inp.conv2d(l, kernel, kernel_l, params) {
                     Ok(s) => Ok(Self::Wgpu(s)),
-                    Err(err) if should_wgpu_cpu_fallback(&err) => {
-                        let cpu_inp = inp.to_cpu_storage()?;
-                        let cpu_kernel = kernel.to_cpu_storage()?;
-                        let cpu = cpu_inp.conv2d(l, &cpu_kernel, kernel_l, params)?;
-                        Ok(Self::Wgpu(inp.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
             (Storage::Vulkan(inp), Storage::Vulkan(kernel)) => {
                 match inp.conv2d(l, kernel, kernel_l, params) {
                     Ok(s) => Ok(Self::Vulkan(s)),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu_inp = inp.to_cpu_storage()?;
-                        let cpu_kernel = kernel.to_cpu_storage()?;
-                        let cpu = cpu_inp.conv2d(l, &cpu_kernel, kernel_l, params)?;
-                        Ok(Self::Vulkan(inp.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -1003,24 +759,12 @@ impl Storage {
             (Storage::Wgpu(inp), Storage::Wgpu(kernel)) => {
                 match inp.conv_transpose2d(l, kernel, kernel_l, params) {
                     Ok(s) => Ok(Self::Wgpu(s)),
-                    Err(err) if should_wgpu_cpu_fallback(&err) => {
-                        let cpu_inp = inp.to_cpu_storage()?;
-                        let cpu_kernel = kernel.to_cpu_storage()?;
-                        let cpu = cpu_inp.conv_transpose2d(l, &cpu_kernel, kernel_l, params)?;
-                        Ok(Self::Wgpu(inp.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
             (Storage::Vulkan(inp), Storage::Vulkan(kernel)) => {
                 match inp.conv_transpose2d(l, kernel, kernel_l, params) {
                     Ok(s) => Ok(Self::Vulkan(s)),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu_inp = inp.to_cpu_storage()?;
-                        let cpu_kernel = kernel.to_cpu_storage()?;
-                        let cpu = cpu_inp.conv_transpose2d(l, &cpu_kernel, kernel_l, params)?;
-                        Ok(Self::Vulkan(inp.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -1052,25 +796,13 @@ impl Storage {
                 let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Metal(storage))
             }
-            Self::Wgpu(storage) => match storage.avg_pool2d(layout, kernel_size, stride) {
-                Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.avg_pool2d(layout, kernel_size, stride)?;
-                    Ok(Self::Wgpu(storage.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            Self::Wgpu(storage) => {
+                let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::Wgpu(storage))
             },
-            Self::Vulkan(storage) => match storage.avg_pool2d(layout, kernel_size, stride) {
-                Ok(storage) => Ok(Self::Vulkan(storage)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.avg_pool2d(layout, kernel_size, stride)?;
-                    Ok(Self::Vulkan(
-                        storage.device().storage_from_cpu_storage(&cpu)?,
-                    ))
-                }
-                Err(err) => Err(err),
+            Self::Vulkan(storage) => {
+                let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::Vulkan(storage))
             },
         }
     }
@@ -1094,25 +826,13 @@ impl Storage {
                 let storage = storage.max_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Metal(storage))
             }
-            Self::Wgpu(storage) => match storage.max_pool2d(layout, kernel_size, stride) {
-                Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.max_pool2d(layout, kernel_size, stride)?;
-                    Ok(Self::Wgpu(storage.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            Self::Wgpu(storage) => {
+                let storage = storage.max_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::Wgpu(storage))
             },
-            Self::Vulkan(storage) => match storage.max_pool2d(layout, kernel_size, stride) {
-                Ok(storage) => Ok(Self::Vulkan(storage)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.max_pool2d(layout, kernel_size, stride)?;
-                    Ok(Self::Vulkan(
-                        storage.device().storage_from_cpu_storage(&cpu)?,
-                    ))
-                }
-                Err(err) => Err(err),
+            Self::Vulkan(storage) => {
+                let storage = storage.max_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::Vulkan(storage))
             },
         }
     }
@@ -1131,25 +851,13 @@ impl Storage {
                 let storage = storage.upsample_nearest1d(layout, sz)?;
                 Ok(Self::Metal(storage))
             }
-            Self::Wgpu(storage) => match storage.upsample_nearest1d(layout, sz) {
-                Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.upsample_nearest1d(layout, sz)?;
-                    Ok(Self::Wgpu(storage.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            Self::Wgpu(storage) => {
+                let storage = storage.upsample_nearest1d(layout, sz)?;
+                Ok(Self::Wgpu(storage))
             },
-            Self::Vulkan(storage) => match storage.upsample_nearest1d(layout, sz) {
-                Ok(storage) => Ok(Self::Vulkan(storage)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.upsample_nearest1d(layout, sz)?;
-                    Ok(Self::Vulkan(
-                        storage.device().storage_from_cpu_storage(&cpu)?,
-                    ))
-                }
-                Err(err) => Err(err),
+            Self::Vulkan(storage) => {
+                let storage = storage.upsample_nearest1d(layout, sz)?;
+                Ok(Self::Vulkan(storage))
             },
         }
     }
@@ -1168,25 +876,13 @@ impl Storage {
                 let storage = storage.upsample_nearest2d(layout, h, w)?;
                 Ok(Self::Metal(storage))
             }
-            Self::Wgpu(storage) => match storage.upsample_nearest2d(layout, h, w) {
-                Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.upsample_nearest2d(layout, h, w)?;
-                    Ok(Self::Wgpu(storage.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            Self::Wgpu(storage) => {
+                let storage = storage.upsample_nearest2d(layout, h, w)?;
+                Ok(Self::Wgpu(storage))
             },
-            Self::Vulkan(storage) => match storage.upsample_nearest2d(layout, h, w) {
-                Ok(storage) => Ok(Self::Vulkan(storage)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu = storage.to_cpu_storage()?;
-                    let cpu = cpu.upsample_nearest2d(layout, h, w)?;
-                    Ok(Self::Vulkan(
-                        storage.device().storage_from_cpu_storage(&cpu)?,
-                    ))
-                }
-                Err(err) => Err(err),
+            Self::Vulkan(storage) => {
+                let storage = storage.upsample_nearest2d(layout, h, w)?;
+                Ok(Self::Vulkan(storage))
             },
         }
     }
@@ -1219,26 +915,12 @@ impl Storage {
             Self::Wgpu(storage) => {
                 match storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w) {
                     Ok(storage) => Ok(Self::Wgpu(storage)),
-                    Err(err) if should_wgpu_cpu_fallback(&err) => {
-                        let cpu = storage.to_cpu_storage()?;
-                        let cpu =
-                            cpu.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
-                        Ok(Self::Wgpu(storage.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
             Self::Vulkan(storage) => {
                 match storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w) {
                     Ok(storage) => Ok(Self::Vulkan(storage)),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu = storage.to_cpu_storage()?;
-                        let cpu =
-                            cpu.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
-                        Ok(Self::Vulkan(
-                            storage.device().storage_from_cpu_storage(&cpu)?,
-                        ))
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -1272,28 +954,12 @@ impl Storage {
             (Self::Wgpu(cond), Self::Wgpu(t), Self::Wgpu(f)) => {
                 match cond.where_cond(layout, t, layout_t, f, layout_f) {
                     Ok(storage) => Ok(Self::Wgpu(storage)),
-                    Err(err) if should_wgpu_cpu_fallback(&err) => {
-                        let cpu_cond = cond.to_cpu_storage()?;
-                        let cpu_t = t.to_cpu_storage()?;
-                        let cpu_f = f.to_cpu_storage()?;
-                        let cpu =
-                            cpu_cond.where_cond(layout, &cpu_t, layout_t, &cpu_f, layout_f)?;
-                        Ok(Self::Wgpu(cond.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
             (Self::Vulkan(cond), Self::Vulkan(t), Self::Vulkan(f)) => {
                 match cond.where_cond(layout, t, layout_t, f, layout_f) {
                     Ok(storage) => Ok(Self::Vulkan(storage)),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu_cond = cond.to_cpu_storage()?;
-                        let cpu_t = t.to_cpu_storage()?;
-                        let cpu_f = f.to_cpu_storage()?;
-                        let cpu =
-                            cpu_cond.where_cond(layout, &cpu_t, layout_t, &cpu_f, layout_f)?;
-                        Ok(Self::Vulkan(cond.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -1327,25 +993,13 @@ impl Storage {
                 let storage = s.gather(l, indexes, indexes_l, d)?;
                 Ok(Self::Metal(storage))
             }
-            (Self::Wgpu(s), Self::Wgpu(indexes)) => match s.gather(l, indexes, indexes_l, d) {
-                Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu_s = s.to_cpu_storage()?;
-                    let cpu_indexes = indexes.to_cpu_storage()?;
-                    let cpu = cpu_s.gather(l, &cpu_indexes, indexes_l, d)?;
-                    Ok(Self::Wgpu(s.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            (Self::Wgpu(s), Self::Wgpu(indexes)) => {
+                let storage = s.gather(l, indexes, indexes_l, d)?;
+                Ok(Self::Wgpu(storage))
             },
-            (Self::Vulkan(s), Self::Vulkan(indexes)) => match s.gather(l, indexes, indexes_l, d) {
-                Ok(storage) => Ok(Self::Vulkan(storage)),
-                Err(err) if should_vulkan_cpu_fallback(&err) => {
-                    let cpu_s = s.to_cpu_storage()?;
-                    let cpu_indexes = indexes.to_cpu_storage()?;
-                    let cpu = cpu_s.gather(l, &cpu_indexes, indexes_l, d)?;
-                    Ok(Self::Vulkan(s.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            (Self::Vulkan(s), Self::Vulkan(indexes)) => {
+                let storage = s.gather(l, indexes, indexes_l, d)?;
+                Ok(Self::Vulkan(storage))
             },
             _ => unreachable!(),
         }
@@ -1375,26 +1029,12 @@ impl Storage {
             (Self::Wgpu(s), Self::Wgpu(indexes), Self::Wgpu(source)) => {
                 match s.scatter_set(l, indexes, indexes_l, source, source_l, d) {
                     Ok(()) => {}
-                    Err(err) if should_wgpu_cpu_fallback(&err) => {
-                        let mut cpu_s = s.to_cpu_storage()?;
-                        let cpu_indexes = indexes.to_cpu_storage()?;
-                        let cpu_source = source.to_cpu_storage()?;
-                        cpu_s.scatter_set(l, &cpu_indexes, indexes_l, &cpu_source, source_l, d)?;
-                        *s = s.device().storage_from_cpu_storage(&cpu_s)?;
-                    }
                     Err(err) => return Err(err),
                 }
             }
             (Self::Vulkan(s), Self::Vulkan(indexes), Self::Vulkan(source)) => {
                 match s.scatter_set(l, indexes, indexes_l, source, source_l, d) {
                     Ok(()) => {}
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let mut cpu_s = s.to_cpu_storage()?;
-                        let cpu_indexes = indexes.to_cpu_storage()?;
-                        let cpu_source = source.to_cpu_storage()?;
-                        cpu_s.scatter_set(l, &cpu_indexes, indexes_l, &cpu_source, source_l, d)?;
-                        *s = s.device().storage_from_cpu_storage(&cpu_s)?;
-                    }
                     Err(err) => return Err(err),
                 }
             }
@@ -1427,40 +1067,12 @@ impl Storage {
             (Self::Wgpu(s), Self::Wgpu(indexes), Self::Wgpu(source)) => {
                 match s.scatter_add_set(l, indexes, indexes_l, source, source_l, d) {
                     Ok(()) => {}
-                    Err(err) if should_wgpu_cpu_fallback(&err) => {
-                        let mut cpu_s = s.to_cpu_storage()?;
-                        let cpu_indexes = indexes.to_cpu_storage()?;
-                        let cpu_source = source.to_cpu_storage()?;
-                        cpu_s.scatter_add_set(
-                            l,
-                            &cpu_indexes,
-                            indexes_l,
-                            &cpu_source,
-                            source_l,
-                            d,
-                        )?;
-                        *s = s.device().storage_from_cpu_storage(&cpu_s)?;
-                    }
                     Err(err) => return Err(err),
                 }
             }
             (Self::Vulkan(s), Self::Vulkan(indexes), Self::Vulkan(source)) => {
                 match s.scatter_add_set(l, indexes, indexes_l, source, source_l, d) {
                     Ok(()) => {}
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let mut cpu_s = s.to_cpu_storage()?;
-                        let cpu_indexes = indexes.to_cpu_storage()?;
-                        let cpu_source = source.to_cpu_storage()?;
-                        cpu_s.scatter_add_set(
-                            l,
-                            &cpu_indexes,
-                            indexes_l,
-                            &cpu_source,
-                            source_l,
-                            d,
-                        )?;
-                        *s = s.device().storage_from_cpu_storage(&cpu_s)?;
-                    }
                     Err(err) => return Err(err),
                 }
             }
@@ -1496,40 +1108,12 @@ impl Storage {
             (Self::Wgpu(s), Self::Wgpu(indexes), Self::Wgpu(source)) => {
                 match s.index_add(l, indexes, indexes_l, source, source_l, d) {
                     Ok(storage) => Ok(Self::Wgpu(storage)),
-                    Err(err) if should_wgpu_cpu_fallback(&err) => {
-                        let cpu_s = s.to_cpu_storage()?;
-                        let cpu_indexes = indexes.to_cpu_storage()?;
-                        let cpu_source = source.to_cpu_storage()?;
-                        let cpu = cpu_s.index_add(
-                            l,
-                            &cpu_indexes,
-                            indexes_l,
-                            &cpu_source,
-                            source_l,
-                            d,
-                        )?;
-                        Ok(Self::Wgpu(s.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
             (Self::Vulkan(s), Self::Vulkan(indexes), Self::Vulkan(source)) => {
                 match s.index_add(l, indexes, indexes_l, source, source_l, d) {
                     Ok(storage) => Ok(Self::Vulkan(storage)),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu_s = s.to_cpu_storage()?;
-                        let cpu_indexes = indexes.to_cpu_storage()?;
-                        let cpu_source = source.to_cpu_storage()?;
-                        let cpu = cpu_s.index_add(
-                            l,
-                            &cpu_indexes,
-                            indexes_l,
-                            &cpu_source,
-                            source_l,
-                            d,
-                        )?;
-                        Ok(Self::Vulkan(s.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -1558,25 +1142,13 @@ impl Storage {
                 let storage = lhs.index_select(rhs, lhs_l, rhs_l, d)?;
                 Ok(Self::Metal(storage))
             }
-            (Self::Wgpu(lhs), Self::Wgpu(rhs)) => match lhs.index_select(rhs, lhs_l, rhs_l, d) {
-                Ok(storage) => Ok(Self::Wgpu(storage)),
-                Err(err) if should_wgpu_cpu_fallback(&err) => {
-                    let cpu_lhs = lhs.to_cpu_storage()?;
-                    let cpu_rhs = rhs.to_cpu_storage()?;
-                    let cpu = cpu_lhs.index_select(&cpu_rhs, lhs_l, rhs_l, d)?;
-                    Ok(Self::Wgpu(lhs.device().storage_from_cpu_storage(&cpu)?))
-                }
-                Err(err) => Err(err),
+            (Self::Wgpu(lhs), Self::Wgpu(rhs)) => {
+                let storage = lhs.index_select(rhs, lhs_l, rhs_l, d)?;
+                Ok(Self::Wgpu(storage))
             },
             (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
                 match lhs.index_select(rhs, lhs_l, rhs_l, d) {
                     Ok(storage) => Ok(Self::Vulkan(storage)),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu_lhs = lhs.to_cpu_storage()?;
-                        let cpu_rhs = rhs.to_cpu_storage()?;
-                        let cpu = cpu_lhs.index_select(&cpu_rhs, lhs_l, rhs_l, d)?;
-                        Ok(Self::Vulkan(lhs.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -1614,12 +1186,6 @@ impl Storage {
             (Self::Wgpu(lhs), Self::Wgpu(rhs)) => {
                 match lhs.matmul(rhs, bmnk, lhs_layout, rhs_layout) {
                     Ok(storage) => Ok(Self::Wgpu(storage)),
-                    Err(err) if should_wgpu_cpu_fallback(&err) => {
-                        let cpu_lhs = lhs.to_cpu_storage()?;
-                        let cpu_rhs = rhs.to_cpu_storage()?;
-                        let cpu = cpu_lhs.matmul(&cpu_rhs, bmnk, lhs_layout, rhs_layout)?;
-                        Ok(Self::Wgpu(lhs.device().storage_from_cpu_storage(&cpu)?))
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -1654,26 +1220,12 @@ impl Storage {
             (Self::Wgpu(src), Self::Wgpu(dst)) => {
                 match src.copy_strided_src(dst, dst_offset, src_l) {
                     Ok(()) => Ok(()),
-                    Err(err) if should_wgpu_cpu_fallback(&err) => {
-                        let cpu_src = src.to_cpu_storage()?;
-                        let mut cpu_dst = dst.to_cpu_storage()?;
-                        cpu_src.copy_strided_src(&mut cpu_dst, dst_offset, src_l)?;
-                        *dst = dst.device().storage_from_cpu_storage(&cpu_dst)?;
-                        Ok(())
-                    }
                     Err(err) => Err(err),
                 }
             }
             (Self::Vulkan(src), Self::Vulkan(dst)) => {
                 match src.copy_strided_src(dst, dst_offset, src_l) {
                     Ok(()) => Ok(()),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu_src = src.to_cpu_storage()?;
-                        let mut cpu_dst = dst.to_cpu_storage()?;
-                        cpu_src.copy_strided_src(&mut cpu_dst, dst_offset, src_l)?;
-                        *dst = dst.device().storage_from_cpu_storage(&cpu_dst)?;
-                        Ok(())
-                    }
                     Err(err) => Err(err),
                 }
             }
@@ -1708,26 +1260,12 @@ impl Storage {
             (Self::Wgpu(src), Self::Wgpu(dst)) => {
                 match src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o) {
                     Ok(()) => Ok(()),
-                    Err(err) if should_wgpu_cpu_fallback(&err) => {
-                        let cpu_src = src.to_cpu_storage()?;
-                        let mut cpu_dst = dst.to_cpu_storage()?;
-                        cpu_src.copy2d(&mut cpu_dst, d1, d2, src_s, dst_s, src_o, dst_o)?;
-                        *dst = dst.device().storage_from_cpu_storage(&cpu_dst)?;
-                        Ok(())
-                    }
                     Err(err) => Err(err),
                 }
             }
             (Self::Vulkan(src), Self::Vulkan(dst)) => {
                 match src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o) {
                     Ok(()) => Ok(()),
-                    Err(err) if should_vulkan_cpu_fallback(&err) => {
-                        let cpu_src = src.to_cpu_storage()?;
-                        let mut cpu_dst = dst.to_cpu_storage()?;
-                        cpu_src.copy2d(&mut cpu_dst, d1, d2, src_s, dst_s, src_o, dst_o)?;
-                        *dst = dst.device().storage_from_cpu_storage(&cpu_dst)?;
-                        Ok(())
-                    }
                     Err(err) => Err(err),
                 }
             }

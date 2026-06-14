@@ -1,5 +1,5 @@
 use crate::backend::{BackendDevice, BackendStorage};
-use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
+use crate::op::{BinaryOpT, CmpOp, Mul, ReduceOp, UnaryOpT};
 use crate::quantized::GgmlDType;
 use crate::{CpuStorage, DType, Error, Layout, Result, Shape, WithDType};
 use std::collections::HashMap;
@@ -337,6 +337,26 @@ struct ScaleParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct RandParams {
+    seed_lo: u32,
+    seed_hi: u32,
+    min_val: f32,
+    max_val: f32,
+    ne: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RandNormalParams {
+    seed_lo: u32,
+    seed_hi: u32,
+    mean: f32,
+    std: f32,
+    ne: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct CopyParams {
     ne: u32,
     offset_src: u32,
@@ -530,32 +550,123 @@ impl WgpuDevice {
     pub fn adapter_pci_bus_id(&self) -> &str {
         &self.inner.adapter_pci_bus_id
     }
+
+    fn run_rand_kernel(
+        &self,
+        shape: &Shape,
+        kernel_dtype: DType,
+        shader: String,
+        params_bytes: &[u8],
+        label: &'static str,
+    ) -> Result<WgpuStorage> {
+        let count = shape.elem_count();
+        let storage = unsafe { self.alloc_uninit(shape, kernel_dtype)? };
+        let param_buffer = self.inner.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("candle-wgpu-rand-params"),
+            size: params_bytes.len() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.inner
+            .queue
+            .write_buffer(&param_buffer, 0, params_bytes);
+        let entries = [storage_entry(0, false), uniform_entry(1)];
+        let bindings = [
+            buffer_binding(0, &storage.buffer),
+            buffer_binding(1, &param_buffer),
+        ];
+        let workgroups = (count as u32).div_ceil(WG_SIZE);
+        self.run_compute(&shader, &entries, &bindings, workgroups, label)?;
+        Ok(storage)
+    }
+
+    fn rand_uniform_gpu(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        min: f64,
+        max: f64,
+    ) -> Result<WgpuStorage> {
+        let count = shape.elem_count();
+        if count == 0 {
+            return self.zeros_impl(shape, dtype);
+        }
+        let seed = self.get_current_seed()?;
+        let kernel_dtype = match dtype {
+            DType::F32 => DType::F32,
+            DType::F16 if self.inner.features.contains(wgpu::Features::SHADER_F16) => DType::F16,
+            DType::F16 | DType::BF16 | DType::F64 => DType::F32,
+            dt => return Err(Error::UnsupportedDTypeForOp(dt, "rand_uniform").bt()),
+        };
+        let params = RandParams {
+            seed_lo: seed as u32,
+            seed_hi: (seed >> 32) as u32,
+            min_val: min as f32,
+            max_val: max as f32,
+            ne: count.try_into()?,
+        };
+        let shader = candle_wgpu_kernels::rand_uniform_shader(wgpu_kernel_dtype(kernel_dtype)?, WG_SIZE)
+            .ok_or_else(|| Error::Msg("wgpu shader rand_uniform.wgsl not embedded".into()).bt())?;
+        let storage = self.run_rand_kernel(
+            shape,
+            kernel_dtype,
+            shader,
+            any_as_bytes(&params),
+            "candle-wgpu-rand-uniform",
+        )?;
+        if kernel_dtype == dtype {
+            Ok(storage)
+        } else {
+            storage.to_dtype(&Layout::contiguous(shape), dtype)
+        }
+    }
+
+    fn rand_normal_gpu(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        mean: f64,
+        std: f64,
+    ) -> Result<WgpuStorage> {
+        let count = shape.elem_count();
+        if count == 0 {
+            return self.zeros_impl(shape, dtype);
+        }
+        let seed = self.get_current_seed()?;
+        let kernel_dtype = match dtype {
+            DType::F32 => DType::F32,
+            DType::F16 if self.inner.features.contains(wgpu::Features::SHADER_F16) => DType::F16,
+            DType::F16 | DType::BF16 | DType::F64 => DType::F32,
+            dt => return Err(Error::UnsupportedDTypeForOp(dt, "rand_normal").bt()),
+        };
+        let params = RandNormalParams {
+            seed_lo: seed as u32,
+            seed_hi: (seed >> 32) as u32,
+            mean: mean as f32,
+            std: std as f32,
+            ne: count.try_into()?,
+        };
+        let shader = candle_wgpu_kernels::rand_normal_shader(wgpu_kernel_dtype(kernel_dtype)?, WG_SIZE)
+            .ok_or_else(|| Error::Msg("wgpu shader rand_normal.wgsl not embedded".into()).bt())?;
+        let storage = self.run_rand_kernel(
+            shape,
+            kernel_dtype,
+            shader,
+            any_as_bytes(&params),
+            "candle-wgpu-rand-normal",
+        )?;
+        if kernel_dtype == dtype {
+            Ok(storage)
+        } else {
+            storage.to_dtype(&Layout::contiguous(shape), dtype)
+        }
+    }
 }
 
 fn unsupported(op: &'static str) -> Error {
     Error::Msg(format!("wgpu backend op {op} not implemented")).bt()
 }
 
-fn should_cpu_fallback(err: &Error) -> bool {
-    fn matches_fallback(err: &Error) -> bool {
-        match err {
-            Error::UnsupportedDTypeForOp(..) => true,
-            Error::Msg(msg) => msg.contains("wgpu backend op") && msg.contains("not implemented"),
-            Error::Context { inner, .. }
-            | Error::WithPath { inner, .. }
-            | Error::WithBacktrace { inner, .. } => matches_fallback(inner),
-            _ => false,
-        }
-    }
-    let fallback = matches_fallback(err);
-    if fallback {
-        // Every backend-internal CPU recovery must be visible to the global
-        // fallback counter, otherwise native-required tests pass while work
-        // silently runs on the CPU.
-        crate::storage::record_wgpu_cpu_fallback(err);
-    }
-    fallback
-}
 
 fn byte_len(dtype: DType, count: usize, op: &'static str) -> Result<usize> {
     let size = dtype.size_in_bytes();
@@ -960,10 +1071,10 @@ fn wgpu_quantized_dtype(dtype: GgmlDType) -> Result<candle_wgpu_kernels::Quantiz
 
 fn unary_shader(op: &str, dtype: DType) -> Result<String> {
     if op == "recip" {
-        if dtype != DType::F32 {
-            return Err(unsupported("unary recip f16"));
-        }
         return Ok(custom_unary_wgsl("1.0 / x"));
+    }
+    if op == "erf" {
+        return Ok(erf_unary_wgsl());
     }
     let op = match op {
         "abs" => candle_wgpu_kernels::UnaryOp::Abs,
@@ -2557,6 +2668,10 @@ fn cond_is_true(idx: u32) -> bool {{
 }
 
 fn custom_unary_wgsl(expr: &str) -> String {
+    custom_unary_wgsl_body(&format!("dst[params.offset_dst + gid.x] = {expr};"))
+}
+
+fn custom_unary_wgsl_body(body: &str) -> String {
     format!(
         r#"
 struct Params {{
@@ -2589,9 +2704,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let src_idx = i0 * params.stride_src0 + i1 * params.stride_src1 +
                   i2 * params.stride_src2 + i3 * params.stride_src3;
     let x = src[params.offset_src + src_idx];
-    dst[params.offset_dst + gid.x] = {expr};
+    {body}
 }}
 "#
+    )
+}
+
+fn erf_unary_wgsl() -> String {
+    custom_unary_wgsl_body(
+        r#"let ax = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * ax);
+  let poly = (((((1.061405429 * t + -1.453152027) * t + 1.421413741) * t + -0.284496736) * t + 0.254829592) * t);
+    dst[params.offset_dst + gid.x] = sign(x) * (1.0 - poly * exp(-ax * ax));"#,
     )
 }
 
@@ -5804,6 +5928,274 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
+    fn run_conv_transpose1d_f32(
+        &self,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose1D,
+    ) -> Result<Self> {
+        let src_dtype = self.dtype;
+        if src_dtype != kernel.dtype {
+            return Err(Error::UnsupportedDTypeForOp(src_dtype, "wgpu conv_transpose1d").bt());
+        }
+        if !matches!(src_dtype, DType::F32 | DType::F16) {
+            return Err(Error::UnsupportedDTypeForOp(src_dtype, "wgpu conv_transpose1d").bt());
+        }
+        let src_len = params
+            .l_in
+            .checked_mul(params.k_size)
+            .ok_or_else(|| Error::Msg("wgpu conv_transpose1d src_len overflow".into()).bt())?;
+        let l_out = params.l_out();
+        if l_out > u32::MAX as usize {
+            return Err(Error::Msg("wgpu conv_transpose1d output too large".into()).bt());
+        }
+
+        let input_f32 = self.materialize_to_f32(layout)?;
+        let input_f32_l = Layout::contiguous(layout.shape());
+        let kernel_f32 = kernel.materialize_to_f32(kernel_l)?;
+        let kernel_mm_l = Layout::contiguous((params.c_in, params.c_out * params.k_size));
+
+        let input_t_view_l = input_f32_l.transpose(1, 2)?;
+        let mut input_t_owned = None;
+        let (input_t, input_mm_l) = if input_t_view_l.is_contiguous() && input_t_view_l.start_offset() == 0
+        {
+            (
+                &input_f32,
+                Layout::contiguous((params.b_size * params.l_in, params.c_in)),
+            )
+        } else {
+            let mut tmp =
+                unsafe { self.device.alloc_uninit(input_t_view_l.shape(), DType::F32)? };
+            input_f32.copy_strided_src(&mut tmp, 0, &input_t_view_l)?;
+            input_t_owned = Some(tmp);
+            (
+                input_t_owned.as_ref().unwrap(),
+                Layout::contiguous((params.b_size * params.l_in, params.c_in)),
+            )
+        };
+
+        let cols = input_t.matmul(
+            &kernel_f32,
+            (
+                1,
+                params.b_size * params.l_in,
+                params.c_out * params.k_size,
+                params.c_in,
+            ),
+            &input_mm_l,
+            &kernel_mm_l,
+        )?;
+        let cols_l = Layout::contiguous((
+            params.b_size,
+            params.l_in,
+            params.c_out,
+            params.k_size,
+        ));
+        let src_perm_l = cols_l.permute(&[0, 2, 1, 3])?;
+        let mut src_owned = None;
+        let (src, src_l) = if src_perm_l.is_contiguous() && src_perm_l.start_offset() == 0 {
+            (
+                &cols,
+                Layout::contiguous((params.b_size * params.c_out, src_len)),
+            )
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(src_perm_l.shape(), DType::F32)? };
+            cols.copy_strided_src(&mut tmp, 0, &src_perm_l)?;
+            src_owned = Some(tmp);
+            (
+                src_owned.as_ref().unwrap(),
+                Layout::contiguous((params.b_size * params.c_out, src_len)),
+            )
+        };
+
+        let mut ids = Vec::with_capacity(src_len);
+        let mut mask = Vec::with_capacity(src_len);
+        for t_in in 0..params.l_in {
+            let base = t_in * params.stride;
+            for k in 0..params.k_size {
+                let pos = base + k * params.dilation;
+                if pos >= params.padding {
+                    let out_idx = pos - params.padding;
+                    if out_idx < l_out {
+                        ids.push(out_idx as u32);
+                        mask.push(1f32);
+                        continue;
+                    }
+                }
+                ids.push(0);
+                mask.push(0f32);
+            }
+        }
+
+        let ids_storage = self.device.storage_from_slice(&ids)?;
+        let ids_l = Layout::contiguous(src_len);
+        let mask_storage = self.device.storage_from_slice(&mask)?;
+        let mask_l = Layout::contiguous((1, src_len))
+            .broadcast_as((params.b_size * params.c_out, src_len))?;
+        let src_masked = src.binary_impl::<Mul>(&mask_storage, &src_l, &mask_l)?;
+
+        let out_shape = Shape::from(vec![params.b_size * params.c_out, l_out]);
+        let out_l = Layout::contiguous(out_shape.clone());
+        let zeros = self.device.zeros_impl(&out_shape, DType::F32)?;
+        let out = zeros.index_add(&out_l, &ids_storage, &ids_l, &src_masked, &src_l, 1)?;
+
+        let final_shape = Shape::from(params.out_dims());
+        let final_l = Layout::contiguous(final_shape.clone());
+        let mut result = unsafe { self.device.alloc_uninit(&final_shape, DType::F32)? };
+        out.copy_strided_src(&mut result, 0, &final_l)?;
+        drop(input_t_owned);
+        drop(src_owned);
+        if src_dtype == DType::F16 {
+            result.to_dtype(&final_l, DType::F16)
+        } else {
+            Ok(result)
+        }
+    }
+
+    fn run_conv_transpose2d_f32(
+        &self,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose2D,
+    ) -> Result<Self> {
+        let src_dtype = self.dtype;
+        if src_dtype != kernel.dtype {
+            return Err(Error::UnsupportedDTypeForOp(src_dtype, "wgpu conv_transpose2d").bt());
+        }
+        if !matches!(src_dtype, DType::F32 | DType::F16) {
+            return Err(Error::UnsupportedDTypeForOp(src_dtype, "wgpu conv_transpose2d").bt());
+        }
+        let input_spatial = params
+            .i_h
+            .checked_mul(params.i_w)
+            .ok_or_else(|| Error::Msg("wgpu conv_transpose2d input_spatial overflow".into()).bt())?;
+        let kernel_spatial = params
+            .k_h
+            .checked_mul(params.k_w)
+            .ok_or_else(|| Error::Msg("wgpu conv_transpose2d kernel_spatial overflow".into()).bt())?;
+        let src_len = input_spatial
+            .checked_mul(kernel_spatial)
+            .ok_or_else(|| Error::Msg("wgpu conv_transpose2d src_len overflow".into()).bt())?;
+        let out_h = params.out_h();
+        let out_w = params.out_w();
+        let out_spatial = out_h
+            .checked_mul(out_w)
+            .ok_or_else(|| Error::Msg("wgpu conv_transpose2d out_spatial overflow".into()).bt())?;
+        if out_spatial > u32::MAX as usize {
+            return Err(Error::Msg("wgpu conv_transpose2d output too large".into()).bt());
+        }
+
+        let input_f32 = self.materialize_to_f32(layout)?;
+        let input_f32_l = Layout::contiguous(layout.shape());
+        let kernel_f32 = kernel.materialize_to_f32(kernel_l)?;
+        let kernel_mm_l = Layout::contiguous((params.c_in, params.c_out * kernel_spatial));
+
+        let input_hw_view_l = input_f32_l.permute(&[0, 2, 3, 1])?;
+        let mut input_hw_owned = None;
+        let (input_hw, input_mm_l) =
+            if input_hw_view_l.is_contiguous() && input_hw_view_l.start_offset() == 0 {
+                (
+                    &input_f32,
+                    Layout::contiguous((params.b_size * input_spatial, params.c_in)),
+                )
+            } else {
+                let mut tmp =
+                    unsafe { self.device.alloc_uninit(input_hw_view_l.shape(), DType::F32)? };
+                input_f32.copy_strided_src(&mut tmp, 0, &input_hw_view_l)?;
+                input_hw_owned = Some(tmp);
+                (
+                    input_hw_owned.as_ref().unwrap(),
+                    Layout::contiguous((params.b_size * input_spatial, params.c_in)),
+                )
+            };
+
+        let cols = input_hw.matmul(
+            &kernel_f32,
+            (
+                1,
+                params.b_size * input_spatial,
+                params.c_out * kernel_spatial,
+                params.c_in,
+            ),
+            &input_mm_l,
+            &kernel_mm_l,
+        )?;
+        let cols_l = Layout::contiguous((
+            params.b_size,
+            input_spatial,
+            params.c_out,
+            kernel_spatial,
+        ));
+        let src_perm_l = cols_l.permute(&[0, 2, 1, 3])?;
+        let mut src_owned = None;
+        let (src, src_l) = if src_perm_l.is_contiguous() && src_perm_l.start_offset() == 0 {
+            (
+                &cols,
+                Layout::contiguous((params.b_size * params.c_out, src_len)),
+            )
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(src_perm_l.shape(), DType::F32)? };
+            cols.copy_strided_src(&mut tmp, 0, &src_perm_l)?;
+            src_owned = Some(tmp);
+            (
+                src_owned.as_ref().unwrap(),
+                Layout::contiguous((params.b_size * params.c_out, src_len)),
+            )
+        };
+
+        let mut ids = Vec::with_capacity(src_len);
+        let mut mask = Vec::with_capacity(src_len);
+        for i_h in 0..params.i_h {
+            let base_h = i_h * params.stride;
+            for i_w in 0..params.i_w {
+                let base_w = i_w * params.stride;
+                for k_h in 0..params.k_h {
+                    let out_h_idx = base_h + k_h * params.dilation;
+                    for k_w in 0..params.k_w {
+                        let out_w_idx = base_w + k_w * params.dilation;
+                        if out_h_idx >= params.padding && out_w_idx >= params.padding {
+                            let out_h_idx = out_h_idx - params.padding;
+                            let out_w_idx = out_w_idx - params.padding;
+                            if out_h_idx < out_h && out_w_idx < out_w {
+                                ids.push((out_h_idx * out_w + out_w_idx) as u32);
+                                mask.push(1f32);
+                                continue;
+                            }
+                        }
+                        ids.push(0);
+                        mask.push(0f32);
+                    }
+                }
+            }
+        }
+
+        let ids_storage = self.device.storage_from_slice(&ids)?;
+        let ids_l = Layout::contiguous(src_len);
+        let mask_storage = self.device.storage_from_slice(&mask)?;
+        let mask_l = Layout::contiguous((1, src_len))
+            .broadcast_as((params.b_size * params.c_out, src_len))?;
+        let src_masked = src.binary_impl::<Mul>(&mask_storage, &src_l, &mask_l)?;
+
+        let out_shape = Shape::from(vec![params.b_size * params.c_out, out_spatial]);
+        let out_l = Layout::contiguous(out_shape.clone());
+        let zeros = self.device.zeros_impl(&out_shape, DType::F32)?;
+        let out = zeros.index_add(&out_l, &ids_storage, &ids_l, &src_masked, &src_l, 1)?;
+
+        let final_shape = Shape::from(params.out_dims());
+        let final_l = Layout::contiguous(final_shape.clone());
+        let mut result = unsafe { self.device.alloc_uninit(&final_shape, DType::F32)? };
+        out.copy_strided_src(&mut result, 0, &final_l)?;
+        drop(input_hw_owned);
+        drop(src_owned);
+        if src_dtype == DType::F16 {
+            result.to_dtype(&final_l, DType::F16)
+        } else {
+            Ok(result)
+        }
+    }
+
     fn run_upsample_nearest1d_f32(&self, layout: &Layout, out_l: usize) -> Result<Self> {
         if self.dtype != DType::F32 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu upsample_nearest1d").bt());
@@ -6699,31 +7091,31 @@ impl BackendStorage for WgpuStorage {
     type Device = WgpuDevice;
 
     fn try_clone(&self, layout: &Layout) -> Result<Self> {
-        if !layout.is_contiguous()
-            || layout.start_offset() != 0
-            || layout.shape().elem_count() != self.count
+        if layout.is_contiguous()
+            && layout.start_offset() == 0
+            && layout.shape().elem_count() == self.count
         {
-            let cpu = self.to_cpu_storage()?;
-            let out_cpu = <CpuStorage as BackendStorage>::try_clone(&cpu, layout)?;
-            return self.device.storage_from_cpu_storage(&out_cpu);
+            let size = byte_len(self.dtype, self.count, "wgpu clone")?;
+            let buffer = self.device.create_storage_buffer(size, "candle-wgpu-clone");
+            let mut encoder =
+                self.device
+                    .inner
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("candle-wgpu-clone"),
+                    });
+            encoder.copy_buffer_to_buffer(&self.buffer, 0, &buffer, 0, wgpu_copy_size(size) as u64);
+            self.device.inner.queue.submit([encoder.finish()]);
+            return Ok(Self {
+                buffer: Arc::new(buffer),
+                device: self.device.clone(),
+                count: self.count,
+                dtype: self.dtype,
+            });
         }
-        let size = byte_len(self.dtype, self.count, "wgpu clone")?;
-        let buffer = self.device.create_storage_buffer(size, "candle-wgpu-clone");
-        let mut encoder =
-            self.device
-                .inner
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("candle-wgpu-clone"),
-                });
-        encoder.copy_buffer_to_buffer(&self.buffer, 0, &buffer, 0, wgpu_copy_size(size) as u64);
-        self.device.inner.queue.submit([encoder.finish()]);
-        Ok(Self {
-            buffer: Arc::new(buffer),
-            device: self.device.clone(),
-            count: self.count,
-            dtype: self.dtype,
-        })
+        let mut out = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        Self::copy_strided_src(self, &mut out, 0, layout)?;
+        Ok(out)
     }
 
     fn dtype(&self) -> DType {
@@ -6741,11 +7133,6 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
-        let cpu_fallback = || -> Result<Self> {
-            let src_cpu = self.to_cpu_storage()?;
-            let out_cpu = <CpuStorage as BackendStorage>::affine(&src_cpu, layout, mul, add)?;
-            self.device.storage_from_cpu_storage(&out_cpu)
-        };
         let gpu = match self.dtype {
             DType::F32 => self.run_scale(layout, mul as f32, add as f32),
             DType::F16 => {
@@ -6765,45 +7152,17 @@ impl BackendStorage for WgpuStorage {
         };
         match gpu {
             Ok(out) => Ok(out),
-            Err(err)
-                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
-            {
-                cpu_fallback()
-            }
             Err(err) => Err(err),
         }
     }
     fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
         if self.dtype == DType::BF16 {
-            return match self.bf16_unary_via_f32(layout, |src, src_l| src.powf(src_l, e)) {
-                Ok(out) => Ok(out),
-                Err(err) if should_cpu_fallback(&err) => {
-                    let src_cpu = self.to_cpu_storage()?;
-                    let out_cpu = <CpuStorage as BackendStorage>::powf(&src_cpu, layout, e)?;
-                    self.device.storage_from_cpu_storage(&out_cpu)
-                }
-                Err(err) => Err(err),
-            };
+            return self.bf16_unary_via_f32(layout, |src, src_l| src.powf(src_l, e));
         }
         let shader = custom_unary_wgsl(&format!("pow(x, {:?})", e as f32));
-        match self.run_unary_like(layout, &shader, "candle-wgpu-powf") {
-            Ok(out) => Ok(out),
-            Err(err)
-                if should_cpu_fallback(&err) || matches!(err, Error::UnsupportedDTypeForOp(..)) =>
-            {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::powf(&src_cpu, layout, e)?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_unary_like(layout, &shader, "candle-wgpu-powf")
     }
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
-        let cpu_fallback = || -> Result<Self> {
-            let src_cpu = self.to_cpu_storage()?;
-            let out_cpu = <CpuStorage as BackendStorage>::elu(&src_cpu, layout, alpha)?;
-            self.device.storage_from_cpu_storage(&out_cpu)
-        };
         if self.dtype == DType::F16
             && !self
                 .device
@@ -6811,44 +7170,33 @@ impl BackendStorage for WgpuStorage {
                 .features
                 .contains(wgpu::Features::SHADER_F16)
         {
-            return cpu_fallback();
+            let src_f32 = self.materialize_to_f32(layout)?;
+            let src_l = Layout::contiguous(layout.shape());
+            let out_f32 = src_f32.elu(&src_l, alpha)?;
+            return out_f32.to_dtype(&src_l, DType::F16);
         }
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
-            if self.dtype == DType::BF16 && alpha == 1.0 {
-                return match self.bf16_unary_via_f32(layout, |src, src_l| src.elu(src_l, alpha)) {
-                    Ok(out) => Ok(out),
-                    Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
-                    Err(err) => Err(err),
-                };
+            if self.dtype == DType::BF16 {
+                return self.bf16_unary_via_f32(layout, |src, src_l| src.elu(src_l, alpha));
             }
-            return cpu_fallback();
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu elu").bt());
         }
         if alpha != 1.0 {
-            return cpu_fallback();
+            let a = alpha as f32;
+            let shader = custom_unary_wgsl(&format!(
+                "select({a} * (exp(x) - 1.0), x, x > 0.0)"
+            ));
+            return self.run_unary_like(layout, &shader, "candle-wgpu-elu-alpha");
         }
         let shader = unary_shader("elu", self.dtype)?;
-        match self.run_unary_like(layout, &shader, "candle-wgpu-elu") {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
-            Err(err) => Err(err),
-        }
+        self.run_unary_like(layout, &shader, "candle-wgpu-elu")
     }
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
-        let cpu_fallback = || -> Result<Self> {
-            let src_cpu = self.to_cpu_storage()?;
-            let out_cpu =
-                <CpuStorage as BackendStorage>::reduce_op(&src_cpu, op, layout, reduce_dims)?;
-            self.device.storage_from_cpu_storage(&out_cpu)
-        };
         if matches!(self.dtype, DType::U8 | DType::U32 | DType::I64) {
-            return match self.run_int_reduce(op, layout, reduce_dims) {
-                Ok(out) => Ok(out),
-                Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
-                Err(err) => Err(err),
-            };
+            return self.run_int_reduce(op, layout, reduce_dims);
         }
         if self.dtype == DType::BF16 {
-            return match self.materialize_to_f32(layout).and_then(|src_f32| {
+            return self.materialize_to_f32(layout).and_then(|src_f32| {
                 let contiguous = Layout::contiguous(layout.shape());
                 let reduced = src_f32.reduce_op(op, &contiguous, reduce_dims)?;
                 if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
@@ -6861,47 +7209,47 @@ impl BackendStorage for WgpuStorage {
                     let out_layout = Layout::contiguous(Shape::from(out_dims));
                     reduced.to_dtype(&out_layout, DType::BF16)
                 }
-            }) {
-                Ok(out) => Ok(out),
-                Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
-                Err(err) => Err(err),
-            };
+            });
+        }
+        if matches!(self.dtype, DType::F16) {
+            let materialized_f32 = self.materialize_to_f32(layout)?;
+            let contiguous_layout = Layout::contiguous(layout.shape());
+            let reduced = materialized_f32.reduce_op(op, &contiguous_layout, reduce_dims)?;
+            if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
+                return Ok(reduced);
+            }
+            let mut out_dims = layout.dims().to_vec();
+            for &dim in reduce_dims {
+                out_dims[dim] = 1;
+            }
+            let out_layout = Layout::contiguous(Shape::from(out_dims));
+            return reduced.to_dtype(&out_layout, DType::F16);
         }
         if self.dtype != DType::F32 {
-            return cpu_fallback();
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu reduce").bt());
         }
         let rank = layout.dims().len();
         if rank == 0 {
-            return cpu_fallback();
-        }
-        if reduce_dims.len() > 1 {
-            return match self.run_reduce_multi_dim(op, layout, reduce_dims) {
-                Ok(out) => Ok(out),
-                Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
-                Err(err) => Err(err),
-            };
+            crate::bail!("wgpu backend op reduce does not support rank-0 tensors")
         }
         if reduce_dims.is_empty() {
-            return cpu_fallback();
+            return self.try_clone(layout);
+        }
+        for &dim in reduce_dims {
+            if dim >= rank {
+                crate::bail!("wgpu backend op reduce got out-of-range dim {dim} for rank {rank}")
+            }
+        }
+        if reduce_dims.len() > 1 {
+            return self.run_reduce_multi_dim(op, layout, reduce_dims);
         }
         let dim = reduce_dims[0];
-        if dim >= rank {
-            return cpu_fallback();
-        }
         if dim != rank - 1 {
-            return match self.run_reduce_non_last_dim(op, layout, dim) {
-                Ok(out) => Ok(out),
-                Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
-                Err(err) => Err(err),
-            };
+            return self.run_reduce_non_last_dim(op, layout, dim);
         }
         match op {
             ReduceOp::ArgMax | ReduceOp::ArgMin | ReduceOp::Max | ReduceOp::Min => {
-                return match self.run_reduce_extrema_last_dim(layout, op) {
-                    Ok(out) => Ok(out),
-                    Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
-                    Err(err) => Err(err),
-                };
+                return self.run_reduce_extrema_last_dim(layout, op);
             }
             ReduceOp::Sum => {}
         }
@@ -6957,7 +7305,6 @@ impl BackendStorage for WgpuStorage {
             "candle-wgpu-sum-rows",
         ) {
             Ok(()) => Ok(dst),
-            Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
             Err(err) => Err(err),
         }
     }
@@ -6972,16 +7319,7 @@ impl BackendStorage for WgpuStorage {
             return src_f32.run_cumsum_last_dim(&src_f32_layout);
         }
         if self.dtype == DType::BF16 {
-            return match self.bf16_unary_via_f32(layout, |src, src_l| src.cumsum_last_dim(src_l)) {
-                Ok(out) => Ok(out),
-                Err(err) if should_cpu_fallback(&err) => {
-                    let src_cpu = self.to_cpu_storage()?;
-                    let out_cpu =
-                        <CpuStorage as BackendStorage>::cumsum_last_dim(&src_cpu, layout)?;
-                    self.device.storage_from_cpu_storage(&out_cpu)
-                }
-                Err(err) => Err(err),
-            };
+            return self.bf16_unary_via_f32(layout, |src, src_l| src.cumsum_last_dim(src_l));
         }
         if self.dtype == DType::F16 {
             let gpu = || -> Result<Self> {
@@ -6994,26 +7332,9 @@ impl BackendStorage for WgpuStorage {
                 let out_f32 = src_f32.cumsum_last_dim(&src_f32_layout)?;
                 out_f32.to_dtype(&src_f32_layout, DType::F16)
             };
-            return match gpu() {
-                Ok(out) => Ok(out),
-                Err(err) if should_cpu_fallback(&err) => {
-                    let src_cpu = self.to_cpu_storage()?;
-                    let out_cpu =
-                        <CpuStorage as BackendStorage>::cumsum_last_dim(&src_cpu, layout)?;
-                    self.device.storage_from_cpu_storage(&out_cpu)
-                }
-                Err(err) => Err(err),
-            };
+            return gpu();
         }
-        match self.run_cumsum_last_dim(layout) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::cumsum_last_dim(&src_cpu, layout)?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_cumsum_last_dim(layout)
     }
     fn clamp(&self, layout: &Layout, min: f32, max: f32) -> Result<Self> {
         if self.dtype == DType::BF16 {
@@ -7021,45 +7342,16 @@ impl BackendStorage for WgpuStorage {
                 .bf16_unary_via_f32(layout, |src, src_l| src.run_clamp(src_l, min, max))
             {
                 Ok(out) => Ok(out),
-                Err(err) if should_cpu_fallback(&err) => {
-                    let src_cpu = self.to_cpu_storage()?;
-                    let out_cpu =
-                        <CpuStorage as BackendStorage>::clamp(&src_cpu, layout, min, max)?;
-                    self.device.storage_from_cpu_storage(&out_cpu)
-                }
-                Err(err) => Err(err),
+            Err(err) => Err(err),
             };
         }
-        match self.run_clamp(layout, min, max) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::clamp(&src_cpu, layout, min, max)?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_clamp(layout, min, max)
     }
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
-        let cpu_fallback = || -> Result<Self> {
-            let lhs_cpu = self.to_cpu_storage()?;
-            let rhs_cpu = rhs.to_cpu_storage()?;
-            let out_cpu =
-                <CpuStorage as BackendStorage>::cmp(&lhs_cpu, op, &rhs_cpu, lhs_l, rhs_l)?;
-            self.device.storage_from_cpu_storage(&out_cpu)
-        };
         if self.dtype == DType::BF16 {
-            return match self.bf16_cmp_via_f32(rhs, lhs_l, rhs_l, op) {
-                Ok(out) => Ok(out),
-                Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
-                Err(err) => Err(err),
-            };
+            return self.bf16_cmp_via_f32(rhs, lhs_l, rhs_l, op);
         }
-        match self.run_cmp_u8(rhs, lhs_l, rhs_l, op) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
-            Err(err) => Err(err),
-        }
+        self.run_cmp_u8(rhs, lhs_l, rhs_l, op)
     }
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
         if layout.dims().len() > 4 {
@@ -7090,28 +7382,26 @@ impl BackendStorage for WgpuStorage {
         };
         match gpu {
             Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::to_dtype(&src_cpu, layout, dtype)?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
             Err(err) => Err(err),
         }
     }
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
-        let cpu_fallback = || -> Result<Self> {
-            let src_cpu = self.to_cpu_storage()?;
-            let out_cpu = <CpuStorage as BackendStorage>::unary_impl::<B>(&src_cpu, layout)?;
-            self.device.storage_from_cpu_storage(&out_cpu)
-        };
         if self.dtype == DType::F16
-            && !self
-                .device
-                .inner
-                .features
-                .contains(wgpu::Features::SHADER_F16)
+            && (matches!(B::NAME, "erf" | "recip")
+                || !self
+                    .device
+                    .inner
+                    .features
+                    .contains(wgpu::Features::SHADER_F16))
         {
-            return cpu_fallback();
+            let src_f32 = self.materialize_to_f32(layout)?;
+            let src_l = if layout.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+            } else {
+                Layout::contiguous(layout.shape())
+            };
+            let out_f32 = src_f32.unary_impl::<B>(&src_l)?;
+            return out_f32.to_dtype(&src_l, DType::F16);
         }
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             if self.dtype == DType::BF16 {
@@ -7119,22 +7409,17 @@ impl BackendStorage for WgpuStorage {
                     .bf16_unary_via_f32(layout, |src, src_l| src.unary_impl::<B>(src_l))
                 {
                     Ok(out) => Ok(out),
-                    Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
                     Err(err) => Err(err),
                 };
             }
-            return cpu_fallback();
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "op").bt());
         }
         if layout.dims().len() > 4 {
             let (src, src_l) = self.materialize_rank_gt4_compact(layout)?;
             return src.unary_impl::<B>(&src_l);
         }
         let shader = unary_shader(B::NAME, self.dtype)?;
-        match self.run_unary_like(layout, &shader, "candle-wgpu-unary") {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
-            Err(err) => Err(err),
-        }
+        self.run_unary_like(layout, &shader, "candle-wgpu-unary")
     }
     fn binary_impl<B: BinaryOpT>(
         &self,
@@ -7142,14 +7427,6 @@ impl BackendStorage for WgpuStorage {
         lhs_layout: &Layout,
         rhs_layout: &Layout,
     ) -> Result<Self> {
-        let cpu_fallback = || -> Result<Self> {
-            let lhs_cpu = self.to_cpu_storage()?;
-            let rhs_cpu = rhs.to_cpu_storage()?;
-            let out_cpu = <CpuStorage as BackendStorage>::binary_impl::<B>(
-                &lhs_cpu, &rhs_cpu, lhs_layout, rhs_layout,
-            )?;
-            self.device.storage_from_cpu_storage(&out_cpu)
-        };
         if self.dtype == DType::F16
             && !self
                 .device
@@ -7157,7 +7434,20 @@ impl BackendStorage for WgpuStorage {
                 .features
                 .contains(wgpu::Features::SHADER_F16)
         {
-            return cpu_fallback();
+            let lhs_f32 = self.materialize_to_f32(lhs_layout)?;
+            let rhs_f32 = rhs.materialize_to_f32(rhs_layout)?;
+            let lhs_l = if lhs_layout.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(lhs_layout))
+            } else {
+                Layout::contiguous(lhs_layout.shape())
+            };
+            let rhs_l = if rhs_layout.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(rhs_layout))
+            } else {
+                Layout::contiguous(rhs_layout.shape())
+            };
+            let out_f32 = lhs_f32.binary_impl::<B>(&rhs_f32, &lhs_l, &rhs_l)?;
+            return out_f32.to_dtype(&lhs_l, DType::F16);
         }
         if !matches!(
             self.dtype,
@@ -7171,14 +7461,13 @@ impl BackendStorage for WgpuStorage {
                     |lhs, rhs, lhs_l, rhs_l| lhs.binary_impl::<B>(rhs, lhs_l, rhs_l),
                 ) {
                     Ok(out) => Ok(out),
-                    Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
                     Err(err) => Err(err),
                 };
             }
-            return cpu_fallback();
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "op").bt());
         }
         if rhs.dtype != self.dtype {
-            return cpu_fallback();
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "op").bt());
         }
         self.device
             .same_device(&rhs.device)
@@ -7276,7 +7565,6 @@ impl BackendStorage for WgpuStorage {
             "candle-wgpu-binary",
         ) {
             Ok(()) => Ok(dst),
-            Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
             Err(err) => Err(err),
         }
     }
@@ -7288,27 +7576,10 @@ impl BackendStorage for WgpuStorage {
         f: &Self,
         f_l: &Layout,
     ) -> Result<Self> {
-        let cpu_fallback = || -> Result<Self> {
-            let cond_cpu = self.to_cpu_storage()?;
-            let t_cpu = t.to_cpu_storage()?;
-            let f_cpu = f.to_cpu_storage()?;
-            let out_cpu = <CpuStorage as BackendStorage>::where_cond(
-                &cond_cpu, layout, &t_cpu, t_l, &f_cpu, f_l,
-            )?;
-            self.device.storage_from_cpu_storage(&out_cpu)
-        };
         if t.dtype == DType::BF16 {
-            return match self.bf16_where_via_f32(layout, t, t_l, f, f_l) {
-                Ok(out) => Ok(out),
-                Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
-                Err(err) => Err(err),
-            };
+            return self.bf16_where_via_f32(layout, t, t_l, f, f_l);
         }
-        match self.run_where_u8_cond(layout, t, t_l, f, f_l) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => cpu_fallback(),
-            Err(err) => Err(err),
-        }
+        self.run_where_u8_cond(layout, t, t_l, f, f_l)
     }
     fn conv1d(
         &self,
@@ -7317,40 +7588,16 @@ impl BackendStorage for WgpuStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
-        match self.run_conv1d_f32(layout, kernel, kernel_l, params) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let kernel_cpu = kernel.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::conv1d(
-                    &src_cpu,
-                    layout,
-                    &kernel_cpu,
-                    kernel_l,
-                    params,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_conv1d_f32(layout, kernel, kernel_l, params)
     }
     fn conv_transpose1d(
         &self,
-        l: &Layout,
+        layout: &Layout,
         kernel: &Self,
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose1D,
     ) -> Result<Self> {
-        let src_cpu = self.to_cpu_storage()?;
-        let kernel_cpu = kernel.to_cpu_storage()?;
-        let out_cpu = <CpuStorage as BackendStorage>::conv_transpose1d(
-            &src_cpu,
-            l,
-            &kernel_cpu,
-            kernel_l,
-            params,
-        )?;
-        self.device.storage_from_cpu_storage(&out_cpu)
+        self.run_conv_transpose1d_f32(layout, kernel, kernel_l, params)
     }
     fn conv2d(
         &self,
@@ -7359,40 +7606,16 @@ impl BackendStorage for WgpuStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        match self.run_conv2d_f32(layout, kernel, kernel_l, params) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let kernel_cpu = kernel.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::conv2d(
-                    &src_cpu,
-                    layout,
-                    &kernel_cpu,
-                    kernel_l,
-                    params,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_conv2d_f32(layout, kernel, kernel_l, params)
     }
     fn conv_transpose2d(
         &self,
-        l: &Layout,
+        layout: &Layout,
         kernel: &Self,
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self> {
-        let src_cpu = self.to_cpu_storage()?;
-        let kernel_cpu = kernel.to_cpu_storage()?;
-        let out_cpu = <CpuStorage as BackendStorage>::conv_transpose2d(
-            &src_cpu,
-            l,
-            &kernel_cpu,
-            kernel_l,
-            params,
-        )?;
-        self.device.storage_from_cpu_storage(&out_cpu)
+        self.run_conv_transpose2d_f32(layout, kernel, kernel_l, params)
     }
     fn avg_pool2d(
         &self,
@@ -7400,20 +7623,7 @@ impl BackendStorage for WgpuStorage {
         kernel_size: (usize, usize),
         stride: (usize, usize),
     ) -> Result<Self> {
-        match self.run_pool2d_im2col_f32(layout, kernel_size, stride, false) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::avg_pool2d(
-                    &src_cpu,
-                    layout,
-                    kernel_size,
-                    stride,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_pool2d_im2col_f32(layout, kernel_size, stride, false)
     }
     fn max_pool2d(
         &self,
@@ -7421,52 +7631,20 @@ impl BackendStorage for WgpuStorage {
         kernel_size: (usize, usize),
         stride: (usize, usize),
     ) -> Result<Self> {
-        match self.run_pool2d_im2col_f32(layout, kernel_size, stride, true) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::max_pool2d(
-                    &src_cpu,
-                    layout,
-                    kernel_size,
-                    stride,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_pool2d_im2col_f32(layout, kernel_size, stride, true)
     }
     fn upsample_nearest1d(&self, layout: &Layout, out_l: usize) -> Result<Self> {
-        match self.run_upsample_nearest1d_f32(layout, out_l) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu =
-                    <CpuStorage as BackendStorage>::upsample_nearest1d(&src_cpu, layout, out_l)?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_upsample_nearest1d_f32(layout, out_l)
     }
     fn upsample_nearest2d(&self, layout: &Layout, out_h: usize, out_w: usize) -> Result<Self> {
         let (_, _, h, w) = layout.shape().dims4()?;
-        match self.run_upsample2d_f32(
+        self.run_upsample2d_f32(
             layout,
             out_h,
             out_w,
             nearest_interp_weights(h, out_h),
             nearest_interp_weights(w, out_w),
-        ) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::upsample_nearest2d(
-                    &src_cpu, layout, out_h, out_w,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        )
     }
     fn upsample_bilinear2d(
         &self,
@@ -7478,43 +7656,42 @@ impl BackendStorage for WgpuStorage {
         scale_w: Option<f64>,
     ) -> Result<Self> {
         let (_, _, h, w) = layout.shape().dims4()?;
-        match self.run_upsample2d_f32(
+        self.run_upsample2d_f32(
             layout,
             out_h,
             out_w,
             bilinear_interp_weights(h, out_h, align_corners, scale_h),
             bilinear_interp_weights(w, out_w, align_corners, scale_w),
-        ) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::upsample_bilinear2d(
-                    &src_cpu,
-                    layout,
-                    out_h,
-                    out_w,
-                    align_corners,
-                    scale_h,
-                    scale_w,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        )
     }
     fn gather(&self, src_l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
-        if dim + 1 == src_l.dims().len() {
-            match self.run_gather_last_dim_f32(ids, src_l, ids_l) {
-                Ok(out) => return Ok(out),
-                Err(err) if should_cpu_fallback(&err) => {}
-                Err(err) => return Err(err),
-            }
+        let rank = src_l.dims().len();
+        if dim + 1 == rank {
+            return self.run_gather_last_dim_f32(ids, src_l, ids_l);
         }
-        let src_cpu = self.to_cpu_storage()?;
-        let ids_cpu = ids.to_cpu_storage()?;
-        let out_cpu =
-            <CpuStorage as BackendStorage>::gather(&src_cpu, src_l, &ids_cpu, ids_l, dim)?;
-        self.device.storage_from_cpu_storage(&out_cpu)
+        if rank == 0 {
+            crate::bail!("wgpu gather requires rank >= 1");
+        }
+        let mut perm: Vec<usize> = (0..rank).filter(|&d| d != dim).collect();
+        perm.push(dim);
+        let mut inv_perm = vec![0usize; rank];
+        for (idx, &src_dim) in perm.iter().enumerate() {
+            inv_perm[src_dim] = idx;
+        }
+        let permute_and_gather = |storage: &Self, layout: &Layout| -> Result<(Self, Layout)> {
+            let permuted_l = layout.permute(&perm)?;
+            let mut compact =
+                unsafe { storage.device.alloc_uninit(permuted_l.shape(), storage.dtype)? };
+            storage.copy_strided_src(&mut compact, 0, &permuted_l)?;
+            Ok((compact, Layout::contiguous(permuted_l.shape())))
+        };
+        let (self_p, self_pl) = permute_and_gather(self, src_l)?;
+        let (ids_p, ids_pl) = permute_and_gather(ids, ids_l)?;
+        let out = self_p.run_gather_last_dim_f32(&ids_p, &self_pl, &ids_pl)?;
+        let out_l = Layout::contiguous(ids_pl.shape()).permute(&inv_perm)?;
+        let mut result = unsafe { self.device.alloc_uninit(out_l.shape(), out.dtype)? };
+        out.copy_strided_src(&mut result, 0, &out_l)?;
+        Ok(result)
     }
     fn scatter_set(
         &mut self,
@@ -7525,26 +7702,33 @@ impl BackendStorage for WgpuStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<()> {
-        if dim + 1 == dst_l.dims().len() {
-            match self.run_scatter_set_last_dim_f32(dst_l, ids, ids_l, src, src_l) {
-                Ok(()) => return Ok(()),
-                Err(err) if should_cpu_fallback(&err) => {}
-                Err(err) => return Err(err),
-            }
+        let rank = dst_l.dims().len();
+        if dim + 1 == rank {
+            return self.run_scatter_set_last_dim_f32(dst_l, ids, ids_l, src, src_l);
         }
-        let mut dst_cpu = self.to_cpu_storage()?;
-        let ids_cpu = ids.to_cpu_storage()?;
-        let src_cpu = src.to_cpu_storage()?;
-        <CpuStorage as BackendStorage>::scatter_set(
-            &mut dst_cpu,
-            dst_l,
-            &ids_cpu,
-            ids_l,
-            &src_cpu,
-            src_l,
-            dim,
-        )?;
-        *self = self.device.storage_from_cpu_storage(&dst_cpu)?;
+        let mut perm: Vec<usize> = (0..rank).filter(|&d| d != dim).collect();
+        perm.push(dim);
+        let mut inv_perm = vec![0usize; rank];
+        for (idx, &src_dim) in perm.iter().enumerate() {
+            inv_perm[src_dim] = idx;
+        }
+        let permute_contiguous = |storage: &Self, layout: &Layout| -> Result<(Self, Layout)> {
+            let permuted_l = layout.permute(&perm)?;
+            let mut compact =
+                unsafe { storage.device.alloc_uninit(permuted_l.shape(), storage.dtype)? };
+            storage.copy_strided_src(&mut compact, 0, &permuted_l)?;
+            Ok((compact, Layout::contiguous(permuted_l.shape())))
+        };
+        let dst_perm_l = dst_l.permute(&perm)?;
+        let mut dst_p =
+            unsafe { self.device.alloc_uninit(dst_perm_l.shape(), self.dtype)? };
+        self.copy_strided_src(&mut dst_p, 0, &dst_perm_l)?;
+        let (ids_p, ids_pl) = permute_contiguous(ids, ids_l)?;
+        let (src_p, src_pl) = permute_contiguous(src, src_l)?;
+        let dst_pl = Layout::contiguous(dst_perm_l.shape());
+        dst_p.run_scatter_set_last_dim_f32(&dst_pl, &ids_p, &ids_pl, &src_p, &src_pl)?;
+        let inv_l = dst_pl.permute(&inv_perm)?;
+        dst_p.copy_strided_src(self, dst_l.start_offset(), &inv_l)?;
         Ok(())
     }
     fn scatter_add_set(
@@ -7556,41 +7740,37 @@ impl BackendStorage for WgpuStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<()> {
-        if dim + 1 == dst_l.dims().len() {
-            match self.run_scatter_add_last_dim_f32(dst_l, ids, ids_l, src, src_l) {
-                Ok(()) => return Ok(()),
-                Err(err) if should_cpu_fallback(&err) => {}
-                Err(err) => return Err(err),
-            }
+        let rank = dst_l.dims().len();
+        if dim + 1 == rank {
+            return self.run_scatter_add_last_dim_f32(dst_l, ids, ids_l, src, src_l);
         }
-        let mut dst_cpu = self.to_cpu_storage()?;
-        let ids_cpu = ids.to_cpu_storage()?;
-        let src_cpu = src.to_cpu_storage()?;
-        <CpuStorage as BackendStorage>::scatter_add_set(
-            &mut dst_cpu,
-            dst_l,
-            &ids_cpu,
-            ids_l,
-            &src_cpu,
-            src_l,
-            dim,
-        )?;
-        *self = self.device.storage_from_cpu_storage(&dst_cpu)?;
+        let mut perm: Vec<usize> = (0..rank).filter(|&d| d != dim).collect();
+        perm.push(dim);
+        let mut inv_perm = vec![0usize; rank];
+        for (idx, &src_dim) in perm.iter().enumerate() {
+            inv_perm[src_dim] = idx;
+        }
+        let permute_contiguous = |storage: &Self, layout: &Layout| -> Result<(Self, Layout)> {
+            let permuted_l = layout.permute(&perm)?;
+            let mut compact =
+                unsafe { storage.device.alloc_uninit(permuted_l.shape(), storage.dtype)? };
+            storage.copy_strided_src(&mut compact, 0, &permuted_l)?;
+            Ok((compact, Layout::contiguous(permuted_l.shape())))
+        };
+        let dst_perm_l = dst_l.permute(&perm)?;
+        let mut dst_p =
+            unsafe { self.device.alloc_uninit(dst_perm_l.shape(), self.dtype)? };
+        self.copy_strided_src(&mut dst_p, 0, &dst_perm_l)?;
+        let (ids_p, ids_pl) = permute_contiguous(ids, ids_l)?;
+        let (src_p, src_pl) = permute_contiguous(src, src_l)?;
+        let dst_pl = Layout::contiguous(dst_perm_l.shape());
+        dst_p.run_scatter_add_last_dim_f32(&dst_pl, &ids_p, &ids_pl, &src_p, &src_pl)?;
+        let inv_l = dst_pl.permute(&inv_perm)?;
+        dst_p.copy_strided_src(self, dst_l.start_offset(), &inv_l)?;
         Ok(())
     }
     fn index_select(&self, ids: &Self, src_l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
-        match self.run_index_select_f32(ids, src_l, ids_l, dim) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let src_cpu = self.to_cpu_storage()?;
-                let ids_cpu = ids.to_cpu_storage()?;
-                let out_cpu = <CpuStorage as BackendStorage>::index_select(
-                    &src_cpu, &ids_cpu, src_l, ids_l, dim,
-                )?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_index_select_f32(ids, src_l, ids_l, dim)
     }
     fn index_add(
         &self,
@@ -7603,19 +7783,35 @@ impl BackendStorage for WgpuStorage {
     ) -> Result<Self> {
         if dim + 1 == dst_l.dims().len() {
             let mut out = self.try_clone(dst_l)?;
-            match out.run_scatter_add_last_dim_f32(dst_l, ids, ids_l, src, src_l) {
-                Ok(()) => return Ok(out),
-                Err(err) if should_cpu_fallback(&err) => {}
-                Err(err) => return Err(err),
-            }
+            out.run_scatter_add_last_dim_f32(dst_l, ids, ids_l, src, src_l)?;
+            return Ok(out);
         }
-        let dst_cpu = self.to_cpu_storage()?;
-        let ids_cpu = ids.to_cpu_storage()?;
-        let src_cpu = src.to_cpu_storage()?;
-        let out_cpu = <CpuStorage as BackendStorage>::index_add(
-            &dst_cpu, dst_l, &ids_cpu, ids_l, &src_cpu, src_l, dim,
-        )?;
-        self.device.storage_from_cpu_storage(&out_cpu)
+        let rank = dst_l.dims().len();
+        let mut perm: Vec<usize> = (0..rank).filter(|&d| d != dim).collect();
+        perm.push(dim);
+        let mut inv_perm = vec![0usize; rank];
+        for (idx, &src_dim) in perm.iter().enumerate() {
+            inv_perm[src_dim] = idx;
+        }
+        let permute_contiguous = |storage: &Self, layout: &Layout| -> Result<(Self, Layout)> {
+            let permuted_l = layout.permute(&perm)?;
+            let mut compact =
+                unsafe { storage.device.alloc_uninit(permuted_l.shape(), storage.dtype)? };
+            storage.copy_strided_src(&mut compact, 0, &permuted_l)?;
+            Ok((compact, Layout::contiguous(permuted_l.shape())))
+        };
+        let dst_perm_l = dst_l.permute(&perm)?;
+        let mut dst_p =
+            unsafe { self.device.alloc_uninit(dst_perm_l.shape(), self.dtype)? };
+        self.copy_strided_src(&mut dst_p, 0, &dst_perm_l)?;
+        let (ids_p, ids_pl) = permute_contiguous(ids, ids_l)?;
+        let (src_p, src_pl) = permute_contiguous(src, src_l)?;
+        let dst_pl = Layout::contiguous(dst_perm_l.shape());
+        dst_p.run_scatter_add_last_dim_f32(&dst_pl, &ids_p, &ids_pl, &src_p, &src_pl)?;
+        let inv_l = dst_pl.permute(&inv_perm)?;
+        let mut out = self.try_clone(dst_l)?;
+        dst_p.copy_strided_src(&mut out, dst_l.start_offset(), &inv_l)?;
+        Ok(out)
     }
     fn matmul(
         &self,
@@ -7624,17 +7820,7 @@ impl BackendStorage for WgpuStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        match self.run_matmul_f32(rhs, bmnk, lhs_l, rhs_l) {
-            Ok(out) => Ok(out),
-            Err(err) if should_cpu_fallback(&err) => {
-                let lhs_cpu = self.to_cpu_storage()?;
-                let rhs_cpu = rhs.to_cpu_storage()?;
-                let out_cpu =
-                    <CpuStorage as BackendStorage>::matmul(&lhs_cpu, &rhs_cpu, bmnk, lhs_l, rhs_l)?;
-                self.device.storage_from_cpu_storage(&out_cpu)
-            }
-            Err(err) => Err(err),
-        }
+        self.run_matmul_f32(rhs, bmnk, lhs_l, rhs_l)
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
@@ -7671,15 +7857,10 @@ impl BackendStorage for WgpuStorage {
                     .features
                     .contains(wgpu::Features::SHADER_F16)
             {
-                let src_cpu = self.to_cpu_storage()?;
-                let mut dst_cpu = dst.to_cpu_storage()?;
-                <CpuStorage as BackendStorage>::copy_strided_src(
-                    &src_cpu,
-                    &mut dst_cpu,
-                    dst_offset,
-                    src_l,
-                )?;
-                *dst = dst.device.storage_from_cpu_storage(&dst_cpu)?;
+                let src_f32 = self.materialize_to_f32(src_l)?;
+                let mut dst_f32 = unsafe { dst.device.alloc_uninit(src_l.shape(), DType::F32)? };
+                src_f32.copy_strided_src(&mut dst_f32, dst_offset, &Layout::contiguous(src_l.shape()))?;
+                *dst = dst_f32.to_dtype(&Layout::contiguous(src_l.shape()), DType::F16)?;
                 return Ok(());
             }
             match self.dtype {
@@ -7687,50 +7868,17 @@ impl BackendStorage for WgpuStorage {
                     let shader = copy_shader(self.dtype, self.dtype)?;
                     match self.run_copy_into(src_l, dst, dst_offset, &shader) {
                         Ok(()) => return Ok(()),
-                        Err(err) if should_cpu_fallback(&err) => {
-                            let src_cpu = self.to_cpu_storage()?;
-                            let mut dst_cpu = dst.to_cpu_storage()?;
-                            <CpuStorage as BackendStorage>::copy_strided_src(
-                                &src_cpu,
-                                &mut dst_cpu,
-                                dst_offset,
-                                src_l,
-                            )?;
-                            *dst = dst.device.storage_from_cpu_storage(&dst_cpu)?;
-                            return Ok(());
-                        }
-                        Err(err) => return Err(err),
+                Err(err) => return Err(err),
                     }
                 }
                 DType::BF16 | DType::U8 | DType::I16 | DType::I64 | DType::F64 => {
                     match self.run_emulated_strided_copy_into(src_l, dst, dst_offset) {
                         Ok(()) => return Ok(()),
-                        Err(err) if should_cpu_fallback(&err) => {
-                            let src_cpu = self.to_cpu_storage()?;
-                            let mut dst_cpu = dst.to_cpu_storage()?;
-                            <CpuStorage as BackendStorage>::copy_strided_src(
-                                &src_cpu,
-                                &mut dst_cpu,
-                                dst_offset,
-                                src_l,
-                            )?;
-                            *dst = dst.device.storage_from_cpu_storage(&dst_cpu)?;
-                            return Ok(());
-                        }
-                        Err(err) => return Err(err),
+                Err(err) => return Err(err),
                     }
                 }
                 _ => {
-                    let src_cpu = self.to_cpu_storage()?;
-                    let mut dst_cpu = dst.to_cpu_storage()?;
-                    <CpuStorage as BackendStorage>::copy_strided_src(
-                        &src_cpu,
-                        &mut dst_cpu,
-                        dst_offset,
-                        src_l,
-                    )?;
-                    *dst = dst.device.storage_from_cpu_storage(&dst_cpu)?;
-                    return Ok(());
+                    return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu copy_strided").bt());
                 }
             }
         }
@@ -7753,18 +7901,7 @@ impl BackendStorage for WgpuStorage {
                 DType::BF16 | DType::U8 | DType::I16 | DType::I64 | DType::F64 => {
                     self.run_emulated_strided_copy_into(src_l, dst, dst_offset)
                 }
-                _ => {
-                    let src_cpu = self.to_cpu_storage()?;
-                    let mut dst_cpu = dst.to_cpu_storage()?;
-                    <CpuStorage as BackendStorage>::copy_strided_src(
-                        &src_cpu,
-                        &mut dst_cpu,
-                        dst_offset,
-                        src_l,
-                    )?;
-                    *dst = dst.device.storage_from_cpu_storage(&dst_cpu)?;
-                    Ok(())
-                }
+                _ => Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu copy_strided").bt()),
             };
         }
         let mut encoder =
@@ -7995,8 +8132,7 @@ impl BackendDevice for WgpuDevice {
         min: f64,
         max: f64,
     ) -> Result<Self::Storage> {
-        let cpu = crate::cpu_backend::CpuDevice.rand_uniform(shape, dtype, min, max)?;
-        self.storage_from_cpu_storage(&cpu)
+        self.rand_uniform_gpu(shape, dtype, min, max)
     }
 
     fn rand_normal(
@@ -8006,8 +8142,7 @@ impl BackendDevice for WgpuDevice {
         mean: f64,
         std: f64,
     ) -> Result<Self::Storage> {
-        let cpu = crate::cpu_backend::CpuDevice.rand_normal(shape, dtype, mean, std)?;
-        self.storage_from_cpu_storage(&cpu)
+        self.rand_normal_gpu(shape, dtype, mean, std)
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {

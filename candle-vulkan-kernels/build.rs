@@ -163,6 +163,16 @@ fn generate_candle_spirv_modules(
             &["A_TYPE=float", "D_TYPE=float", "FLOAT_TYPE=float"],
         ),
         (
+            "erf_f32",
+            candle_shaders_dir.join("erf.comp"),
+            &["A_TYPE=float", "D_TYPE=float", "FLOAT_TYPE=float"],
+        ),
+        (
+            "recip_f32",
+            candle_shaders_dir.join("recip.comp"),
+            &["A_TYPE=float", "D_TYPE=float", "FLOAT_TYPE=float"],
+        ),
+        (
             "cmp_f32",
             candle_shaders_dir.join("cmp.comp"),
             &[
@@ -427,6 +437,26 @@ fn generate_candle_spirv_modules(
             "fill_raw_f8e8m0",
             candle_shaders_dir.join("fill_raw.comp"),
             &["D_TYPE=uint8_t", "RAW_CAST=p.value0"],
+        ),
+        (
+            "rand_uniform_f32",
+            candle_shaders_dir.join("rand_uniform.comp"),
+            &[],
+        ),
+        (
+            "rand_uniform_f64",
+            candle_shaders_dir.join("rand_uniform.comp"),
+            &["USE_F64"],
+        ),
+        (
+            "rand_normal_f32",
+            candle_shaders_dir.join("rand_normal.comp"),
+            &[],
+        ),
+        (
+            "rand_normal_f64",
+            candle_shaders_dir.join("rand_normal.comp"),
+            &["USE_F64"],
         ),
         (
             "convert_f32_u8",
