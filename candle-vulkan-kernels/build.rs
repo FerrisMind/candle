@@ -373,6 +373,11 @@ fn generate_candle_spirv_modules(
             &[],
         ),
         (
+            "matmul_f64",
+            candle_shaders_dir.join("matmul_f64.comp"),
+            &[],
+        ),
+        (
             "set_rows_add_f32_i32",
             candle_shaders_dir.join("set_rows_add.comp"),
             &[
@@ -532,6 +537,26 @@ fn generate_candle_spirv_modules(
             "convert_i16_i16",
             candle_shaders_dir.join("convert.comp"),
             &["A_TYPE=int16_t", "D_TYPE=int16_t"],
+        ),
+        (
+            "convert_f32_i16",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=float", "D_TYPE=int16_t"],
+        ),
+        (
+            "convert_i16_f32",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=int16_t", "D_TYPE=float"],
+        ),
+        (
+            "convert_f32_i32",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=float", "D_TYPE=int32_t"],
+        ),
+        (
+            "convert_i32_f32",
+            candle_shaders_dir.join("convert.comp"),
+            &["A_TYPE=int32_t", "D_TYPE=float"],
         ),
         (
             "convert_i64_i64",

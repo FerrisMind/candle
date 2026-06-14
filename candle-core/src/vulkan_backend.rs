@@ -294,6 +294,27 @@ struct VulkanRopeParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct VulkanF64MatmulParams {
+    offset_src0: u32,
+    offset_src1: u32,
+    offset_dst: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    stride_01: u32,
+    stride_11: u32,
+    stride_02: u32,
+    stride_12: u32,
+    stride_03: u32,
+    stride_13: u32,
+    bs02: u32,
+    bs03: u32,
+    broadcast2: u32,
+    broadcast3: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct VulkanMatmulParams {
     m: u32,
     n: u32,
@@ -527,6 +548,17 @@ impl VulkanDevice {
         self.inner.subgroup_max_size
     }
 
+    fn advance_rand_seed(&self, count: usize) -> Result<u64> {
+        let mut guard = self
+            .inner
+            .seed_value
+            .write()
+            .map_err(|_| Error::msg("vulkan seed lock poisoned"))?;
+        let seed_at_call = *guard;
+        *guard = seed_at_call.wrapping_add(count as u64);
+        Ok(seed_at_call)
+    }
+
     fn run_rand_kernel(
         &self,
         shape: &Shape,
@@ -556,7 +588,7 @@ impl VulkanDevice {
         if count == 0 {
             return self.zeros_impl(shape, dtype);
         }
-        let seed = self.get_current_seed()?;
+        let seed = self.advance_rand_seed(count)?;
         let kernel_dtype = match dtype {
             DType::F32 => DType::F32,
             DType::F64 => DType::F64,
@@ -599,7 +631,7 @@ impl VulkanDevice {
         if count == 0 {
             return self.zeros_impl(shape, dtype);
         }
-        let seed = self.get_current_seed()?;
+        let seed = self.advance_rand_seed(count)?;
         let kernel_dtype = match dtype {
             DType::F32 => DType::F32,
             DType::F64 => DType::F64,
@@ -2791,6 +2823,8 @@ fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
         (DType::U8, DType::U8) => "convert_u8_u8",
         (DType::U32, DType::U32) => "convert_u32_u32",
         (DType::I16, DType::I16) => "convert_i16_i16",
+        (DType::F32, DType::I16) => "convert_f32_i16",
+        (DType::I16, DType::F32) => "convert_i16_f32",
         (DType::I64, DType::I64) => "convert_i64_i64",
         (DType::F32, DType::U8) => "convert_f32_u8",
         (DType::F32, DType::U32) => "convert_f32_u32",
@@ -3450,6 +3484,59 @@ impl VulkanStorage {
         out_f32.to_dtype(&out_layout, DType::BF16)
     }
 
+    fn gpu_resident_via_f32(
+        &self,
+        layout: &Layout,
+        out_shape: &Shape,
+        op_name: &'static str,
+        f: impl FnOnce(&Self, &Layout) -> Result<Self>,
+    ) -> Result<Self> {
+        let src_dtype = self.dtype;
+        match src_dtype {
+            DType::F32 => f(self, layout),
+            DType::F16 | DType::BF16 => {
+                let src_f32 = self.materialize_to_f32(layout)?;
+                let src_f32_l = Layout::contiguous(layout.shape());
+                let out_f32 = f(&src_f32, &src_f32_l)?;
+                let out_l = Layout::contiguous(out_shape);
+                out_f32.to_dtype(&out_l, src_dtype)
+            }
+            _ => Err(Error::UnsupportedDTypeForOp(src_dtype, op_name).bt()),
+        }
+    }
+
+    fn cuda_parity_conv_via_f32(
+        &self,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        out_shape: &Shape,
+        op_name: &'static str,
+        f: impl FnOnce(&Self, &Layout, &Self, &Layout) -> Result<Self>,
+    ) -> Result<Self> {
+        let src_dtype = self.dtype;
+        if kernel.dtype != src_dtype {
+            return Err(Error::UnsupportedDTypeForOp(kernel.dtype, op_name).bt());
+        }
+        match src_dtype {
+            DType::F32 => f(self, layout, kernel, kernel_l),
+            DType::F16 | DType::BF16 => {
+                let input_f32 = self.materialize_to_f32(layout)?;
+                let kernel_f32 = kernel.materialize_to_f32(kernel_l)?;
+                let input_l = Layout::contiguous(layout.shape());
+                let kernel_l = if kernel_l.is_contiguous() && kernel_l.start_offset() == 0 {
+                    kernel_l.clone()
+                } else {
+                    Layout::contiguous(kernel_l.shape())
+                };
+                let out_f32 = f(&input_f32, &input_l, &kernel_f32, &kernel_l)?;
+                let out_l = Layout::contiguous(out_shape);
+                out_f32.to_dtype(&out_l, src_dtype)
+            }
+            _ => Err(Error::UnsupportedDTypeForOp(src_dtype, op_name).bt()),
+        }
+    }
+
     fn run_unary_head(&self, layout: &Layout, spirv: &[u32]) -> Result<Self> {
         if layout.dims().len() > 4 {
             let (materialized, compact_l) = self.materialize_rank_gt4_compact(layout)?;
@@ -4103,6 +4190,9 @@ impl VulkanStorage {
     // dim to the end, last-dim dispatches the Candle-owned integer kernels.
     fn run_int_reduce(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
         let rank = layout.dims().len();
+        if rank == 0 {
+            return self.try_clone(layout);
+        }
         if reduce_dims.len() > 1 {
             if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
                 return Err(unsupported("int reduce multi-dim arg"));
@@ -4480,7 +4570,10 @@ impl VulkanStorage {
         asc: bool,
         last_dim: usize,
     ) -> Result<Self> {
-        if matches!(self.dtype, DType::F16 | DType::BF16 | DType::U8) {
+        if matches!(
+            self.dtype,
+            DType::F16 | DType::BF16 | DType::U8 | DType::I16 | DType::I32 | DType::F8E4M3
+        ) {
             let src_f32 = self.to_dtype(layout, DType::F32)?;
             let src_f32_layout = Layout::contiguous(layout.shape());
             return src_f32.argsort_last_dim_f32(&src_f32_layout, asc, last_dim);
@@ -4978,6 +5071,25 @@ impl VulkanStorage {
         }
     }
 
+    fn materialize_contiguous(&self, layout: &Layout) -> Result<(Self, Layout)> {
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            return Ok((self.try_clone(layout)?, layout.clone()));
+        }
+        let mut compact = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        self.copy_strided_src(&mut compact, 0, layout)?;
+        Ok((compact, Layout::contiguous(layout.shape())))
+    }
+
+    fn normalize_index_ids(&self, ids_l: &Layout) -> Result<(Self, Layout)> {
+        let (ids, ids_l) = self.materialize_contiguous(ids_l)?;
+        let normalized = match ids.dtype {
+            DType::U32 => ids,
+            DType::U8 | DType::I64 => ids.to_dtype(&ids_l, DType::U32)?,
+            dt => return Err(Error::UnsupportedDTypeForOp(dt, "vulkan index ids").bt()),
+        };
+        Ok((normalized, ids_l))
+    }
+
     fn run_index_select_f32(
         &self,
         ids: &Self,
@@ -4985,17 +5097,24 @@ impl VulkanStorage {
         ids_l: &Layout,
         dim: usize,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan index_select").bt());
+        let (src, src_l) = self.materialize_contiguous(src_l)?;
+        let (ids, ids_l) = ids.normalize_index_ids(ids_l)?;
+        if !matches!(
+            src.dtype,
+            DType::F32
+                | DType::F16
+                | DType::BF16
+                | DType::U8
+                | DType::U32
+                | DType::I64
+                | DType::F64
+        ) {
+            return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan index_select").bt());
         }
-        if ids.dtype != DType::U32 {
-            return Err(Error::UnsupportedDTypeForOp(ids.dtype, "vulkan index_select ids").bt());
-        }
-        if !src_l.is_contiguous() {
-            return Err(unsupported("index_select strided"));
-        }
-        if src_l.start_offset() > u16::MAX as usize || ids_l.start_offset() > u8::MAX as usize {
-            return Err(unsupported("index_select offset"));
+        if src.dtype == DType::F16 {
+            let src_f32 = src.to_dtype(&src_l, DType::F32)?;
+            let src_f32_l = Layout::contiguous(src_l.shape().clone());
+            return src_f32.run_index_select_f32(&ids, &src_f32_l, &ids_l, dim);
         }
         let ids_len = match ids_l.dims() {
             [ids_len] => *ids_len,
@@ -5007,7 +5126,7 @@ impl VulkanStorage {
         let mut dst_dims = src_l.dims().to_vec();
         dst_dims[dim] = ids_len;
         let dst_shape = Shape::from(dst_dims);
-        let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
+        let dst = unsafe { src.device.alloc_uninit(&dst_shape, src.dtype)? };
         let params = GgmlBinaryParams {
             ne: (left_size * ids_len * right_size).try_into()?,
             ne00: right_size.try_into()?,
@@ -5041,18 +5160,22 @@ impl VulkanStorage {
             param3: 0,
         };
         let bindings = [
-            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&src.buffer),
             VulkanBinding::Storage(&ids.buffer),
             VulkanBinding::Storage(&dst.buffer),
         ];
-        let spirv_name = match self.dtype {
+        let spirv_name = match src.dtype {
             DType::F32 => "get_rows_f32_f32",
-            DType::F16 => "get_rows_f16",
+            DType::BF16 => "get_rows_bf16_raw",
+            DType::U8 => "get_rows_u8",
+            DType::U32 => "get_rows_i32",
+            DType::I64 => "get_rows_i64",
+            DType::F64 => "get_rows_f64",
             _ => unreachable!(),
         };
         let spirv = candle_vulkan_kernels::spirv(spirv_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
-        self.device.run_compute_3d(
+        src.device.run_compute_3d(
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
@@ -5066,8 +5189,10 @@ impl VulkanStorage {
     }
 
     fn run_gather_last_dim_f32(&self, ids: &Self, src_l: &Layout, ids_l: &Layout) -> Result<Self> {
+        let (src, src_l) = self.materialize_contiguous(src_l)?;
+        let (ids, ids_l) = ids.normalize_index_ids(ids_l)?;
         if !matches!(
-            self.dtype,
+            src.dtype,
             DType::F32
                 | DType::F16
                 | DType::BF16
@@ -5076,19 +5201,7 @@ impl VulkanStorage {
                 | DType::I64
                 | DType::F64
         ) {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan gather").bt());
-        }
-        if ids.dtype != DType::U32 {
-            return Err(Error::UnsupportedDTypeForOp(ids.dtype, "vulkan gather ids").bt());
-        }
-        if !src_l.is_contiguous() {
-            return Err(unsupported("gather strided src"));
-        }
-        if !ids_l.is_contiguous() {
-            return Err(unsupported("gather strided ids"));
-        }
-        if src_l.start_offset() > u16::MAX as usize || ids_l.start_offset() > u8::MAX as usize {
-            return Err(unsupported("gather offset"));
+            return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan gather").bt());
         }
         let rank = src_l.dims().len();
         if rank == 0 || ids_l.dims().len() != rank {
@@ -5098,7 +5211,7 @@ impl VulkanStorage {
         let left_size: usize = ids_l.dims()[..rank - 1].iter().product();
         let src_dim = src_l.dims()[rank - 1];
         let dst_shape = ids_l.shape().clone();
-        let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
+        let dst = unsafe { src.device.alloc_uninit(&dst_shape, src.dtype)? };
         let params = GgmlBinaryParams {
             ne: (left_size * ids_dim).try_into()?,
             ne00: 1,
@@ -5132,11 +5245,11 @@ impl VulkanStorage {
             param3: 0,
         };
         let bindings = [
-            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&src.buffer),
             VulkanBinding::Storage(&ids.buffer),
             VulkanBinding::Storage(&dst.buffer),
         ];
-        let spirv_name = match self.dtype {
+        let spirv_name = match src.dtype {
             DType::F32 => "get_rows_f32_f32",
             DType::F16 => "get_rows_f16",
             DType::BF16 => "get_rows_bf16_raw",
@@ -5148,7 +5261,7 @@ impl VulkanStorage {
         };
         let spirv = candle_vulkan_kernels::spirv(spirv_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
-        self.device.run_compute_3d(
+        src.device.run_compute_3d(
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
@@ -5165,41 +5278,36 @@ impl VulkanStorage {
         src: &Self,
         src_l: &Layout,
     ) -> Result<()> {
-        if (self.dtype != DType::F32 && self.dtype != DType::F16) || self.dtype != src.dtype {
+        let (ids, ids_l) = ids.normalize_index_ids(ids_l)?;
+        let (src, src_l) = src.materialize_contiguous(src_l)?;
+        if !dst_l.is_contiguous() || dst_l.start_offset() != 0 {
+            let mut compact = unsafe { self.device.alloc_uninit(dst_l.shape(), self.dtype)? };
+            self.copy_strided_src(&mut compact, 0, dst_l)?;
+            let dst_cl = Layout::contiguous(dst_l.shape());
+            compact.run_scatter_set_last_dim_f32(&dst_cl, &ids, &ids_l, &src, &src_l)?;
+            compact.copy_strided_src(self, dst_l.start_offset(), dst_l)?;
+            return Ok(());
+        }
+        if !matches!(
+            self.dtype,
+            DType::F32 | DType::F16 | DType::BF16 | DType::U8 | DType::I64 | DType::F64
+        ) || self.dtype != src.dtype {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_set").bt());
         }
-        if self.dtype == DType::F16 {
+        if matches!(self.dtype, DType::F16 | DType::BF16 | DType::U8 | DType::I64 | DType::F64) {
             let mut dst_f32 = self.to_dtype(dst_l, DType::F32)?;
-            let src_f32 = src.to_dtype(src_l, DType::F32)?;
+            let src_f32 = src.to_dtype(&src_l, DType::F32)?;
             let dst_f32_layout = Layout::contiguous(dst_l.shape().clone());
             let src_f32_layout = Layout::contiguous(src_l.shape().clone());
             dst_f32.run_scatter_set_last_dim_f32(
                 &dst_f32_layout,
-                ids,
-                ids_l,
+                &ids,
+                &ids_l,
                 &src_f32,
                 &src_f32_layout,
             )?;
-            *self = dst_f32.to_dtype(&dst_f32_layout, DType::F16)?;
+            *self = dst_f32.to_dtype(&dst_f32_layout, self.dtype)?;
             return Ok(());
-        }
-        if ids.dtype != DType::U32 {
-            return Err(Error::UnsupportedDTypeForOp(ids.dtype, "vulkan scatter_set ids").bt());
-        }
-        if !dst_l.is_contiguous() {
-            return Err(unsupported("scatter_set strided dst"));
-        }
-        if !src_l.is_contiguous() {
-            return Err(unsupported("scatter_set strided src"));
-        }
-        if !ids_l.is_contiguous() {
-            return Err(unsupported("scatter_set strided ids"));
-        }
-        if src_l.start_offset() > u16::MAX as usize
-            || ids_l.start_offset() > u8::MAX as usize
-            || dst_l.start_offset() > u8::MAX as usize
-        {
-            return Err(unsupported("scatter_set offset"));
         }
         let rank = dst_l.dims().len();
         if rank == 0 || ids_l.dims().len() != rank || src_l.dims().len() != rank {
@@ -5267,26 +5375,18 @@ impl VulkanStorage {
         src: &Self,
         src_l: &Layout,
     ) -> Result<()> {
+        let (ids, ids_l) = ids.normalize_index_ids(ids_l)?;
+        let (src, src_l) = src.materialize_contiguous(src_l)?;
+        if !dst_l.is_contiguous() || dst_l.start_offset() != 0 {
+            let mut compact = unsafe { self.device.alloc_uninit(dst_l.shape(), self.dtype)? };
+            self.copy_strided_src(&mut compact, 0, dst_l)?;
+            let dst_cl = Layout::contiguous(dst_l.shape());
+            compact.run_scatter_add_last_dim_f32(&dst_cl, &ids, &ids_l, &src, &src_l)?;
+            compact.copy_strided_src(self, dst_l.start_offset(), dst_l)?;
+            return Ok(());
+        }
         if self.dtype != DType::F32 || self.dtype != src.dtype {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_add").bt());
-        }
-        if ids.dtype != DType::U32 {
-            return Err(Error::UnsupportedDTypeForOp(ids.dtype, "vulkan scatter_add ids").bt());
-        }
-        if !dst_l.is_contiguous() {
-            return Err(unsupported("scatter_add strided dst"));
-        }
-        if !src_l.is_contiguous() {
-            return Err(unsupported("scatter_add strided src"));
-        }
-        if !ids_l.is_contiguous() {
-            return Err(unsupported("scatter_add strided ids"));
-        }
-        if src_l.start_offset() > u16::MAX as usize
-            || ids_l.start_offset() > u8::MAX as usize
-            || dst_l.start_offset() > u8::MAX as usize
-        {
-            return Err(unsupported("scatter_add offset"));
         }
         let rank = dst_l.dims().len();
         if rank == 0 || src_l.dims().len() != rank {
@@ -5370,7 +5470,11 @@ impl VulkanStorage {
         if self.dtype != rhs.dtype {
             return Err(unsupported("matmul mixed dtype"));
         }
-        if self.dtype != DType::F32 && self.dtype != DType::F16 && self.dtype != DType::BF16 {
+        if self.dtype != DType::F32
+            && self.dtype != DType::F16
+            && self.dtype != DType::BF16
+            && self.dtype != DType::F64
+        {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan matmul").bt());
         }
         let rank = lhs_l.dims().len();
@@ -5541,6 +5645,60 @@ impl VulkanStorage {
         } else {
             n * k
         };
+        let bs03 = if rank >= 4 {
+            lhs_layout.dims()[rank - 4]
+        } else {
+            1
+        };
+        let lhs_stride_batch_outer = if rank >= 4 {
+            lhs_stride[rank - 4]
+        } else {
+            b * m * k
+        };
+        let rhs_stride_batch_outer = if rank >= 4 {
+            rhs_t_stride[rank - 4]
+        } else {
+            b * n * k
+        };
+
+        if self.dtype == DType::F64 {
+            let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F64)? };
+            let params = VulkanF64MatmulParams {
+                offset_src0: 0,
+                offset_src1: lhs_layout.start_offset().try_into()?,
+                offset_dst: 0,
+                m: n.try_into()?,
+                n: m.try_into()?,
+                k: k.try_into()?,
+                stride_01: k.try_into()?,
+                stride_11: lhs_stride[rank - 2].try_into()?,
+                stride_02: rhs_stride_batch_inner.try_into()?,
+                stride_12: lhs_stride_batch_inner.try_into()?,
+                stride_03: rhs_stride_batch_outer.try_into()?,
+                stride_13: lhs_stride_batch_outer.try_into()?,
+                bs02: bs02.try_into()?,
+                bs03: bs03.try_into()?,
+                broadcast2: 1,
+                broadcast3: 1,
+            };
+            let bindings = [
+                VulkanBinding::Storage(&rhs_t.buffer),
+                VulkanBinding::Storage(&lhs.buffer),
+                VulkanBinding::Storage(&dst.buffer),
+            ];
+            let spirv = candle_vulkan_kernels::spirv("matmul_f64").ok_or_else(|| {
+                Error::Msg("vulkan shader matmul_f64 not generated".into()).bt()
+            })?;
+            let total = b * m * n;
+            self.device.run_compute(
+                spirv,
+                &bindings,
+                Some(any_as_bytes(&params)),
+                total.div_ceil(256).try_into()?,
+            )?;
+            drop(lhs_contiguous);
+            return Ok(dst);
+        }
 
         let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
         let params = VulkanMatmulParams {
@@ -7128,7 +7286,7 @@ impl BackendStorage for VulkanStorage {
         }
         let rank = layout.dims().len();
         if rank == 0 {
-            crate::bail!("vulkan backend op reduce does not support rank-0 tensors")
+            return self.try_clone(layout);
         }
         if reduce_dims.is_empty() {
             return self.try_clone(layout);
@@ -7231,12 +7389,32 @@ impl BackendStorage for VulkanStorage {
             let contiguous = Layout::contiguous(layout.shape().clone());
             return f32_storage.to_dtype(&contiguous, dtype);
         }
-        let spirv = copy_spirv(self.dtype, dtype)?;
+        let spirv = match copy_spirv(self.dtype, dtype) {
+            Ok(spirv) => spirv,
+            Err(err) => {
+                if self.dtype == DType::F64 || dtype == DType::F64 {
+                    let f32_storage = if self.dtype == DType::F32 {
+                        self.try_clone(layout)?
+                    } else {
+                        self.to_dtype(layout, DType::F32)?
+                    };
+                    let contiguous = Layout::contiguous(layout.shape().clone());
+                    return f32_storage.to_dtype(&contiguous, dtype);
+                }
+                return Err(err);
+            }
+        };
         self.run_unary_generic_with_params_dtype(layout, spirv, 0.0, 0.0, dtype)
     }
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
         if self.dtype == DType::BF16 {
             return self.bf16_unary_via_f32(layout, |src, src_l| src.unary_impl::<B>(src_l));
+        }
+        if self.dtype == DType::F64 {
+            let src_l = Layout::contiguous(layout.shape());
+            let src_f32 = self.to_dtype(layout, DType::F32)?;
+            let out_f32 = src_f32.unary_impl::<B>(&src_l)?;
+            return out_f32.to_dtype(&src_l, DType::F64);
         }
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan unary").bt());
@@ -7279,6 +7457,14 @@ impl BackendStorage for VulkanStorage {
                 rhs_layout,
                 |lhs, rhs, lhs_l, rhs_l| lhs.binary_impl::<B>(rhs, lhs_l, rhs_l),
             );
+        }
+        if self.dtype == DType::F64 {
+            let lhs_l = Layout::contiguous(lhs_layout.shape());
+            let rhs_l = Layout::contiguous(rhs_layout.shape());
+            let lhs_f32 = self.to_dtype(lhs_layout, DType::F32)?;
+            let rhs_f32 = rhs.to_dtype(rhs_layout, DType::F32)?;
+            let out_f32 = lhs_f32.binary_impl::<B>(&rhs_f32, &lhs_l, &rhs_l)?;
+            return out_f32.to_dtype(&lhs_l, DType::F64);
         }
         if lhs_layout.dims().len() > 4 || rhs_layout.dims().len() > 4 {
             let (lhs, lhs_l) = if lhs_layout.dims().len() > 4 {
@@ -7354,7 +7540,17 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
-        self.run_conv1d_f32(layout, kernel, kernel_l, params)
+        let out_shape = Shape::from(params.out_dims());
+        self.cuda_parity_conv_via_f32(
+            layout,
+            kernel,
+            kernel_l,
+            &out_shape,
+            "vulkan conv1d",
+            |input, input_l, kernel, kernel_l| {
+                input.run_conv1d_f32(input_l, kernel, kernel_l, params)
+            },
+        )
     }
     fn conv_transpose1d(
         &self,
@@ -7363,25 +7559,17 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose1D,
     ) -> Result<Self> {
-        let src_dtype = self.dtype;
-        if src_dtype == DType::F16 {
-            if kernel.dtype != DType::F16 {
-                return Err(Error::UnsupportedDTypeForOp(kernel.dtype, "vulkan conv_transpose1d").bt());
-            }
-            let input_f32 = self.materialize_to_f32(layout)?;
-            let kernel_f32 = kernel.materialize_to_f32(kernel_l)?;
-            let input_l = Layout::contiguous(layout.shape());
-            let kernel_l = if kernel_l.is_contiguous() && kernel_l.start_offset() == 0 {
-                kernel_l.clone()
-            } else {
-                Layout::contiguous(kernel_l.shape())
-            };
-            let out_f32 =
-                input_f32.run_conv_transpose1d_f32(&input_l, &kernel_f32, &kernel_l, params)?;
-            let out_l = Layout::contiguous(params.out_dims());
-            return out_f32.to_dtype(&out_l, DType::F16);
-        }
-        self.run_conv_transpose1d_f32(layout, kernel, kernel_l, params)
+        let out_shape = Shape::from(params.out_dims());
+        self.cuda_parity_conv_via_f32(
+            layout,
+            kernel,
+            kernel_l,
+            &out_shape,
+            "vulkan conv_transpose1d",
+            |input, input_l, kernel, kernel_l| {
+                input.run_conv_transpose1d_f32(input_l, kernel, kernel_l, params)
+            },
+        )
     }
     fn conv2d(
         &self,
@@ -7390,7 +7578,17 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        self.run_conv2d_f32(layout, kernel, kernel_l, params)
+        let out_shape = Shape::from(params.out_dims());
+        self.cuda_parity_conv_via_f32(
+            layout,
+            kernel,
+            kernel_l,
+            &out_shape,
+            "vulkan conv2d",
+            |input, input_l, kernel, kernel_l| {
+                input.run_conv2d_f32(input_l, kernel, kernel_l, params)
+            },
+        )
     }
     fn conv_transpose2d(
         &self,
@@ -7399,25 +7597,17 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self> {
-        let src_dtype = self.dtype;
-        if src_dtype == DType::F16 {
-            if kernel.dtype != DType::F16 {
-                return Err(Error::UnsupportedDTypeForOp(kernel.dtype, "vulkan conv_transpose2d").bt());
-            }
-            let input_f32 = self.materialize_to_f32(layout)?;
-            let kernel_f32 = kernel.materialize_to_f32(kernel_l)?;
-            let input_l = Layout::contiguous(layout.shape());
-            let kernel_l = if kernel_l.is_contiguous() && kernel_l.start_offset() == 0 {
-                kernel_l.clone()
-            } else {
-                Layout::contiguous(kernel_l.shape())
-            };
-            let out_f32 =
-                input_f32.run_conv_transpose2d_f32(&input_l, &kernel_f32, &kernel_l, params)?;
-            let out_l = Layout::contiguous(params.out_dims());
-            return out_f32.to_dtype(&out_l, DType::F16);
-        }
-        self.run_conv_transpose2d_f32(layout, kernel, kernel_l, params)
+        let out_shape = Shape::from(params.out_dims());
+        self.cuda_parity_conv_via_f32(
+            layout,
+            kernel,
+            kernel_l,
+            &out_shape,
+            "vulkan conv_transpose2d",
+            |input, input_l, kernel, kernel_l| {
+                input.run_conv_transpose2d_f32(input_l, kernel, kernel_l, params)
+            },
+        )
     }
     fn avg_pool2d(
         &self,
@@ -7425,7 +7615,16 @@ impl BackendStorage for VulkanStorage {
         kernel_size: (usize, usize),
         stride: (usize, usize),
     ) -> Result<Self> {
-        self.run_pool2d_f32(layout, kernel_size, stride, false)
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let out_shape = Shape::from(vec![
+            b,
+            c,
+            (h - kernel_size.0) / stride.0 + 1,
+            (w - kernel_size.1) / stride.1 + 1,
+        ]);
+        self.gpu_resident_via_f32(layout, &out_shape, "vulkan avg_pool2d", |src, src_l| {
+            src.run_pool2d_f32(src_l, kernel_size, stride, false)
+        })
     }
     fn max_pool2d(
         &self,
@@ -7433,20 +7632,32 @@ impl BackendStorage for VulkanStorage {
         kernel_size: (usize, usize),
         stride: (usize, usize),
     ) -> Result<Self> {
-        self.run_pool2d_f32(layout, kernel_size, stride, true)
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let out_shape = Shape::from(vec![
+            b,
+            c,
+            (h - kernel_size.0) / stride.0 + 1,
+            (w - kernel_size.1) / stride.1 + 1,
+        ]);
+        self.gpu_resident_via_f32(layout, &out_shape, "vulkan max_pool2d", |src, src_l| {
+            src.run_pool2d_f32(src_l, kernel_size, stride, true)
+        })
     }
     fn upsample_nearest1d(&self, layout: &Layout, out_l: usize) -> Result<Self> {
         self.run_upsample_nearest1d_f32(layout, out_l)
     }
     fn upsample_nearest2d(&self, layout: &Layout, out_h: usize, out_w: usize) -> Result<Self> {
-        let (_, _, h, w) = layout.shape().dims4()?;
-        self.run_upsample2d_f32(
-            layout,
-            out_h,
-            out_w,
-            nearest_interp_weights(h, out_h),
-            nearest_interp_weights(w, out_w),
-        )
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let out_shape = Shape::from(vec![b, c, out_h, out_w]);
+        self.gpu_resident_via_f32(layout, &out_shape, "vulkan upsample_nearest2d", |src, src_l| {
+            src.run_upsample2d_f32(
+                src_l,
+                out_h,
+                out_w,
+                nearest_interp_weights(h, out_h),
+                nearest_interp_weights(w, out_w),
+            )
+        })
     }
     fn upsample_bilinear2d(
         &self,
@@ -7457,14 +7668,17 @@ impl BackendStorage for VulkanStorage {
         scale_h: Option<f64>,
         scale_w: Option<f64>,
     ) -> Result<Self> {
-        let (_, _, h, w) = layout.shape().dims4()?;
-        self.run_upsample2d_f32(
-            layout,
-            out_h,
-            out_w,
-            bilinear_interp_weights(h, out_h, align_corners, scale_h),
-            bilinear_interp_weights(w, out_w, align_corners, scale_w),
-        )
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let out_shape = Shape::from(vec![b, c, out_h, out_w]);
+        self.gpu_resident_via_f32(layout, &out_shape, "vulkan upsample_bilinear2d", |src, src_l| {
+            src.run_upsample2d_f32(
+                src_l,
+                out_h,
+                out_w,
+                bilinear_interp_weights(h, out_h, align_corners, scale_h),
+                bilinear_interp_weights(w, out_w, align_corners, scale_w),
+            )
+        })
     }
     fn gather(&self, src_l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
         let rank = src_l.dims().len();
@@ -7643,6 +7857,7 @@ impl BackendStorage for VulkanStorage {
                         | DType::U32
                         | DType::I16
                         | DType::I64
+                        | DType::F64
                 )
             {
                 let (materialized, _) = self.materialize_rank_gt4_compact(src_l)?;
@@ -7656,7 +7871,8 @@ impl BackendStorage for VulkanStorage {
                 | DType::U8
                 | DType::U32
                 | DType::I16
-                | DType::I64 => self.run_copy_into(
+                | DType::I64
+                | DType::F64 => self.run_copy_into(
                     src_l,
                     dst,
                     dst_offset,

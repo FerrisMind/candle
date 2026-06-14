@@ -551,6 +551,21 @@ impl WgpuDevice {
         &self.inner.adapter_pci_bus_id
     }
 
+    pub fn shader_f64_enabled(&self) -> bool {
+        wgpu_shader_f64_enabled(self)
+    }
+
+    fn advance_rand_seed(&self, count: usize) -> Result<u64> {
+        let mut guard = self
+            .inner
+            .seed_value
+            .write()
+            .map_err(|_| Error::msg("wgpu seed lock poisoned"))?;
+        let seed_at_call = *guard;
+        *guard = seed_at_call.wrapping_add(count as u64);
+        Ok(seed_at_call)
+    }
+
     fn run_rand_kernel(
         &self,
         shape: &Shape,
@@ -591,7 +606,7 @@ impl WgpuDevice {
         if count == 0 {
             return self.zeros_impl(shape, dtype);
         }
-        let seed = self.get_current_seed()?;
+        let seed = self.advance_rand_seed(count)?;
         let kernel_dtype = match dtype {
             DType::F32 => DType::F32,
             DType::F16 if self.inner.features.contains(wgpu::Features::SHADER_F16) => DType::F16,
@@ -632,7 +647,7 @@ impl WgpuDevice {
         if count == 0 {
             return self.zeros_impl(shape, dtype);
         }
-        let seed = self.get_current_seed()?;
+        let seed = self.advance_rand_seed(count)?;
         let kernel_dtype = match dtype {
             DType::F32 => DType::F32,
             DType::F16 if self.inner.features.contains(wgpu::Features::SHADER_F16) => DType::F16,
@@ -661,6 +676,18 @@ impl WgpuDevice {
             storage.to_dtype(&Layout::contiguous(shape), dtype)
         }
     }
+}
+
+fn wgpu_shader_f16_enabled(device: &WgpuDevice) -> bool {
+    device.inner.features.contains(wgpu::Features::SHADER_F16)
+}
+
+fn wgpu_shader_f64_enabled(device: &WgpuDevice) -> bool {
+    device.inner.features.contains(wgpu::Features::SHADER_F64)
+}
+
+fn wgpu_f16_emulates_f32(device: &WgpuDevice, dtype: DType) -> bool {
+    dtype == DType::F16 && !wgpu_shader_f16_enabled(device)
 }
 
 fn unsupported(op: &'static str) -> Error {
@@ -2062,6 +2089,65 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 
 fn custom_int_binary_wgsl(op: &str, dtype: DType) -> Result<String> {
+    const I64_WGSL_HELPERS: &str = r#"
+fn u64_shl1_or(lo: u32, hi: u32, bit: u32) -> vec2<u32> {
+    return vec2((lo << 1u) | bit, (hi << 1u) | (lo >> 31u));
+}
+fn u64_sub(lo_a: u32, hi_a: u32, lo_b: u32, hi_b: u32) -> vec2<u32> {
+    let lo = lo_a - lo_b;
+    let borrow = select(0u, 1u, lo_a < lo_b);
+    let hi = hi_a - hi_b - borrow;
+    return vec2(lo, hi);
+}
+fn u64_ge(lo_a: u32, hi_a: u32, lo_b: u32, hi_b: u32) -> bool {
+    if (hi_a != hi_b) { return hi_a > hi_b; }
+    return lo_a >= lo_b;
+}
+fn u64_neg(lo: u32, hi: u32) -> vec2<u32> {
+    let lo_n = 0u - lo;
+    let borrow = select(0u, 1u, lo != 0u);
+    let hi_n = 0u - hi - borrow;
+    return vec2(lo_n, hi_n);
+}
+fn u64_abs(lo: u32, hi: u32) -> vec2<u32> {
+    if (bitcast<i32>(hi) < 0) { return u64_neg(lo, hi); }
+    return vec2(lo, hi);
+}
+fn u64_div_unsigned(n_lo: u32, n_hi: u32, d_lo: u32, d_hi: u32) -> vec2<u32> {
+    if (d_lo == 0u && d_hi == 0u) { return vec2(0u, 0u); }
+    var r_lo = 0u;
+    var r_hi = 0u;
+    var q_lo = 0u;
+    var q_hi = 0u;
+    for (var i: i32 = 63; i >= 0; i = i - 1) {
+        let bit = select((n_lo >> u32(i)) & 1u, (n_hi >> u32(i - 32)) & 1u, i >= 32);
+        let shifted = u64_shl1_or(r_lo, r_hi, bit);
+        r_lo = shifted.x;
+        r_hi = shifted.y;
+        if (u64_ge(r_lo, r_hi, d_lo, d_hi)) {
+            let sub = u64_sub(r_lo, r_hi, d_lo, d_hi);
+            r_lo = sub.x;
+            r_hi = sub.y;
+            if (i < 32) {
+                q_lo = q_lo | (1u << u32(i));
+            } else {
+                q_hi = q_hi | (1u << u32(i - 32));
+            }
+        }
+    }
+    return vec2(q_lo, q_hi);
+}
+fn i64_div_trunc(lo_a: u32, hi_a: u32, lo_b: u32, hi_b: u32) -> vec2<u32> {
+    if (lo_b == 0u && hi_b == 0u) { return vec2(0u, 0u); }
+    let neg_a = bitcast<i32>(hi_a) < 0;
+    let neg_b = bitcast<i32>(hi_b) < 0;
+    let aa = u64_abs(lo_a, hi_a);
+    let bb = u64_abs(lo_b, hi_b);
+    var q = u64_div_unsigned(aa.x, aa.y, bb.x, bb.y);
+    if (neg_a != neg_b) { q = u64_neg(q.x, q.y); }
+    return q;
+}
+"#;
     let indexing = r#"
 fn src0_index(_i: u32) -> u32 {
     var i = _i;
@@ -2204,6 +2290,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let hi = p11 + (mid >> 16u) + mid_carry + lo_carry + a_lo * b_hi + a_hi * b_lo;
 "#
                 }
+                "div" => {
+                    r#"
+    let q = i64_div_trunc(a_lo, a_hi, b_lo, b_hi);
+    let lo = q.x;
+    let hi = q.y;
+"#
+                }
                 "maximum" | "minimum" => {
                     let pick_a = if op == "maximum" { "a_gt_b" } else { "!a_gt_b" };
                     return Ok(format!(
@@ -2226,8 +2319,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 "#
                     ));
                 }
-                // i64 division needs a full software divider; no model path
-                // exercises it, so keep it explicit instead of silently wrong.
                 _ => return Err(unsupported("binary int op")),
             };
             format!(
@@ -2247,7 +2338,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
         other => return Err(Error::UnsupportedDTypeForOp(other, "wgpu binary int").bt()),
     };
-    Ok(format!("{params_struct}\n{indexing}\n{main}\n"))
+    let helpers = if dtype == DType::I64 {
+        I64_WGSL_HELPERS
+    } else {
+        ""
+    };
+    Ok(format!("{params_struct}\n{helpers}\n{indexing}\n{main}\n"))
 }
 
 fn copy_shader(src: DType, dst: DType) -> Result<String> {
@@ -2922,15 +3018,6 @@ impl WgpuStorage {
         rhs_layout: &Layout,
         op: CmpOp,
     ) -> Result<Self> {
-        if self.dtype == DType::F16
-            && !self
-                .device
-                .inner
-                .features
-                .contains(wgpu::Features::SHADER_F16)
-        {
-            return Err(unsupported("cmp f16"));
-        }
         if !matches!(
             self.dtype,
             DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64
@@ -3044,9 +3131,6 @@ impl WgpuStorage {
     ) -> Result<Self> {
         if self.dtype != DType::U8 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu where_cond").bt());
-        }
-        if t.dtype == DType::F16 && !t.device.inner.features.contains(wgpu::Features::SHADER_F16) {
-            return Err(unsupported("where_cond f16"));
         }
         if !matches!(
             t.dtype,
@@ -3417,6 +3501,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             DType::I64 => {
                 "let lo = src[2u * i]; let hi = src[2u * i + 1u]; let v = f32(bitcast<i32>(hi)) * 4294967296.0 + f32(lo);"
             }
+            DType::I16 => {
+                "let u = (src[i / 2u] >> (16u * (i % 2u))) & 0xffffu; let sw = select(i32(u), i32(u) - 65536, (u & 0x8000u) != 0u); let v = f32(sw); let lo = src[i / 2u]; let hi = 0u;"
+            }
             other => return Err(Error::UnsupportedDTypeForOp(other, "wgpu emulated cast").bt()),
         };
         let src_is_float = matches!(self.dtype, DType::F32 | DType::F16 | DType::BF16);
@@ -3546,6 +3633,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 "#
                 )
             }
+            DType::I16 => format!(
+                r#"
+    let base = gid.x * 2u;
+    if (base >= params.ne) {{ return; }}
+    var w: u32 = 0u;
+    {{
+        let i = base;
+        {load}
+        let si = i32(trunc(clamp(v, f32(-32768), f32(32767))));
+        let u = bitcast<u32>(si) & 0xffffu;
+        w = w | u;
+    }}
+    if (base + 1u < params.ne) {{
+        let i = base + 1u;
+        {load}
+        let si = i32(trunc(clamp(v, f32(-32768), f32(32767))));
+        let u = bitcast<u32>(si) & 0xffffu;
+        w = w | (u << 16u);
+    }}
+    dst[gid.x] = w;
+"#
+            ),
             other => {
                 return Err(Error::UnsupportedDTypeForOp(other, "wgpu emulated cast dst").bt())
             }
@@ -3881,6 +3990,59 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             Layout::contiguous(layout.shape())
         };
         out_f32.to_dtype(&out_layout, DType::BF16)
+    }
+
+    fn gpu_resident_via_f32(
+        &self,
+        layout: &Layout,
+        out_shape: &Shape,
+        op_name: &'static str,
+        f: impl FnOnce(&Self, &Layout) -> Result<Self>,
+    ) -> Result<Self> {
+        let src_dtype = self.dtype;
+        match src_dtype {
+            DType::F32 => f(self, layout),
+            DType::F16 | DType::BF16 => {
+                let src_f32 = self.materialize_to_f32(layout)?;
+                let src_f32_l = Layout::contiguous(layout.shape());
+                let out_f32 = f(&src_f32, &src_f32_l)?;
+                let out_l = Layout::contiguous(out_shape);
+                out_f32.to_dtype(&out_l, src_dtype)
+            }
+            _ => Err(Error::UnsupportedDTypeForOp(src_dtype, op_name).bt()),
+        }
+    }
+
+    fn cuda_parity_conv_via_f32(
+        &self,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        out_shape: &Shape,
+        op_name: &'static str,
+        f: impl FnOnce(&Self, &Layout, &Self, &Layout) -> Result<Self>,
+    ) -> Result<Self> {
+        let src_dtype = self.dtype;
+        if kernel.dtype != src_dtype {
+            return Err(Error::UnsupportedDTypeForOp(kernel.dtype, op_name).bt());
+        }
+        match src_dtype {
+            DType::F32 => f(self, layout, kernel, kernel_l),
+            DType::F16 | DType::BF16 => {
+                let input_f32 = self.materialize_to_f32(layout)?;
+                let kernel_f32 = kernel.materialize_to_f32(kernel_l)?;
+                let input_l = Layout::contiguous(layout.shape());
+                let kernel_l = if kernel_l.is_contiguous() && kernel_l.start_offset() == 0 {
+                    kernel_l.clone()
+                } else {
+                    Layout::contiguous(kernel_l.shape())
+                };
+                let out_f32 = f(&input_f32, &input_l, &kernel_f32, &kernel_l)?;
+                let out_l = Layout::contiguous(out_shape);
+                out_f32.to_dtype(&out_l, src_dtype)
+            }
+            _ => Err(Error::UnsupportedDTypeForOp(src_dtype, op_name).bt()),
+        }
     }
 
     // Strided same-dtype copy for dtypes WGSL cannot address as scalars:
@@ -4528,7 +4690,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         asc: bool,
         last_dim: usize,
     ) -> Result<Self> {
-        if matches!(self.dtype, DType::F16 | DType::BF16 | DType::U8) {
+        if matches!(
+            self.dtype,
+            DType::F16 | DType::BF16 | DType::U8 | DType::I16 | DType::I32 | DType::F8E4M3
+        ) {
             let src_f32 = self.to_dtype(layout, DType::F32)?;
             let src_f32_layout = Layout::contiguous(layout.shape());
             return src_f32.argsort_last_dim_f32(&src_f32_layout, asc, last_dim);
@@ -4895,14 +5060,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu rope").bt());
         }
-        if self.dtype == DType::F16
-            && !self
-                .device
-                .inner
-                .features
-                .contains(wgpu::Features::SHADER_F16)
-        {
-            return Err(unsupported("rope f16"));
+        if wgpu_f16_emulates_f32(&self.device, self.dtype) {
+            let src_f32 = self.to_dtype(layout, DType::F32)?;
+            let src_l = Layout::contiguous(layout.shape().clone());
+            let out_f32 = src_f32.ggml_rope(
+                &src_l,
+                pos,
+                pos_layout,
+                n_dims,
+                freq_base,
+                mode,
+            )?;
+            return out_f32.to_dtype(&src_l, DType::F16);
         }
         if pos.dtype != DType::I32 {
             return Err(Error::UnsupportedDTypeForOp(pos.dtype, "wgpu rope positions").bt());
@@ -4992,19 +5161,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             if self.dtype != DType::F16 || alpha.dtype != DType::F16 {
                 return Err(unsupported("rms_norm mixed dtype"));
             }
-            if !self
-                .device
-                .inner
-                .features
-                .contains(wgpu::Features::SHADER_F16)
-            {
-                return Err(unsupported("rms_norm f16"));
-            }
             let src_f32 = self.to_dtype(layout, DType::F32)?;
             let alpha_f32 = alpha.to_dtype(alpha_layout, DType::F32)?;
             let src_f32_layout = Layout::contiguous(layout.shape().clone());
             let alpha_f32_layout = Layout::contiguous(alpha_layout.shape().clone());
-            let out_f32 = src_f32.rms_norm(&src_f32_layout, &alpha_f32, &alpha_f32_layout, eps)?;
+            let out_f32 =
+                src_f32.rms_norm(&src_f32_layout, &alpha_f32, &alpha_f32_layout, eps)?;
             let copy = copy_shader(DType::F32, DType::F16)?;
             return out_f32.run_copy_to_dtype(&src_f32_layout, DType::F16, &copy);
         }
@@ -5085,17 +5247,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu sigmoid").bt());
         }
-        if self.dtype == DType::F16
-            && !self
-                .device
-                .inner
-                .features
-                .contains(wgpu::Features::SHADER_F16)
-        {
-            return Err(unsupported("sigmoid f16"));
+        if wgpu_f16_emulates_f32(&self.device, self.dtype) {
+            let src_f32 = self.materialize_to_f32(layout)?;
+            let src_l = Layout::contiguous(layout.shape());
+            let out_f32 = src_f32.sigmoid(&src_l)?;
+            return out_f32.to_dtype(&src_l, DType::F16);
         }
         let shader = unary_shader("sigmoid", self.dtype)?;
         self.run_unary_like(layout, &shader, "candle-wgpu-sigmoid")
+    }
+
+    fn materialize_contiguous(&self, layout: &Layout) -> Result<(Self, Layout)> {
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            return Ok((self.try_clone(layout)?, layout.clone()));
+        }
+        let mut compact = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        self.copy_strided_src(&mut compact, 0, layout)?;
+        Ok((compact, Layout::contiguous(layout.shape())))
+    }
+
+    fn normalize_index_ids(&self, ids_l: &Layout) -> Result<(Self, Layout)> {
+        let (ids, ids_l) = self.materialize_contiguous(ids_l)?;
+        let normalized = match ids.dtype {
+            DType::U32 => ids,
+            DType::U8 | DType::I64 => ids.run_emulated_cast(&ids_l, DType::U32)?,
+            dt => return Err(Error::UnsupportedDTypeForOp(dt, "wgpu index ids").bt()),
+        };
+        Ok((normalized, ids_l))
     }
 
     fn run_index_select_f32(
@@ -5105,23 +5283,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         ids_l: &Layout,
         dim: usize,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu index_select").bt());
+        let (src, src_l) = self.materialize_contiguous(src_l)?;
+        let (ids, ids_l) = ids.normalize_index_ids(ids_l)?;
+        if !matches!(
+            src.dtype,
+            DType::F32
+                | DType::F16
+                | DType::U8
+                | DType::U32
+                | DType::I64
+                | DType::F64
+                | DType::BF16
+        ) {
+            return Err(Error::UnsupportedDTypeForOp(src.dtype, "wgpu index_select").bt());
         }
-        if self.dtype == DType::F16
-            && !self
-                .device
-                .inner
-                .features
-                .contains(wgpu::Features::SHADER_F16)
-        {
-            return Err(unsupported("index_select f16"));
-        }
-        if ids.dtype != DType::U32 {
-            return Err(Error::UnsupportedDTypeForOp(ids.dtype, "wgpu index_select ids").bt());
-        }
-        if !src_l.is_contiguous() {
-            return Err(unsupported("index_select strided"));
+        let use_f32_hub = match src.dtype {
+            DType::F32 => false,
+            DType::F16 => wgpu_f16_emulates_f32(&src.device, src.dtype),
+            _ => true,
+        };
+        if use_f32_hub {
+            let src_f32 = src.to_dtype(&src_l, DType::F32)?;
+            let src_f32_l = Layout::contiguous(src_l.shape());
+            let out_f32 = src_f32.run_index_select_f32(&ids, &src_f32_l, &ids_l, dim)?;
+            if src.dtype == src_f32.dtype {
+                return Ok(out_f32);
+            }
+            let mut dst_dims = src_l.dims().to_vec();
+            dst_dims[dim] = match ids_l.dims() {
+                [ids_len] => *ids_len,
+                _ => return Err(unsupported("index_select ids rank")),
+            };
+            return out_f32.to_dtype(&Layout::contiguous(Shape::from(dst_dims)), src.dtype);
         }
         let ids_len = match ids_l.dims() {
             [ids_len] => *ids_len,
@@ -5135,12 +5328,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         dst_dims[dim] = ids_len;
         let dst_shape = Shape::from(dst_dims);
         let dst_layout = Layout::contiguous(dst_shape.clone());
-        let tmp_dtype = if self.dtype == DType::F16 {
+        let tmp_dtype = if src.dtype == DType::F16 {
             DType::F32
         } else {
-            self.dtype
+            src.dtype
         };
-        let dst = unsafe { self.device.alloc_uninit(&dst_shape, tmp_dtype)? };
+        let dst = unsafe { src.device.alloc_uninit(&dst_shape, tmp_dtype)? };
         let params = GetRowsParams {
             offset_src: src_l.start_offset().try_into()?,
             offset_idx: ids_l.start_offset().try_into()?,
@@ -5161,7 +5354,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             idx1: 1,
             idx2: 1,
         };
-        let param_buffer = self
+        let param_buffer = src
             .device
             .inner
             .device
@@ -5171,7 +5364,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-        self.device
+        src.device
             .inner
             .queue
             .write_buffer(&param_buffer, 0, any_as_bytes(&params));
@@ -5182,28 +5375,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             uniform_entry(3),
         ];
         let bindings = [
-            buffer_binding(0, &self.buffer),
+            buffer_binding(0, &src.buffer),
             buffer_binding(1, &ids.buffer),
             buffer_binding(2, &dst.buffer),
             buffer_binding(3, &param_buffer),
         ];
-        let shader = match self.dtype {
+        let shader = match src.dtype {
             DType::F32 => candle_wgpu_kernels::get_rows_f32_shader(WG_SIZE),
             DType::F16 => candle_wgpu_kernels::get_rows_f16_shader(WG_SIZE),
+            DType::BF16 => Some(bf16_gather_last_dim_wgsl()),
+            DType::U8 => Some(u8_gather_last_dim_wgsl()),
+            DType::U32 => candle_wgpu_kernels::get_rows_u32_shader(WG_SIZE),
+            DType::I64 => Some(i64_gather_last_dim_wgsl()),
+            DType::F64 => Some(f64_gather_last_dim_wgsl()),
             _ => None,
         }
         .ok_or_else(|| Error::Msg("wgpu shader get_rows.wgsl not embedded".into()).bt())?;
         let rows: u32 = (left_size * ids_len).try_into()?;
-        let workgroups = rows.div_ceil(WG_SIZE);
-        self.device.run_compute(
+        let work_items = match src.dtype {
+            DType::U8 => rows.div_ceil(4),
+            DType::BF16 => rows.div_ceil(2),
+            _ => rows,
+        };
+        src.device.run_compute(
             &shader,
             &entries,
             &bindings,
-            workgroups,
+            work_items.div_ceil(WG_SIZE),
             "candle-wgpu-get-rows",
         )?;
         debug_assert_eq!(dst.count, dst_el);
-        if self.dtype == DType::F16 {
+        if src.dtype == DType::F16 {
             let copy = copy_shader(DType::F32, DType::F16)?;
             dst.run_copy_to_dtype(&dst_layout, DType::F16, &copy)
         } else {
@@ -5212,8 +5414,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }
 
     fn run_gather_last_dim_f32(&self, ids: &Self, src_l: &Layout, ids_l: &Layout) -> Result<Self> {
+        let (src, src_l) = self.materialize_contiguous(src_l)?;
+        let (ids, ids_l) = ids.normalize_index_ids(ids_l)?;
         if !matches!(
-            self.dtype,
+            src.dtype,
             DType::F32
                 | DType::F16
                 | DType::U8
@@ -5222,25 +5426,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 | DType::F64
                 | DType::BF16
         ) {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu gather").bt());
+            return Err(Error::UnsupportedDTypeForOp(src.dtype, "wgpu gather").bt());
         }
-        if self.dtype == DType::F16
-            && !self
-                .device
-                .inner
-                .features
-                .contains(wgpu::Features::SHADER_F16)
-        {
-            return Err(unsupported("gather f16"));
-        }
-        if ids.dtype != DType::U32 {
-            return Err(Error::UnsupportedDTypeForOp(ids.dtype, "wgpu gather ids").bt());
-        }
-        if !src_l.is_contiguous() {
-            return Err(unsupported("gather strided src"));
-        }
-        if !ids_l.is_contiguous() {
-            return Err(unsupported("gather strided ids"));
+        if wgpu_f16_emulates_f32(&src.device, src.dtype) {
+            let src_f32 = src.to_dtype(&src_l, DType::F32)?;
+            let src_f32_l = Layout::contiguous(src_l.shape());
+            return src_f32.run_gather_last_dim_f32(&ids, &src_f32_l, &ids_l);
         }
         let rank = src_l.dims().len();
         if rank == 0 || ids_l.dims().len() != rank {
@@ -5250,12 +5441,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let left_size: usize = ids_l.dims()[..rank - 1].iter().product();
         let src_dim = src_l.dims()[rank - 1];
         let dst_shape = ids_l.shape().clone();
-        let tmp_dtype = if self.dtype == DType::F16 {
+        let tmp_dtype = if src.dtype == DType::F16 {
             DType::F32
         } else {
-            self.dtype
+            src.dtype
         };
-        let dst = unsafe { self.device.alloc_uninit(&dst_shape, tmp_dtype)? };
+        let dst = unsafe { src.device.alloc_uninit(&dst_shape, tmp_dtype)? };
         let params = GetRowsParams {
             offset_src: src_l.start_offset().try_into()?,
             offset_idx: ids_l.start_offset().try_into()?,
@@ -5276,7 +5467,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             idx1: left_size.try_into()?,
             idx2: 1,
         };
-        let param_buffer = self
+        let param_buffer = src
             .device
             .inner
             .device
@@ -5286,7 +5477,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-        self.device
+        src.device
             .inner
             .queue
             .write_buffer(&param_buffer, 0, any_as_bytes(&params));
@@ -5297,12 +5488,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             uniform_entry(3),
         ];
         let bindings = [
-            buffer_binding(0, &self.buffer),
+            buffer_binding(0, &src.buffer),
             buffer_binding(1, &ids.buffer),
             buffer_binding(2, &dst.buffer),
             buffer_binding(3, &param_buffer),
         ];
-        let shader = match self.dtype {
+        let shader = match src.dtype {
             DType::F32 => candle_wgpu_kernels::get_rows_f32_shader(WG_SIZE),
             DType::F16 => candle_wgpu_kernels::get_rows_f16_shader(WG_SIZE),
             DType::BF16 => Some(bf16_gather_last_dim_wgsl()),
@@ -5314,19 +5505,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
         .ok_or_else(|| Error::Msg("wgpu shader get_rows.wgsl not embedded".into()).bt())?;
         let rows: u32 = (left_size * ids_dim).try_into()?;
-        let work_items = match self.dtype {
+        let work_items = match src.dtype {
             DType::U8 => rows.div_ceil(4),
             DType::BF16 => rows.div_ceil(2),
             _ => rows,
         };
-        self.device.run_compute(
+        src.device.run_compute(
             &shader,
             &entries,
             &bindings,
             work_items.div_ceil(WG_SIZE),
             "candle-wgpu-gather",
         )?;
-        if self.dtype == DType::F16 {
+        if src.dtype == DType::F16 {
             let dst_layout = Layout::contiguous(dst_shape.clone());
             let copy = copy_shader(DType::F32, DType::F16)?;
             dst.run_copy_to_dtype(&dst_layout, DType::F16, &copy)
@@ -5343,29 +5534,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         src: &Self,
         src_l: &Layout,
     ) -> Result<()> {
-        if (self.dtype != DType::F32 && self.dtype != DType::F16) || self.dtype != src.dtype {
+        let (ids, ids_l) = ids.normalize_index_ids(ids_l)?;
+        let (src, src_l) = src.materialize_contiguous(src_l)?;
+        if !dst_l.is_contiguous() || dst_l.start_offset() != 0 {
+            let mut compact = unsafe { self.device.alloc_uninit(dst_l.shape(), self.dtype)? };
+            self.copy_strided_src(&mut compact, 0, dst_l)?;
+            let dst_cl = Layout::contiguous(dst_l.shape());
+            compact.run_scatter_set_last_dim_f32(&dst_cl, &ids, &ids_l, &src, &src_l)?;
+            compact.copy_strided_src(self, dst_l.start_offset(), dst_l)?;
+            return Ok(());
+        }
+        if (self.dtype != DType::F32 && self.dtype != DType::F16 && self.dtype != DType::U32)
+            || self.dtype != src.dtype
+        {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu scatter_set").bt());
         }
-        if self.dtype == DType::F16
-            && !self
-                .device
-                .inner
-                .features
-                .contains(wgpu::Features::SHADER_F16)
-        {
-            return Err(unsupported("scatter_set f16"));
-        }
-        if ids.dtype != DType::U32 {
-            return Err(Error::UnsupportedDTypeForOp(ids.dtype, "wgpu scatter_set ids").bt());
-        }
-        if !dst_l.is_contiguous() {
-            return Err(unsupported("scatter_set strided dst"));
-        }
-        if !src_l.is_contiguous() {
-            return Err(unsupported("scatter_set strided src"));
-        }
-        if !ids_l.is_contiguous() {
-            return Err(unsupported("scatter_set strided ids"));
+        if wgpu_f16_emulates_f32(&self.device, self.dtype) {
+            let mut dst_f32 = self.to_dtype(dst_l, DType::F32)?;
+            let src_f32 = src.to_dtype(&src_l, DType::F32)?;
+            let dst_f32_layout = Layout::contiguous(dst_l.shape().clone());
+            let src_f32_layout = Layout::contiguous(src_l.shape().clone());
+            dst_f32.run_scatter_set_last_dim_f32(
+                &dst_f32_layout,
+                &ids,
+                &ids_l,
+                &src_f32,
+                &src_f32_layout,
+            )?;
+            *self = dst_f32.to_dtype(&dst_f32_layout, DType::F16)?;
+            return Ok(());
         }
         let rank = dst_l.dims().len();
         if rank == 0 || ids_l.dims().len() != rank || src_l.dims().len() != rank {
@@ -5423,6 +5620,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let shader = match self.dtype {
             DType::F32 => candle_wgpu_kernels::set_rows_f32_shader(WG_SIZE),
             DType::F16 => candle_wgpu_kernels::set_rows_f16_shader(WG_SIZE),
+            DType::U32 => candle_wgpu_kernels::set_rows_u32_shader(WG_SIZE),
             _ => None,
         }
         .ok_or_else(|| Error::Msg("wgpu shader set_rows.wgsl not embedded".into()).bt())?;
@@ -5445,20 +5643,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         src: &Self,
         src_l: &Layout,
     ) -> Result<()> {
+        let (ids, ids_l) = ids.normalize_index_ids(ids_l)?;
+        let (src, src_l) = src.materialize_contiguous(src_l)?;
+        if !dst_l.is_contiguous() || dst_l.start_offset() != 0 {
+            let mut compact = unsafe { self.device.alloc_uninit(dst_l.shape(), self.dtype)? };
+            self.copy_strided_src(&mut compact, 0, dst_l)?;
+            let dst_cl = Layout::contiguous(dst_l.shape());
+            compact.run_scatter_add_last_dim_f32(&dst_cl, &ids, &ids_l, &src, &src_l)?;
+            compact.copy_strided_src(self, dst_l.start_offset(), dst_l)?;
+            return Ok(());
+        }
         if self.dtype != DType::F32 || self.dtype != src.dtype {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu scatter_add").bt());
-        }
-        if ids.dtype != DType::U32 {
-            return Err(Error::UnsupportedDTypeForOp(ids.dtype, "wgpu scatter_add ids").bt());
-        }
-        if !dst_l.is_contiguous() {
-            return Err(unsupported("scatter_add strided dst"));
-        }
-        if !src_l.is_contiguous() {
-            return Err(unsupported("scatter_add strided src"));
-        }
-        if !ids_l.is_contiguous() {
-            return Err(unsupported("scatter_add strided ids"));
         }
         let rank = dst_l.dims().len();
         if rank == 0 || src_l.dims().len() != rank {
@@ -5549,7 +5745,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if self.dtype != rhs.dtype {
             return Err(unsupported("matmul mixed dtype"));
         }
-        if self.dtype != DType::F32 && self.dtype != DType::F16 && self.dtype != DType::BF16 {
+        if self.dtype != DType::F32
+            && self.dtype != DType::F16
+            && self.dtype != DType::BF16
+            && self.dtype != DType::F64
+        {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu matmul").bt());
         }
         let rank = lhs_l.dims().len();
@@ -5586,8 +5786,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if b != lhs_l.dims()[..rank - 2].iter().product::<usize>() {
             return Err(unsupported("matmul batch"));
         }
-        if matches!(self.dtype, DType::F16 | DType::BF16) {
-            // Keep low-precision storage compatibility while executing numerically stable f32 matmul.
+        if matches!(self.dtype, DType::F16 | DType::BF16)
+            || wgpu_f16_emulates_f32(&self.device, self.dtype)
+        {
             let lhs_f32 = self.materialize_to_f32(lhs_l)?;
             let rhs_f32 = rhs.materialize_to_f32(rhs_l)?;
             let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
@@ -5663,12 +5864,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         };
 
         let dst_shape = Shape::from(vec![b, m, n]);
-        let tmp_dtype = if self.dtype == DType::F16 {
-            DType::F32
-        } else {
-            self.dtype
-        };
-        let dst = unsafe { self.device.alloc_uninit(&dst_shape, tmp_dtype)? };
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
         let params = MulMatParams {
             offset_src0: 0,
             offset_src1: lhs_layout.start_offset().try_into()?,
@@ -5713,19 +5909,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             buffer_binding(2, &dst.buffer),
             buffer_binding(3, &param_buffer),
         ];
-        let shader = match self.dtype {
-            DType::F32 => candle_wgpu_kernels::matmul_f32_shader(),
-            DType::F16 => candle_wgpu_kernels::matmul_f16_shader(),
-            _ => None,
-        }
-        .ok_or_else(|| Error::Msg("wgpu shader mul_mat.wgsl not embedded".into()).bt())?;
+        let shader_storage;
+        let matmul_label: &'static str;
+        let shader: &str = match self.dtype {
+            DType::F32 => {
+                matmul_label = "candle-wgpu-matmul";
+                shader_storage = candle_wgpu_kernels::matmul_f32_shader().ok_or_else(|| {
+                    Error::Msg("wgpu shader mul_mat.wgsl not embedded".into()).bt()
+                })?;
+                &shader_storage
+            }
+            DType::F16 => {
+                matmul_label = "candle-wgpu-matmul";
+                shader_storage = candle_wgpu_kernels::matmul_f16_shader().ok_or_else(|| {
+                    Error::Msg("wgpu shader mul_mat.wgsl not embedded".into()).bt()
+                })?;
+                &shader_storage
+            }
+            DType::F64 => {
+                matmul_label = "candle-wgpu-matmul-f64";
+                candle_wgpu_kernels::matmul_f64_shader().ok_or_else(|| {
+                    Error::Msg("wgpu shader mul_mat_f64.wgsl not embedded".into()).bt()
+                })?
+            }
+            _ => {
+                return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu matmul").bt());
+            }
+        };
         let workgroups = (b * m * n).try_into().map(|v: u32| v.div_ceil(WG_SIZE))?;
         self.device.run_compute(
-            &shader,
+            shader,
             &entries,
             &bindings,
             workgroups,
-            "candle-wgpu-matmul",
+            matmul_label,
         )?;
         drop(lhs_contiguous);
         Ok(dst)
@@ -5939,7 +6156,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if src_dtype != kernel.dtype {
             return Err(Error::UnsupportedDTypeForOp(src_dtype, "wgpu conv_transpose1d").bt());
         }
-        if !matches!(src_dtype, DType::F32 | DType::F16) {
+        if !matches!(
+            src_dtype,
+            DType::F32 | DType::F16 | DType::BF16 | DType::F64 | DType::U8
+        ) {
             return Err(Error::UnsupportedDTypeForOp(src_dtype, "wgpu conv_transpose1d").bt());
         }
         let src_len = params
@@ -6046,10 +6266,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         out.copy_strided_src(&mut result, 0, &final_l)?;
         drop(input_t_owned);
         drop(src_owned);
-        if src_dtype == DType::F16 {
-            result.to_dtype(&final_l, DType::F16)
-        } else {
+        if src_dtype == DType::F32 {
             Ok(result)
+        } else {
+            result.to_dtype(&final_l, src_dtype)
         }
     }
 
@@ -6064,7 +6284,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if src_dtype != kernel.dtype {
             return Err(Error::UnsupportedDTypeForOp(src_dtype, "wgpu conv_transpose2d").bt());
         }
-        if !matches!(src_dtype, DType::F32 | DType::F16) {
+        if !matches!(
+            src_dtype,
+            DType::F32 | DType::F16 | DType::BF16 | DType::F64 | DType::U8
+        ) {
             return Err(Error::UnsupportedDTypeForOp(src_dtype, "wgpu conv_transpose2d").bt());
         }
         let input_spatial = params
@@ -6189,10 +6412,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         out.copy_strided_src(&mut result, 0, &final_l)?;
         drop(input_hw_owned);
         drop(src_owned);
-        if src_dtype == DType::F16 {
-            result.to_dtype(&final_l, DType::F16)
-        } else {
+        if src_dtype == DType::F32 {
             Ok(result)
+        } else {
+            result.to_dtype(&final_l, src_dtype)
         }
     }
 
@@ -6954,7 +7177,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     fn run_int_reduce(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
         let rank = layout.dims().len();
         if rank == 0 {
-            return Err(unsupported("int reduce rank-0"));
+            return self.try_clone(layout);
         }
         if reduce_dims.is_empty() {
             return self.try_clone(layout);
@@ -7230,7 +7453,7 @@ impl BackendStorage for WgpuStorage {
         }
         let rank = layout.dims().len();
         if rank == 0 {
-            crate::bail!("wgpu backend op reduce does not support rank-0 tensors")
+            return self.try_clone(layout);
         }
         if reduce_dims.is_empty() {
             return self.try_clone(layout);
@@ -7351,6 +7574,13 @@ impl BackendStorage for WgpuStorage {
         if self.dtype == DType::BF16 {
             return self.bf16_cmp_via_f32(rhs, lhs_l, rhs_l, op);
         }
+        if wgpu_f16_emulates_f32(&self.device, self.dtype) {
+            let lhs_f32 = self.materialize_to_f32(lhs_l)?;
+            let rhs_f32 = rhs.materialize_to_f32(rhs_l)?;
+            let lhs_l = Layout::contiguous(lhs_l.shape());
+            let rhs_l = Layout::contiguous(rhs_l.shape());
+            return lhs_f32.run_cmp_u8(&rhs_f32, &lhs_l, &rhs_l, op);
+        }
         self.run_cmp_u8(rhs, lhs_l, rhs_l, op)
     }
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
@@ -7359,24 +7589,42 @@ impl BackendStorage for WgpuStorage {
             return materialized.to_dtype(&compact_layout, dtype);
         }
         let f16_involved = self.dtype == DType::F16 || dtype == DType::F16;
-        let gpu = if f16_involved
-            && !self
-                .device
-                .inner
-                .features
-                .contains(wgpu::Features::SHADER_F16)
-        {
-            Err(unsupported("to_dtype f16"))
-        } else {
+        let gpu = if f16_involved && !wgpu_shader_f16_enabled(&self.device) {
             if matches!(
                 (self.dtype, dtype),
                 (DType::F32, DType::F64) | (DType::F64, DType::F32) | (DType::F64, DType::F64)
             ) {
                 self.run_f64_f32_cast(layout, dtype)
+            } else if dtype == DType::F64 || self.dtype == DType::F64 {
+                let f32 = self.materialize_to_f32(layout)?;
+                f32.to_dtype(&Layout::contiguous(layout.shape()), dtype)
             } else {
-                match copy_shader(self.dtype, dtype) {
-                    Ok(shader) => self.run_copy_to_dtype(layout, dtype, &shader),
-                    Err(_) => self.run_emulated_cast(layout, dtype),
+                self.run_emulated_cast(layout, dtype)
+            }
+        } else if matches!(
+            (self.dtype, dtype),
+            (DType::F32, DType::F64) | (DType::F64, DType::F32) | (DType::F64, DType::F64)
+        ) {
+            self.run_f64_f32_cast(layout, dtype)
+        } else {
+            match copy_shader(self.dtype, dtype) {
+                Ok(shader) => self.run_copy_to_dtype(layout, dtype, &shader),
+                Err(_) => {
+                    if self.dtype == DType::F64 || dtype == DType::F64 {
+                        let layout_c = Layout::contiguous(layout.shape());
+                        let f32 = if self.dtype == DType::F32 {
+                            if layout.is_contiguous() && layout.start_offset() == 0 {
+                                self.try_clone(layout)?
+                            } else {
+                                self.materialize_to_f32(layout)?
+                            }
+                        } else {
+                            self.materialize_to_f32(layout)?
+                        };
+                        f32.to_dtype(&layout_c, dtype)
+                    } else {
+                        self.run_emulated_cast(layout, dtype)
+                    }
                 }
             }
         };
@@ -7388,11 +7636,7 @@ impl BackendStorage for WgpuStorage {
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
         if self.dtype == DType::F16
             && (matches!(B::NAME, "erf" | "recip")
-                || !self
-                    .device
-                    .inner
-                    .features
-                    .contains(wgpu::Features::SHADER_F16))
+                || !wgpu_shader_f16_enabled(&self.device))
         {
             let src_f32 = self.materialize_to_f32(layout)?;
             let src_l = if layout.dims().len() > 4 {
@@ -7402,6 +7646,16 @@ impl BackendStorage for WgpuStorage {
             };
             let out_f32 = src_f32.unary_impl::<B>(&src_l)?;
             return out_f32.to_dtype(&src_l, DType::F16);
+        }
+        if self.dtype == DType::F64 {
+            let src_l = if layout.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+            } else {
+                Layout::contiguous(layout.shape())
+            };
+            let src_f32 = self.to_dtype(layout, DType::F32)?;
+            let out_f32 = src_f32.unary_impl::<B>(&src_l)?;
+            return out_f32.to_dtype(&src_l, DType::F64);
         }
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             if self.dtype == DType::BF16 {
@@ -7448,6 +7702,22 @@ impl BackendStorage for WgpuStorage {
             };
             let out_f32 = lhs_f32.binary_impl::<B>(&rhs_f32, &lhs_l, &rhs_l)?;
             return out_f32.to_dtype(&lhs_l, DType::F16);
+        }
+        if self.dtype == DType::F64 {
+            let lhs_l = if lhs_layout.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(lhs_layout))
+            } else {
+                Layout::contiguous(lhs_layout.shape())
+            };
+            let rhs_l = if rhs_layout.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(rhs_layout))
+            } else {
+                Layout::contiguous(rhs_layout.shape())
+            };
+            let lhs_f32 = self.to_dtype(lhs_layout, DType::F32)?;
+            let rhs_f32 = rhs.to_dtype(rhs_layout, DType::F32)?;
+            let out_f32 = lhs_f32.binary_impl::<B>(&rhs_f32, &lhs_l, &rhs_l)?;
+            return out_f32.to_dtype(&lhs_l, DType::F64);
         }
         if !matches!(
             self.dtype,
@@ -7579,6 +7849,29 @@ impl BackendStorage for WgpuStorage {
         if t.dtype == DType::BF16 {
             return self.bf16_where_via_f32(layout, t, t_l, f, f_l);
         }
+        if wgpu_f16_emulates_f32(&t.device, t.dtype) {
+            let t_f32 = t.materialize_to_f32(t_l)?;
+            let f_f32 = f.materialize_to_f32(f_l)?;
+            let layout_l = if layout.dims().len() > 4 {
+                let (cond, cond_l) = self.materialize_rank_gt4_compact(layout)?;
+                let out_f32 = cond.run_where_u8_cond(&cond_l, &t_f32, t_l, &f_f32, f_l)?;
+                return out_f32.to_dtype(&cond_l, DType::F16);
+            } else {
+                Layout::contiguous(layout.shape())
+            };
+            let t_l = if t_l.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(t_l))
+            } else {
+                Layout::contiguous(t_l.shape())
+            };
+            let f_l = if f_l.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(f_l))
+            } else {
+                Layout::contiguous(f_l.shape())
+            };
+            let out_f32 = self.run_where_u8_cond(layout, &t_f32, &t_l, &f_f32, &f_l)?;
+            return out_f32.to_dtype(&layout_l, DType::F16);
+        }
         self.run_where_u8_cond(layout, t, t_l, f, f_l)
     }
     fn conv1d(
@@ -7588,7 +7881,17 @@ impl BackendStorage for WgpuStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
-        self.run_conv1d_f32(layout, kernel, kernel_l, params)
+        let out_shape = Shape::from(params.out_dims());
+        self.cuda_parity_conv_via_f32(
+            layout,
+            kernel,
+            kernel_l,
+            &out_shape,
+            "wgpu conv1d",
+            |input, input_l, kernel, kernel_l| {
+                input.run_conv1d_f32(input_l, kernel, kernel_l, params)
+            },
+        )
     }
     fn conv_transpose1d(
         &self,
@@ -7606,7 +7909,17 @@ impl BackendStorage for WgpuStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        self.run_conv2d_f32(layout, kernel, kernel_l, params)
+        let out_shape = Shape::from(params.out_dims());
+        self.cuda_parity_conv_via_f32(
+            layout,
+            kernel,
+            kernel_l,
+            &out_shape,
+            "wgpu conv2d",
+            |input, input_l, kernel, kernel_l| {
+                input.run_conv2d_f32(input_l, kernel, kernel_l, params)
+            },
+        )
     }
     fn conv_transpose2d(
         &self,
@@ -7623,7 +7936,16 @@ impl BackendStorage for WgpuStorage {
         kernel_size: (usize, usize),
         stride: (usize, usize),
     ) -> Result<Self> {
-        self.run_pool2d_im2col_f32(layout, kernel_size, stride, false)
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let out_shape = Shape::from(vec![
+            b,
+            c,
+            (h - kernel_size.0) / stride.0 + 1,
+            (w - kernel_size.1) / stride.1 + 1,
+        ]);
+        self.gpu_resident_via_f32(layout, &out_shape, "wgpu avg_pool2d", |src, src_l| {
+            src.run_pool2d_im2col_f32(src_l, kernel_size, stride, false)
+        })
     }
     fn max_pool2d(
         &self,
@@ -7631,20 +7953,32 @@ impl BackendStorage for WgpuStorage {
         kernel_size: (usize, usize),
         stride: (usize, usize),
     ) -> Result<Self> {
-        self.run_pool2d_im2col_f32(layout, kernel_size, stride, true)
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let out_shape = Shape::from(vec![
+            b,
+            c,
+            (h - kernel_size.0) / stride.0 + 1,
+            (w - kernel_size.1) / stride.1 + 1,
+        ]);
+        self.gpu_resident_via_f32(layout, &out_shape, "wgpu max_pool2d", |src, src_l| {
+            src.run_pool2d_im2col_f32(src_l, kernel_size, stride, true)
+        })
     }
     fn upsample_nearest1d(&self, layout: &Layout, out_l: usize) -> Result<Self> {
         self.run_upsample_nearest1d_f32(layout, out_l)
     }
     fn upsample_nearest2d(&self, layout: &Layout, out_h: usize, out_w: usize) -> Result<Self> {
-        let (_, _, h, w) = layout.shape().dims4()?;
-        self.run_upsample2d_f32(
-            layout,
-            out_h,
-            out_w,
-            nearest_interp_weights(h, out_h),
-            nearest_interp_weights(w, out_w),
-        )
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let out_shape = Shape::from(vec![b, c, out_h, out_w]);
+        self.gpu_resident_via_f32(layout, &out_shape, "wgpu upsample_nearest2d", |src, src_l| {
+            src.run_upsample2d_f32(
+                src_l,
+                out_h,
+                out_w,
+                nearest_interp_weights(h, out_h),
+                nearest_interp_weights(w, out_w),
+            )
+        })
     }
     fn upsample_bilinear2d(
         &self,
@@ -7655,14 +7989,17 @@ impl BackendStorage for WgpuStorage {
         scale_h: Option<f64>,
         scale_w: Option<f64>,
     ) -> Result<Self> {
-        let (_, _, h, w) = layout.shape().dims4()?;
-        self.run_upsample2d_f32(
-            layout,
-            out_h,
-            out_w,
-            bilinear_interp_weights(h, out_h, align_corners, scale_h),
-            bilinear_interp_weights(w, out_w, align_corners, scale_w),
-        )
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let out_shape = Shape::from(vec![b, c, out_h, out_w]);
+        self.gpu_resident_via_f32(layout, &out_shape, "wgpu upsample_bilinear2d", |src, src_l| {
+            src.run_upsample2d_f32(
+                src_l,
+                out_h,
+                out_w,
+                bilinear_interp_weights(h, out_h, align_corners, scale_h),
+                bilinear_interp_weights(w, out_w, align_corners, scale_w),
+            )
+        })
     }
     fn gather(&self, src_l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
         let rank = src_l.dims().len();
@@ -8040,7 +8377,14 @@ impl BackendDevice for WgpuDevice {
         let adapter_info = adapter.get_info();
         let adapter_features = adapter.features();
         let adapter_limits = adapter.limits();
-        let required_features = adapter_features & wgpu::Features::SHADER_F16;
+        if !adapter_features.contains(wgpu::Features::SHADER_F64) {
+            return Err(Error::msg(format!(
+                "wgpu adapter {:?} does not support SHADER_F64 (required for native f64)",
+                adapter_info.name
+            )));
+        }
+        let required_features = wgpu::Features::SHADER_F64
+            | (adapter_features & wgpu::Features::SHADER_F16);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("candle-wgpu"),
             required_features,

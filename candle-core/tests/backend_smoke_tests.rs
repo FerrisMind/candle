@@ -99,7 +99,6 @@ fn backend_smoke_dummy_vulkan_does_not_claim_bf16() {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_reports_adapter_identity() -> Result<()> {
     let _guard = support::fallback_counter_guard();
     let Some(device) = backend_device_or_skip(
@@ -140,7 +139,6 @@ fn backend_smoke_vulkan_reports_physical_device_identity() -> Result<()> {
 
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_upload_and_dtype,
     TestBackend::Wgpu,
     fallback_allowed,
@@ -155,7 +153,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_unary_binary,
     TestBackend::Wgpu,
     fallback_allowed,
@@ -170,7 +167,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_reductions,
     TestBackend::Wgpu,
     fallback_allowed,
@@ -185,7 +181,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_shape_layout,
     TestBackend::Wgpu,
     fallback_allowed,
@@ -200,7 +195,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_matmul_conv_pool,
     TestBackend::Wgpu,
     fallback_allowed,
@@ -215,7 +209,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_to_device_transfers_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -230,7 +223,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_dtype_conversion_matrix_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -245,7 +237,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_strided_dtype_conversion_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -260,7 +251,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_f64_cuda_cast_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -275,7 +265,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_rand_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -290,7 +279,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_strided_const_set_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -305,7 +293,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_i16_layout_copy_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -320,7 +307,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_matmul_shape_sweep_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -335,7 +321,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_bf16_matmul_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -350,7 +335,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_f16_affine_minmax_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -365,7 +349,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_half_cumsum_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -380,7 +363,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_quantized_paths,
     TestBackend::Wgpu,
     native_required,
@@ -395,7 +377,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_rank5_native_policy,
     TestBackend::Wgpu,
     native_required,
@@ -410,7 +391,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_rank5_matmul_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -425,7 +405,6 @@ backend_family_test!(
 );
 backend_family_test!(
     #[cfg(feature = "wgpu")]
-    #[ignore = "requires a usable wgpu adapter and driver"]
     backend_smoke_wgpu_rank5_cumsum_native_only,
     TestBackend::Wgpu,
     native_required,
@@ -511,7 +490,6 @@ fn backend_smoke_vulkan_q8_1_qmatmul_regression() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_q8_1_quantized_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_q8_1_quantized_native_only",
@@ -522,7 +500,6 @@ fn backend_smoke_wgpu_q8_1_quantized_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_q8k_quantized_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_q8k_quantized_native_only",
@@ -533,7 +510,6 @@ fn backend_smoke_wgpu_q8k_quantized_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_quantized_dequantize_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_quantized_dequantize_native_only",
@@ -592,7 +568,6 @@ fn backend_smoke_vulkan_powf_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_cmp_where_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_cmp_where_native_only",
@@ -613,7 +588,6 @@ fn backend_smoke_vulkan_cmp_where_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_bf16_cmp_where_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_bf16_cmp_where_native_only",
@@ -634,7 +608,6 @@ fn backend_smoke_vulkan_bf16_cmp_where_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_int_cmp_where_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_int_cmp_where_native_only",
@@ -655,7 +628,6 @@ fn backend_smoke_vulkan_int_cmp_where_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_int_binary_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_int_binary_native_only",
@@ -686,7 +658,6 @@ fn backend_smoke_vulkan_int_reductions_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_int_reductions_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_int_reductions_native_only",
@@ -707,7 +678,6 @@ fn backend_smoke_vulkan_bf16_unary_binary_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_bf16_unary_binary_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_bf16_unary_binary_native_only",
@@ -728,7 +698,6 @@ fn backend_smoke_vulkan_bf16_reductions_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_bf16_reductions_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_bf16_reductions_native_only",
@@ -739,7 +708,6 @@ fn backend_smoke_wgpu_bf16_reductions_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_scatter_add_index_add_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_scatter_add_index_add_native_only",
@@ -760,7 +728,6 @@ fn backend_smoke_vulkan_scatter_add_index_add_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_shape_indexing_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_shape_indexing_native_only",
@@ -771,7 +738,6 @@ fn backend_smoke_wgpu_shape_indexing_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_argsort_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_argsort_native_only",
@@ -802,7 +768,6 @@ fn backend_smoke_vulkan_argsort_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_upsample_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_upsample_native_only",
@@ -813,7 +778,6 @@ fn backend_smoke_wgpu_upsample_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
-#[ignore = "requires a usable wgpu adapter and driver"]
 fn backend_smoke_wgpu_conv_transpose_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_conv_transpose_native_only",
@@ -1470,6 +1434,15 @@ fn smoke_rand_native_only(device: &Device) -> Result<()> {
         u1.to_vec1::<f32>()?,
         u_other.to_vec1::<f32>()?,
         "rand_uniform must change when the seed changes"
+    );
+
+    device.set_seed(123)?;
+    let stream_a = Tensor::rand(0.0f32, 1.0f32, (64,), device)?;
+    let stream_b = Tensor::rand(0.0f32, 1.0f32, (64,), device)?;
+    assert_ne!(
+        stream_a.to_vec1::<f32>()?,
+        stream_b.to_vec1::<f32>()?,
+        "consecutive rand calls without set_seed must advance the RNG stream"
     );
 
     let ranged = Tensor::rand(2.0f32, 5.0f32, (64,), device)?;
@@ -4013,6 +3986,7 @@ fn smoke_int_binary_ops(device: &Device) -> Result<()> {
         ((&ga + &gb)?, (&ca + &cb)?),
         ((&ga - &gb)?, (&ca - &cb)?),
         ((&ga * &gb)?, (&ca * &cb)?),
+        ((&ga / &gb)?, (&ca / &cb)?),
         (ga.maximum(&gb)?, ca.maximum(&cb)?),
         (ga.minimum(&gb)?, ca.minimum(&cb)?),
     ] {

@@ -1,0 +1,67 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Src0 { float64_t src0[]; };
+layout(binding = 1) readonly buffer Src1 { float64_t src1[]; };
+layout(binding = 2) writeonly buffer Dst { float64_t dst[]; };
+
+layout(push_constant) uniform parameter {
+    uint offset_src0;
+    uint offset_src1;
+    uint offset_dst;
+    uint m;
+    uint n;
+    uint k;
+    uint stride_01;
+    uint stride_11;
+    uint stride_02;
+    uint stride_12;
+    uint stride_03;
+    uint stride_13;
+    uint bs02;
+    uint bs03;
+    uint broadcast2;
+    uint broadcast3;
+} p;
+
+void main() {
+    const uint global_idx = gl_GlobalInvocationID.x;
+    const uint total = p.m * p.n * p.bs02 * p.broadcast2 * p.bs03 * p.broadcast3;
+    if (global_idx >= total) {
+        return;
+    }
+
+    const uint dst2_stride = p.m * p.n;
+    const uint dst3_stride = dst2_stride * p.bs02 * p.broadcast2;
+
+    const uint dst3_idx = global_idx / dst3_stride;
+    const uint src03_idx = dst3_idx / p.broadcast3;
+    const uint src13_idx = dst3_idx;
+    const uint dst3_rem = global_idx % dst3_stride;
+
+    const uint dst2_idx = dst3_rem / dst2_stride;
+    const uint src02_idx = dst2_idx / p.broadcast2;
+    const uint src12_idx = dst2_idx;
+    const uint dst2_rem = dst3_rem % dst2_stride;
+
+    const uint row = dst2_rem / p.m;
+    const uint col = dst2_rem % p.m;
+
+    const uint src0_idx_base =
+        p.offset_src0 + src03_idx * p.stride_03 + src02_idx * p.stride_02 + col * p.stride_01;
+    const uint src1_idx_base =
+        p.offset_src1 + src13_idx * p.stride_13 + src12_idx * p.stride_12 + row * p.stride_11;
+
+    float64_t sum = float64_t(0.0);
+    for (uint i = 0u; i < p.k; i++) {
+        sum += src0[src0_idx_base + i] * src1[src1_idx_base + i];
+    }
+
+    const uint dst_idx =
+        p.offset_dst + dst3_idx * dst3_stride + dst2_idx * dst2_stride + row * p.m + col;
+    dst[dst_idx] = sum;
+}

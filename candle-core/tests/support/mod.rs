@@ -153,6 +153,48 @@ where
     run_backend_case(test_name, backend, FallbackPolicy::NativeRequired, body)
 }
 
+/// CUDA reference device for wgpu/vulkan parity matrix tests.
+#[cfg(feature = "cuda")]
+pub fn cuda_device_or_skip(test_name: &str) -> Result<Option<Device>> {
+    let require_device = std::env::var_os("CANDLE_REQUIRE_CUDA_TEST_DEVICE").is_some();
+    match Device::new_cuda(0) {
+        Ok(device) => Ok(Some(device)),
+        Err(err) if require_device => Err(err),
+        Err(err) => {
+            eprintln!("skipping {test_name}: cuda device unavailable: {err}");
+            Ok(None)
+        }
+    }
+}
+
+/// Run a parity body against wgpu/vulkan (`under_test`) with CUDA as reference.
+#[cfg(feature = "cuda")]
+pub fn native_required_cuda_parity<F>(test_name: &str, backend: TestBackend, body: F) -> Result<()>
+where
+    F: FnOnce(&Device, &Device) -> Result<()>,
+{
+    let _guard = fallback_counter_guard();
+    let Some(cuda) = cuda_device_or_skip(test_name)? else {
+        return Ok(());
+    };
+    let Some(under_test) = backend_device_or_skip(test_name, backend)? else {
+        return Ok(());
+    };
+    reset_backend_fallback_count(backend);
+    body(&under_test, &cuda)?;
+    under_test.synchronize()?;
+    cuda.synchronize()?;
+    let fallback_count = backend_fallback_count(backend);
+    assert_eq!(
+        fallback_count,
+        0,
+        "{test_name}: {} path triggered {} CPU fallbacks",
+        backend_name(backend),
+        fallback_count
+    );
+    Ok(())
+}
+
 pub fn backend_fallback_count(backend: TestBackend) -> usize {
     match backend {
         TestBackend::Wgpu => candle_core::wgpu_cpu_fallback_count(),
@@ -212,14 +254,35 @@ pub fn assert_close_vec(actual: &[f32], expected: &[f32], dtype: DType, label: &
     Ok(())
 }
 
+pub fn assert_close_f64_vec(actual: &[f64], expected: &[f64], label: &str) -> Result<()> {
+    if actual.len() != expected.len() {
+        candle_core::bail!(
+            "{label}: length mismatch, got {}, expected {}",
+            actual.len(),
+            expected.len()
+        );
+    }
+    let (atol, rtol) = tolerance(DType::F64);
+    let atol = atol as f64;
+    let rtol = rtol as f64;
+    for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+        let diff = (actual - expected).abs();
+        let tol = atol + rtol * actual.abs().max(expected.abs());
+        if diff > tol {
+            candle_core::bail!(
+                "{label}: mismatch at idx {idx}: got {actual}, expected {expected}, diff {diff}, tol {tol}"
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn assert_tensors_close(
     actual: &Tensor,
     expected: &Tensor,
     dtype: DType,
     label: &str,
 ) -> Result<()> {
-    let actual = actual.to_dtype(DType::F32)?;
-    let expected = expected.to_dtype(DType::F32)?;
     if actual.dims() != expected.dims() {
         candle_core::bail!(
             "{label}: shape mismatch, got {:?}, expected {:?}",
@@ -227,6 +290,13 @@ pub fn assert_tensors_close(
             expected.dims()
         );
     }
+    if dtype == DType::F64 {
+        let actual_vals = actual.flatten_all()?.to_vec1::<f64>()?;
+        let expected_vals = expected.flatten_all()?.to_vec1::<f64>()?;
+        return assert_close_f64_vec(&actual_vals, &expected_vals, label);
+    }
+    let actual = actual.to_dtype(DType::F32)?;
+    let expected = expected.to_dtype(DType::F32)?;
     let actual_vals = actual.flatten_all()?.to_vec1::<f32>()?;
     let expected_vals = expected.flatten_all()?.to_vec1::<f32>()?;
     assert_close_vec(&actual_vals, &expected_vals, dtype, label)
@@ -275,6 +345,47 @@ fn tolerance(dtype: DType) -> (f32, f32) {
     match dtype {
         DType::F16 => (1e-2, 1e-3),
         DType::BF16 => (1e-2, 1e-2),
+        DType::F64 => (1e-6, 1e-5),
         _ => (1e-4, 1e-4),
     }
 }
+
+/// Probe whether CUDA supports `src -> dst` cast for P0 parity rows (same size as cast matrix).
+#[cfg(feature = "cuda")]
+pub fn cuda_cast_supported(cuda: &Device, src: DType, dst: DType) -> bool {
+    let vals: Vec<f32> = (0..64).map(|v| v as f32 / 8.0).collect();
+    let Ok(base) = Tensor::from_vec(vals, 64, cuda) else {
+        return false;
+    };
+    let Ok(src_t) = base.to_dtype(src) else {
+        return false;
+    };
+    if src == dst {
+        return true;
+    }
+    src_t.to_dtype(dst).is_ok()
+}
+
+/// Returns true when both results are unsupported-dtype errors (CUDA parity for rejected paths).
+pub fn assert_same_error_class(got: &Result<Tensor>, want: &Result<Tensor>, label: &str) -> Result<()> {
+    match (got, want) {
+        (Ok(_), Ok(_)) => candle_core::bail!("{label}: expected both casts to fail"),
+        (Err(_), Err(_)) => Ok(()),
+        (Ok(_), Err(_)) => candle_core::bail!("{label}: under_test succeeded but CUDA rejected"),
+        (Err(_), Ok(_)) => candle_core::bail!("{label}: under_test rejected but CUDA succeeded"),
+    }
+}
+
+/// P0 cast matrix dtypes. Rows where CUDA rejects a pair are skipped via [`cuda_cast_supported`].
+pub const P0_CAST_DTYPES: &[DType] = &[
+    DType::F32,
+    DType::F16,
+    DType::BF16,
+    DType::U8,
+    DType::U32,
+    DType::I16,
+    DType::I32,
+    DType::I64,
+    DType::F64,
+    DType::F8E4M3,
+];
