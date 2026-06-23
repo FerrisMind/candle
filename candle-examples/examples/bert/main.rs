@@ -53,22 +53,53 @@ struct Args {
     /// Include padding token embeddings when performing mean pooling. By default, these are masked away.
     #[arg(long, default_value = "false")]
     include_padding_embeddings: bool,
+
+    /// Local model directory (config.json, tokenizer.json, model.safetensors).
+    #[arg(long)]
+    weight_path: Option<String>,
+
+    #[arg(long)]
+    config_file: Option<String>,
+
+    #[arg(long)]
+    tokenizer_file: Option<String>,
+
+    #[arg(long)]
+    model_file: Option<String>,
 }
 
 impl Args {
     fn build_model_and_tokenizer(&self) -> Result<(BertModel, Tokenizer)> {
         let device = candle_examples::device(self.cpu)?;
-        let default_model = "sentence-transformers/all-MiniLM-L6-v2".to_string();
-        let default_revision = "refs/pr/21".to_string();
-        let (model_id, revision) = match (self.model_id.to_owned(), self.revision.to_owned()) {
-            (Some(model_id), Some(revision)) => (model_id, revision),
-            (Some(model_id), None) => (model_id, "main".to_string()),
-            (None, Some(revision)) => (default_model, revision),
-            (None, None) => (default_model, default_revision),
-        };
+        let (config_filename, tokenizer_filename, weights_filename) = if let Some(path) =
+            &self.weight_path
+        {
+            let path = std::path::Path::new(path);
+            (
+                self.config_file
+                    .as_ref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| path.join("config.json")),
+                self.tokenizer_file
+                    .as_ref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| path.join("tokenizer.json")),
+                self.model_file
+                    .as_ref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| path.join("model.safetensors")),
+            )
+        } else {
+            let default_model = "sentence-transformers/all-MiniLM-L6-v2".to_string();
+            let default_revision = "refs/pr/21".to_string();
+            let (model_id, revision) = match (self.model_id.to_owned(), self.revision.to_owned()) {
+                (Some(model_id), Some(revision)) => (model_id, revision),
+                (Some(model_id), None) => (model_id, "main".to_string()),
+                (None, Some(revision)) => (default_model, revision),
+                (None, None) => (default_model, default_revision),
+            };
 
-        let repo = Repo::with_revision(model_id, RepoType::Model, revision);
-        let (config_filename, tokenizer_filename, weights_filename) = {
+            let repo = Repo::with_revision(model_id, RepoType::Model, revision);
             let api = Api::new()?;
             let api = api.repo(repo);
             let config = api.get("config.json")?;

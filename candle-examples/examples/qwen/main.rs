@@ -70,18 +70,23 @@ impl TextGeneration {
     }
 
     fn run(&mut self, prompt: &str, sample_len: usize) -> Result<()> {
-        use std::io::Write;
-        self.tokenizer.clear();
-        let mut tokens = self
+        let tokens = self
             .tokenizer
             .tokenizer()
             .encode(prompt, true)
             .map_err(E::msg)?
             .get_ids()
             .to_vec();
+        self.run_tokens(tokens, sample_len)
+    }
+
+    fn run_tokens(&mut self, tokens: Vec<u32>, sample_len: usize) -> Result<()> {
+        use std::io::Write;
+        self.tokenizer.clear();
+        let prompt_len = tokens.len();
         for &t in tokens.iter() {
             if let Some(t) = self.tokenizer.next_token(t)? {
-                print!("{t}")
+                print!("{t}");
             }
         }
         std::io::stdout().flush()?;
@@ -95,7 +100,10 @@ impl TextGeneration {
             Some(token) => token,
             None => anyhow::bail!("cannot find the <|im_end|> token"),
         };
-        let start_gen = std::time::Instant::now();
+        let start_prefill = std::time::Instant::now();
+        let mut start_decode = start_prefill;
+        let mut prompt_dt = None;
+        let mut tokens = tokens;
         for index in 0..sample_len {
             let context_size = if index > 0 { 1 } else { tokens.len() };
             let start_pos = tokens.len().saturating_sub(context_size);
@@ -117,6 +125,10 @@ impl TextGeneration {
             let next_token = self.logits_processor.sample(&logits)?;
             tokens.push(next_token);
             generated_tokens += 1;
+            if index == 0 {
+                prompt_dt = Some(start_prefill.elapsed());
+                start_decode = std::time::Instant::now();
+            }
             if next_token == eos_token || next_token == eos_token2 {
                 break;
             }
@@ -125,15 +137,24 @@ impl TextGeneration {
                 std::io::stdout().flush()?;
             }
         }
-        let dt = start_gen.elapsed();
         if let Some(rest) = self.tokenizer.decode_rest().map_err(E::msg)? {
             print!("{rest}");
         }
         std::io::stdout().flush()?;
-        println!(
-            "\n{generated_tokens} tokens generated ({:.2} token/s)",
-            generated_tokens as f64 / dt.as_secs_f64(),
-        );
+        if let Some(pt) = prompt_dt {
+            println!(
+                "\n{prompt_len:4} prompt tokens processed: {:.2} token/s",
+                prompt_len as f64 / pt.as_secs_f64(),
+            );
+        }
+        let decode_tokens = generated_tokens.saturating_sub(1);
+        if decode_tokens > 0 {
+            let dt = start_decode.elapsed();
+            println!(
+                "{decode_tokens:4} tokens generated: {:.2} token/s",
+                decode_tokens as f64 / dt.as_secs_f64(),
+            );
+        }
         Ok(())
     }
 }
@@ -186,7 +207,11 @@ struct Args {
     tracing: bool,
 
     #[arg(long)]
-    prompt: String,
+    prompt: Option<String>,
+
+    /// Synthesize a fixed-length prompt for prefill/decode benchmarks (llama-bench style).
+    #[arg(long)]
+    bench_prompt_tokens: Option<usize>,
 
     /// The temperature used to generate samples.
     #[arg(long)]
@@ -410,7 +435,16 @@ fn main() -> Result<()> {
         args.repeat_last_n,
         &device,
     );
-    let prompt = format_prompt(&args.prompt, use_chat_template, thinking);
-    pipeline.run(&prompt, args.sample_len)?;
+    let prompt = format_prompt(
+        args.prompt.as_deref().unwrap_or("bench"),
+        use_chat_template,
+        thinking,
+    );
+    if let Some(n) = args.bench_prompt_tokens {
+        let tokens = candle_examples::bench_prompt_token_ids(pipeline.tokenizer.tokenizer(), n)?;
+        pipeline.run_tokens(tokens, args.sample_len)?;
+    } else {
+        pipeline.run(&prompt, args.sample_len)?;
+    }
     Ok(())
 }

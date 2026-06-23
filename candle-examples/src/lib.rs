@@ -11,6 +11,30 @@ use candle::utils::{
 use candle::{Device, Result, Tensor};
 use std::env;
 
+/// Repeat a short fragment until the tokenizer emits at least `n` tokens, then truncate.
+pub fn bench_prompt_token_ids(tokenizer: &tokenizers::Tokenizer, n: usize) -> Result<Vec<u32>> {
+    if n == 0 {
+        return Ok(vec![]);
+    }
+    let mut text = String::new();
+    while tokenizer
+        .encode(text.as_str(), false)
+        .map_err(candle::Error::wrap)?
+        .get_ids()
+        .len()
+        < n
+    {
+        text.push_str("the ");
+    }
+    let mut ids = tokenizer
+        .encode(text.as_str(), false)
+        .map_err(candle::Error::wrap)?
+        .get_ids()
+        .to_vec();
+    ids.truncate(n);
+    Ok(ids)
+}
+
 pub fn device(cpu: bool) -> Result<Device> {
     if cpu || matches!(env::var("CANDLE_DEVICE").ok().as_deref(), Some("cpu")) {
         Ok(Device::Cpu)

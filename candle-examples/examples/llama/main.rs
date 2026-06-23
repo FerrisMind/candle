@@ -88,6 +88,10 @@ struct Args {
     #[arg(long)]
     no_kv_cache: bool,
 
+    /// Synthesize a fixed-length prompt for prefill/decode benchmarks (llama-bench style).
+    #[arg(long)]
+    bench_prompt_tokens: Option<usize>,
+
     /// The initial prompt.
     #[arg(long)]
     prompt: Option<String>,
@@ -105,6 +109,16 @@ struct Args {
 
     #[arg(long)]
     revision: Option<String>,
+
+    /// Local model directory (config.json, tokenizer.json, model.safetensors).
+    #[arg(long)]
+    weight_path: Option<String>,
+
+    #[arg(long)]
+    config_file: Option<String>,
+
+    #[arg(long)]
+    tokenizer_file: Option<String>,
 
     /// The model size to use.
     #[arg(long, default_value = "v3")]
@@ -145,67 +159,90 @@ fn main() -> Result<()> {
         None => DType::F16,
     };
     let (llama, tokenizer_filename, mut cache, config) = {
-        let api = Api::new()?;
-        let model_id = args.model_id.unwrap_or_else(|| {
-            let str = match args.which {
-                Which::V1 => "Narsil/amall-7b",
-                Which::V2 => "meta-llama/Llama-2-7b-hf",
-                Which::V3 => "meta-llama/Meta-Llama-3-8B",
-                Which::V3Instruct => "meta-llama/Meta-Llama-3-8B-Instruct",
-                Which::V31 => "meta-llama/Llama-3.1-8B",
-                Which::V31Instruct => "meta-llama/Llama-3.1-8B-Instruct",
-                Which::V32_1b => "meta-llama/Llama-3.2-1B",
-                Which::V32_1bInstruct => "meta-llama/Llama-3.2-1B-Instruct",
-                Which::V32_3b => "meta-llama/Llama-3.2-3B",
-                Which::V32_3bInstruct => "meta-llama/Llama-3.2-3B-Instruct",
-                Which::Solar10_7B => "upstage/SOLAR-10.7B-v1.0",
-                Which::TinyLlama1_1BChat => "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                Which::SmolLM2_135M => "HuggingFaceTB/SmolLM2-135M",
-                Which::SmolLM2_135MInstruct => "HuggingFaceTB/SmolLM2-135M-Instruct",
-                Which::SmolLM2_360M => "HuggingFaceTB/SmolLM2-360M",
-                Which::SmolLM2_360MInstruct => "HuggingFaceTB/SmolLM2-360M-Instruct",
-                Which::SmolLM2_1B => "HuggingFaceTB/SmolLM2-1.7B",
-                Which::SmolLM2_1BInstruct => "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        if let Some(weight_path) = &args.weight_path {
+            let path = std::path::Path::new(weight_path);
+            println!("loading local model from {}", path.display());
+            let config_filename = match &args.config_file {
+                Some(f) => std::path::PathBuf::from(f),
+                None => path.join("config.json"),
             };
-            str.to_string()
-        });
-        println!("loading the model weights from {model_id}");
-        let revision = args.revision.unwrap_or("main".to_string());
-        let api = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
+            let tokenizer_filename = match &args.tokenizer_file {
+                Some(f) => std::path::PathBuf::from(f),
+                None => path.join("tokenizer.json"),
+            };
+            let config: LlamaConfig = serde_json::from_slice(&std::fs::read(config_filename)?)?;
+            let config = config.into_config(args.use_flash_attn);
+            let filenames = if path.join("model.safetensors.index.json").exists() {
+                candle_examples::hub_load_local_safetensors(path, "model.safetensors.index.json")?
+            } else {
+                vec![path.join("model.safetensors")]
+            };
+            let cache = model::Cache::new(!args.no_kv_cache, dtype, &config, &device)?;
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
+            (Llama::load(vb, &config)?, tokenizer_filename, cache, config)
+        } else {
+            let api = Api::new()?;
+            let model_id = args.model_id.unwrap_or_else(|| {
+                let str = match args.which {
+                    Which::V1 => "Narsil/amall-7b",
+                    Which::V2 => "meta-llama/Llama-2-7b-hf",
+                    Which::V3 => "meta-llama/Meta-Llama-3-8B",
+                    Which::V3Instruct => "meta-llama/Meta-Llama-3-8B-Instruct",
+                    Which::V31 => "meta-llama/Llama-3.1-8B",
+                    Which::V31Instruct => "meta-llama/Llama-3.1-8B-Instruct",
+                    Which::V32_1b => "meta-llama/Llama-3.2-1B",
+                    Which::V32_1bInstruct => "meta-llama/Llama-3.2-1B-Instruct",
+                    Which::V32_3b => "meta-llama/Llama-3.2-3B",
+                    Which::V32_3bInstruct => "meta-llama/Llama-3.2-3B-Instruct",
+                    Which::Solar10_7B => "upstage/SOLAR-10.7B-v1.0",
+                    Which::TinyLlama1_1BChat => "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                    Which::SmolLM2_135M => "HuggingFaceTB/SmolLM2-135M",
+                    Which::SmolLM2_135MInstruct => "HuggingFaceTB/SmolLM2-135M-Instruct",
+                    Which::SmolLM2_360M => "HuggingFaceTB/SmolLM2-360M",
+                    Which::SmolLM2_360MInstruct => "HuggingFaceTB/SmolLM2-360M-Instruct",
+                    Which::SmolLM2_1B => "HuggingFaceTB/SmolLM2-1.7B",
+                    Which::SmolLM2_1BInstruct => "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+                };
+                str.to_string()
+            });
+            println!("loading the model weights from {model_id}");
+            let revision = args.revision.unwrap_or("main".to_string());
+            let api = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
 
-        let tokenizer_filename = api.get("tokenizer.json")?;
-        let config_filename = api.get("config.json")?;
-        let config: LlamaConfig = serde_json::from_slice(&std::fs::read(config_filename)?)?;
-        let config = config.into_config(args.use_flash_attn);
+            let tokenizer_filename = api.get("tokenizer.json")?;
+            let config_filename = api.get("config.json")?;
+            let config: LlamaConfig = serde_json::from_slice(&std::fs::read(config_filename)?)?;
+            let config = config.into_config(args.use_flash_attn);
 
-        let filenames = match args.which {
-            Which::V1
-            | Which::V2
-            | Which::V3
-            | Which::V3Instruct
-            | Which::V31
-            | Which::V31Instruct
-            | Which::V32_3b
-            | Which::V32_3bInstruct
-            | Which::Solar10_7B => {
-                candle_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?
-            }
-            Which::SmolLM2_360M
-            | Which::SmolLM2_360MInstruct
-            | Which::SmolLM2_135M
-            | Which::SmolLM2_135MInstruct
-            | Which::SmolLM2_1B
-            | Which::SmolLM2_1BInstruct
-            | Which::V32_1b
-            | Which::V32_1bInstruct
-            | Which::TinyLlama1_1BChat => {
-                vec![api.get("model.safetensors")?]
-            }
-        };
-        let cache = model::Cache::new(!args.no_kv_cache, dtype, &config, &device)?;
+            let filenames = match args.which {
+                Which::V1
+                | Which::V2
+                | Which::V3
+                | Which::V3Instruct
+                | Which::V31
+                | Which::V31Instruct
+                | Which::V32_3b
+                | Which::V32_3bInstruct
+                | Which::Solar10_7B => {
+                    candle_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?
+                }
+                Which::SmolLM2_360M
+                | Which::SmolLM2_360MInstruct
+                | Which::SmolLM2_135M
+                | Which::SmolLM2_135MInstruct
+                | Which::SmolLM2_1B
+                | Which::SmolLM2_1BInstruct
+                | Which::V32_1b
+                | Which::V32_1bInstruct
+                | Which::TinyLlama1_1BChat => {
+                    vec![api.get("model.safetensors")?]
+                }
+            };
+            let cache = model::Cache::new(!args.no_kv_cache, dtype, &config, &device)?;
 
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-        (Llama::load(vb, &config)?, tokenizer_filename, cache, config)
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
+            (Llama::load(vb, &config)?, tokenizer_filename, cache, config)
+        }
     };
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
     let eos_token_id = config.eos_token_id.or_else(|| {
@@ -214,15 +251,22 @@ fn main() -> Result<()> {
             .map(model::LlamaEosToks::Single)
     });
     let prompt = args.prompt.as_ref().map_or(DEFAULT_PROMPT, |p| p.as_str());
-    let mut tokens = tokenizer
-        .encode(prompt, true)
-        .map_err(E::msg)?
-        .get_ids()
-        .to_vec();
+    let mut tokens = if let Some(n) = args.bench_prompt_tokens {
+        candle_examples::bench_prompt_token_ids(&tokenizer, n)?
+    } else {
+        tokenizer
+            .encode(prompt, true)
+            .map_err(E::msg)?
+            .get_ids()
+            .to_vec()
+    };
+    let prompt_len = tokens.len();
     let mut tokenizer = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
 
     println!("starting the inference loop");
-    print!("{prompt}");
+    if args.bench_prompt_tokens.is_none() {
+        print!("{prompt}");
+    }
     let mut logits_processor = {
         let temperature = args.temperature;
         let sampling = if temperature <= 0. {
@@ -238,18 +282,17 @@ fn main() -> Result<()> {
         LogitsProcessor::from_sampling(args.seed, sampling)
     };
 
-    let mut start_gen = std::time::Instant::now();
+    let start_prefill = std::time::Instant::now();
+    let mut start_decode = start_prefill;
+    let mut prompt_dt = None;
     let mut index_pos = 0;
-    let mut token_generated = 0;
+    let mut token_generated = 0usize;
     for index in 0..args.sample_len {
         let (context_size, context_index) = if cache.use_kv_cache && index > 0 {
             (1, index_pos)
         } else {
             (tokens.len(), 0)
         };
-        if index == 1 {
-            start_gen = std::time::Instant::now()
-        }
         let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
         let input = Tensor::new(ctxt, &device)?.unsqueeze(0)?;
         let logits = llama.forward(&input, context_index, &mut cache)?;
@@ -270,6 +313,11 @@ fn main() -> Result<()> {
         token_generated += 1;
         tokens.push(next_token);
 
+        if index == 0 {
+            prompt_dt = Some(start_prefill.elapsed());
+            start_decode = std::time::Instant::now();
+        }
+
         match eos_token_id {
             Some(model::LlamaEosToks::Single(eos_tok_id)) if next_token == eos_tok_id => {
                 break;
@@ -287,11 +335,20 @@ fn main() -> Result<()> {
     if let Some(rest) = tokenizer.decode_rest().map_err(E::msg)? {
         print!("{rest}");
     }
-    let dt = start_gen.elapsed();
-    println!(
-        "\n\n{} tokens generated ({} token/s)\n",
-        token_generated,
-        (token_generated - 1) as f64 / dt.as_secs_f64(),
-    );
+    if let Some(pt) = prompt_dt {
+        println!(
+            "\n\n{:4} prompt tokens processed: {:.2} token/s",
+            prompt_len,
+            prompt_len as f64 / pt.as_secs_f64(),
+        );
+    }
+    let decode_tokens = token_generated.saturating_sub(1);
+    if decode_tokens > 0 {
+        let dt = start_decode.elapsed();
+        println!(
+            "{decode_tokens:4} tokens generated: {:.2} token/s",
+            decode_tokens as f64 / dt.as_secs_f64(),
+        );
+    }
     Ok(())
 }

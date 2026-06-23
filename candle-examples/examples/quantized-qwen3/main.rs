@@ -80,6 +80,10 @@ struct Args {
     #[arg(long)]
     split_prompt: bool,
 
+    /// Synthesize a fixed-length prompt for prefill/decode benchmarks (llama-bench style).
+    #[arg(long)]
+    bench_prompt_tokens: Option<usize>,
+
     /// Run on CPU rather than GPU even if a GPU is available.
     #[arg(long)]
     cpu: bool,
@@ -209,20 +213,23 @@ fn main() -> anyhow::Result<()> {
 
     let tokenizer = args.tokenizer()?;
     let mut tos = TokenOutputStream::new(tokenizer);
-    let prompt_str = args
-        .prompt
-        .clone()
-        .unwrap_or_else(|| DEFAULT_PROMPT.to_string());
 
-    let prompt_str = format!("<|im_start|>user\n{prompt_str}<|im_end|>\n<|im_start|>assistant\n");
-    print!("formatted prompt: {}", &prompt_str);
-
-    let tokens = tos
-        .tokenizer()
-        .encode(prompt_str, true)
-        .map_err(anyhow::Error::msg)?;
-
-    let tokens = tokens.get_ids();
+    let tokens: Vec<u32> = if let Some(n) = args.bench_prompt_tokens {
+        candle_examples::bench_prompt_token_ids(tos.tokenizer(), n)?
+    } else {
+        let prompt_str = args
+            .prompt
+            .clone()
+            .unwrap_or_else(|| DEFAULT_PROMPT.to_string());
+        let prompt_str =
+            format!("<|im_start|>user\n{prompt_str}<|im_end|>\n<|im_start|>assistant\n");
+        print!("formatted prompt: {}", &prompt_str);
+        tos.tokenizer()
+            .encode(prompt_str, true)
+            .map_err(anyhow::Error::msg)?
+            .get_ids()
+            .to_vec()
+    };
 
     let to_sample = args.sample_len.saturating_sub(1);
 
@@ -246,7 +253,7 @@ fn main() -> anyhow::Result<()> {
     let start_prompt_processing = std::time::Instant::now();
 
     let mut next_token = if !args.split_prompt {
-        let input = Tensor::new(tokens, &device)?.unsqueeze(0)?;
+        let input = Tensor::new(tokens.as_slice(), &device)?.unsqueeze(0)?;
         let logits = model.forward(&input, 0)?;
         let logits = logits.squeeze(0)?;
         logits_processor.sample(&logits)?
@@ -312,9 +319,12 @@ fn main() -> anyhow::Result<()> {
         tokens.len(),
         tokens.len() as f64 / prompt_dt.as_secs_f64(),
     );
-    println!(
-        "{sampled:4} tokens generated: {:.2} token/s",
-        sampled as f64 / dt.as_secs_f64(),
-    );
+    if sampled > 0 {
+        let dt = start_post_prompt.elapsed();
+        println!(
+            "{sampled:4} tokens generated: {:.2} token/s",
+            sampled as f64 / dt.as_secs_f64(),
+        );
+    }
     Ok(())
 }
