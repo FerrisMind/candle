@@ -648,9 +648,6 @@ pub fn rope_ggml(
     freq_base: f32,
     mode: u32,
 ) -> Result<Tensor> {
-    if !xs.is_contiguous() {
-        candle::bail!("xs has to be contiguous in rope_ggml")
-    }
     if !positions.is_contiguous() {
         candle::bail!("positions has to be contiguous in rope_ggml")
     }

@@ -9,12 +9,8 @@ use safetensors::{slice::IndexOp, tensor::SafeTensors};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-fn normalize_dtype_for_device(dtype: DType, dev: &Device) -> DType {
-    if dtype == DType::BF16 && (dev.is_wgpu() || dev.is_vulkan()) {
-        DType::F16
-    } else {
-        dtype
-    }
+fn normalize_dtype_for_device(dtype: DType, _dev: &Device) -> DType {
+    dtype
 }
 
 /// A structure used to retrieve variables, these variables can either come from storage or be
