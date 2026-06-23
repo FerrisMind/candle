@@ -87,8 +87,8 @@ impl Qwen3RotaryEmbedding {
             } else {
                 self.positions.narrow(0, offset, seq_len)?
             };
-            let q_ggml = q.transpose(1, 2)?.contiguous()?;
-            let k_ggml = k.transpose(1, 2)?.contiguous()?;
+            let q_ggml = q.transpose(1, 2)?;
+            let k_ggml = k.transpose(1, 2)?;
             let q_embed = candle_nn::rotary_emb::rope_ggml(
                 &q_ggml,
                 &positions,
@@ -96,8 +96,7 @@ impl Qwen3RotaryEmbedding {
                 self.rope_theta,
                 GGML_ROPE_TYPE_NEOX,
             )?
-            .transpose(1, 2)?
-            .contiguous()?;
+            .transpose(1, 2)?;
             let k_embed = candle_nn::rotary_emb::rope_ggml(
                 &k_ggml,
                 &positions,
@@ -105,8 +104,7 @@ impl Qwen3RotaryEmbedding {
                 self.rope_theta,
                 GGML_ROPE_TYPE_NEOX,
             )?
-            .transpose(1, 2)?
-            .contiguous()?;
+            .transpose(1, 2)?;
             Ok((q_embed, k_embed))
         } else {
             let (_, _, seq_len, _) = q.dims4()?;
