@@ -158,11 +158,11 @@ impl Storage {
             Self::Wgpu(storage) => {
                 let storage = storage.affine(layout, mul, add)?;
                 Ok(Self::Wgpu(storage))
-            },
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.affine(layout, mul, add)?;
                 Ok(Self::Vulkan(storage))
-            },
+            }
         }
     }
 
@@ -183,11 +183,11 @@ impl Storage {
             Self::Wgpu(storage) => {
                 let storage = storage.powf(layout, alpha)?;
                 Ok(Self::Wgpu(storage))
-            },
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.powf(layout, alpha)?;
                 Ok(Self::Vulkan(storage))
-            },
+            }
         }
     }
 
@@ -208,11 +208,11 @@ impl Storage {
             Self::Wgpu(storage) => {
                 let storage = storage.elu(layout, alpha)?;
                 Ok(Self::Wgpu(storage))
-            },
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.elu(layout, alpha)?;
                 Ok(Self::Vulkan(storage))
-            },
+            }
         }
     }
 
@@ -241,7 +241,7 @@ impl Storage {
             (Self::Wgpu(lhs), Self::Wgpu(rhs)) => {
                 let storage = lhs.cmp(op, rhs, lhs_layout, rhs_layout)?;
                 Ok(Self::Wgpu(storage))
-            },
+            }
             (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
                 match lhs.cmp(op, rhs, lhs_layout, rhs_layout) {
                     Ok(storage) => Ok(Self::Vulkan(storage)),
@@ -278,11 +278,11 @@ impl Storage {
             Self::Wgpu(storage) => {
                 let storage = storage.reduce_op(op, layout, s)?;
                 Ok(Self::Wgpu(storage))
-            },
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.reduce_op(op, layout, s)?;
                 Ok(Self::Vulkan(storage))
-            },
+            }
         }
     }
 
@@ -303,11 +303,11 @@ impl Storage {
             Self::Wgpu(storage) => {
                 let storage = storage.cumsum_last_dim(layout)?;
                 Ok(Self::Wgpu(storage))
-            },
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.cumsum_last_dim(layout)?;
                 Ok(Self::Vulkan(storage))
-            },
+            }
         }
     }
 
@@ -328,11 +328,11 @@ impl Storage {
             Self::Wgpu(storage) => {
                 let storage = storage.clamp(layout, min, max)?;
                 Ok(Self::Wgpu(storage))
-            },
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.clamp(layout, min, max)?;
                 Ok(Self::Vulkan(storage))
-            },
+            }
         }
     }
 
@@ -353,11 +353,11 @@ impl Storage {
             Self::Wgpu(storage) => {
                 let storage = storage.to_dtype(layout, dtype)?;
                 Ok(Self::Wgpu(storage))
-            },
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.to_dtype(layout, dtype)?;
                 Ok(Self::Vulkan(storage))
-            },
+            }
         }
     }
 
@@ -378,11 +378,11 @@ impl Storage {
             Self::Wgpu(storage) => {
                 let (storage, shape) = c.wgpu_fwd(storage, l)?;
                 Ok((Self::Wgpu(storage), shape))
-            },
+            }
             Self::Vulkan(storage) => {
                 let (storage, shape) = c.vulkan_fwd(storage, l)?;
                 Ok((Self::Vulkan(storage), shape))
-            },
+            }
         }
     }
 
@@ -464,16 +464,12 @@ impl Storage {
             Self::Cpu(storage) => c.cpu_fwd(storage, l),
             Self::Cuda(storage) => c.cuda_fwd(storage, l),
             Self::Metal(storage) => c.metal_fwd(storage, l),
-            Self::Wgpu(_) => Err(Error::Msg(format!(
-                "no wgpu implementation for {}",
-                c.name()
-            ))
-            .bt()),
-            Self::Vulkan(_) => Err(Error::Msg(format!(
-                "no vulkan implementation for {}",
-                c.name()
-            ))
-            .bt()),
+            Self::Wgpu(_) => {
+                Err(Error::Msg(format!("no wgpu implementation for {}", c.name())).bt())
+            }
+            Self::Vulkan(_) => {
+                Err(Error::Msg(format!("no vulkan implementation for {}", c.name())).bt())
+            }
         }
     }
 
@@ -489,16 +485,12 @@ impl Storage {
             (Self::Cpu(s1), Self::Cpu(s2)) => c.cpu_fwd(s1, l1, s2, l2),
             (Self::Cuda(s1), Self::Cuda(s2)) => c.cuda_fwd(s1, l1, s2, l2),
             (Self::Metal(s1), Self::Metal(s2)) => c.metal_fwd(s1, l1, s2, l2),
-            (Self::Wgpu(_), Self::Wgpu(_)) => Err(Error::Msg(format!(
-                "no wgpu implementation for {}",
-                c.name()
-            ))
-            .bt()),
-            (Self::Vulkan(_), Self::Vulkan(_)) => Err(Error::Msg(format!(
-                "no vulkan implementation for {}",
-                c.name()
-            ))
-            .bt()),
+            (Self::Wgpu(_), Self::Wgpu(_)) => {
+                Err(Error::Msg(format!("no wgpu implementation for {}", c.name())).bt())
+            }
+            (Self::Vulkan(_), Self::Vulkan(_)) => {
+                Err(Error::Msg(format!("no vulkan implementation for {}", c.name())).bt())
+            }
             _ => unreachable!(),
         }
     }
@@ -520,16 +512,12 @@ impl Storage {
             (Self::Metal(s1), Self::Metal(s2), Self::Metal(s3)) => {
                 c.metal_fwd(s1, l1, s2, l2, s3, l3)
             }
-            (Self::Wgpu(_), Self::Wgpu(_), Self::Wgpu(_)) => Err(Error::Msg(format!(
-                "no wgpu implementation for {}",
-                c.name()
-            ))
-            .bt()),
-            (Self::Vulkan(_), Self::Vulkan(_), Self::Vulkan(_)) => Err(Error::Msg(format!(
-                "no vulkan implementation for {}",
-                c.name()
-            ))
-            .bt()),
+            (Self::Wgpu(_), Self::Wgpu(_), Self::Wgpu(_)) => {
+                Err(Error::Msg(format!("no wgpu implementation for {}", c.name())).bt())
+            }
+            (Self::Vulkan(_), Self::Vulkan(_), Self::Vulkan(_)) => {
+                Err(Error::Msg(format!("no vulkan implementation for {}", c.name())).bt())
+            }
             _ => unreachable!(),
         }
     }
@@ -799,11 +787,11 @@ impl Storage {
             Self::Wgpu(storage) => {
                 let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Wgpu(storage))
-            },
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Vulkan(storage))
-            },
+            }
         }
     }
 
@@ -829,11 +817,11 @@ impl Storage {
             Self::Wgpu(storage) => {
                 let storage = storage.max_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Wgpu(storage))
-            },
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.max_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Vulkan(storage))
-            },
+            }
         }
     }
 
@@ -854,11 +842,11 @@ impl Storage {
             Self::Wgpu(storage) => {
                 let storage = storage.upsample_nearest1d(layout, sz)?;
                 Ok(Self::Wgpu(storage))
-            },
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.upsample_nearest1d(layout, sz)?;
                 Ok(Self::Vulkan(storage))
-            },
+            }
         }
     }
 
@@ -879,11 +867,11 @@ impl Storage {
             Self::Wgpu(storage) => {
                 let storage = storage.upsample_nearest2d(layout, h, w)?;
                 Ok(Self::Wgpu(storage))
-            },
+            }
             Self::Vulkan(storage) => {
                 let storage = storage.upsample_nearest2d(layout, h, w)?;
                 Ok(Self::Vulkan(storage))
-            },
+            }
         }
     }
 
@@ -996,11 +984,11 @@ impl Storage {
             (Self::Wgpu(s), Self::Wgpu(indexes)) => {
                 let storage = s.gather(l, indexes, indexes_l, d)?;
                 Ok(Self::Wgpu(storage))
-            },
+            }
             (Self::Vulkan(s), Self::Vulkan(indexes)) => {
                 let storage = s.gather(l, indexes, indexes_l, d)?;
                 Ok(Self::Vulkan(storage))
-            },
+            }
             _ => unreachable!(),
         }
     }
@@ -1145,7 +1133,7 @@ impl Storage {
             (Self::Wgpu(lhs), Self::Wgpu(rhs)) => {
                 let storage = lhs.index_select(rhs, lhs_l, rhs_l, d)?;
                 Ok(Self::Wgpu(storage))
-            },
+            }
             (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
                 match lhs.index_select(rhs, lhs_l, rhs_l, d) {
                     Ok(storage) => Ok(Self::Vulkan(storage)),

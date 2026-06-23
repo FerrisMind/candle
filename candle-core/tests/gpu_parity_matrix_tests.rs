@@ -19,7 +19,7 @@ use candle_core::{DType, Device, Result, Tensor};
 #[cfg(all(feature = "cuda", any(feature = "wgpu", feature = "vulkan")))]
 use support::{
     assert_same_error_class, assert_tensors_close, cuda_cast_supported, deterministic_f32_tensor,
-    native_required_cuda_parity, P0_CAST_DTYPES, TestBackend,
+    native_required_cuda_parity, TestBackend, P0_CAST_DTYPES,
 };
 
 #[cfg(all(feature = "cuda", any(feature = "wgpu", feature = "vulkan")))]
@@ -31,15 +31,30 @@ fn parity_unary_dtype_matrix(under_test: &Device, cuda: &Device) -> Result<()> {
         let got_x = Tensor::from_vec(vals.clone(), shape, under_test)?.to_dtype(dtype)?;
         let want_x = Tensor::from_vec(vals.clone(), shape, cuda)?.to_dtype(dtype)?;
 
-        assert_tensors_close(&got_x.erf()?, &want_x.erf()?, dtype, &format!("erf {dtype:?}"))?;
+        assert_tensors_close(
+            &got_x.erf()?,
+            &want_x.erf()?,
+            dtype,
+            &format!("erf {dtype:?}"),
+        )?;
         assert_tensors_close(
             &got_x.recip()?,
             &want_x.recip()?,
             dtype,
             &format!("recip {dtype:?}"),
         )?;
-        assert_tensors_close(&got_x.neg()?, &want_x.neg()?, dtype, &format!("neg {dtype:?}"))?;
-        assert_tensors_close(&got_x.abs()?, &want_x.abs()?, dtype, &format!("abs {dtype:?}"))?;
+        assert_tensors_close(
+            &got_x.neg()?,
+            &want_x.neg()?,
+            dtype,
+            &format!("neg {dtype:?}"),
+        )?;
+        assert_tensors_close(
+            &got_x.abs()?,
+            &want_x.abs()?,
+            dtype,
+            &format!("abs {dtype:?}"),
+        )?;
     }
     Ok(())
 }
@@ -108,14 +123,14 @@ fn parity_rank_layout_matrix(under_test: &Device, cuda: &Device) -> Result<()> {
         "rank5 strided bf16 relu",
     )?;
 
-    let u8_a = Tensor::from_vec((0..24u8).collect::<Vec<_>>(), (2, 3, 4), under_test)?
-        .transpose(0, 2)?;
-    let u8_b = Tensor::from_vec((1..=24u8).collect::<Vec<_>>(), (2, 3, 4), under_test)?
-        .transpose(0, 2)?;
-    let u8_a_cuda = Tensor::from_vec((0..24u8).collect::<Vec<_>>(), (2, 3, 4), cuda)?
-        .transpose(0, 2)?;
-    let u8_b_cuda = Tensor::from_vec((1..=24u8).collect::<Vec<_>>(), (2, 3, 4), cuda)?
-        .transpose(0, 2)?;
+    let u8_a =
+        Tensor::from_vec((0..24u8).collect::<Vec<_>>(), (2, 3, 4), under_test)?.transpose(0, 2)?;
+    let u8_b =
+        Tensor::from_vec((1..=24u8).collect::<Vec<_>>(), (2, 3, 4), under_test)?.transpose(0, 2)?;
+    let u8_a_cuda =
+        Tensor::from_vec((0..24u8).collect::<Vec<_>>(), (2, 3, 4), cuda)?.transpose(0, 2)?;
+    let u8_b_cuda =
+        Tensor::from_vec((1..=24u8).collect::<Vec<_>>(), (2, 3, 4), cuda)?.transpose(0, 2)?;
     assert_eq!(
         u8_a.add(&u8_b)?.flatten_all()?.to_vec1::<u8>()?,
         u8_a_cuda.add(&u8_b_cuda)?.flatten_all()?.to_vec1::<u8>()?
@@ -132,18 +147,12 @@ fn parity_conv_transpose(under_test: &Device, cuda: &Device) -> Result<()> {
             Tensor::from_vec(input_vals.clone(), (1, 1, 3), under_test)?.to_dtype(dtype)?;
         let kernel_got =
             Tensor::from_vec(kernel_vals.clone(), (1, 1, 3), under_test)?.to_dtype(dtype)?;
-        let input_want =
-            Tensor::from_vec(input_vals.clone(), (1, 1, 3), cuda)?.to_dtype(dtype)?;
+        let input_want = Tensor::from_vec(input_vals.clone(), (1, 1, 3), cuda)?.to_dtype(dtype)?;
         let kernel_want =
             Tensor::from_vec(kernel_vals.clone(), (1, 1, 3), cuda)?.to_dtype(dtype)?;
         let got = input_got.conv_transpose1d(&kernel_got, 0, 0, 1, 1, 1)?;
         let want = input_want.conv_transpose1d(&kernel_want, 0, 0, 1, 1, 1)?;
-        assert_tensors_close(
-            &got,
-            &want,
-            dtype,
-            &format!("conv_transpose1d {dtype:?}"),
-        )?;
+        assert_tensors_close(&got, &want, dtype, &format!("conv_transpose1d {dtype:?}"))?;
     }
     Ok(())
 }
@@ -239,8 +248,7 @@ fn parity_conv_pool_bf16(under_test: &Device, cuda: &Device) -> Result<()> {
     let image = Tensor::from_slice(&image_vals, (1, 1, 3, 3), under_test)?.to_dtype(DType::BF16)?;
     let kernel =
         Tensor::from_slice(&kernel_vals, (1, 1, 2, 2), under_test)?.to_dtype(DType::BF16)?;
-    let image_cuda =
-        Tensor::from_slice(&image_vals, (1, 1, 3, 3), cuda)?.to_dtype(DType::BF16)?;
+    let image_cuda = Tensor::from_slice(&image_vals, (1, 1, 3, 3), cuda)?.to_dtype(DType::BF16)?;
     let kernel_cuda =
         Tensor::from_slice(&kernel_vals, (1, 1, 2, 2), cuda)?.to_dtype(DType::BF16)?;
     assert_tensors_close(
@@ -406,18 +414,11 @@ fn parity_indexing_matrix(under_test: &Device, cuda: &Device) -> Result<()> {
             dtype,
             &format!("index_select dim0 {dtype:?}"),
         )?;
-        let got_gather = Tensor::from_vec(
-            vec![1.0f32, 2.0, 3.0, 10.0, 20.0, 30.0],
-            (2, 3),
-            under_test,
-        )?
-        .to_dtype(dtype)?;
-        let want_gather = Tensor::from_vec(
-            vec![1.0f32, 2.0, 3.0, 10.0, 20.0, 30.0],
-            (2, 3),
-            cuda,
-        )?
-        .to_dtype(dtype)?;
+        let got_gather =
+            Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 10.0, 20.0, 30.0], (2, 3), under_test)?
+                .to_dtype(dtype)?;
+        let want_gather = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 10.0, 20.0, 30.0], (2, 3), cuda)?
+            .to_dtype(dtype)?;
         assert_tensors_close(
             &got_gather.gather(&ids_1, 1)?,
             &want_gather.gather(&ids_1_cuda, 1)?,

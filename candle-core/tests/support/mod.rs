@@ -367,7 +367,11 @@ pub fn cuda_cast_supported(cuda: &Device, src: DType, dst: DType) -> bool {
 }
 
 /// Returns true when both results are unsupported-dtype errors (CUDA parity for rejected paths).
-pub fn assert_same_error_class(got: &Result<Tensor>, want: &Result<Tensor>, label: &str) -> Result<()> {
+pub fn assert_same_error_class(
+    got: &Result<Tensor>,
+    want: &Result<Tensor>,
+    label: &str,
+) -> Result<()> {
     match (got, want) {
         (Ok(_), Ok(_)) => candle_core::bail!("{label}: expected both casts to fail"),
         (Err(_), Err(_)) => Ok(()),

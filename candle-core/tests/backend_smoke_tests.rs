@@ -4257,7 +4257,12 @@ fn smoke_f32_extended_unary_ops(device: &Device) -> Result<()> {
     let erf_input = Tensor::from_slice(&[0.0f32, 1.0, -1.0, 0.5], (2, 2), device)?;
     let erf_cpu = Tensor::from_slice(&[0.0f32, 1.0, -1.0, 0.5], (2, 2), &Device::Cpu)?;
     support::assert_tensors_close(&erf_input.erf()?, &erf_cpu.erf()?, DType::F32, "erf f32")?;
-    support::assert_tensors_close(&xs.recip()?, &xs.to_device(&Device::Cpu)?.recip()?, DType::F32, "recip f32")?;
+    support::assert_tensors_close(
+        &xs.recip()?,
+        &xs.to_device(&Device::Cpu)?.recip()?,
+        DType::F32,
+        "recip f32",
+    )?;
 
     Ok(())
 }
