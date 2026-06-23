@@ -130,10 +130,15 @@ fn update(dst_i: u32, src0_i: u32, src1_i: u32) {
 }
 
 @compute @workgroup_size(WG_SIZE)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x < params.ne) {
-        let src0_i = params.offset_src0 + src0_index(gid.x);
-        let src1_i = params.offset_src1 + src1_index(gid.x);
-        update(params.offset_dst + gid.x, src0_i, src1_i);
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let linear = (wid.x + wid.y * num_wg.x) * WG_SIZE + lid.x;
+    if (linear < params.ne) {
+        let src0_i = params.offset_src0 + src0_index(linear);
+        let src1_i = params.offset_src1 + src1_index(linear);
+        update(params.offset_dst + linear, src0_i, src1_i);
     }
 }

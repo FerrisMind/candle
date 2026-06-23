@@ -43,12 +43,17 @@ struct Params {
 var<storage, read_write> src: array<f32>;
 
 @compute @workgroup_size(WG_SIZE)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.ne) {
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let linear = (wid.x + wid.y * num_wg.x) * WG_SIZE + lid.x;
+    if (linear >= params.ne) {
         return;
     }
 
-    var i = gid.x;
+    var i = linear;
     let i3 = i / (params.ne2 * params.ne1 * params.ne0);
     i = i % (params.ne2 * params.ne1 * params.ne0);
     let i2 = i / (params.ne1 * params.ne0);

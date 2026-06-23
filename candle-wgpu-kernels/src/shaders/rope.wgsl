@@ -143,9 +143,14 @@ fn pair_offset(is_neox: bool, is_mrope: bool, is_vision: bool) -> u32 {
 }
 
 @compute @workgroup_size(WG_SIZE)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let linear = (wid.x + wid.y * num_wg.x) * WG_SIZE + lid.x;
     // two elements per n_threads
-    if (gid.x >= params.n_threads) {
+    if (linear >= params.n_threads) {
         return;
     }
 
@@ -154,7 +159,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let is_imrope = params.mode == 40;
     let is_vision = params.mode == 24;
 
-    var i = gid.x * 2; // start index for this thread
+    var i = linear * 2; // start index for this thread
     let i3 = i / (params.ne2 * params.ne1 * params.ne0);
     i = i % (params.ne2 * params.ne1 * params.ne0);
     let i2 = i / (params.ne1 * params.ne0);

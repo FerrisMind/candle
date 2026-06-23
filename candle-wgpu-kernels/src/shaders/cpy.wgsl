@@ -48,19 +48,26 @@ struct Params{
 
     dst_ne0: u32,
     dst_ne1: u32,
-    dst_ne2: u32
+    dst_ne2: u32,
+
+    elem_base: u32,
 };
 
 @group(0) @binding(2)
 var<uniform> params: Params;
 
 @compute @workgroup_size(WG_SIZE)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.ne) {
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let linear = (wid.x + wid.y * num_wg.x) * WG_SIZE + lid.x;
+    if (linear >= params.ne) {
         return;
     }
 
-    var i = gid.x;
+    var i = linear + params.elem_base;
     let i3 = i / (params.src_ne2 * params.src_ne1 * params.src_ne0);
     i = i % (params.src_ne2 * params.src_ne1 * params.src_ne0);
     let i2 = i / (params.src_ne1 * params.src_ne0);
@@ -68,7 +75,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i1 = i / params.src_ne0;
     let i0 = i % params.src_ne0;
 
-    var j = gid.x;
+    var j = linear + params.elem_base;
     let j3 = j / (params.dst_ne2 * params.dst_ne1 * params.dst_ne0);
     j = j % (params.dst_ne2 * params.dst_ne1 * params.dst_ne0);
     let j2 = j / (params.dst_ne1 * params.dst_ne0);

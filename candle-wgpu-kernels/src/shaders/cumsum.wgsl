@@ -17,8 +17,10 @@ var<workgroup> shared_sum: array<f32, WG_SIZE>;
 
 @compute @workgroup_size(WG_SIZE)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row_idx = params.offset_src + wid.x * params.ne0;
+    let row = wid.x + wid.y * num_wg.x;
+    let row_idx = params.offset_src + row * params.ne0;
     let elems = (params.ne0 + WG_SIZE - 1) / WG_SIZE;
     var local_sum: f32 = 0.0;
     for (var col = lid.x * elems; col < (lid.x + 1) * elems && col < params.ne0; col ++) {
@@ -61,6 +63,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     var running_sum = shared_sum[lid.x];
     for (var col = lid.x * elems; col < (lid.x + 1) * elems && col < params.ne0; col ++) {
         running_sum += src[row_idx + col];
-        dst[params.offset_dst + wid.x * params.ne0 + col] = running_sum;
+        dst[params.offset_dst + row * params.ne0 + col] = running_sum;
     }
 }
