@@ -1809,6 +1809,40 @@ vec4 bf16_to_fp32(uvec4 u)
     return vec4(bf16_to_fp32(u.x), bf16_to_fp32(u.y), bf16_to_fp32(u.z), bf16_to_fp32(u.w));
 }
 
+#if defined(DATA_B_BF16)
+#define B_TYPE uint16_t
+#endif
+#if defined(DATA_D_BF16)
+#define D_TYPE uint16_t
+#endif
+
+#if defined(DATA_A_BF16) || defined(DATA_B_BF16) || defined(DATA_ROPE_A_BF16)
+#define STORAGE_TO_FLOAT(v) bf16_to_fp32(uint32_t(v))
+#else
+#define STORAGE_TO_FLOAT(v) FLOAT_TYPE(v)
+#endif
+
+#if defined(DATA_D_BF16)
+#define STORAGE_FROM_FLOAT(v) uint16_t(fp32_to_bf16(float(v)))
+#elif defined(DATA_ROPE_D_BF16)
+#define STORAGE_FROM_FLOAT(v) uint16_t(fp32_to_bf16(float(v)))
+#else
+#define STORAGE_FROM_FLOAT(v) D_TYPE(v)
+#endif
+
+#if defined(DATA_ROPE_A_BF16) || defined(DATA_A_BF16)
+#define ROPE_STORAGE_TO_FLOAT(v) bf16_to_fp32(uint32_t(v))
+#define ROPE_STORAGE_FROM_FLOAT(v) uint16_t(fp32_to_bf16(v))
+#else
+#define ROPE_STORAGE_TO_FLOAT(v) float(v)
+#define ROPE_STORAGE_FROM_FLOAT(v) ROPE_D_TYPE(v)
+#endif
+
+#if defined(DATA_ROPE_D_BF16)
+#undef ROPE_D_TYPE
+#define ROPE_D_TYPE uint16_t
+#endif
+
 float e8m0_to_fp32(uint8_t x) {
     uint32_t bits;
 

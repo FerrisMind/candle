@@ -65,7 +65,7 @@ void rms_norm(uint num_iters) {
     [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
         FLOAT_TYPE xi = FLOAT_TYPE(0);
         if (col < ncols) {
-            xi = FLOAT_TYPE(data_a[a_offset + col]);
+            xi = STORAGE_TO_FLOAT(data_a[a_offset + col]);
         }
         sum += xi * xi;
     }
@@ -91,14 +91,14 @@ void rms_norm(uint num_iters) {
                 if (col >= ncols) {
                     continue;
                 }
-                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]));
+                data_d[d_offset + col] = STORAGE_FROM_FLOAT(scale * STORAGE_TO_FLOAT(data_a[a_offset + col]) * STORAGE_TO_FLOAT(data_b[b_offset + fastmod(col, p.ne10)]));
             }
         } else {
             [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
                 if (col >= ncols) {
                     continue;
                 }
-                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
+                data_d[d_offset + col] = STORAGE_FROM_FLOAT(scale * STORAGE_TO_FLOAT(data_a[a_offset + col]) * STORAGE_TO_FLOAT(data_b[b_offset + col]));
             }
         }
     } else {
@@ -106,7 +106,7 @@ void rms_norm(uint num_iters) {
             if (col >= ncols) {
                 continue;
             }
-            data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+            data_d[d_offset + col] = STORAGE_FROM_FLOAT(scale * STORAGE_TO_FLOAT(data_a[a_offset + col]));
         }
     }
 #if RMS_NORM_ROPE_FUSION

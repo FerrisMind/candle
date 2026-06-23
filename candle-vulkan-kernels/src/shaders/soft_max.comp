@@ -80,12 +80,12 @@ void soft_max(uint num_iters) {
 
         FLOAT_TYPE a = FLOAT_TYPE(0);
         if (col < p.KX) {
-            a = data_a[rowx * p.KX + col];
+            a = STORAGE_TO_FLOAT(data_a[rowx * p.KX + col]);
         }
 
         FLOAT_TYPE b = FLOAT_TYPE(0);
         if (p.KY > 0 && col < p.KX) {
-            b = data_b[rowy_start + col];
+            b = STORAGE_TO_FLOAT(data_b[rowy_start + col]);
         }
 
         FLOAT_TYPE v = a * p.scale + slope * b;
@@ -129,13 +129,13 @@ void soft_max(uint num_iters) {
         if (idx < DATA_CACHE_SIZE) {
             val = exp(data_cache[idx] - max_val);
         } else {
-            val = exp(FLOAT_TYPE(data_a[i]) * p.scale + (p.KY > 0 ? slope * FLOAT_TYPE(data_b[rowy_start + col]) : FLOAT_TYPE(0.0f)) - max_val);
+            val = exp(STORAGE_TO_FLOAT(data_a[i]) * p.scale + (p.KY > 0 ? slope * STORAGE_TO_FLOAT(data_b[rowy_start + col]) : FLOAT_TYPE(0.0f)) - max_val);
         }
         sum += val;
         if (idx < DATA_CACHE_SIZE) {
             data_cache[idx] = val;
         } else {
-            data_d[i] = D_TYPE(val);
+            data_d[i] = STORAGE_FROM_FLOAT(val);
         }
     }
 
@@ -164,9 +164,9 @@ void soft_max(uint num_iters) {
         }
 
         if (idx < DATA_CACHE_SIZE) {
-            data_d[rowx*p.KX + col] = D_TYPE(data_cache[idx] * rcpdivisor);
+            data_d[rowx*p.KX + col] = STORAGE_FROM_FLOAT(data_cache[idx] * rcpdivisor);
         } else {
-            data_d[rowx*p.KX + col] *= D_TYPE(rcpdivisor);
+            data_d[rowx*p.KX + col] = STORAGE_FROM_FLOAT(STORAGE_TO_FLOAT(data_d[rowx*p.KX + col]) * rcpdivisor);
         }
     }
 }
