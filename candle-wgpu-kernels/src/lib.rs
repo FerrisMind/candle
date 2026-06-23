@@ -29,7 +29,6 @@ pub fn get(name: &str) -> Option<Module> {
         .find(|module| module.name == name)
 }
 
-
 #[derive(Debug, Clone, Copy)]
 pub enum DType {
     F32,
@@ -440,6 +439,11 @@ pub fn matmul_f32_shader() -> Option<String> {
         ("SRC1_TYPE".to_string(), "f32".to_string()),
     ];
     Some(preprocess(&source, &defines, &replacements, DType::F32))
+}
+
+pub fn matmul_bf16_shader() -> Option<String> {
+    let source = get("mul_mat_bf16.wgsl")?.source();
+    Some(source.to_string())
 }
 
 pub fn matmul_f16_shader() -> Option<String> {
