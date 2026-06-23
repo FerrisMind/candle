@@ -47,7 +47,15 @@ out.wav
 bria.mp3
 bria.safetensors
 bria.wav
+
+# Local benchmark harness outputs (bench_examples.py).
+bench_logs/
 bench_results/
+bench_results.json
+
+# CodeGraph index (local per machine; keep only the nested gitignore template).
+.codegraph/*
+!.codegraph/.gitignore
 
 # Local Codex/agent session guidance.
 AGENTS.md
