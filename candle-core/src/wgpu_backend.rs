@@ -977,9 +977,9 @@ impl WgpuDevice {
             let wgpu::BindingResource::Buffer(buf) = &entry.resource else {
                 continue;
             };
-            let key = wgpu_buffer_key(&buf.buffer);
+            let key = wgpu_buffer_key(buf.buffer);
             if seen.insert(key) {
-                if let Some(arc) = self.upgrade_registered_buffer(&buf.buffer) {
+                if let Some(arc) = self.upgrade_registered_buffer(buf.buffer) {
                     retained.push(arc);
                 }
             }
@@ -1260,7 +1260,7 @@ impl WgpuDevice {
                 layout: &cached.bind_group_layout,
                 entries: bindings,
             });
-        if {
+        let batch_limit = {
             let slot = self
                 .inner
                 .active_batch
@@ -1269,7 +1269,8 @@ impl WgpuDevice {
             slot.as_ref()
                 .map(|batch| batch.dispatch_count + 1 > Self::MAX_BATCH_DISPATCHES)
                 .unwrap_or(false)
-        } {
+        };
+        if batch_limit {
             self.flush_active_batch("batch_limit")?;
         }
         self.ensure_active_batch()?;
@@ -4197,6 +4198,22 @@ impl WgpuStorage {
                     let block_layout =
                         Layout::contiguous_with_offset(Shape::from(len), start_offset);
                     return self.run_raw_fill_inplace(&block_layout, value);
+                }
+                crate::StridedBlocks::UniformBlocks {
+                    start_offset,
+                    block_len,
+                    count,
+                    src_stride,
+                } => {
+                    for i in 0..count {
+                        let off = start_offset
+                            .checked_add(i * src_stride)
+                            .ok_or_else(|| Error::msg("wgpu fill uniform offset overflow"))?;
+                        let block_layout =
+                            Layout::contiguous_with_offset(Shape::from(block_len), off);
+                        self.run_raw_fill_inplace(&block_layout, value)?;
+                    }
+                    return Ok(());
                 }
                 crate::StridedBlocks::MultipleBlocks {
                     block_start_index,

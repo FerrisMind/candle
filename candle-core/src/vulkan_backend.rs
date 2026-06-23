@@ -3337,36 +3337,6 @@ impl VulkanStorage {
         Ok(out)
     }
 
-    fn materialize_rank_gt4_matmul_operand_to_f32(
-        &self,
-        layout: &Layout,
-        batch: usize,
-        rows: usize,
-        cols: usize,
-    ) -> Result<Self> {
-        if self.dtype == DType::F32 {
-            return self.materialize_rank_gt4_matmul_operand(layout, batch, rows, cols);
-        }
-        let out_shape = Shape::from(vec![batch, rows, cols]);
-        let mut out = unsafe { self.device.alloc_uninit(&out_shape, DType::F32)? };
-        let matrix_shape = Shape::from(vec![rows, cols]);
-        let matrix_contiguous = Layout::contiguous(matrix_shape.clone());
-        let rank = layout.dims().len();
-        let matrix_stride = vec![layout.stride()[rank - 2], layout.stride()[rank - 1]];
-        for batch_idx in 0..batch {
-            let matrix_layout = Layout::new(
-                matrix_shape.clone(),
-                matrix_stride.clone(),
-                Self::rank_gt4_batch_start_offset(layout, batch_idx),
-            );
-            let mut matrix = unsafe { self.device.alloc_uninit(&matrix_shape, self.dtype)? };
-            self.copy_strided_src(&mut matrix, 0, &matrix_layout)?;
-            let matrix_f32 = matrix.to_dtype(&matrix_contiguous, DType::F32)?;
-            matrix_f32.copy_strided_src(&mut out, batch_idx * rows * cols, &matrix_contiguous)?;
-        }
-        Ok(out)
-    }
-
     fn bf16_unary_via_f32(
         &self,
         layout: &Layout,
@@ -4101,6 +4071,47 @@ impl VulkanStorage {
                     false,
                 )?;
             }
+            crate::StridedBlocks::UniformBlocks {
+                start_offset,
+                block_len,
+                count,
+                src_stride,
+            } => {
+                if block_len == 0 || count == 0 {
+                    return Ok(());
+                }
+                let block_size = block_len
+                    .checked_mul(elem_size)
+                    .ok_or_else(|| Error::msg("vulkan copy block size overflow"))?;
+                let mut dst_elem_index = dst_offset;
+                let mut regions = Vec::with_capacity(count);
+                for i in 0..count {
+                    let src_index = start_offset
+                        .checked_add(i * src_stride)
+                        .ok_or_else(|| Error::msg("vulkan copy uniform src overflow"))?;
+                    let src_offset = src_index
+                        .checked_mul(elem_size)
+                        .ok_or_else(|| Error::msg("vulkan copy src offset overflow"))?;
+                    let dst_off = dst_elem_index
+                        .checked_mul(elem_size)
+                        .ok_or_else(|| Error::msg("vulkan copy dst offset overflow"))?;
+                    regions.push(
+                        vk::BufferCopy::default()
+                            .src_offset(src_offset as u64)
+                            .dst_offset(dst_off as u64)
+                            .size(block_size as u64),
+                    );
+                    dst_elem_index = dst_elem_index
+                        .checked_add(block_len)
+                        .ok_or_else(|| Error::msg("vulkan copy dst element overflow"))?;
+                }
+                self.device.submit_copy_regions_and_track(
+                    &self.buffer,
+                    &dst.buffer,
+                    &regions,
+                    false,
+                )?;
+            }
             crate::StridedBlocks::MultipleBlocks {
                 block_start_index,
                 block_len,
@@ -4148,6 +4159,22 @@ impl VulkanStorage {
                     let block_layout =
                         Layout::contiguous_with_offset(Shape::from(len), start_offset);
                     return self.run_raw_fill_inplace(&block_layout, value);
+                }
+                crate::StridedBlocks::UniformBlocks {
+                    start_offset,
+                    block_len,
+                    count,
+                    src_stride,
+                } => {
+                    for i in 0..count {
+                        let off = start_offset
+                            .checked_add(i * src_stride)
+                            .ok_or_else(|| Error::msg("vulkan fill uniform offset overflow"))?;
+                        let block_layout =
+                            Layout::contiguous_with_offset(Shape::from(block_len), off);
+                        self.run_raw_fill_inplace(&block_layout, value)?;
+                    }
+                    return Ok(());
                 }
                 crate::StridedBlocks::MultipleBlocks {
                     block_start_index,
@@ -4967,9 +4994,7 @@ impl VulkanStorage {
                 let src_f32 = self.to_dtype(layout, DType::F32)?;
                 let out_f32 =
                     src_f32.ggml_rope(&contiguous, pos, pos_layout, n_dims, freq_base, mode)?;
-                return out_f32
-                    .to_dtype(&contiguous, self.dtype)
-                    .and_then(|out| Ok(out));
+                return out_f32.to_dtype(&contiguous, self.dtype);
             }
         };
         let (dims, strides) = dims4_ggml(layout)?;

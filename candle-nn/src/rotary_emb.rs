@@ -603,6 +603,7 @@ pub fn rope_slow(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(any(feature = "wgpu", feature = "vulkan")), allow(dead_code))]
 struct RotaryEmbGgml {
     n_dims: usize,
     freq_base: f32,

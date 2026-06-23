@@ -252,16 +252,10 @@ fn main() -> anyhow::Result<()> {
 
     let start_prompt_processing = std::time::Instant::now();
 
-    let mut next_token = if !args.split_prompt {
-        let input = Tensor::new(tokens.as_slice(), &device)?.unsqueeze(0)?;
-        let logits = model.forward(&input, 0)?;
-        let logits = logits.squeeze(0)?;
-        logits_processor.sample(&logits)?
-    } else {
-        let mut next_token = 0;
-        for (pos, token) in tokens.iter().enumerate() {
-            let input = Tensor::new(&[*token], &device)?.unsqueeze(0)?;
-            let logits = model.forward(&input, pos)?;
+    let (prompt_dt, sampled, dt) = device.with_context(|| -> anyhow::Result<_> {
+        let mut next_token = if !args.split_prompt {
+            let input = Tensor::new(tokens.as_slice(), &device)?.unsqueeze(0)?;
+            let logits = model.forward(&input, 0)?;
             let logits = logits.squeeze(0)?;
             logits_processor.sample(&logits)?
         } else {
@@ -329,7 +323,6 @@ fn main() -> anyhow::Result<()> {
         tokens.len() as f64 / prompt_dt.as_secs_f64(),
     );
     if sampled > 0 {
-        let dt = start_post_prompt.elapsed();
         println!(
             "{sampled:4} tokens generated: {:.2} token/s",
             sampled as f64 / dt.as_secs_f64(),
