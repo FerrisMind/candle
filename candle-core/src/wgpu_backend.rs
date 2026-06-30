@@ -3,6 +3,7 @@ use crate::op::{BinaryOpT, CmpOp, Mul, ReduceOp, UnaryOpT};
 use crate::quantized::GgmlDType;
 use crate::{CpuStorage, DType, Error, Layout, Result, Shape, WithDType};
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
@@ -132,6 +133,7 @@ struct WhereParams {
     ne0: u32,
     ne1: u32,
     ne2: u32,
+    base: u32,
 }
 
 #[repr(C)]
@@ -245,6 +247,7 @@ struct SoftmaxParams {
     n_head_log2: f32,
     m0: f32,
     m1: f32,
+    row_base: u32,
 }
 
 #[repr(C)]
@@ -2904,6 +2907,7 @@ struct Params {{
     n_head_log2: f32,
     m0: f32,
     m1: f32,
+    row_base: u32,
 }};
 @group(0) @binding(0) var<storage, read_write> src: array<u32>;
 @group(0) @binding(1) var<uniform> params: Params;
@@ -2924,7 +2928,7 @@ fn main(
     @builtin(num_workgroups) num_wg: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {{
-    var i = wid.x + wid.y * num_wg.x;
+    var i = wid.x + wid.y * num_wg.x + params.row_base;
     let i3 = i / (params.ne2 * params.ne1);
     i = i % (params.ne2 * params.ne1);
     let i2 = i / params.ne1;
@@ -3483,27 +3487,27 @@ fn custom_where_u8_wgsl(dtype: DType) -> Result<String> {
         r#"@compute @workgroup_size({WG_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     if (gid.x >= params.ne) {{ return; }}
-    let logical_idx = gid.x;
+    let logical_idx = params.base + gid.x;
     let coords = decompose_idx(logical_idx);
     let pred = cond_is_true(params.offset_cond + cond_index(coords));
     let t = on_true[params.offset_true + true_index(coords)];
-    let f = on_false[params.offset_false + false_index(coords)];
-    dst[params.offset_dst + logical_idx] = select(f, t, pred);
+    let f = on_false[params.offset_false + false_index(coords) - params.base];
+    dst[params.offset_dst + logical_idx - params.base] = select(f, t, pred);
 }}"#
     );
     let u8_main = format!(
         r#"@compute @workgroup_size({WG_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let base = gid.x * 4u;
-    if (base >= params.ne) {{ return; }}
+    let lane0 = params.base + gid.x * 4u;
+    if (gid.x * 4u >= params.ne) {{ return; }}
     var out_word: u32 = 0u;
     for (var lane: u32 = 0u; lane < 4u; lane = lane + 1u) {{
-        let logical_idx = base + lane;
-        if (logical_idx >= params.ne) {{ break; }}
+        let logical_idx = lane0 + lane;
+        if (logical_idx >= params.base + params.ne) {{ break; }}
         let coords = decompose_idx(logical_idx);
         let pred = cond_is_true(params.offset_cond + cond_index(coords));
         let t_idx = params.offset_true + true_index(coords);
-        let f_idx = params.offset_false + false_index(coords);
+        let f_idx = params.offset_false + false_index(coords) - params.base;
         let t_b = (on_true[t_idx / 4u] >> (8u * (t_idx % 4u))) & 0xffu;
         let f_b = (on_false[f_idx / 4u] >> (8u * (f_idx % 4u))) & 0xffu;
         let b = select(f_b, t_b, pred);
@@ -3516,15 +3520,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         r#"@compute @workgroup_size({WG_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     if (gid.x >= params.ne) {{ return; }}
-    let logical_idx = gid.x;
+    let logical_idx = params.base + gid.x;
     let coords = decompose_idx(logical_idx);
     let pred = cond_is_true(params.offset_cond + cond_index(coords));
     let t_idx = params.offset_true + true_index(coords);
-    let f_idx = params.offset_false + false_index(coords);
+    let f_idx = params.offset_false + false_index(coords) - params.base;
     let lo = select(on_false[2u * f_idx], on_true[2u * t_idx], pred);
     let hi = select(on_false[2u * f_idx + 1u], on_true[2u * t_idx + 1u], pred);
-    dst[2u * (params.offset_dst + logical_idx)] = lo;
-    dst[2u * (params.offset_dst + logical_idx) + 1u] = hi;
+    let dst_idx = params.offset_dst + logical_idx - params.base;
+    dst[2u * dst_idx] = lo;
+    dst[2u * dst_idx + 1u] = hi;
 }}"#
     );
     let (ty, main) = match dtype {
@@ -3560,6 +3565,7 @@ struct Params {{
     ne0: u32,
     ne1: u32,
     ne2: u32,
+    base: u32,
 }};
 
 @group(0) @binding(0) var<storage, read> cond_words: array<u32>;
@@ -3690,6 +3696,99 @@ fn buffer_binding<'a>(binding: u32, buffer: &'a wgpu::Buffer) -> wgpu::BindGroup
     }
 }
 
+fn buffer_binding_range<'a>(
+    binding: u32,
+    buffer: &'a wgpu::Buffer,
+    offset_bytes: u64,
+    size_bytes: u64,
+) -> Result<wgpu::BindGroupEntry<'a>> {
+    let size = NonZeroU64::new(size_bytes).ok_or_else(|| {
+        Error::Msg("wgpu binding range size must be non-zero".into()).bt()
+    })?;
+    Ok(wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer,
+            offset: offset_bytes,
+            size: Some(size),
+        }),
+    })
+}
+
+fn storage_buffer_binding<'a>(
+    device: &WgpuDevice,
+    binding: u32,
+    buffer: &'a wgpu::Buffer,
+    dtype: DType,
+    start_elem: usize,
+    num_elems: usize,
+) -> Result<wgpu::BindGroupEntry<'a>> {
+    let elem_size = dtype.size_in_bytes();
+    let offset_bytes = (start_elem * elem_size) as u64;
+    let size_bytes = (num_elems * elem_size) as u64;
+    if size_bytes == 0 {
+        return Err(Error::Msg("wgpu storage buffer binding with zero size".into()).bt());
+    }
+    let align = device.inner.limits.min_storage_buffer_offset_alignment as u64;
+    if offset_bytes % align != 0 {
+        return Err(Error::Msg(format!(
+            "wgpu buffer binding offset {offset_bytes} not aligned to {align}"
+        ))
+        .bt());
+    }
+    let max = device.inner.limits.max_storage_buffer_binding_size as u64;
+    if size_bytes > max {
+        return Err(Error::Msg(format!(
+            "wgpu storage buffer binding size {size_bytes} exceeds max {max}"
+        ))
+        .bt());
+    }
+    buffer_binding_range(binding, buffer, offset_bytes, size_bytes)
+}
+
+fn layout_storage_binding<'a>(
+    device: &WgpuDevice,
+    binding: u32,
+    buffer: &'a wgpu::Buffer,
+    layout: &Layout,
+    dtype: DType,
+    storage_count: usize,
+) -> Result<wgpu::BindGroupEntry<'a>> {
+    let start = layout.start_offset();
+    let num_elems = if layout.is_contiguous() {
+        layout.shape().elem_count()
+    } else {
+        storage_count.saturating_sub(start)
+    };
+    storage_buffer_binding(device, binding, buffer, dtype, start, num_elems)
+}
+
+fn storage_layout_binding<'a>(
+    storage: &'a WgpuStorage,
+    layout: &Layout,
+    binding: u32,
+) -> Result<wgpu::BindGroupEntry<'a>> {
+    layout_storage_binding(
+        &storage.device,
+        binding,
+        &storage.buffer,
+        layout,
+        storage.dtype,
+        storage.count,
+    )
+}
+
+fn layout_binding_bytes(storage: &WgpuStorage, layout: &Layout) -> usize {
+    let elem_size = storage.dtype.size_in_bytes().max(1);
+    let start = layout.start_offset();
+    let num_elems = if layout.is_contiguous() {
+        layout.shape().elem_count()
+    } else {
+        storage.count.saturating_sub(start)
+    };
+    num_elems.saturating_mul(elem_size)
+}
+
 impl WgpuStorage {
     fn run_unary_like(&self, layout: &Layout, shader: &str, label: &'static str) -> Result<Self> {
         let (dims, strides) = dims4(layout)?;
@@ -3741,7 +3840,7 @@ impl WgpuStorage {
     fn run_scale(&self, layout: &Layout, scale: f32, bias: f32) -> Result<Self> {
         let count = layout.shape().elem_count();
         let params = ScaleParams {
-            offset_src: layout.start_offset().try_into()?,
+            offset_src: 0,
             offset_dst: 0,
             stride_src1: 0,
             stride_src2: 0,
@@ -3778,14 +3877,15 @@ impl WgpuStorage {
         if self.dtype == DType::BF16 && layout.is_contiguous() && bias == 0.0 {
             // ponytail: in-place pair-write — saves one full attn-scores buffer at long prefill.
             let mut inplace_params = params;
-            inplace_params.offset_dst = layout.start_offset().try_into()?;
+            inplace_params.offset_src = 0;
+            inplace_params.offset_dst = 0;
             self.device
                 .inner
                 .queue
                 .write_buffer(&param_buffer, 0, any_as_bytes(&inplace_params));
             let bindings = [
-                buffer_binding(0, &self.buffer),
-                buffer_binding(1, &self.buffer),
+                storage_layout_binding(self, layout, 0)?,
+                storage_layout_binding(self, layout, 1)?,
                 buffer_binding(2, &param_buffer),
             ];
             let pairs = count.div_ceil(2) as u32;
@@ -3813,32 +3913,96 @@ impl WgpuStorage {
             let _ = (dims, strides);
             unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? }
         };
-        let bindings = [
-            buffer_binding(0, &self.buffer),
-            buffer_binding(1, &dst.buffer),
-            buffer_binding(2, &param_buffer),
-        ];
+        let mut dispatch_params = params;
+        dispatch_params.offset_src = 0;
+        dispatch_params.offset_dst = 0;
         let shader = if self.dtype == DType::BF16 {
             bf16_scale_shader()
         } else {
             let (dims, strides) = dims4(layout)?;
-            let mut f32_params = params;
-            f32_params.stride_src1 = strides[1];
-            f32_params.stride_src2 = strides[2];
-            f32_params.stride_src3 = strides[3];
-            f32_params.stride_dst1 = dims[0];
-            f32_params.stride_dst2 = dims[0] * dims[1];
-            f32_params.stride_dst3 = dims[0] * dims[1] * dims[2];
-            f32_params.ne0 = dims[0];
-            f32_params.ne1 = dims[1];
-            f32_params.ne2 = dims[2];
-            self.device
-                .inner
-                .queue
-                .write_buffer(&param_buffer, 0, any_as_bytes(&f32_params));
+            dispatch_params.stride_src1 = strides[1];
+            dispatch_params.stride_src2 = strides[2];
+            dispatch_params.stride_src3 = strides[3];
+            dispatch_params.stride_dst1 = dims[0];
+            dispatch_params.stride_dst2 = dims[0] * dims[1];
+            dispatch_params.stride_dst3 = dims[0] * dims[1] * dims[2];
+            dispatch_params.ne0 = dims[0];
+            dispatch_params.ne1 = dims[1];
+            dispatch_params.ne2 = dims[2];
             candle_wgpu_kernels::scale_shader(WG_SIZE)
                 .ok_or_else(|| Error::Msg("wgpu shader scale.wgsl not embedded".into()).bt())?
         };
+        let elem_size = self.dtype.size_in_bytes();
+        let total_bytes = count * elem_size;
+        let max_binding_bytes = self.device.inner.limits.max_storage_buffer_binding_size as usize;
+        if layout.is_contiguous() && total_bytes > max_binding_bytes {
+            let align = self.device.inner.limits.min_storage_buffer_offset_alignment as usize;
+            let mut chunk_bytes_cap = max_binding_bytes;
+            if chunk_bytes_cap > align {
+                chunk_bytes_cap = (chunk_bytes_cap / align) * align;
+            }
+            if chunk_bytes_cap == 0 {
+                return Err(Error::Msg("wgpu scale chunk size is zero".into()).bt());
+            }
+            let start_bytes = layout.start_offset() * elem_size;
+            let mut base_bytes = 0usize;
+            while base_bytes < total_bytes {
+                let chunk_bytes = (total_bytes - base_bytes).min(chunk_bytes_cap);
+                let chunk_elems = chunk_bytes / elem_size;
+                let mut chunk_params = dispatch_params;
+                chunk_params.offset_src = 0;
+                chunk_params.offset_dst = 0;
+                chunk_params.ne = chunk_elems.try_into()?;
+                if self.dtype != DType::BF16 {
+                    chunk_params.stride_src1 = 0;
+                    chunk_params.stride_src2 = 0;
+                    chunk_params.stride_src3 = 0;
+                    chunk_params.stride_dst1 = 0;
+                    chunk_params.stride_dst2 = 0;
+                    chunk_params.stride_dst3 = 0;
+                    chunk_params.ne0 = chunk_elems.try_into()?;
+                    chunk_params.ne1 = 1;
+                    chunk_params.ne2 = 1;
+                }
+                self.device
+                    .inner
+                    .queue
+                    .write_buffer(&param_buffer, 0, any_as_bytes(&chunk_params));
+                let chunk_bindings = [
+                    buffer_binding_range(
+                        0,
+                        &self.buffer,
+                        (start_bytes + base_bytes) as u64,
+                        chunk_bytes as u64,
+                    )?,
+                    buffer_binding_range(1, &dst.buffer, base_bytes as u64, chunk_bytes as u64)?,
+                    buffer_binding(2, &param_buffer),
+                ];
+                let work = if self.dtype == DType::BF16 {
+                    chunk_elems.div_ceil(2) as u32
+                } else {
+                    chunk_elems as u32
+                };
+                self.device.run_compute_linear(
+                    &shader,
+                    &entries,
+                    &chunk_bindings,
+                    work,
+                    "candle-wgpu-scale",
+                )?;
+                base_bytes += chunk_bytes;
+            }
+            return Ok(dst);
+        }
+        let bindings = [
+            storage_layout_binding(self, layout, 0)?,
+            storage_layout_binding(&dst, &Layout::contiguous(layout.shape()), 1)?,
+            buffer_binding(2, &param_buffer),
+        ];
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&dispatch_params));
         let work = if self.dtype == DType::BF16 {
             count.div_ceil(2) as u32
         } else {
@@ -4083,9 +4247,9 @@ impl WgpuStorage {
         let dst = unsafe { t.device.alloc_uninit(layout.shape(), t.dtype)? };
         let params = WhereParams {
             ne: count.try_into()?,
-            offset_cond: layout.start_offset().try_into()?,
-            offset_true: t_l.start_offset().try_into()?,
-            offset_false: f_l.start_offset().try_into()?,
+            offset_cond: 0,
+            offset_true: 0,
+            offset_false: 0,
             offset_dst: 0,
             stride_cond0: cond_strides[0],
             stride_cond1: cond_strides[1],
@@ -4102,6 +4266,7 @@ impl WgpuStorage {
             ne0: dims[0],
             ne1: dims[1],
             ne2: dims[2],
+            base: 0,
         };
         let param_buffer = self
             .device
@@ -4124,11 +4289,72 @@ impl WgpuStorage {
             storage_entry(3, false),
             uniform_entry(4),
         ];
+        let max_binding_bytes = self.device.inner.limits.max_storage_buffer_binding_size as usize;
+        let dst_layout = Layout::contiguous(layout.shape());
+        let needs_chunk = layout_binding_bytes(self, layout) > max_binding_bytes
+            || layout_binding_bytes(t, t_l) > max_binding_bytes
+            || layout_binding_bytes(f, f_l) > max_binding_bytes
+            || layout_binding_bytes(&dst, &dst_layout) > max_binding_bytes;
+        if needs_chunk {
+            if !f_l.is_contiguous() {
+                return Err(Error::Msg(
+                    "wgpu where chunking requires a contiguous on_false operand".into(),
+                )
+                .bt());
+            }
+            let value_elem_size = t.dtype.size_in_bytes();
+            let align = self.device.inner.limits.min_storage_buffer_offset_alignment as usize;
+            let mut chunk_bytes_cap = max_binding_bytes;
+            if chunk_bytes_cap > align {
+                chunk_bytes_cap = (chunk_bytes_cap / align) * align;
+            }
+            if chunk_bytes_cap == 0 {
+                return Err(Error::Msg("wgpu where chunk size is zero".into()).bt());
+            }
+            let chunk_elems_cap = chunk_bytes_cap / value_elem_size.max(1);
+            if chunk_elems_cap == 0 {
+                return Err(Error::Msg("wgpu where chunk elems is zero".into()).bt());
+            }
+            let mut base = 0usize;
+            while base < count {
+                let chunk_elems = (count - base).min(chunk_elems_cap);
+                let chunk_shape = Shape::from(chunk_elems);
+                let false_chunk_l =
+                    Layout::contiguous_with_offset(chunk_shape.clone(), f_l.start_offset() + base);
+                let dst_chunk_l = Layout::contiguous_with_offset(chunk_shape, base);
+                let mut chunk_params = params;
+                chunk_params.ne = chunk_elems.try_into()?;
+                chunk_params.base = base.try_into()?;
+                chunk_params.offset_false = 0;
+                chunk_params.offset_dst = 0;
+                self.device
+                    .inner
+                    .queue
+                    .write_buffer(&param_buffer, 0, any_as_bytes(&chunk_params));
+                let chunk_bindings = [
+                    storage_layout_binding(self, layout, 0)?,
+                    storage_layout_binding(t, t_l, 1)?,
+                    storage_layout_binding(f, &false_chunk_l, 2)?,
+                    storage_layout_binding(&dst, &dst_chunk_l, 3)?,
+                    buffer_binding(4, &param_buffer),
+                ];
+                let workgroups = (chunk_elems as u32).div_ceil(WG_SIZE);
+                t.device.run_compute(
+                    &custom_where_u8_wgsl(t.dtype)?,
+                    &entries,
+                    &chunk_bindings,
+                    workgroups,
+                    "candle-wgpu-where",
+                )?;
+                base += chunk_elems;
+            }
+            return Ok(dst);
+        }
         let bindings = [
-            buffer_binding(0, &self.buffer),
-            buffer_binding(1, &t.buffer),
-            buffer_binding(2, &f.buffer),
-            buffer_binding(3, &dst.buffer),
+            storage_layout_binding(self, layout, 0)?,
+            storage_layout_binding(t, t_l, 1)?,
+            storage_layout_binding(f, f_l, 2)?,
+            storage_layout_binding(&dst, &dst_layout, 3)?,
             buffer_binding(4, &param_buffer),
         ];
         let workgroups = (count as u32).div_ceil(WG_SIZE);
@@ -5930,6 +6156,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 n_head_log2: 0.0,
                 m0: 0.0,
                 m1: 0.0,
+                row_base: 0,
             };
             let param_buffer = self
                 .device
@@ -5997,6 +6224,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             n_head_log2: 0.0,
             m0: 0.0,
             m1: 0.0,
+            row_base: 0,
         };
         let param_buffer = self
             .device
@@ -6017,14 +6245,63 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             storage_entry(1, false),
             uniform_entry(2),
         ];
-        let bindings = [
-            buffer_binding(0, &self.buffer),
-            buffer_binding(1, &dst.buffer),
-            buffer_binding(2, &param_buffer),
-        ];
+        let rows = count / layout.dims()[layout.dims().len() - 1];
         let shader = candle_wgpu_kernels::softmax_shader(WG_SIZE)
             .ok_or_else(|| Error::Msg("wgpu shader soft_max.wgsl not embedded".into()).bt())?;
-        let rows = count / layout.dims()[layout.dims().len() - 1];
+        let elem_size = self.dtype.size_in_bytes();
+        let row_elems = layout.dims()[layout.dims().len() - 1];
+        let row_bytes = row_elems * elem_size;
+        let total_bytes = count * elem_size;
+        let max_binding_bytes = self.device.inner.limits.max_storage_buffer_binding_size as usize;
+        if total_bytes > max_binding_bytes {
+            let align = self.device.inner.limits.min_storage_buffer_offset_alignment as usize;
+            let mut row_bytes_cap = max_binding_bytes;
+            if row_bytes_cap > align {
+                row_bytes_cap = (row_bytes_cap / align) * align;
+            }
+            let rows_per_chunk = (row_bytes_cap / row_bytes.max(1)).max(1);
+            let mut row_base = 0usize;
+            while row_base < rows {
+                let chunk_rows = (rows - row_base).min(rows_per_chunk);
+                let chunk_bytes = chunk_rows * row_bytes;
+                let src_byte_off = (layout.start_offset() + row_base * row_elems) * elem_size;
+                let dst_byte_off = row_base * row_elems * elem_size;
+                let mut chunk_params = params;
+                chunk_params.offset_src0 = 0;
+                chunk_params.offset_dst = 0;
+                chunk_params.row_base = row_base.try_into()?;
+                self.device
+                    .inner
+                    .queue
+                    .write_buffer(&param_buffer, 0, any_as_bytes(&chunk_params));
+                let chunk_bindings = [
+                    buffer_binding_range(0, &self.buffer, src_byte_off as u64, chunk_bytes as u64)?,
+                    buffer_binding_range(1, &dst.buffer, dst_byte_off as u64, chunk_bytes as u64)?,
+                    buffer_binding(2, &param_buffer),
+                ];
+                self.device.run_compute(
+                    &shader,
+                    &entries,
+                    &chunk_bindings,
+                    chunk_rows.try_into()?,
+                    "candle-wgpu-softmax",
+                )?;
+                row_base += chunk_rows;
+            }
+            return Ok(dst);
+        }
+        let bindings = [
+            storage_layout_binding(self, layout, 0)?,
+            storage_layout_binding(&dst, &Layout::contiguous(layout.shape()), 1)?,
+            buffer_binding(2, &param_buffer),
+        ];
+        let mut ranged_params = params;
+        ranged_params.offset_src0 = 0;
+        ranged_params.offset_dst = 0;
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&ranged_params));
         self.device.run_compute(
             &shader,
             &entries,
@@ -6898,9 +7175,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
         let dst_shape = Shape::from(vec![b, m, n]);
         let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
+        let dst_layout = Layout::contiguous(dst_shape);
         let params = MulMatParams {
             offset_src0: 0,
-            offset_src1: lhs_layout.start_offset().try_into()?,
+            offset_src1: 0,
             offset_dst: 0,
             m: n.try_into()?,
             n: m.try_into()?,
@@ -6936,12 +7214,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             storage_entry(2, false),
             uniform_entry(3),
         ];
-        let bindings = [
-            buffer_binding(0, &rhs_t.buffer),
-            buffer_binding(1, &lhs.buffer),
-            buffer_binding(2, &dst.buffer),
-            buffer_binding(3, &param_buffer),
-        ];
         let shader_storage;
         let matmul_label: &'static str;
         let shader: &str = match self.dtype {
@@ -6976,11 +7248,110 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu matmul").bt());
             }
         };
-        let total_wg = (b * m * n).try_into().map(|v: u32| v.div_ceil(WG_SIZE))?;
-        let max_per_dim = wgpu_dispatch_wg_cap(&self.device);
-        let (wg_x, wg_y) = compute_2d_workgroups(total_wg, max_per_dim);
-        self.device
-            .run_compute_xyz(shader, &entries, &bindings, (wg_x, wg_y, 1), matmul_label)?;
+        let max_binding_bytes = self.device.inner.limits.max_storage_buffer_binding_size as usize;
+        let dst_bytes = byte_len(self.dtype, b * m * n, "wgpu matmul dst")?;
+        let lhs_bytes = layout_binding_bytes(lhs, &lhs_layout);
+        let rhs_bytes = layout_binding_bytes(&rhs_t, &rhs_t_layout);
+        let elem_size = self.dtype.size_in_bytes();
+        let matrix_elems = m * n;
+        let matrix_bytes = matrix_elems * elem_size;
+        let lhs_matrix_bytes = m * k * elem_size;
+        let rhs_matrix_bytes = n * k * elem_size;
+        let needs_batch_chunk = dst_bytes > max_binding_bytes
+            || lhs_bytes > max_binding_bytes
+            || rhs_bytes > max_binding_bytes;
+        if needs_batch_chunk {
+            if b <= 1 {
+                return Err(Error::Msg(format!(
+                    "wgpu matmul binding exceeds max_storage_buffer_binding_size (dst={dst_bytes}, lhs={lhs_bytes}, rhs={rhs_bytes}, max={max_binding_bytes})"
+                ))
+                .bt());
+            }
+            if matrix_bytes > max_binding_bytes
+                || lhs_matrix_bytes > max_binding_bytes
+                || rhs_matrix_bytes > max_binding_bytes
+            {
+                return Err(Error::Msg(format!(
+                    "wgpu matmul per-batch binding exceeds max_storage_buffer_binding_size (dst={matrix_bytes}, lhs={lhs_matrix_bytes}, rhs={rhs_matrix_bytes}, max={max_binding_bytes})"
+                ))
+                .bt());
+            }
+            let max_per_dim = wgpu_dispatch_wg_cap(&self.device);
+            let total_wg = (m * n).try_into().map(|v: u32| v.div_ceil(WG_SIZE))?;
+            let (wg_x, wg_y) = compute_2d_workgroups(total_wg, max_per_dim);
+            let mut chunk_params = params;
+            chunk_params.bs02 = 1;
+            chunk_params.bs03 = 1;
+            chunk_params.broadcast2 = 1;
+            chunk_params.broadcast3 = 1;
+            let matrix_elems_u64 = matrix_elems as u64;
+            let lhs_matrix_elems_u64 = (m * k) as u64;
+            let rhs_matrix_elems_u64 = (n * k) as u64;
+            let elem_size_u64 = elem_size as u64;
+            for batch_idx in 0..b {
+                let dst2_idx = batch_idx % bs02;
+                let dst3_idx = batch_idx / bs02;
+                let src02_idx = dst2_idx;
+                let src03_idx = dst3_idx;
+                let src12_idx = dst2_idx;
+                let src13_idx = dst3_idx;
+                let rhs_elem_off = params.offset_src0 as u64
+                    + (src03_idx as u64 * rhs_stride_batch_outer as u64
+                        + src02_idx as u64 * rhs_stride_batch_inner as u64);
+                let lhs_elem_off = params.offset_src1 as u64
+                    + (src13_idx as u64 * lhs_stride_batch_outer as u64
+                        + src12_idx as u64 * lhs_stride_batch_inner as u64);
+                let mut dispatch_params = chunk_params;
+                dispatch_params.offset_src0 = 0;
+                dispatch_params.offset_src1 = 0;
+                dispatch_params.offset_dst = 0;
+                self.device
+                    .inner
+                    .queue
+                    .write_buffer(&param_buffer, 0, any_as_bytes(&dispatch_params));
+                let dst_offset_bytes = (batch_idx as u64)
+                    .saturating_mul(matrix_elems_u64)
+                    .saturating_mul(elem_size_u64);
+                let batch_bindings = [
+                    buffer_binding_range(
+                        0,
+                        &rhs_t.buffer,
+                        rhs_elem_off.saturating_mul(elem_size_u64),
+                        rhs_matrix_elems_u64.saturating_mul(elem_size_u64),
+                    )?,
+                    buffer_binding_range(
+                        1,
+                        &lhs.buffer,
+                        lhs_elem_off.saturating_mul(elem_size_u64),
+                        lhs_matrix_elems_u64.saturating_mul(elem_size_u64),
+                    )?,
+                    buffer_binding_range(
+                        2,
+                        &dst.buffer,
+                        dst_offset_bytes,
+                        matrix_elems_u64.saturating_mul(elem_size_u64),
+                    )?,
+                    buffer_binding(3, &param_buffer),
+                ];
+                self.device.run_compute_xyz(
+                    shader,
+                    &entries,
+                    &batch_bindings,
+                    (wg_x, wg_y, 1),
+                    matmul_label,
+                )?;
+            }
+        } else {
+            let rhs_bind = storage_layout_binding(&rhs_t, &rhs_t_layout, 0)?;
+            let lhs_bind = storage_layout_binding(lhs, &lhs_layout, 1)?;
+            let dst_bind = storage_layout_binding(&dst, &dst_layout, 2)?;
+            let bindings = [rhs_bind, lhs_bind, dst_bind, buffer_binding(3, &param_buffer)];
+            let total_wg = (b * m * n).try_into().map(|v: u32| v.div_ceil(WG_SIZE))?;
+            let max_per_dim = wgpu_dispatch_wg_cap(&self.device);
+            let (wg_x, wg_y) = compute_2d_workgroups(total_wg, max_per_dim);
+            self.device
+                .run_compute_xyz(shader, &entries, &bindings, (wg_x, wg_y, 1), matmul_label)?;
+        }
         drop(lhs_contiguous);
         Ok(dst)
     }

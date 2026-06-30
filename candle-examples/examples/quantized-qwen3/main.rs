@@ -252,7 +252,7 @@ fn main() -> anyhow::Result<()> {
 
     let start_prompt_processing = std::time::Instant::now();
 
-    let (prompt_dt, sampled, dt) = device.with_context(|| -> anyhow::Result<_> {
+    let (prompt_dt, sampled, dt) = (|| -> anyhow::Result<_> {
         let mut next_token = if !args.split_prompt {
             let input = Tensor::new(tokens.as_slice(), &device)?.unsqueeze(0)?;
             let logits = model.forward(&input, 0)?;
@@ -310,7 +310,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         Ok((prompt_dt, sampled, start_post_prompt.elapsed()))
-    })?;
+    })()?;
 
     if let Some(rest) = tos.decode_rest().map_err(candle::Error::msg)? {
         print!("{rest}");

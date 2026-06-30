@@ -41,6 +41,7 @@ struct Params {
     n_head_log2: f32,
     m0: f32,
     m1: f32,
+    row_base: u32,
 };
 
 @group(0) @binding(0)
@@ -161,7 +162,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(num_workgroups) num_wg: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
 
-    var i = wid.x + wid.y * num_wg.x;
+    var i = wid.x + wid.y * num_wg.x + params.row_base;
     let i3 = i / (params.ne2 * params.ne1);
     i = i % (params.ne2 * params.ne1);
     let i2 = i / params.ne1;
