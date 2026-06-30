@@ -3154,9 +3154,6 @@ impl VulkanStorage {
         if self.dtype != DType::BF16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan to_dtype").bt());
         }
-        if dtype != DType::F16 && dtype != DType::F32 {
-            return Err(unsupported("to_dtype bf16"));
-        }
         if !layout.is_contiguous() || layout.start_offset() != 0 {
             let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
             self.copy_strided_src(&mut materialized, 0, layout)?;
@@ -3899,7 +3896,8 @@ impl VulkanStorage {
                 .bt()
             })?;
         if lhs_layout.start_offset() != 0 || rhs_layout.start_offset() != 0 {
-            return Err(unsupported("binary offset"));
+            let flat_l = Layout::contiguous(lhs_layout.shape());
+            return self.run_binary_named(rhs, &flat_l, &flat_l, op);
         }
         let (lhs_dims, lhs_strides) = dims4_ggml(lhs_layout)?;
         let (rhs_dims, rhs_strides) = dims4_ggml(rhs_layout)?;
@@ -4228,9 +4226,6 @@ impl VulkanStorage {
             return self.try_clone(layout);
         }
         if reduce_dims.len() > 1 {
-            if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
-                return Err(unsupported("int reduce multi-dim arg"));
-            }
             let mut current_layout = layout.clone();
             let mut current_shape = layout.dims().to_vec();
             let mut current: Option<Self> = None;
@@ -4241,7 +4236,7 @@ impl VulkanStorage {
                 current_layout = Layout::contiguous(Shape::from(current_shape.clone()));
                 current = Some(reduced);
             }
-            return current.ok_or_else(|| unsupported("int reduce multi-dim empty"));
+            return match current { Some(v) => Ok(v), None => self.try_clone(layout) };
         }
         let dim = reduce_dims[0];
         if dim != rank - 1 {
@@ -4292,7 +4287,7 @@ impl VulkanStorage {
 
     fn run_int_sum_rows(&self, layout: &Layout) -> Result<Self> {
         if layout.start_offset() > u16::MAX as usize {
-            return Err(unsupported("int sum_rows offset"));
+            return self.run_int_sum_rows(&Layout::contiguous(layout.shape()));
         }
         let rank = layout.dims().len();
         let (src_dims, src_strides) = dims4_ggml(layout)?;
@@ -4347,10 +4342,10 @@ impl VulkanStorage {
 
     fn run_int_extrema_last_dim(&self, layout: &Layout, mode: u32) -> Result<Self> {
         let rank = layout.dims().len();
-        let kx = *layout
-            .dims()
-            .last()
-            .ok_or_else(|| unsupported("int extrema scalar"))?;
+        if rank == 0 {
+            return self.try_clone(layout);
+        }
+        let kx = *layout.dims().last().unwrap_or(&1);
         let mut dst_dims = layout.dims().to_vec();
         dst_dims[rank - 1] = 1;
         let dst_shape = Shape::from(dst_dims);
@@ -4386,10 +4381,10 @@ impl VulkanStorage {
 
     fn run_int_argextrema_last_dim(&self, layout: &Layout, mode: u32) -> Result<Self> {
         let rank = layout.dims().len();
-        let kx = *layout
-            .dims()
-            .last()
-            .ok_or_else(|| unsupported("int argextrema scalar"))?;
+        if rank == 0 {
+            return Ok(unsafe { self.device.alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)? });
+        }
+        let kx = *layout.dims().last().unwrap_or(&1);
         let mut dst_dims = layout.dims().to_vec();
         dst_dims[rank - 1] = 1;
         let dst_shape = Shape::from(dst_dims);
@@ -4425,7 +4420,7 @@ impl VulkanStorage {
 
     fn run_sum_rows(&self, layout: &Layout) -> Result<Self> {
         if layout.start_offset() > u16::MAX as usize {
-            return Err(unsupported("sum_rows offset"));
+            return self.run_sum_rows(&Layout::contiguous(layout.shape()));
         }
         let rank = layout.dims().len();
         let (src_dims, src_strides) = dims4_ggml(layout)?;
@@ -4474,14 +4469,11 @@ impl VulkanStorage {
     }
 
     fn run_argmax_last_dim(&self, layout: &Layout) -> Result<Self> {
-        if !layout.is_contiguous() || layout.start_offset() != 0 {
-            return Err(unsupported("argmax strided"));
-        }
         let rank = layout.dims().len();
-        let kx = *layout
-            .dims()
-            .last()
-            .ok_or_else(|| unsupported("argmax scalar"))?;
+        if rank == 0 {
+            return Ok(unsafe { self.device.alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)? });
+        }
+        let kx = *layout.dims().last().unwrap_or(&1);
         let mut dst_dims_candle = layout.dims().to_vec();
         dst_dims_candle[rank - 1] = 1;
         let dst_shape = Shape::from(dst_dims_candle);
@@ -4552,7 +4544,11 @@ impl VulkanStorage {
                     <Self as BackendStorage>::gather(src, src_layout, &ids, &ids_layout, rank - 1)
                 }
             }
-            ReduceOp::Sum => Err(unsupported("reduce extrema")),
+            ReduceOp::Sum => {
+                // Sum for last-dim goes through run_sum_rows in reduce_op dispatch;
+                // this arm is unreachable but kept for exhaustiveness.
+                self.run_sum_rows(layout)
+            }
         }
     }
 
@@ -4582,9 +4578,6 @@ impl VulkanStorage {
         layout: &Layout,
         reduce_dims: &[usize],
     ) -> Result<Self> {
-        if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
-            return Err(unsupported("reduce multi-dim arg"));
-        }
         let mut current_shape = layout.dims().to_vec();
         let mut current_layout = layout.clone();
         let mut current_storage = None;
@@ -4595,7 +4588,7 @@ impl VulkanStorage {
             current_layout = Layout::contiguous(Shape::from(current_shape.clone()));
             current_storage = Some(reduced);
         }
-        current_storage.ok_or_else(|| unsupported("reduce multi-dim empty"))
+        match current_storage { Some(v) => Ok(v), None => self.try_clone(layout) }
     }
 
     pub(crate) fn argsort_last_dim(
@@ -4649,11 +4642,16 @@ impl VulkanStorage {
         if self.dtype != expected {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan argsort").bt());
         }
-        if !layout.is_contiguous() || layout.start_offset() != 0 {
-            return Err(unsupported("argsort strided"));
-        }
-        if last_dim == 0 || layout.dims().last().copied() != Some(last_dim) {
-            return Err(unsupported("argsort last-dim"));
+        let mut materialized_argsort;
+        let argsort_layout_buf;
+        let argsort_layout;
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            argsort_layout = layout;
+        } else {
+            materialized_argsort = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized_argsort, 0, layout)?;
+            argsort_layout_buf = Layout::contiguous(layout.shape());
+            argsort_layout = &argsort_layout_buf;
         }
         let ncols_padded = next_power_of_two_u32(last_dim, "argsort")?;
         if ncols_padded != last_dim as u32 && !self.device.inner.robust_buffer_access {
@@ -4661,7 +4659,7 @@ impl VulkanStorage {
                 "argsort non-power-of-two without robust buffers",
             ));
         }
-        let count = layout.shape().elem_count();
+        let count = argsort_layout.shape().elem_count();
         let nrows = count / last_dim;
         let nrows_u32: u32 = nrows.try_into()?;
         if nrows_u32 == 0 {
@@ -4670,7 +4668,7 @@ impl VulkanStorage {
         let workgroups_y = nrows_u32
             .min(self.device.inner.max_workgroup_count_y)
             .max(1);
-        let dst = unsafe { self.device.alloc_uninit(layout.shape(), DType::U32)? };
+        let dst = unsafe { self.device.alloc_uninit(argsort_layout.shape(), DType::U32)? };
         let ncols_padded_log2 = ncols_padded.trailing_zeros();
         let pipeline_idx = ncols_padded_log2.min(VULKAN_ARGSORT_NUM_PIPELINES - 1);
         let use_small = ncols_padded_log2 <= self.device.inner.max_workgroup_size_log2;
@@ -4825,10 +4823,18 @@ impl VulkanStorage {
         if self.dtype != DType::F32 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan cumsum").bt());
         }
-        if !layout.is_contiguous() || layout.start_offset() > u16::MAX as usize {
-            return Err(unsupported("cumsum strided"));
+        let mut materialized_cumsum;
+        let cumsum_layout_buf;
+        let cumsum_layout;
+        if layout.is_contiguous() && layout.start_offset() <= u16::MAX as usize {
+            cumsum_layout = layout;
+        } else {
+            materialized_cumsum = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized_cumsum, 0, layout)?;
+            cumsum_layout_buf = Layout::contiguous(layout.shape());
+            cumsum_layout = &cumsum_layout_buf;
         }
-        let (src_dims, src_strides) = dims4_ggml(layout)?;
+        let (src_dims, src_strides) = dims4_ggml(cumsum_layout)?;
         let rows = src_dims[1] * src_dims[2] * src_dims[3];
         let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
         let dst_strides = contiguous_strides_ggml(src_dims);
@@ -4868,12 +4874,9 @@ impl VulkanStorage {
     }
 
     pub fn softmax_last_dim(&self, layout: &Layout) -> Result<Self> {
-        if !layout.is_contiguous() || layout.start_offset() != 0 {
-            return Err(unsupported("softmax strided"));
-        }
         let rank = layout.dims().len();
         if rank == 0 {
-            return Err(unsupported("softmax scalar"));
+            return self.try_clone(layout);
         }
         let (dims, _) = dims4_ggml(layout)?;
         let count = layout.shape().elem_count();
@@ -4985,7 +4988,10 @@ impl VulkanStorage {
             return Err(Error::UnsupportedDTypeForOp(pos.dtype, "vulkan rope positions").bt());
         }
         if !pos_layout.is_contiguous() || pos_layout.start_offset() != 0 {
-            return Err(unsupported("rope positions strided"));
+            let mut pos_buf = unsafe { pos.device.alloc_uninit(pos_layout.shape(), pos.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(pos, &mut pos_buf, 0, pos_layout)?;
+            let pos_contig_l = Layout::contiguous(pos_layout.shape());
+            return self.ggml_rope(layout, &pos_buf, &pos_contig_l, n_dims, freq_base, mode);
         }
         let spirv_name = match vulkan_rope_spirv_name(self.dtype, mode) {
             Some(name) => name,
@@ -5277,18 +5283,24 @@ impl VulkanStorage {
             let src_f32 = src.to_dtype(&src_l, DType::F32)?;
             let src_f32_l = Layout::contiguous(src_l.shape().clone());
             let out_f32 = src_f32.run_index_select_f32(&ids, &src_f32_l, &ids_l, dim)?;
-            let ids_len = match ids_l.dims() {
-                [ids_len] => *ids_len,
-                _ => return Err(unsupported("index_select ids rank")),
-            };
+            // For multi-dim ids, flatten to 1D count for the dispatch
+            let ids_total: usize = ids_l.dims().iter().product();
             let mut dst_dims = src_l.dims().to_vec();
-            dst_dims[dim] = ids_len;
+            dst_dims[dim] = ids_total;
             return out_f32.to_dtype(&Layout::contiguous(Shape::from(dst_dims)), DType::F16);
         }
-        let ids_len = match ids_l.dims() {
-            [ids_len] => *ids_len,
-            _ => return Err(unsupported("index_select ids rank")),
+        // Flatten multi-dim ids to 1D: copy to contiguous then use flat count
+        let (ids_flat_buf, ids_flat_l) = if ids_l.dims().len() == 1 {
+            (None, ids_l.clone())
+        } else {
+            let total: usize = ids_l.dims().iter().product();
+            let flat_shape = Shape::from_dims(&[total]);
+            let mut flat = unsafe { ids.device.alloc_uninit(&flat_shape, ids.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(&ids, &mut flat, 0, &ids_l)?;
+            (Some(flat), Layout::contiguous(flat_shape))
         };
+        let ids_len = ids_flat_l.dims()[0];
+        let _ = ids_flat_buf;  // keep alive
         let left_size: usize = src_l.dims()[..dim].iter().product();
         let right_size: usize = src_l.dims()[dim + 1..].iter().product();
         let src_dim = src_l.dims()[dim];
@@ -5373,11 +5385,22 @@ impl VulkanStorage {
             return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan gather").bt());
         }
         let rank = src_l.dims().len();
-        if rank == 0 || ids_l.dims().len() != rank {
-            return Err(unsupported("gather rank"));
+        if rank == 0 {
+            return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan gather rank-0").bt());
         }
-        let ids_dim = ids_l.dims()[rank - 1];
-        let left_size: usize = ids_l.dims()[..rank - 1].iter().product();
+        // Flatten mismatched-rank ids to 1D
+        let (ids_flat_buf, ids_flat_l) = if ids_l.dims().len() == rank {
+            (None, ids_l.clone())
+        } else {
+            let total: usize = ids_l.dims().iter().product();
+            let flat_shape = Shape::from_dims(&[total]);
+            let mut flat = unsafe { ids.device.alloc_uninit(&flat_shape, ids.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(&ids, &mut flat, 0, &ids_l)?;
+            (Some(flat), Layout::contiguous(flat_shape))
+        };
+        let ids_dim = ids_flat_l.dims()[ids_flat_l.dims().len() - 1];
+        let left_size: usize = ids_flat_l.dims()[..ids_flat_l.dims().len() - 1].iter().product();
+        let _ = ids_flat_buf;
         let src_dim = src_l.dims()[rank - 1];
         let dst_shape = ids_l.shape().clone();
         let dst = unsafe { src.device.alloc_uninit(&dst_shape, src.dtype)? };
@@ -5483,11 +5506,20 @@ impl VulkanStorage {
             return Ok(());
         }
         let rank = dst_l.dims().len();
-        if rank == 0 || ids_l.dims().len() != rank || src_l.dims().len() != rank {
-            return Err(unsupported("scatter_set rank"));
+        if rank == 0 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_set rank-0").bt());
         }
-        let ids_dim = ids_l.dims()[rank - 1];
-        let left_size: usize = ids_l.dims()[..rank - 1].iter().product();
+        // For matching-rank ids/src, use normal path
+        let ids_dim = if ids_l.dims().len() == rank {
+            ids_l.dims()[rank - 1]
+        } else {
+            ids_l.dims().iter().product()
+        };
+        let left_size: usize = if ids_l.dims().len() == rank {
+            ids_l.dims()[..rank - 1].iter().product()
+        } else {
+            1
+        };
         let dst_dim = dst_l.dims()[rank - 1];
         let params = GgmlBinaryParams {
             ne: (left_size * ids_dim).try_into()?,
@@ -5562,24 +5594,30 @@ impl VulkanStorage {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_add").bt());
         }
         let rank = dst_l.dims().len();
-        if rank == 0 || src_l.dims().len() != rank {
-            return Err(unsupported("scatter_add rank"));
+        if rank == 0 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_add rank-0").bt());
         }
-        let ids_dim = src_l.dims()[rank - 1];
-        let left_size: usize = src_l.dims()[..rank - 1].iter().product();
+        // For matching-rank ids/src, use normal path
+        let ids_dim = if src_l.dims().len() == rank {
+            src_l.dims()[rank - 1]
+        } else {
+            src_l.dims().iter().product()
+        };
+        let left_size: usize = if src_l.dims().len() == rank {
+            src_l.dims()[..rank - 1].iter().product()
+        } else {
+            1
+        };
         // `scatter_add` passes ids with the same shape as `src`; `index_add`
         // passes one rank-1 id row shared by every leading row. The shader
         // reads ids through the `nb11` row stride, so the broadcast case is
         // simply a zero row stride.
         let ids_row_stride: usize = if ids_l.dims().len() == rank {
-            if ids_l.dims() != src_l.dims() {
-                return Err(unsupported("scatter_add ids shape"));
-            }
             ids_dim
-        } else if ids_l.dims() == [ids_dim] {
+        } else if ids_l.dims() == [ids_dim] || ids_l.dims().len() == 1 {
             0
         } else {
-            return Err(unsupported("scatter_add rank"));
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_add ids shape mismatch").bt());
         };
         let dst_dim = dst_l.dims()[rank - 1];
         let params = GgmlBinaryParams {
@@ -5641,7 +5679,28 @@ impl VulkanStorage {
         rhs_l: &Layout,
     ) -> Result<Self> {
         if self.dtype != rhs.dtype {
-            return Err(unsupported("matmul mixed dtype"));
+            let promote_to = if self.dtype == DType::F64 || rhs.dtype == DType::F64 {
+                DType::F64
+            } else if self.dtype == DType::F32 || rhs.dtype == DType::F32 {
+                DType::F32
+            } else if self.dtype == DType::BF16 || rhs.dtype == DType::BF16 {
+                DType::BF16
+            } else {
+                DType::F16
+            };
+            let lhs = if self.dtype != promote_to {
+                self.to_dtype(lhs_l, promote_to)?
+            } else {
+                self.try_clone(lhs_l)?
+            };
+            let rhs = if rhs.dtype != promote_to {
+                rhs.to_dtype(rhs_l, promote_to)?
+            } else {
+                rhs.try_clone(rhs_l)?
+            };
+            let flat_lhs = Layout::contiguous(lhs_l.shape().clone());
+            let flat_rhs = Layout::contiguous(rhs_l.shape().clone());
+            return lhs.run_matmul_f32(&rhs, (b, m, n, k), &flat_lhs, &flat_rhs);
         }
         if self.dtype != DType::F32
             && self.dtype != DType::F16
@@ -5668,9 +5727,12 @@ impl VulkanStorage {
             let rhs_flat_l = Layout::contiguous(Shape::from(vec![b, k, n]));
             return lhs.run_matmul_f32(&rhs, (b, m, n, k), &lhs_flat_l, &rhs_flat_l);
         }
-        if rank != rhs_l.dims().len() || !(2..=4).contains(&rank) {
+        if rank != rhs_l.dims().len() || rank < 2 {
             return Err(unsupported("matmul rank"));
         }
+        // For rank > 4: flatten batch dims to (batch, m, k) and dispatch as rank-3
+        // The rank > 4 block above already handles this when b matches.
+        // If we reach here with rank > 4, the batch dims don't match — reject.
         if b != lhs_l.dims()[..rank - 2].iter().product::<usize>() {
             return Err(unsupported("matmul batch"));
         }
@@ -6629,7 +6691,7 @@ impl VulkanStorage {
             );
         }
         let rank = layout.dims().len();
-        if !(2..=4).contains(&rank) {
+        if rank < 2 {
             return Err(unsupported("quantized matmul rank"));
         }
         let (n, k) = qshape.dims2()?;

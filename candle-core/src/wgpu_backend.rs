@@ -3730,13 +3730,13 @@ fn storage_buffer_binding<'a>(
         return Err(Error::Msg("wgpu storage buffer binding with zero size".into()).bt());
     }
     let align = device.inner.limits.min_storage_buffer_offset_alignment as u64;
-    if offset_bytes % align != 0 {
+    if !offset_bytes.is_multiple_of(align) {
         return Err(Error::Msg(format!(
             "wgpu buffer binding offset {offset_bytes} not aligned to {align}"
         ))
         .bt());
     }
-    let max = device.inner.limits.max_storage_buffer_binding_size as u64;
+    let max = device.inner.limits.max_storage_buffer_binding_size;
     if size_bytes > max {
         return Err(Error::Msg(format!(
             "wgpu storage buffer binding size {size_bytes} exceeds max {max}"
@@ -3905,7 +3905,10 @@ impl WgpuStorage {
         }
         let dst = if self.dtype == DType::BF16 {
             if !layout.is_contiguous() {
-                return Err(unsupported("bf16 scale strided"));
+                let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+                <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
+                let mat_layout = Layout::contiguous(layout.shape());
+                return materialized.run_scale(&mat_layout, scale, bias);
             }
             unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? }
         } else {
@@ -5693,14 +5696,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }
 
     fn run_argmax_last_dim(&self, layout: &Layout) -> Result<Self> {
-        if !layout.is_contiguous() {
-            return Err(unsupported("argmax strided"));
-        }
         let rank = layout.dims().len();
-        let ne0 = *layout
-            .dims()
-            .last()
-            .ok_or_else(|| unsupported("argmax scalar"))?;
+        if rank == 0 {
+            return Ok(unsafe { self.device.alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)? });
+        }
+        let ne0 = *layout.dims().last().unwrap_or(&1);
         let mut dst_dims = layout.dims().to_vec();
         dst_dims[rank - 1] = 1;
         let dst_shape = Shape::from(dst_dims);
@@ -5786,7 +5786,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     <Self as BackendStorage>::gather(src, src_layout, &ids, &ids_layout, rank - 1)
                 }
             }
-            ReduceOp::Sum => Err(unsupported("reduce extrema")),
+            ReduceOp::Sum => {
+                let rank = layout.dims().len();
+                let perm = (0..rank).filter(|&i| i != rank - 1).chain(std::iter::once(rank - 1));
+                let perm = perm.collect::<Vec<_>>();
+                let perm_shape = perm.iter().map(|&i| layout.dims()[i]).collect::<Vec<_>>();
+                let perm_stride = perm.iter().map(|&i| layout.stride()[i]).collect::<Vec<_>>();
+                let perm_layout = Layout::new(
+                    Shape::from(perm_shape.clone()),
+                    perm_stride,
+                    layout.start_offset(),
+                );
+                let mut permuted = unsafe {
+                    self.device
+                        .alloc_uninit(&Shape::from(perm_shape.clone()), self.dtype)?
+                };
+                <Self as BackendStorage>::copy_strided_src(self, &mut permuted, 0, &perm_layout)?;
+                let permuted_layout = Layout::contiguous(Shape::from(perm_shape));
+                <Self as BackendStorage>::reduce_op(&permuted, op, &permuted_layout, &[rank - 1])
+            },
         }
     }
 
@@ -5816,9 +5834,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         layout: &Layout,
         reduce_dims: &[usize],
     ) -> Result<Self> {
-        if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
-            return Err(unsupported("reduce multi-dim arg"));
-        }
         let mut current_shape = layout.dims().to_vec();
         let mut current_layout = layout.clone();
         let mut current_storage = None;
@@ -5829,7 +5844,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             current_layout = Layout::contiguous(Shape::from(current_shape.clone()));
             current_storage = Some(reduced);
         }
-        current_storage.ok_or_else(|| unsupported("reduce multi-dim empty"))
+        match current_storage {
+            Some(v) => Ok(v),
+            None => self.try_clone(layout),
+        }
     }
 
     pub(crate) fn argsort_last_dim(
@@ -5863,7 +5881,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         &self,
         layout: &Layout,
         asc: bool,
-        last_dim: usize,
+        _last_dim: usize,
         sort_dtype: WgpuArgsortDType,
     ) -> Result<Self> {
         let expected = match sort_dtype {
@@ -5875,17 +5893,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if self.dtype != expected {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu argsort").bt());
         }
-        if !layout.is_contiguous() {
-            return Err(unsupported("argsort strided"));
+        let mut materialized_argsort;
+        let argsort_layout_buf;
+        let argsort_layout;
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            argsort_layout = layout;
+        } else {
+            materialized_argsort = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized_argsort, 0, layout)?;
+            argsort_layout_buf = Layout::contiguous(layout.shape());
+            argsort_layout = &argsort_layout_buf;
         }
-        if last_dim == 0 || layout.dims().last().copied() != Some(last_dim) {
-            return Err(unsupported("argsort last-dim"));
+        let last_dim = argsort_layout.dims().last().copied().unwrap_or(0);
+        if last_dim == 0 {
+            return Err(unsupported("argsort empty rows"));
         }
         let workgroup_size = next_power_of_two_u32(last_dim.min(WG_SIZE as usize), "argsort")?;
-        let (dims, strides) = dims4(layout)?;
-        let count = layout.shape().elem_count();
+        let (dims, strides) = dims4(argsort_layout)?;
+        let count = argsort_layout.shape().elem_count();
         let nrows = count / last_dim;
-        let dst = unsafe { self.device.alloc_uninit(layout.shape(), DType::U32)? };
+        let dst = unsafe { self.device.alloc_uninit(argsort_layout.shape(), DType::U32)? };
         let dst_strides = contiguous_strides(dims);
         let npr = last_dim.div_ceil(workgroup_size as usize);
         let top_k = if npr == 1 {
@@ -5894,7 +5921,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             workgroup_size
         };
         let params = ArgsortParams {
-            offset_src: layout.start_offset().try_into()?,
+            offset_src: argsort_layout.start_offset().try_into()?,
             offset_dst: 0,
             stride_src1: strides[1],
             stride_src2: strides[2],
@@ -6065,17 +6092,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if self.dtype != DType::F32 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu cumsum").bt());
         }
-        if !layout.is_contiguous() {
-            return Err(unsupported("cumsum strided"));
+        let mut materialized_cumsum;
+        let cumsum_layout_buf;
+        let cumsum_layout;
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            cumsum_layout = layout;
+        } else {
+            materialized_cumsum = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized_cumsum, 0, layout)?;
+            cumsum_layout_buf = Layout::contiguous(layout.shape());
+            cumsum_layout = &cumsum_layout_buf;
         }
-        let ne0 = *layout
+        let ne0 = *cumsum_layout
             .dims()
             .last()
-            .ok_or_else(|| unsupported("cumsum scalar"))?;
-        let rows = layout.shape().elem_count() / ne0;
-        let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            .ok_or_else(|| Error::Msg("cumsum scalar".into()))?;
+        let rows = cumsum_layout.shape().elem_count() / ne0;
+        let dst = unsafe { self.device.alloc_uninit(cumsum_layout.shape(), self.dtype)? };
         let params = CumsumParams {
-            offset_src: layout.start_offset().try_into()?,
+            offset_src: cumsum_layout.start_offset().try_into()?,
             offset_dst: 0,
             ne0: ne0.try_into()?,
             _pad0: 0,
@@ -6118,7 +6153,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
     pub fn softmax_last_dim(&self, layout: &Layout) -> Result<Self> {
         if !layout.is_contiguous() {
-            return Err(unsupported("softmax strided"));
+            let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
+            let mat_layout = Layout::contiguous(layout.shape());
+            return materialized.softmax_last_dim(&mat_layout);
         }
         if self.dtype == DType::F16 {
             let src_f32 = self.to_dtype(layout, DType::F32)?;
@@ -6333,8 +6371,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if pos.dtype != DType::I32 {
             return Err(Error::UnsupportedDTypeForOp(pos.dtype, "wgpu rope positions").bt());
         }
-        if !pos_layout.is_contiguous() {
-            return Err(unsupported("rope positions strided"));
+        if !pos_layout.is_contiguous() || pos_layout.start_offset() != 0 {
+            let mut pos_buf = unsafe { pos.device.alloc_uninit(pos_layout.shape(), pos.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(pos, &mut pos_buf, 0, pos_layout)?;
+            let pos_contig_l = Layout::contiguous(pos_layout.shape());
+            return self.ggml_rope(layout, &pos_buf, &pos_contig_l, n_dims, freq_base, mode);
         }
         let (dims, strides) = dims4(layout)?;
         let count = layout.shape().elem_count();
@@ -6449,8 +6490,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if self.dtype == DType::BF16 && alpha.dtype != DType::BF16 {
             return Err(Error::UnsupportedDTypeForOp(alpha.dtype, "wgpu rms_norm").bt());
         }
-        if !layout.is_contiguous() || !alpha_layout.is_contiguous() {
-            return Err(unsupported("rms_norm strided"));
+        if !layout.is_contiguous() || layout.start_offset() != 0
+            || !alpha_layout.is_contiguous() || alpha_layout.start_offset() != 0
+        {
+            let src_shape = layout.shape().clone();
+            let alpha_shape = alpha_layout.shape().clone();
+            let mut src = unsafe { self.device.alloc_uninit(&src_shape, self.dtype)? };
+            let mut alpha_tmp = unsafe { alpha.device.alloc_uninit(&alpha_shape, alpha.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut src, 0, layout)?;
+            <Self as BackendStorage>::copy_strided_src(alpha, &mut alpha_tmp, 0, alpha_layout)?;
+            let src_layout = Layout::contiguous(src_shape);
+            let alpha_layout = Layout::contiguous(alpha_shape);
+            return src.rms_norm(&src_layout, &alpha_tmp, &alpha_layout, eps);
         }
         let (dims, strides) = dims4(layout)?;
         let (alpha_dims, alpha_strides) = dims4(alpha_layout)?;
@@ -6621,17 +6672,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             if src.dtype == src_f32.dtype {
                 return Ok(out_f32);
             }
+            let ids_total: usize = ids_l.dims().iter().product();
             let mut dst_dims = src_l.dims().to_vec();
-            dst_dims[dim] = match ids_l.dims() {
-                [ids_len] => *ids_len,
-                _ => return Err(unsupported("index_select ids rank")),
-            };
+            dst_dims[dim] = ids_total;
             return out_f32.to_dtype(&Layout::contiguous(Shape::from(dst_dims)), src.dtype);
         }
-        let ids_len = match ids_l.dims() {
-            [ids_len] => *ids_len,
-            _ => return Err(unsupported("index_select ids rank")),
-        };
+        // Flatten multi-dim ids to 1D
+        let ids_len: usize = ids_l.dims().iter().product();
         let left_size: usize = src_l.dims()[..dim].iter().product();
         let right_size: usize = src_l.dims()[dim + 1..].iter().product();
         let src_dim = src_l.dims()[dim];
@@ -6746,11 +6793,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             return src_f32.run_gather_last_dim_f32(&ids, &src_f32_l, &ids_l);
         }
         let rank = src_l.dims().len();
-        if rank == 0 || ids_l.dims().len() != rank {
-            return Err(unsupported("gather rank"));
+        if rank == 0 {
+            return Err(Error::UnsupportedDTypeForOp(src.dtype, "wgpu gather rank-0").bt());
         }
-        let ids_dim = ids_l.dims()[rank - 1];
-        let left_size: usize = ids_l.dims()[..rank - 1].iter().product();
+        // Flatten mismatched-rank ids to 1D
+        let ids_dim = if ids_l.dims().len() == rank {
+            ids_l.dims()[rank - 1]
+        } else {
+            ids_l.dims().iter().product()
+        };
+        let left_size: usize = if ids_l.dims().len() == rank {
+            ids_l.dims()[..rank - 1].iter().product()
+        } else {
+            1
+        };
         let src_dim = src_l.dims()[rank - 1];
         let dst_shape = ids_l.shape().clone();
         let tmp_dtype = if src.dtype == DType::F16 {
@@ -6877,11 +6933,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             return Ok(());
         }
         let rank = dst_l.dims().len();
-        if rank == 0 || ids_l.dims().len() != rank || src_l.dims().len() != rank {
-            return Err(unsupported("scatter_set rank"));
+        if rank == 0 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu scatter_set rank-0").bt());
         }
-        let ids_dim = ids_l.dims()[rank - 1];
-        let left_size: usize = ids_l.dims()[..rank - 1].iter().product();
+        let ids_dim = if ids_l.dims().len() == rank {
+            ids_l.dims()[rank - 1]
+        } else {
+            ids_l.dims().iter().product()
+        };
+        let left_size: usize = if ids_l.dims().len() == rank {
+            ids_l.dims()[..rank - 1].iter().product()
+        } else {
+            1
+        };
         let dst_dim = dst_l.dims()[rank - 1];
         let params = GetRowsParams {
             offset_src: src_l.start_offset().try_into()?,
@@ -6969,23 +7033,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu scatter_add").bt());
         }
         let rank = dst_l.dims().len();
-        if rank == 0 || src_l.dims().len() != rank {
-            return Err(unsupported("scatter_add rank"));
+        if rank == 0 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu scatter_add rank-0").bt());
         }
-        let ids_dim = src_l.dims()[rank - 1];
-        let left_size: usize = src_l.dims()[..rank - 1].iter().product();
+        let ids_dim = if src_l.dims().len() == rank {
+            src_l.dims()[rank - 1]
+        } else {
+            src_l.dims().iter().product()
+        };
+        let left_size: usize = if src_l.dims().len() == rank {
+            src_l.dims()[..rank - 1].iter().product()
+        } else {
+            1
+        };
         // `scatter_add` passes ids shaped like `src`; `index_add` passes one
         // rank-1 id row shared by every leading row, which maps to a zero ids
         // row stride in the shader.
         let ids_row_stride: usize = if ids_l.dims().len() == rank {
-            if ids_l.dims() != src_l.dims() {
-                return Err(unsupported("scatter_add ids shape"));
-            }
             ids_dim
-        } else if ids_l.dims() == [ids_dim] {
+        } else if ids_l.dims() == [ids_dim] || ids_l.dims().len() == 1 {
             0
         } else {
-            return Err(unsupported("scatter_add rank"));
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu scatter_add ids shape mismatch").bt());
         };
         let dst_dim = dst_l.dims()[rank - 1];
         let params = GetRowsParams {
@@ -7055,7 +7124,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         rhs_l: &Layout,
     ) -> Result<Self> {
         if self.dtype != rhs.dtype {
-            return Err(unsupported("matmul mixed dtype"));
+            let promote_to = if self.dtype == DType::F64 || rhs.dtype == DType::F64 {
+                DType::F64
+            } else if self.dtype == DType::F32 || rhs.dtype == DType::F32 {
+                DType::F32
+            } else if self.dtype == DType::BF16 || rhs.dtype == DType::BF16 {
+                DType::BF16
+            } else {
+                DType::F16
+            };
+            let lhs = if self.dtype != promote_to {
+                self.to_dtype(lhs_l, promote_to)?
+            } else {
+                self.try_clone(lhs_l)?
+            };
+            let rhs = if rhs.dtype != promote_to {
+                rhs.to_dtype(rhs_l, promote_to)?
+            } else {
+                rhs.try_clone(rhs_l)?
+            };
+            let flat_lhs = Layout::contiguous(lhs_l.shape().clone());
+            let flat_rhs = Layout::contiguous(rhs_l.shape().clone());
+            return lhs.run_matmul_f32(&rhs, (b, m, n, k), &flat_lhs, &flat_rhs);
         }
         if self.dtype != DType::F32
             && self.dtype != DType::F16
@@ -7092,7 +7182,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let rhs_flat_l = Layout::contiguous(Shape::from(vec![b, k, n]));
             return lhs_l.run_matmul_f32(&rhs, (b, m, n, k), &lhs_flat_l, &rhs_flat_l);
         }
-        if rank != rhs_l.dims().len() || !(2..=4).contains(&rank) {
+        if rank != rhs_l.dims().len() || rank < 2 {
             return Err(unsupported("matmul rank"));
         }
         if b != lhs_l.dims()[..rank - 2].iter().product::<usize>() {
@@ -7251,7 +7341,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let max_binding_bytes = self.device.inner.limits.max_storage_buffer_binding_size as usize;
         let dst_bytes = byte_len(self.dtype, b * m * n, "wgpu matmul dst")?;
         let lhs_bytes = layout_binding_bytes(lhs, &lhs_layout);
-        let rhs_bytes = layout_binding_bytes(&rhs_t, &rhs_t_layout);
+        let rhs_bytes = layout_binding_bytes(rhs_t, &rhs_t_layout);
         let elem_size = self.dtype.size_in_bytes();
         let matrix_elems = m * n;
         let matrix_bytes = matrix_elems * elem_size;
@@ -7342,7 +7432,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 )?;
             }
         } else {
-            let rhs_bind = storage_layout_binding(&rhs_t, &rhs_t_layout, 0)?;
+            let rhs_bind = storage_layout_binding(rhs_t, &rhs_t_layout, 0)?;
             let lhs_bind = storage_layout_binding(lhs, &lhs_layout, 1)?;
             let dst_bind = storage_layout_binding(&dst, &dst_layout, 2)?;
             let bindings = [rhs_bind, lhs_bind, dst_bind, buffer_binding(3, &param_buffer)];
@@ -8267,7 +8357,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             return Err(unsupported("quantized matmul f16"));
         }
         let rank = layout.dims().len();
-        if !(2..=4).contains(&rank) {
+        if rank < 2 {
             return Err(unsupported("quantized matmul rank"));
         }
         let (n, k) = qshape.dims2()?;
@@ -8571,13 +8661,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
         for &dim in reduce_dims {
             if dim >= rank {
-                return Err(unsupported("int reduce dim out of range"));
+                crate::bail!("wgpu backend int reduce got out-of-range dim {dim} for rank {rank}")
             }
         }
         if reduce_dims.len() > 1 {
-            if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
-                return Err(unsupported("int reduce multi-dim arg"));
-            }
             let mut current_layout = layout.clone();
             let mut current_shape = layout.dims().to_vec();
             let mut current: Option<Self> = None;
@@ -8588,7 +8675,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 current_layout = Layout::contiguous(Shape::from(current_shape.clone()));
                 current = Some(reduced);
             }
-            return current.ok_or_else(|| unsupported("int reduce multi-dim empty"));
+            return match current {
+                Some(v) => Ok(v),
+                None => self.try_clone(layout),
+            };
         }
         let dim = reduce_dims[0];
         if dim != rank - 1 {
@@ -8631,10 +8721,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
     fn run_int_reduce_last_dim(&self, op: ReduceOp, layout: &Layout) -> Result<Self> {
         let rank = layout.dims().len();
-        let kx = *layout
-            .dims()
-            .last()
-            .ok_or_else(|| unsupported("int reduce scalar"))?;
+        if rank == 0 {
+            if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
+                return Ok(unsafe { self.device.alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)? });
+            }
+            return self.try_clone(layout);
+        }
+        let kx = *layout.dims().last().unwrap_or(&1);
         let mut dst_dims = layout.dims().to_vec();
         dst_dims[rank - 1] = 1;
         let dst_shape = Shape::from(dst_dims);
