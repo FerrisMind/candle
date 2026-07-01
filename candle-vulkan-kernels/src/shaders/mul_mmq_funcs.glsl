@@ -6,6 +6,15 @@
 
 // Each iqs value maps to a 32-bit integer
 
+int32_t dot4x8_unsigned(int32_t a, int32_t b) {
+    const u8vec4 va = unpack8(uint(a) & 0x0F0F0F0Fu);
+    const i8vec4 vb = unpack8(b);
+    return int(va.x) * int(vb.x)
+         + int(va.y) * int(vb.y)
+         + int(va.z) * int(vb.z)
+         + int(va.w) * int(vb.w);
+}
+
 #if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1)
 // 2-byte loads for Q4_0 blocks (18 bytes)
 // 4-byte loads for Q4_1 blocks (20 bytes)
@@ -44,8 +53,8 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
         const int32_t qs_b0 = cache_b.qs[iqs];
         const int32_t qs_b1 = cache_b.qs[iqs + 4];
 
-        q_sum += dotPacked4x8EXT(qs_a.x, qs_b0);
-        q_sum += dotPacked4x8EXT(qs_a.y, qs_b1);
+        q_sum += dot4x8_unsigned(qs_a.x, qs_b0);
+        q_sum += dot4x8_unsigned(qs_a.y, qs_b1);
     }
 
 #ifdef DATA_A_Q4_0

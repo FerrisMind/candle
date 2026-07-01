@@ -132,14 +132,24 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const i
 }
 #endif
 
+
+int32_t dot4x8_unsigned(int32_t a, int32_t b) {
+    const u8vec4 va = unpack8(uint(a) & 0x0F0F0F0Fu);
+    const i8vec4 vb = unpack8(b);
+    return int(va.x) * int(vb.x)
+         + int(va.y) * int(vb.y)
+         + int(va.z) * int(vb.z)
+         + int(va.w) * int(vb.w);
+}
+
 #if defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     int32_t q_sum = 0;
 #if QUANT_R == 2
     const i32vec2 data_a_qs = repack(ib_a, iqs);
-    q_sum += dotPacked4x8EXT(data_a_qs.x,
+    q_sum += dot4x8_unsigned(data_a_qs.x,
                              cache_b_qs[0]);
-    q_sum += dotPacked4x8EXT(data_a_qs.y,
+    q_sum += dot4x8_unsigned(data_a_qs.y,
                              cache_b_qs[1]);
 #else
     int32_t data_a_qs = repack(ib_a, iqs * 2);

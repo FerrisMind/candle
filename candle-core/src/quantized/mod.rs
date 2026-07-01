@@ -1785,17 +1785,8 @@ thread_local! {
 impl QMatMul {
     pub fn from_arc(qtensor: std::sync::Arc<QTensor>) -> Result<Self> {
         let dtype = qtensor.dtype();
-        // Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 fused SPIR-V shaders (QUANT_R=2 path) produce
-        // wrong results on Vulkan/WGPU due to a dotPacked4x8EXT driver bug on NVIDIA.
-        // K-quant types (Q4_K, Q5_K, Q6_K etc.) use QUANT_R=1 and work correctly.
         let dequantize = match dtype {
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => true,
-            // Legacy quant types use dotPacked4x8EXT with QUANT_R=2 — broken on Vulkan/WGPU
-            GgmlDType::Q4_0
-            | GgmlDType::Q4_1
-            | GgmlDType::Q5_0
-            | GgmlDType::Q5_1
-            | GgmlDType::Q8_0 => true,
             _ => DEQUANTIZE_ALL.with(|b| *b),
         };
         let t = if dequantize {

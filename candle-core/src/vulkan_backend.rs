@@ -982,7 +982,14 @@ fn vulkan_dmmv_workgroup(
         return VulkanDmmvWorkgroup::Subgroup;
     }
     let mut workgroup = VulkanDmmvWorkgroup::Subgroup;
-    if matches!(
+    // The USE_SUBGROUP_ADD_NO_SHMEM path (Large workgroup) only reduces within a
+    // single subgroup via subgroupAdd, so it is only correct when the workgroup
+    // contains exactly one subgroup (block_size == subgroup_size).  When the
+    // device's minimum subgroup size is > 16 the Large variant would launch
+    // block_size = subgroup_size * 4 > 1 subgroup, losing cross-subgroup partial
+    // sums.  Fall back to Subgroup in that case.
+    let large_ok = device.inner.subgroup_min_size <= 16;
+    if large_ok && matches!(
         device.inner.vendor_id,
         VULKAN_VENDOR_ID_NVIDIA | VULKAN_VENDOR_ID_INTEL
     ) {
