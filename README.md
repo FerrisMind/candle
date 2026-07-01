@@ -47,6 +47,27 @@ Having installed `candle` with Cuda support, simply define the `device` to be on
 
 For more advanced examples, please have a look at the following section.
 
+## Platforms and backends
+
+| Backend | Cargo feature | Linux | Windows | macOS | iOS | Android | WebAssembly |
+|---------|---------------|:-----:|:-------:|:-----:|:---:|:-------:|:-----------:|
+| CPU | (default) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| CUDA | `cuda` | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Metal | `metal` | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| WGPU | `wgpu` | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
+| Vulkan | `vulkan` | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
+
+Notes:
+
+- GPU backends are opt-in Cargo features; CPU is always available.
+- **CUDA** — NVIDIA GPUs only.
+- **WGPU** — Vulkan on Linux/Android, Vulkan or DX12 on Windows, Metal on macOS, WebGPU in the browser. Override with `WGPU_BACKEND=vulkan|dx12|metal|gl`.
+- **Vulkan** — native Vulkan via ash (Linux, Windows, and Android).
+- CPU extras: `mkl` on Linux/Windows x86_64, `accelerate` on macOS.
+
+Device selection in examples: `CANDLE_DEVICE=cpu|cuda|metal|wgpu|vulkan`.
+Pick a GPU with `CANDLE_WGPU_ADAPTER_NAME` or `CANDLE_VULKAN_DEVICE_NAME` when several adapters are present.
+
 ## Check out our examples
 
 These online demos run entirely in your browser:
@@ -147,8 +168,10 @@ Run them using commands like:
 cargo run --example quantized --release
 ```
 
-In order to use **CUDA** add `--features cuda` to the example command line. If
-you have cuDNN installed, use `--features cudnn` for even more speedups.
+In order to use a GPU backend, add the matching feature to the example command
+line: `--features cuda`, `--features metal`, `--features wgpu`, or
+`--features vulkan`. If you have cuDNN installed, use `--features cudnn` for
+even more CUDA speedups.
 
 There are also some wasm examples for whisper and
 [llama2.c](https://github.com/karpathy/llama2.c). You can either build them with
@@ -210,7 +233,10 @@ If you have an addition to this list, please submit a pull request.
     - Embed user-defined ops/kernels, such as [flash-attention v2](https://github.com/huggingface/candle/blob/89ba005962495f2bfbda286e185e9c3c7f5300a3/candle-flash-attn/src/lib.rs#L152).
 - Backends.
     - Optimized CPU backend with optional MKL support for x86 and Accelerate for macs.
-    - CUDA backend for efficiently running on GPUs, multiple GPU distribution via NCCL.
+    - CUDA backend for efficiently running on NVIDIA GPUs, multiple GPU distribution via NCCL.
+    - Metal backend for Apple GPUs (macOS and iOS).
+    - WGPU backend for cross-platform GPU compute (Vulkan, DX12, Metal).
+    - Vulkan backend for native Vulkan GPU compute on Linux and Windows.
     - WASM support, run your models in a browser.
 - Included models.
     - Language Models.
@@ -288,6 +314,8 @@ Cheatsheet:
 - [candle-nn](./candle-nn/): Tools to build real models
 - [candle-examples](./candle-examples/): Examples of using the library in realistic settings
 - [candle-kernels](./candle-kernels/): CUDA custom kernels
+- [candle-wgpu-kernels](./candle-wgpu-kernels/): WGPU compute shaders (WGSL)
+- [candle-vulkan-kernels](./candle-vulkan-kernels/): Vulkan compute shaders (SPIR-V)
 - [candle-datasets](./candle-datasets/): Datasets and data loaders.
 - [candle-transformers](./candle-transformers): transformers-related utilities.
 - [candle-flash-attn](./candle-flash-attn): Flash attention v2 layer.

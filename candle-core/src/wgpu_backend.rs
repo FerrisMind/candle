@@ -8362,7 +8362,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         ];
         let bindings = [
             buffer_binding(0, &self.buffer),
-            buffer_binding(1, &ids.buffer),
+            buffer_binding(1, &ids_data.buffer),
             buffer_binding(2, &dst.buffer),
             buffer_binding(3, &param_buffer),
         ];

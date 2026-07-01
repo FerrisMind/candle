@@ -6693,8 +6693,8 @@ impl VulkanStorage {
             return repacked.quantized_index_select_f32(
                 GgmlDType::Q8_0,
                 src_shape,
-                ids,
-                ids_l,
+                &ids_data,
+                &ids_l,
                 dim,
             );
         }
@@ -6744,7 +6744,7 @@ impl VulkanStorage {
         };
         let bindings = [
             VulkanBinding::Storage(&self.buffer),
-            VulkanBinding::Storage(&ids.buffer),
+            VulkanBinding::Storage(&ids_data.buffer),
             VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv_name = format!("get_rows_{}_f32", vulkan_quantized_stem(qdtype)?);
