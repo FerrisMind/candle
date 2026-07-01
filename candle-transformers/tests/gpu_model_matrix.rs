@@ -307,13 +307,6 @@ fn quantized_qwen3_multi_quant_case(device: &Device) -> Result<()> {
             println!("skipping {quant_name}: {path:?} not found");
             continue;
         }
-        // ponytail: Legacy quant matmul shaders (Q4_0, Q8_0) produce wrong results
-        // on Vulkan/WGPU. K-quant types (Q4_K_M, Q5_K_M, Q6_K) work fine.
-        // Skip legacy quants until the SPIR-V fused matmul shaders are fixed.
-        if !device.is_cuda() && matches!(quant_name, "Q4_0" | "Q8_0") {
-            println!("skipping {quant_name} on {}: known legacy quant matmul shader bug", backend_name(device));
-            continue;
-        }
         println!("testing {quant_name} on {}", backend_name(device));
         let start = Instant::now();
         let mut cpu_model = load_quantized_qwen3_model(&path, &cpu)?;
