@@ -944,6 +944,34 @@ impl candle::CustomOp3 for LayerNorm {
         let newstorage = candle::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        s1: &candle::WgpuStorage,
+        l1: &Layout,
+        s2: &candle::WgpuStorage,
+        l2: &Layout,
+        s3: &candle::WgpuStorage,
+        l3: &Layout,
+    ) -> Result<(candle::WgpuStorage, Shape)> {
+        let storage = s1.layer_norm(l1, s2, l2, s3, l3, self.eps)?;
+        Ok((storage, l1.shape().clone()))
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        s1: &candle::VulkanStorage,
+        l1: &Layout,
+        s2: &candle::VulkanStorage,
+        l2: &Layout,
+        s3: &candle::VulkanStorage,
+        l3: &Layout,
+    ) -> Result<(candle::VulkanStorage, Shape)> {
+        let storage = s1.layer_norm(l1, s2, l2, s3, l3, self.eps)?;
+        Ok((storage, l1.shape().clone()))
+    }
 }
 
 pub fn layer_norm_slow(x: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Result<Tensor> {
@@ -977,9 +1005,6 @@ pub fn layer_norm(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Resul
             alpha.shape(),
             beta.shape()
         )
-    }
-    if xs.device().is_wgpu() || xs.device().is_vulkan() {
-        return layer_norm_slow(xs, alpha, beta, eps);
     }
     xs.apply_op3_no_bwd(alpha, beta, &LayerNorm { eps })
 }

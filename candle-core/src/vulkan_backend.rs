@@ -5226,6 +5226,85 @@ impl VulkanStorage {
         Ok(dst)
     }
 
+    pub fn layer_norm(
+        &self,
+        layout: &Layout,
+        alpha: &Self,
+        alpha_layout: &Layout,
+        beta: &Self,
+        beta_layout: &Layout,
+        eps: f32,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32
+            || alpha.dtype != DType::F32
+            || beta.dtype != DType::F32
+        {
+            let out_dtype = self.dtype;
+            let src_f32 = self.to_dtype(layout, DType::F32)?;
+            let alpha_f32 = alpha.to_dtype(alpha_layout, DType::F32)?;
+            let beta_f32 = beta.to_dtype(beta_layout, DType::F32)?;
+            let src_f32_layout = Layout::contiguous(layout.shape().clone());
+            let alpha_f32_layout = Layout::contiguous(alpha_layout.shape().clone());
+            let beta_f32_layout = Layout::contiguous(beta_layout.shape().clone());
+            let out_f32 =
+                src_f32.layer_norm(&src_f32_layout, &alpha_f32, &alpha_f32_layout, &beta_f32, &beta_f32_layout, eps)?;
+            if out_dtype == DType::F32 {
+                return Ok(out_f32);
+            }
+            return out_f32.to_dtype(&src_f32_layout, out_dtype);
+        }
+        if !layout.is_contiguous() || layout.start_offset() != 0
+            || !alpha_layout.is_contiguous() || alpha_layout.start_offset() != 0
+            || !beta_layout.is_contiguous() || beta_layout.start_offset() != 0
+        {
+            let src_shape = layout.shape().clone();
+            let alpha_shape = alpha_layout.shape().clone();
+            let beta_shape = beta_layout.shape().clone();
+            let mut src = unsafe { self.device.alloc_uninit(&src_shape, self.dtype)? };
+            let mut alpha_tmp = unsafe { alpha.device.alloc_uninit(&alpha_shape, alpha.dtype)? };
+            let mut beta_tmp = unsafe { beta.device.alloc_uninit(&beta_shape, beta.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut src, 0, layout)?;
+            <Self as BackendStorage>::copy_strided_src(alpha, &mut alpha_tmp, 0, alpha_layout)?;
+            <Self as BackendStorage>::copy_strided_src(beta, &mut beta_tmp, 0, beta_layout)?;
+            let src_layout = Layout::contiguous(src_shape);
+            let alpha_layout = Layout::contiguous(alpha_shape);
+            let beta_layout = Layout::contiguous(beta_shape);
+            return src.layer_norm(&src_layout, &alpha_tmp, &alpha_layout, &beta_tmp, &beta_layout, eps);
+        }
+        let count = layout.shape().elem_count();
+        let (dims, _strides) = dims4_ggml(layout)?;
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct LayerNormPushConstants {
+            ne0: u32,
+            eps_bits: u32,
+        }
+
+        let pc = LayerNormPushConstants {
+            ne0: dims[0],
+            eps_bits: eps.to_bits(),
+        };
+
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&alpha.buffer),
+            VulkanBinding::Storage(&beta.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("layernorm")
+            .ok_or_else(|| Error::Msg("vulkan shader layernorm not generated".into()).bt())?;
+        let rows = count / dims[0] as usize;
+        self.device.run_compute(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&pc)),
+            rows.try_into()?,
+        )?;
+        Ok(dst)
+    }
+
     pub fn sigmoid(&self, layout: &Layout) -> Result<Self> {
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan sigmoid").bt());
@@ -6592,12 +6671,18 @@ impl VulkanStorage {
             )
             .bt());
         }
-        if !ids_l.is_contiguous() {
-            return Err(unsupported("quantized index_select ids strided"));
-        }
+        let (ids_data, ids_l) = if !ids_l.is_contiguous() || ids_l.start_offset() != 0 {
+            let mut tmp = unsafe { ids.device.alloc_uninit(ids_l.shape(), ids.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(ids, &mut tmp, 0, ids_l)?;
+            (tmp, Layout::contiguous(ids_l.shape().clone()))
+        } else {
+            (ids.clone(), ids_l.clone())
+        };
         let ids_len = match ids_l.dims() {
             [ids_len] => *ids_len,
-            _ => return Err(unsupported("quantized index_select ids rank")),
+            _ => {
+                ids_l.shape().elem_count()
+            }
         };
         let dims = src_shape.dims();
         if dim >= dims.len() {

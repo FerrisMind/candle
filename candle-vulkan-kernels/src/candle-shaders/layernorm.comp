@@ -1,0 +1,48 @@
+#version 450
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer Src {float src[];};
+layout (binding = 1) readonly buffer Alpha {float alpha[];};
+layout (binding = 2) readonly buffer Beta {float beta[];};
+layout (binding = 3) writeonly buffer Dst {float dst[];};
+
+layout(push_constant) uniform Params {
+    uint ne0;
+    uint eps_bits;
+} p;
+
+shared vec2 partial[512];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const float eps = uintBitsToFloat(p.eps_bits);
+
+    partial[tid] = vec2(0.0, 0.0);
+
+    for (uint col = tid; col < p.ne0; col += 512) {
+        const float v = src[row * p.ne0 + col];
+        partial[tid].x += v;
+        partial[tid].y += v * v;
+    }
+
+    barrier();
+    for (int s = 256; s > 0; s >>= 1) {
+        if (int(tid) < s) {
+            partial[tid] += partial[tid + s];
+        }
+        barrier();
+    }
+
+    const float mean = partial[0].x / float(p.ne0);
+    const float var_ = partial[0].y / float(p.ne0) - mean * mean;
+    const float inv_std = inversesqrt(var_ + eps);
+
+    for (uint col = tid; col < p.ne0; col += 512) {
+        const float v = src[row * p.ne0 + col];
+        const float a = alpha[col];
+        const float b = beta[col];
+        dst[row * p.ne0 + col] = (v - mean) * inv_std * a + b;
+    }
+}

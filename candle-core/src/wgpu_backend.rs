@@ -6606,6 +6606,162 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
+    pub fn layer_norm(
+        &self,
+        layout: &Layout,
+        alpha: &Self,
+        alpha_layout: &Layout,
+        beta: &Self,
+        beta_layout: &Layout,
+        eps: f32,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32
+            || alpha.dtype != DType::F32
+            || beta.dtype != DType::F32
+        {
+            let out_dtype = self.dtype;
+            let src_f32 = self.to_dtype(layout, DType::F32)?;
+            let alpha_f32 = alpha.to_dtype(alpha_layout, DType::F32)?;
+            let beta_f32 = beta.to_dtype(beta_layout, DType::F32)?;
+            let src_f32_layout = Layout::contiguous(layout.shape().clone());
+            let alpha_f32_layout = Layout::contiguous(alpha_layout.shape().clone());
+            let beta_f32_layout = Layout::contiguous(beta_layout.shape().clone());
+            let out_f32 =
+                src_f32.layer_norm(&src_f32_layout, &alpha_f32, &alpha_f32_layout, &beta_f32, &beta_f32_layout, eps)?;
+            if out_dtype == DType::F32 {
+                return Ok(out_f32);
+            }
+            return out_f32.to_dtype(&src_f32_layout, out_dtype);
+        }
+        if !layout.is_contiguous() || layout.start_offset() != 0
+            || !alpha_layout.is_contiguous() || alpha_layout.start_offset() != 0
+            || !beta_layout.is_contiguous() || beta_layout.start_offset() != 0
+        {
+            let src_shape = layout.shape().clone();
+            let alpha_shape = alpha_layout.shape().clone();
+            let beta_shape = beta_layout.shape().clone();
+            let mut src = unsafe { self.device.alloc_uninit(&src_shape, self.dtype)? };
+            let mut alpha_tmp = unsafe { alpha.device.alloc_uninit(&alpha_shape, alpha.dtype)? };
+            let mut beta_tmp = unsafe { beta.device.alloc_uninit(&beta_shape, beta.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut src, 0, layout)?;
+            <Self as BackendStorage>::copy_strided_src(alpha, &mut alpha_tmp, 0, alpha_layout)?;
+            <Self as BackendStorage>::copy_strided_src(beta, &mut beta_tmp, 0, beta_layout)?;
+            let src_layout = Layout::contiguous(src_shape);
+            let alpha_layout = Layout::contiguous(alpha_shape);
+            let beta_layout = Layout::contiguous(beta_shape);
+            return src.layer_norm(&src_layout, &alpha_tmp, &alpha_layout, &beta_tmp, &beta_layout, eps);
+        }
+        let (dims, strides) = dims4(layout)?;
+        let (alpha_dims, alpha_strides) = dims4(alpha_layout)?;
+        let (_beta_dims, beta_strides) = dims4(beta_layout)?;
+        let count = layout.shape().elem_count();
+        let dst_strides = contiguous_strides(dims);
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct LayerNormParams {
+            offset_src: u32,
+            offset_alpha: u32,
+            offset_beta: u32,
+            offset_dst: u32,
+            stride_src1: u32,
+            stride_src2: u32,
+            stride_src3: u32,
+            stride_alpha1: u32,
+            stride_alpha2: u32,
+            stride_alpha3: u32,
+            stride_beta1: u32,
+            stride_beta2: u32,
+            stride_beta3: u32,
+            stride_dst1: u32,
+            stride_dst2: u32,
+            stride_dst3: u32,
+            alpha_ne0: u32,
+            alpha_ne1: u32,
+            alpha_ne2: u32,
+            alpha_ne3: u32,
+            ne0: u32,
+            ne1: u32,
+            ne2: u32,
+            ne3: u32,
+            eps: f32,
+        }
+
+        let params = LayerNormParams {
+            offset_src: layout.start_offset().try_into()?,
+            offset_alpha: alpha_layout.start_offset().try_into()?,
+            offset_beta: beta_layout.start_offset().try_into()?,
+            offset_dst: 0,
+            stride_src1: strides[1],
+            stride_src2: strides[2],
+            stride_src3: strides[3],
+            stride_alpha1: alpha_strides[1],
+            stride_alpha2: alpha_strides[2],
+            stride_alpha3: alpha_strides[3],
+            stride_beta1: beta_strides[1],
+            stride_beta2: beta_strides[2],
+            stride_beta3: beta_strides[3],
+            stride_dst1: dst_strides[1],
+            stride_dst2: dst_strides[2],
+            stride_dst3: dst_strides[3],
+            alpha_ne0: alpha_dims[0],
+            alpha_ne1: alpha_dims[1],
+            alpha_ne2: alpha_dims[2],
+            alpha_ne3: alpha_dims[3],
+            ne0: dims[0],
+            ne1: dims[1],
+            ne2: dims[2],
+            ne3: dims[3],
+            eps,
+        };
+
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-layernorm-params"),
+                size: std::mem::size_of::<LayerNormParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            storage_entry(3, false),
+            uniform_entry(4),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &alpha.buffer),
+            buffer_binding(2, &beta.buffer),
+            buffer_binding(3, &dst.buffer),
+            buffer_binding(4, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::LAYERNORM_WGSL
+            .source()
+            .replace("WG_SIZE", &WG_SIZE.to_string());
+        let rows = count / dims[0] as usize;
+        let rows_u32: u32 = rows.try_into()?;
+        let max_per_dim = wgpu_dispatch_wg_cap(&self.device);
+        let (wg_x, wg_y) = compute_2d_workgroups(rows_u32, max_per_dim);
+        self.device.run_compute_xyz(
+            &shader,
+            &entries,
+            &bindings,
+            (wg_x, wg_y, 1),
+            "candle-wgpu-layernorm",
+        )?;
+        Ok(dst)
+    }
+
     pub fn sigmoid(&self, layout: &Layout) -> Result<Self> {
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu sigmoid").bt());
@@ -8133,12 +8289,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 Error::UnsupportedDTypeForOp(ids.dtype, "wgpu quantized index_select ids").bt(),
             );
         }
-        if !ids_l.is_contiguous() {
-            return Err(unsupported("quantized index_select ids strided"));
-        }
+        let (ids_data, ids_l) = if !ids_l.is_contiguous() || ids_l.start_offset() != 0 {
+            let mut tmp = unsafe { ids.device.alloc_uninit(ids_l.shape(), ids.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(ids, &mut tmp, 0, ids_l)?;
+            (tmp, Layout::contiguous(ids_l.shape().clone()))
+        } else {
+            (ids.clone(), ids_l.clone())
+        };
         let ids_len = match ids_l.dims() {
             [ids_len] => *ids_len,
-            _ => return Err(unsupported("quantized index_select ids rank")),
+            _ => {
+                // Flatten multi-dim ids to 1D
+                ids_l.shape().elem_count()
+            }
         };
         let dims = src_shape.dims();
         if dim >= dims.len() {

@@ -668,6 +668,11 @@ fn generate_candle_spirv_modules(
             candle_shaders_dir.join("dequant_q8_k_f32.comp"),
             &[],
         ),
+        (
+            "layernorm",
+            candle_shaders_dir.join("layernorm.comp"),
+            &[],
+        ),
     ];
     for (name, source, defines) in modules {
         let output = spv_dir.join(format!("{name}.spv"));
