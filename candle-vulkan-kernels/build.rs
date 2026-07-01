@@ -258,6 +258,16 @@ fn generate_candle_spirv_modules(
             ],
         ),
         (
+            "binary_int_i32",
+            candle_shaders_dir.join("binary_int.comp"),
+            &[
+                "A_TYPE=int",
+                "B_TYPE=int",
+                "D_TYPE=int",
+                "FLOAT_TYPE=float",
+            ],
+        ),
+        (
             "binary_int_i64",
             candle_shaders_dir.join("binary_int.comp"),
             &[

@@ -1461,7 +1461,7 @@ fn binary_shader(op: &str, dtype: DType) -> Result<String> {
     if dtype == DType::BF16 {
         return Ok(bf16_binary_wgsl(op));
     }
-    if matches!(dtype, DType::U8 | DType::U32 | DType::I64) {
+    if matches!(dtype, DType::U8 | DType::U32 | DType::I32 | DType::I64) {
         return custom_int_binary_wgsl(op, dtype);
     }
     if op == "maximum" {
@@ -2663,6 +2663,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 }}"#
             )
         }
+        DType::I32 => {
+            let expr = match op {
+                "add" => "a + b",
+                "sub" => "a - b",
+                "mul" => "a * b",
+                "div" => "select(a / select(b, 1, b == 0), 0, b == 0)",
+                "maximum" => "max(a, b)",
+                "minimum" => "min(a, b)",
+                _ => return Err(unsupported("binary int op")),
+            };
+            format!(
+                r#"@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    if (gid.x >= params.ne) {{ return; }}
+    let a = bitcast<i32>(src0[params.offset_src0 + src0_index(gid.x)]);
+    let b = bitcast<i32>(src1[params.offset_src1 + src1_index(gid.x)]);
+    dst[params.offset_dst + gid.x] = bitcast<u32>({expr});
+}}"#
+            )
+        }
         other => return Err(Error::UnsupportedDTypeForOp(other, "wgpu binary int").bt()),
     };
     let helpers = if dtype == DType::I64 {
@@ -2748,15 +2768,17 @@ fn copy_shader(src: DType, dst: DType) -> Result<String> {
 }
 
 fn bf16_binary_wgsl(op: &str) -> String {
-    let expr = match op {
-        "add" => "a + b",
-        "sub" => "a - b",
-        "mul" => "a * b",
-        "div" => "a / b",
-        _ => "a + b",
+    let (ea, eb) = match op {
+        "add" => ("a0 + b0", "a1 + b1"),
+        "sub" => ("a0 - b0", "a1 - b1"),
+        "mul" => ("a0 * b0", "a1 * b1"),
+        "div" => ("a0 / b0", "a1 / b1"),
+        "maximum" => ("max(a0, b0)", "max(a1, b1)"),
+        "minimum" => ("min(a0, b0)", "min(a1, b1)"),
+        other => panic!("bf16_binary_wgsl: unsupported op {other}"),
     };
-    let expr0 = expr.replace('a', "a0").replace('b', "b0");
-    let expr1 = expr.replace('a', "a1").replace('b', "b1");
+    let expr0 = ea;
+    let expr1 = eb;
     format!(
         r#"
 fn bf16_bits(v: f32) -> u32 {{
@@ -2769,7 +2791,7 @@ fn bf16_to_f32(word: u32, half: u32) -> f32 {{
 fn bf16_store(word: u32, half: u32, v: f32) -> u32 {{
     let p = bf16_bits(v);
     let shift = half * 16u;
-    let mask = select(0xffff0000u, 0x0000ffffu, half == 0u);
+    let mask = select(0x0000ffffu, 0xffff0000u, half == 0u);
     return (word & mask) | (p << shift);
 }}
 
@@ -2870,7 +2892,7 @@ fn bf16_to_f32(word: u32, half: u32) -> f32 {
 fn bf16_store_half(word: u32, half: u32, v: f32) -> u32 {
     let p = bf16_bits(v);
     let shift = half * 16u;
-    let mask = select(0xffff0000u, 0x0000ffffu, half == 0u);
+    let mask = select(0x0000ffffu, 0xffff0000u, half == 0u);
     return (word & mask) | (p << shift);
 }
 "#;
@@ -3177,7 +3199,7 @@ fn rotate(i_dst0: u32, i_dst1: u32, out0: f32, out1: f32) {{
     let wi0 = i_dst0 / 2u;
     let half0 = i_dst0 % 2u;
     let p0 = bf16_bits(out0);
-    let mask0 = select(0xffff0000u, 0x0000ffffu, half0 == 0u);
+    let mask0 = select(0x0000ffffu, 0xffff0000u, half0 == 0u);
     loop {{
         let old = atomicLoad(&dst[wi0]);
         let desired = (old & mask0) | (p0 << (half0 * 16u));
@@ -3187,7 +3209,7 @@ fn rotate(i_dst0: u32, i_dst1: u32, out0: f32, out1: f32) {{
     let wi1 = i_dst1 / 2u;
     let half1 = i_dst1 % 2u;
     let p1 = bf16_bits(out1);
-    let mask1 = select(0xffff0000u, 0x0000ffffu, half1 == 0u);
+    let mask1 = select(0x0000ffffu, 0xffff0000u, half1 == 0u);
     loop {{
         let old = atomicLoad(&dst[wi1]);
         let desired = (old & mask1) | (p1 << (half1 * 16u));
@@ -3725,9 +3747,10 @@ fn storage_buffer_binding<'a>(
 ) -> Result<wgpu::BindGroupEntry<'a>> {
     let elem_size = dtype.size_in_bytes();
     let offset_bytes = (start_elem * elem_size) as u64;
-    let size_bytes = (num_elems * elem_size) as u64;
+    let size_bytes = (num_elems * elem_size).next_multiple_of(4) as u64;
     if size_bytes == 0 {
-        return Err(Error::Msg("wgpu storage buffer binding with zero size".into()).bt());
+        // Empty tensors use a 1-byte dummy buffer; wgpu requires non-zero bindings.
+        return buffer_binding_range(binding, buffer, 0, buffer.size().max(1));
     }
     let align = device.inner.limits.min_storage_buffer_offset_alignment as u64;
     if !offset_bytes.is_multiple_of(align) {
@@ -3786,7 +3809,8 @@ fn layout_binding_bytes(storage: &WgpuStorage, layout: &Layout) -> usize {
     } else {
         storage.count.saturating_sub(start)
     };
-    num_elems.saturating_mul(elem_size)
+    let raw = num_elems.saturating_mul(elem_size);
+    raw.next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize)
 }
 
 impl WgpuStorage {
@@ -5906,7 +5930,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
         let last_dim = argsort_layout.dims().last().copied().unwrap_or(0);
         if last_dim == 0 {
-            return Err(unsupported("argsort empty rows"));
+            return Ok(unsafe { self.device.alloc_uninit(layout.shape(), DType::U32)? });
         }
         let workgroup_size = next_power_of_two_u32(last_dim.min(WG_SIZE as usize), "argsort")?;
         let (dims, strides) = dims4(argsort_layout)?;
@@ -7302,6 +7326,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let flat_lhs = Layout::contiguous(lhs_l.shape().clone());
             let flat_rhs = Layout::contiguous(rhs_l.shape().clone());
             return lhs.run_matmul_f32(&rhs, (b, m, n, k), &flat_lhs, &flat_rhs);
+        }
+        if self.dtype == DType::BF16 {
+            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
+            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
+            let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
+            let rhs_f32_l = Layout::contiguous(rhs_l.shape().clone());
+            let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
+            let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
+            return out_f32.to_dtype(&out_l, DType::BF16);
         }
         if self.dtype != DType::F32
             && self.dtype != DType::F16
@@ -9025,7 +9058,16 @@ impl BackendStorage for WgpuStorage {
                 let scaled = src_f32.run_scale(&src_f32_layout, mul as f32, add as f32)?;
                 scaled.to_dtype(&src_f32_layout, DType::F16)
             }
-            DType::BF16 => self.run_scale(layout, mul as f32, add as f32),
+            DType::BF16 => {
+                let src_f32 = self.materialize_to_f32(layout)?;
+                let src_f32_layout = if layout.dims().len() > 4 {
+                    Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+                } else {
+                    Layout::contiguous(layout.shape())
+                };
+                let scaled = src_f32.run_scale(&src_f32_layout, mul as f32, add as f32)?;
+                scaled.to_dtype(&src_f32_layout, DType::BF16)
+            }
             _ => Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu affine").bt()),
         };
         match gpu {
@@ -9373,7 +9415,7 @@ impl BackendStorage for WgpuStorage {
         }
         if !matches!(
             self.dtype,
-            DType::F32 | DType::F16 | DType::BF16 | DType::U8 | DType::U32 | DType::I64
+            DType::F32 | DType::F16 | DType::BF16 | DType::U8 | DType::U32 | DType::I32 | DType::I64
         ) {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "op").bt());
         }
@@ -9424,70 +9466,7 @@ impl BackendStorage for WgpuStorage {
         let (lhs_dims, lhs_strides) = dims4(lhs_layout)?;
         let (rhs_dims, rhs_strides) = dims4(rhs_layout)?;
         let count = lhs_layout.shape().elem_count();
-        if self.dtype == DType::BF16 && B::NAME == "add" && lhs_layout.is_contiguous() {
-            let offset_dst = lhs_layout.start_offset().try_into()?;
-            let params = BinaryParams {
-                ne: count.try_into()?,
-                offset_src0: offset_dst,
-                offset_src1: rhs_layout.start_offset().try_into()?,
-                offset_dst,
-                stride_src0_0: lhs_strides[0],
-                stride_src0_1: lhs_strides[1],
-                stride_src0_2: lhs_strides[2],
-                stride_src0_3: lhs_strides[3],
-                stride_src1_0: rhs_strides[0],
-                stride_src1_1: rhs_strides[1],
-                stride_src1_2: rhs_strides[2],
-                stride_src1_3: rhs_strides[3],
-                a_ne0: lhs_dims[0],
-                a_ne1: lhs_dims[1],
-                a_ne2: lhs_dims[2],
-                b_ne0: rhs_dims[0],
-                b_ne1: rhs_dims[1],
-                b_ne2: rhs_dims[2],
-                b_ne3: rhs_dims[3],
-                _pad0: 0,
-            };
-            let param_buffer = self
-                .device
-                .inner
-                .device
-                .create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("candle-wgpu-binary-params"),
-                    size: std::mem::size_of::<BinaryParams>() as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-            self.device
-                .inner
-                .queue
-                .write_buffer(&param_buffer, 0, any_as_bytes(&params));
-            let entries = [
-                storage_entry(0, false),
-                storage_entry(1, false),
-                storage_entry(2, false),
-                uniform_entry(3),
-            ];
-            let bindings = [
-                buffer_binding(0, &self.buffer),
-                buffer_binding(1, &rhs.buffer),
-                buffer_binding(2, &self.buffer),
-                buffer_binding(3, &param_buffer),
-            ];
-            self.device.run_compute_linear(
-                &bf16_binary_wgsl(B::NAME),
-                &entries,
-                &bindings,
-                count.div_ceil(2) as u32,
-                "candle-wgpu-binary-bf16-inplace",
-            )?;
-            return Ok(WgpuStorage {
-                buffer: self.buffer.clone(),
-                device: self.device.clone(),
-                count,
-                dtype: self.dtype,
-            });
-        }
+
         let dst = unsafe { self.device.alloc_uninit(lhs_layout.shape(), self.dtype)? };
         let params = BinaryParams {
             ne: count.try_into()?,
@@ -10164,8 +10143,10 @@ impl BackendDevice for WgpuDevice {
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
         let count = shape.elem_count();
         let size = byte_len(dtype, count, "wgpu zeros")?;
+        // wgpu can't allocate 0-byte buffers; use a 1-byte dummy for empty shapes.
+        let alloc_size = size.max(1);
         let buffer =
-            self.register_buffer(self.create_zeroed_storage_buffer(size, "candle-wgpu-zeros"));
+            self.register_buffer(self.create_zeroed_storage_buffer(alloc_size, "candle-wgpu-zeros"));
         Ok(WgpuStorage {
             buffer,
             device: self.clone(),
@@ -10177,13 +10158,15 @@ impl BackendDevice for WgpuDevice {
     unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
         let count = shape.elem_count();
         let size = byte_len(dtype, count, "wgpu alloc_uninit")?;
-        if size >= 4 * 1024 * 1024 {
+        // wgpu can't allocate 0-byte buffers; use a 1-byte dummy for empty shapes.
+        let alloc_size = size.max(1);
+        if alloc_size >= 4 * 1024 * 1024 {
             self.flush_active_batch("large_alloc")?;
             self.cleanup_pending_submissions(true)?;
             self.prune_buffer_registry();
         }
         let buffer =
-            self.register_buffer(self.create_storage_buffer(size, "candle-wgpu-alloc-uninit"));
+            self.register_buffer(self.create_storage_buffer(alloc_size, "candle-wgpu-alloc-uninit"));
         Ok(WgpuStorage {
             buffer,
             device: self.clone(),

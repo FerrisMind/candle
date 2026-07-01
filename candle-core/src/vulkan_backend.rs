@@ -2776,11 +2776,12 @@ fn binary_spirv(op: &str, dtype: DType) -> Result<&'static [u32]> {
     let suffix = match dtype {
         DType::F32 => "f32_f32_f32",
         DType::F16 => "f16_f16_f16",
-        DType::U8 | DType::U32 | DType::I64 => {
+        DType::U8 | DType::U32 | DType::I32 | DType::I64 => {
             // One opcode-switched Candle-owned shader per integer dtype.
             let name = match dtype {
                 DType::U8 => "binary_int_u8",
                 DType::U32 => "binary_int_u32",
+                DType::I32 => "binary_int_i32",
                 _ => "binary_int_i64",
             };
             binary_int_opcode(op)?;
@@ -3877,7 +3878,7 @@ impl VulkanStorage {
         rhs_layout: &Layout,
         op: &'static str,
     ) -> Result<Self> {
-        let int_dtype = matches!(self.dtype, DType::U8 | DType::U32 | DType::I64);
+        let int_dtype = matches!(self.dtype, DType::U8 | DType::U32 | DType::I32 | DType::I64);
         if self.dtype != DType::F32 && self.dtype != DType::F16 && !int_dtype {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan binary").bt());
         }
@@ -4663,7 +4664,7 @@ impl VulkanStorage {
         let nrows = count / last_dim;
         let nrows_u32: u32 = nrows.try_into()?;
         if nrows_u32 == 0 {
-            return Err(unsupported("argsort empty rows"));
+            return Ok(unsafe { self.device.alloc_uninit(layout.shape(), DType::U32)? });
         }
         let workgroups_y = nrows_u32
             .min(self.device.inner.max_workgroup_count_y)
@@ -5780,6 +5781,15 @@ impl VulkanStorage {
             let flat_lhs = Layout::contiguous(lhs_l.shape().clone());
             let flat_rhs = Layout::contiguous(rhs_l.shape().clone());
             return lhs.run_matmul_f32(&rhs, (b, m, n, k), &flat_lhs, &flat_rhs);
+        }
+        if self.dtype == DType::BF16 {
+            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
+            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
+            let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
+            let rhs_f32_l = Layout::contiguous(rhs_l.shape().clone());
+            let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
+            let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
+            return out_f32.to_dtype(&out_l, DType::BF16);
         }
         if self.dtype != DType::F32
             && self.dtype != DType::F16
@@ -7590,7 +7600,7 @@ impl BackendStorage for VulkanStorage {
         cond.where_cond(&zero_l, self, layout, &elu_neg, layout)
     }
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
-        let int_dtype = matches!(self.dtype, DType::U8 | DType::U32 | DType::I64);
+        let int_dtype = matches!(self.dtype, DType::U8 | DType::U32 | DType::I32 | DType::I64);
         if self.dtype != DType::F32
             && self.dtype != DType::F16
             && self.dtype != DType::BF16
@@ -7800,7 +7810,7 @@ impl BackendStorage for VulkanStorage {
             return lhs.binary_impl::<B>(&rhs, &lhs_l, &rhs_l);
         }
         match match B::NAME {
-            "maximum" | "minimum" if matches!(self.dtype, DType::U8 | DType::U32 | DType::I64) => {
+            "maximum" | "minimum" if matches!(self.dtype, DType::U8 | DType::U32 | DType::I32 | DType::I64) => {
                 self.run_binary_named(rhs, lhs_layout, rhs_layout, B::NAME)
             }
             "maximum" | "minimum" => {
@@ -8636,8 +8646,10 @@ impl BackendDevice for VulkanDevice {
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
         let count = shape.elem_count();
         let size = byte_len(dtype, count, "vulkan zeros")?;
-        let buffer = self.create_buffer(size, "candle-vulkan-zeros")?;
-        self.write_buffer(&buffer, &vec![0u8; size])?;
+        // Vulkan can't allocate 0-byte buffers; use a 1-byte dummy for empty shapes.
+        let alloc_size = size.max(1);
+        let buffer = self.create_buffer(alloc_size, "candle-vulkan-zeros")?;
+        self.write_buffer(&buffer, &vec![0u8; alloc_size])?;
         Ok(VulkanStorage {
             buffer,
             device: self.clone(),
@@ -8649,7 +8661,9 @@ impl BackendDevice for VulkanDevice {
     unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
         let count = shape.elem_count();
         let size = byte_len(dtype, count, "vulkan alloc_uninit")?;
-        let buffer = self.create_buffer(size, "candle-vulkan-alloc-uninit")?;
+        // Vulkan can't allocate 0-byte buffers; use a 1-byte dummy for empty shapes.
+        let alloc_size = size.max(1);
+        let buffer = self.create_buffer(alloc_size, "candle-vulkan-alloc-uninit")?;
         Ok(VulkanStorage {
             buffer,
             device: self.clone(),

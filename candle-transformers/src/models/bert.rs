@@ -677,7 +677,7 @@ mod tests {
         let (config, weights_path) = minilm_fixture()?;
         let cpu = Device::Cpu;
         let cpu_vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], DTYPE, &cpu)? };
+            unsafe { VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&weights_path), DTYPE, &cpu)? };
         let dev_vb =
             unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, device)? };
         let cpu_model = BertModel::load(cpu_vb.clone(), &config)?;

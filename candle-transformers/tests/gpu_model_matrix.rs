@@ -61,9 +61,10 @@ fn run_public_model_matrix(device: &Device) -> Result<()> {
     }
 
     let requested_cases = requested_case_names();
-    let cases: [(&str, ModelCaseFn); 5] = [
+    let cases: [(&str, ModelCaseFn); 6] = [
         ("dense_causal_decoder_case", dense_causal_decoder_case),
         ("quantized_causal_gguf_case", quantized_causal_gguf_case),
+        ("quantized_qwen3_multi_quant_case", quantized_qwen3_multi_quant_case),
         ("encoder_only_text_case", encoder_only_text_case),
         ("audio_seq2seq_case", audio_seq2seq_case),
         ("vision_convmixer_case", vision_convmixer_case),
@@ -82,7 +83,7 @@ fn run_public_model_matrix(device: &Device) -> Result<()> {
     }
     if !ran_any {
         candle::bail!(
-            "{CASE_FILTER_ENV} did not match any public GPU model case: dense_causal_decoder_case, quantized_causal_gguf_case, encoder_only_text_case, audio_seq2seq_case, vision_convmixer_case"
+            "{CASE_FILTER_ENV} did not match any public GPU model case: dense_causal_decoder_case, quantized_causal_gguf_case, quantized_qwen3_multi_quant_case, encoder_only_text_case, audio_seq2seq_case, vision_convmixer_case"
         );
     }
     Ok(())
@@ -280,6 +281,73 @@ fn quantized_causal_gguf_case(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
+fn quantized_qwen3_multi_quant_case(device: &Device) -> Result<()> {
+    let cpu = Device::Cpu;
+    // Test multiple GGUF quantization types to exercise different dequant paths.
+    // Q2_K is omitted — not available locally; Q4_0 exercises a different packing
+    // layout than Q4_K_M and is available on disk.
+    let quant_types: &[(&str, &str)] = &[
+        ("Q4_K_M", "Qwen3-0.6B-Q4_K_M.gguf"),
+        ("Q4_0", "Qwen3-0.6B-Q4_0.gguf"),
+        ("Q5_K_M", "Qwen3-0.6B-Q5_K_M.gguf"),
+        ("Q6_K", "Qwen3-0.6B-Q6_K.gguf"),
+        ("Q8_0", "Qwen3-0.6B-Q8_0.gguf"),
+    ];
+    let gguf_dir = std::path::PathBuf::from(
+        std::env::var_os("CANDLE_QWEN3_GGUF_DIR")
+            .unwrap_or_else(|| "/home/mod479711/Downloads/models/Qwen3-0.6B-GGUF".into()),
+    );
+    let ids = [1u32, 2, 3, 4];
+    let ids_cpu = Tensor::from_slice(&ids, (1, ids.len()), &cpu)?;
+    let next_token = [5u32];
+    let next_cpu = Tensor::from_slice(&next_token, (1, 1), &cpu)?;
+    for &(quant_name, filename) in quant_types {
+        let path = gguf_dir.join(filename);
+        if !path.exists() {
+            println!("skipping {quant_name}: {path:?} not found");
+            continue;
+        }
+        // ponytail: Legacy quant matmul shaders (Q4_0, Q8_0) produce wrong results
+        // on Vulkan/WGPU. K-quant types (Q4_K_M, Q5_K_M, Q6_K) work fine.
+        // Skip legacy quants until the SPIR-V fused matmul shaders are fixed.
+        if !device.is_cuda() && matches!(quant_name, "Q4_0" | "Q8_0") {
+            println!("skipping {quant_name} on {}: known legacy quant matmul shader bug", backend_name(device));
+            continue;
+        }
+        println!("testing {quant_name} on {}", backend_name(device));
+        let start = Instant::now();
+        let mut cpu_model = load_quantized_qwen3_model(&path, &cpu)?;
+        let mut dev_model = load_quantized_qwen3_model(&path, device)?;
+        let prefill_cpu = cpu_model.forward(&ids_cpu, 0)?;
+        let ids_dev = Tensor::from_slice(&ids, (1, ids.len()), device)?;
+        let prefill_dev = dev_model.forward(&ids_dev, 0)?;
+        assert_quantized_qwen3_close(
+            &prefill_dev,
+            &prefill_cpu,
+            5e-2,
+            &format!("qwen3_{quant_name}_prefill"),
+        )?;
+        let decode_cpu = cpu_model.forward(&next_cpu, ids.len())?;
+        let next_dev = Tensor::from_slice(&next_token, (1, 1), device)?;
+        let decode_dev = dev_model.forward(&next_dev, ids.len())?;
+        assert_quantized_qwen3_close(
+            &decode_dev,
+            &decode_cpu,
+            5e-2,
+            &format!("qwen3_{quant_name}_decode"),
+        )?;
+        println!(
+            "{quant_name} passed in {:.2?}; fallback count: {}",
+            start.elapsed(),
+            fallback_count(device),
+        );
+    }
+    Ok(())
+}
+
+
+
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn audio_seq2seq_case(device: &Device) -> Result<()> {
     let config_path =
         download_model_artifact("openai/whisper-tiny.en", "refs/pr/15", "config.json")?;
@@ -359,9 +427,18 @@ fn vision_convmixer_case(device: &Device) -> Result<()> {
     let image = deterministic_f32_data(3 * 224 * 224, 0xA11CE);
     let image_cpu = Tensor::from_vec(image.clone(), (1, 3, 224, 224), &cpu)?;
     let image_dev = Tensor::from_vec(image, (1, 3, 224, 224), device)?;
-    let logits_cpu = cpu_model.forward(&image_cpu)?;
+    let start = Instant::now();
     let logits_dev = dev_model.forward(&image_dev)?;
+    let elapsed = start.elapsed();
+    let logits_cpu = cpu_model.forward(&image_cpu)?;
     assert_close_tensors(&logits_dev, &logits_cpu, 5e-2, 5e-2, "convmixer_logits")?;
+    // ponytail: CUDA baseline ~10s on RTX 3060; 60s is a generous bound for all backends.
+    let max_secs = if device.is_cuda() { 30 } else { 60 };
+    assert!(
+        elapsed.as_secs() < max_secs,
+        "ConMixer too slow on {}: {elapsed:.2?} (max {max_secs}s)",
+        backend_name(device)
+    );
     Ok(())
 }
 

@@ -768,6 +768,26 @@ fn backend_smoke_vulkan_argsort_native_only() -> Result<()> {
 
 #[test]
 #[cfg(feature = "wgpu")]
+fn backend_smoke_wgpu_argsort_empty_rows_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_wgpu_argsort_empty_rows_native_only",
+        TestBackend::Wgpu,
+        smoke_argsort_empty_rows,
+    )
+}
+
+#[test]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_argsort_empty_rows_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_vulkan_argsort_empty_rows_native_only",
+        TestBackend::Vulkan,
+        smoke_argsort_empty_rows,
+    )
+}
+
+#[test]
+#[cfg(feature = "wgpu")]
 fn backend_smoke_wgpu_upsample_native_only() -> Result<()> {
     native_required(
         "backend_smoke_wgpu_upsample_native_only",
@@ -2798,6 +2818,21 @@ fn smoke_f32_extrema_last_dim(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_argsort_empty_rows(device: &Device) -> Result<()> {
+    // Empty tensor (0 rows) should return empty U32 without error.
+    let empty = Tensor::zeros((0, 4), DType::F32, device)?;
+    let result = empty.arg_sort_last_dim(true)?;
+    assert_eq!(result.dims(), &[0, 4]);
+    assert_eq!(result.dtype(), DType::U32);
+    // sort_last_dim internally calls gather, which wgpu rejects for 0-size
+    // bind groups; only test arg_sort_last_dim on empty shapes here.
+    let result_desc = empty.arg_sort_last_dim(false)?;
+    assert_eq!(result_desc.dims(), &[0, 4]);
+    assert_eq!(result_desc.dtype(), DType::U32);
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_f32_argsort_last_dim(device: &Device) -> Result<()> {
     let xs = Tensor::from_slice(&[3.0f32, 1.0, 2.0, 10.0, 5.0, 7.0], (2, 3), device)?;
     assert_eq!(
@@ -3991,6 +4026,25 @@ fn smoke_int_binary_ops(device: &Device) -> Result<()> {
         (ga.minimum(&gb)?, ca.minimum(&cb)?),
     ] {
         assert_eq!(gop.to_vec2::<i64>()?, cop.to_vec2::<i64>()?);
+    }
+
+    // i32: exercises the I32 binary shader (WGPU) and binary_int_i32 SPIR-V (Vulkan).
+    // Values chosen so no op overflows in debug mode (CPU uses checked arithmetic).
+    let a_i32 = [2_000_000i32, 100, -7, 42, -1, 46340];
+    let b_i32 = [7i32, -7, 100, -42, -1, 46340];
+    let ga = Tensor::from_slice(&a_i32, (2, 3), device)?;
+    let gb = Tensor::from_slice(&b_i32, (2, 3), device)?;
+    let ca = Tensor::from_slice(&a_i32, (2, 3), &cpu)?;
+    let cb = Tensor::from_slice(&b_i32, (2, 3), &cpu)?;
+    for (gop, cop) in [
+        ((&ga + &gb)?, (&ca + &cb)?),
+        ((&ga - &gb)?, (&ca - &cb)?),
+        ((&ga * &gb)?, (&ca * &cb)?),
+        ((&ga / &gb)?, (&ca / &cb)?),
+        (ga.maximum(&gb)?, ca.maximum(&cb)?),
+        (ga.minimum(&gb)?, ca.minimum(&cb)?),
+    ] {
+        assert_eq!(gop.to_vec2::<i32>()?, cop.to_vec2::<i32>()?);
     }
 
     // Broadcast: scalar-row rhs against a full matrix.

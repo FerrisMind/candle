@@ -464,7 +464,7 @@ mod tests {
         let (config, weights_path) = whisper_fixture()?;
         let cpu = Device::Cpu;
         let cpu_vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], super::super::DTYPE, &cpu)?
+            VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&weights_path), super::super::DTYPE, &cpu)?
         };
         let dev_vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights_path], super::super::DTYPE, device)?
