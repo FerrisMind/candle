@@ -273,6 +273,7 @@ impl Qwen3Attention {
         // 6. Attention dispatch: auto-select best available path
         //    - CPU (no flash-attn feature): fused CPU flash kernel
         //    - GPU (flash-attn feature):    CUDA flash attention
+        //    - Vulkan:                      fused GPU flash attention via sdpa
         //    - Fallback:                    standard matmul attention
         let on_cpu = x.device().is_cpu();
 
@@ -283,6 +284,20 @@ impl Qwen3Attention {
         #[cfg(feature = "flash-attn")]
         if !on_cpu {
             return self.forward_flash_attn(&q, &k, &v, offset, b, l);
+        }
+
+        if x.device().is_vulkan() {
+            let scale = 1.0 / (self.head_dim as f32).sqrt();
+            let ctx = candle_nn::ops::sdpa(
+                &q,
+                &k,
+                &v,
+                None,
+                l > 1,
+                scale,
+                1.0,
+            )?;
+            return ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj);
         }
 
         self.forward_standard_attn(&q, &k, &v, attn_mask, b, l)

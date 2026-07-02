@@ -5248,6 +5248,105 @@ impl VulkanStorage {
         )?;
         Ok(dst)
     }
+    /// Fused flash attention: O = softmax(Q * K^T * scale + causal_mask) * V
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn(
+        q: &VulkanStorage,
+        q_layout: &Layout,
+        k: &VulkanStorage,
+        k_layout: &Layout,
+        v: &VulkanStorage,
+        v_layout: &Layout,
+        scale: f32,
+        causal: bool,
+    ) -> Result<VulkanStorage> {
+        use crate::DType;
+
+        // Decide compute dtype: F16 when inputs are BF16/F16 (halves VRAM,
+        // matches CUDA flash-attn tensor-core path), F32 when inputs are F32.
+        let use_f16 = matches!(q.dtype, DType::BF16 | DType::F16);
+        let compute_dtype = if use_f16 { DType::F16 } else { DType::F32 };
+
+        let ensure_contiguous = |src: &VulkanStorage, l: &Layout| -> Result<(VulkanStorage, Layout)> {
+            let storage = if src.dtype == compute_dtype {
+                if !l.is_contiguous() || l.start_offset() != 0 {
+                    let shape_ref = l.shape();
+                    let mut tmp = unsafe { src.device.alloc_uninit(shape_ref, compute_dtype)? };
+                    src.copy_strided_src(&mut tmp, 0, l)?;
+                    tmp
+                } else {
+                    src.try_clone(l)?
+                }
+            } else {
+                src.to_dtype(l, compute_dtype)?
+            };
+            let layout = Layout::contiguous(l.shape().clone());
+            Ok((storage, layout))
+        };
+
+        let (q_buf, q_l) = ensure_contiguous(q, q_layout)?;
+        let (k_buf, k_l) = ensure_contiguous(k, k_layout)?;
+        let (v_buf, _v_l) = ensure_contiguous(v, v_layout)?;
+
+        let dims_q = q_l.dims();
+        let (b, h, seq_q, head_dim) = if dims_q.len() == 4 {
+            (dims_q[0], dims_q[1], dims_q[2], dims_q[3])
+        } else {
+            return Err(Error::Msg("flash_attn expects 4D Q tensor [B,H,S,D]".into()).bt());
+        };
+        let seq_kv = k_l.dims()[2];
+
+        let out_shape = Shape::from_dims(&[b, h, seq_q, head_dim]);
+        let dst = unsafe { q_buf.device.alloc_uninit(&out_shape, DType::F32)? };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FlashAttnParams {
+            seq_q: u32,
+            seq_kv: u32,
+            head_dim: u32,
+            num_heads: u32,
+            num_kv_heads: u32,
+            batch_size: u32,
+            scale: f32,
+            causal: u32,
+        }
+
+        let params = FlashAttnParams {
+            seq_q: seq_q as u32,
+            seq_kv: seq_kv as u32,
+            head_dim: head_dim as u32,
+            num_heads: h as u32,
+            num_kv_heads: k_l.dims()[1] as u32,
+            batch_size: b as u32,
+            scale,
+            causal: if causal { 1 } else { 0 },
+        };
+
+        let bindings = [
+            VulkanBinding::Storage(&q_buf.buffer),
+            VulkanBinding::Storage(&k_buf.buffer),
+            VulkanBinding::Storage(&v_buf.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+
+        let shader_name = if use_f16 { "flash_attn_f16" } else { "flash_attn" };
+        let spirv = candle_vulkan_kernels::spirv(shader_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {shader_name} not generated").into()).bt())?;
+
+        let total_q_rows = (b * h * seq_q) as u32;
+        let workgroup_size = 256u32;
+        let num_workgroups = total_q_rows.div_ceil(workgroup_size);
+
+        q_buf.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (num_workgroups, 1, 1),
+        )?;
+
+        Ok(dst)
+    }
 
     pub fn sigmoid(&self, layout: &Layout) -> Result<Self> {
         if self.dtype != DType::F32 && self.dtype != DType::F16 {

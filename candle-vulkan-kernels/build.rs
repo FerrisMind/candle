@@ -693,6 +693,16 @@ fn generate_candle_spirv_modules(
             candle_shaders_dir.join("layernorm.comp"),
             &[],
         ),
+        (
+            "flash_attn",
+            candle_shaders_dir.join("flash_attn.comp"),
+            &[],
+        ),
+        (
+            "flash_attn_f16",
+            candle_shaders_dir.join("flash_attn.comp"),
+            &["INPUT_F16"],
+        ),
     ];
     for (name, source, defines) in modules {
         let output = spv_dir.join(format!("{name}.spv"));

@@ -1,6 +1,7 @@
 //! Tensor ops.
 //!
 
+use candle::backend::BackendStorage;
 use candle::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
 use rayon::prelude::*;
 
@@ -1340,6 +1341,35 @@ impl candle::CustomOp3 for Sdpa {
         let newstorage = candle::MetalStorage::new(output, device.clone(), elem_count, q.dtype());
         Ok((newstorage, out_shape))
     }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        q: &candle::VulkanStorage,
+        q_l: &Layout,
+        k: &candle::VulkanStorage,
+        k_l: &Layout,
+        v: &candle::VulkanStorage,
+        v_l: &Layout,
+    ) -> Result<(candle::VulkanStorage, Shape)> {
+        let out_dims = vec![q_l.dim(0)?, q_l.dim(1)?, q_l.dim(2)?, v_l.dim(3)?];
+        let q_dtype = q.dtype();
+        let out = candle::VulkanStorage::flash_attn(
+            q, q_l,
+            k, k_l,
+            v, v_l,
+            self.scale,
+            self.do_causal,
+        )?;
+        // Cast back to input dtype if needed (flash_attn always outputs F32)
+        let out = if out.dtype() != q_dtype {
+            let out_l = candle::Layout::contiguous(candle::Shape::from_dims(&out_dims));
+            out.to_dtype(&out_l, q_dtype)?
+        } else {
+            out
+        };
+        Ok((out, Shape::from_dims(&out_dims)))
+    }
 }
 
 fn sdpa_causal_mask(q_seq: usize, k_seq: usize, device: &candle::Device) -> Result<Tensor> {
@@ -1494,7 +1524,7 @@ pub fn sdpa(
     scale: f32,
     softcapping: f32,
 ) -> Result<Tensor> {
-    if q.device().is_metal() {
+    if q.device().is_metal() || q.device().is_vulkan() {
         return q.apply_op3_no_bwd(
             k,
             v,

@@ -1,0 +1,82 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Fused Flash Attention — F16 input variant.
+// Q, K, V are stored as float16_t; accumulation and output are float32.
+// This halves VRAM for Q/K/V buffers vs the F32 variant, matching CUDA
+// flash-attn behaviour (tensor cores operate on F16).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer QBuf  { float16_t data_q[]; };
+layout(binding = 1) readonly buffer KBuf  { float16_t data_k[]; };
+layout(binding = 2) readonly buffer VBuf  { float16_t data_v[]; };
+layout(binding = 3) writeonly buffer OBuf { float data_o[]; };
+
+layout(push_constant) uniform params {
+    uint seq_q;
+    uint seq_kv;
+    uint head_dim;
+    uint num_heads;
+    uint num_kv_heads;
+    uint batch_size;
+    float scale;
+    uint causal;
+};
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint wg_id = gl_WorkGroupID.x;
+    const uint global_idx = wg_id * 256u + tid;
+    const uint total_q_rows = batch_size * num_heads * seq_q;
+
+    if (global_idx >= total_q_rows) return;
+
+    const uint D = head_dim;
+    const uint bh = global_idx / seq_q;
+    const uint s = global_idx % seq_q;
+    const uint b = bh / num_heads;
+    const uint h_q = bh % num_heads;
+
+    const uint h_kv = h_q / max(1u, num_heads / num_kv_heads);
+
+    const uint q_base = (b * num_heads + h_q) * seq_q * D;
+    const uint k_base = (b * num_kv_heads + h_kv) * seq_kv * D;
+
+    float m = -1e30;
+    float l = 0.0;
+
+    float o_acc[128];
+    for (uint d = 0; d < D; d++) {
+        o_acc[d] = 0.0;
+    }
+
+    for (uint kv = 0u; kv < seq_kv; kv++) {
+        if (causal != 0u && kv > s) continue;
+
+        float score = 0.0;
+        for (uint d = 0u; d < D; d++) {
+            score += float(data_q[q_base + s * D + d]) * float(data_k[k_base + kv * D + d]);
+        }
+        score *= scale;
+
+        float m_new = max(m, score);
+        float exp_diff = (m_new - m < 80.0) ? exp(m - m_new) : 0.0;
+        float w = exp(score - m_new);
+
+        for (uint d = 0u; d < D; d++) {
+            o_acc[d] = o_acc[d] * exp_diff + w * float(data_v[k_base + kv * D + d]);
+        }
+
+        l = l * exp_diff + w;
+        m = m_new;
+    }
+
+    float inv_l = (l > 0.0) ? (1.0 / l) : 0.0;
+    for (uint d = 0u; d < D; d++) {
+        data_o[q_base + s * D + d] = o_acc[d] * inv_l;
+    }
+}

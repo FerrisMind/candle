@@ -1,0 +1,113 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "types.glsl"
+
+// Fused Flash Attention with GQA support.
+// Computes: O = softmax(Q * K^T * scale + causal_mask) * V
+// Uses online softmax to avoid materializing the full attention matrix.
+// Handles GQA: num_heads may differ from num_kv_heads.
+//
+// Each thread processes one Q row across all KV positions.
+// Q is read from global memory on-the-fly (no register spill for 128-dim).
+// O accumulator fits in registers (128 floats x 4 bytes = 512 bytes/thread).
+//
+// INPUT_F16: Q/K/V buffers are float16_t (saves 2x VRAM vs F32).
+//            BF16 inputs are converted to F16 before dispatch.
+//            All arithmetic is promoted to float for softmax precision.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#if defined(INPUT_F16)
+layout(binding = 0) readonly buffer QBuf  { float16_t data_q[]; };
+layout(binding = 1) readonly buffer KBuf  { float16_t data_k[]; };
+layout(binding = 2) readonly buffer VBuf  { float16_t data_v[]; };
+#define READ_Q(i) float(data_q[i])
+#define READ_K(i) float(data_k[i])
+#define READ_V(i) float(data_v[i])
+#else
+layout(binding = 0) readonly buffer QBuf  { float data_q[]; };
+layout(binding = 1) readonly buffer KBuf  { float data_k[]; };
+layout(binding = 2) readonly buffer VBuf  { float data_v[]; };
+#define READ_Q(i) data_q[i]
+#define READ_K(i) data_k[i]
+#define READ_V(i) data_v[i]
+#endif
+
+layout(binding = 3) writeonly buffer OBuf { float data_o[]; };
+
+layout(push_constant) uniform params {
+    uint seq_q;
+    uint seq_kv;
+    uint head_dim;
+    uint num_heads;
+    uint num_kv_heads;
+    uint batch_size;
+    float scale;
+    uint causal;
+};
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint wg_id = gl_WorkGroupID.x;
+    const uint global_idx = wg_id * 256u + tid;
+    const uint total_q_rows = batch_size * num_heads * seq_q;
+
+    if (global_idx >= total_q_rows) return;
+
+    const uint D = head_dim;
+    const uint bh = global_idx / seq_q;
+    const uint s = global_idx % seq_q;
+    const uint b = bh / num_heads;
+    const uint h_q = bh % num_heads;
+
+    // GQA: map Q head to KV head
+    const uint h_kv = h_q / max(1u, num_heads / num_kv_heads);
+
+    const uint q_base = (b * num_heads + h_q) * seq_q * D;
+    const uint k_base = (b * num_kv_heads + h_kv) * seq_kv * D;
+
+    // Online softmax state
+    float m = -1e30;
+    float l = 0.0;
+
+    // Output accumulator
+    float o_acc[128];
+    for (uint d = 0; d < D; d++) {
+        o_acc[d] = 0.0;
+    }
+
+    // Iterate over KV positions
+    for (uint kv = 0u; kv < seq_kv; kv++) {
+        if (causal != 0u && kv > s) continue;
+
+        // Compute score = dot(Q[s], K[kv]) * scale
+        float score = 0.0;
+        for (uint d = 0u; d < D; d++) {
+            score += READ_Q(q_base + s * D + d) * READ_K(k_base + kv * D + d);
+        }
+        score *= scale;
+
+        // Online softmax update
+        float m_new = max(m, score);
+        float exp_diff = (m_new - m < 80.0) ? exp(m - m_new) : 0.0;
+        float w = exp(score - m_new);
+
+        // Rescale accumulator and add V contribution
+        for (uint d = 0u; d < D; d++) {
+            o_acc[d] = o_acc[d] * exp_diff + w * READ_V(k_base + kv * D + d);
+        }
+
+        l = l * exp_diff + w;
+        m = m_new;
+    }
+
+    // Normalize and write output
+    float inv_l = (l > 0.0) ? (1.0 / l) : 0.0;
+    for (uint d = 0u; d < D; d++) {
+        data_o[q_base + s * D + d] = o_acc[d] * inv_l;
+    }
+}
