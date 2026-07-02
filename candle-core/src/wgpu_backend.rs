@@ -6495,10 +6495,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         alpha_layout: &Layout,
         eps: f32,
     ) -> Result<Self> {
-        // CUDA parity: mixed dtypes and emulated F16 use a GPU-resident F32 hub.
+        // CUDA parity: mixed dtypes and F16 use a GPU-resident F32 hub.
+        // rms_norm WGSL only supports f32/bf16 — always upconvert F16.
         if self.dtype != alpha.dtype
-            || wgpu_f16_emulates_f32(&self.device, self.dtype)
-            || wgpu_f16_emulates_f32(&self.device, alpha.dtype)
+            || self.dtype == DType::F16
+            || alpha.dtype == DType::F16
         {
             let out_dtype = self.dtype;
             let src_f32 = self.to_dtype(layout, DType::F32)?;
@@ -7335,6 +7336,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
             let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
             return out_f32.to_dtype(&out_l, DType::BF16);
+        }
+        // ponytail: F16 matmul shader writes f32 dst — must upconvert to avoid buffer overflow.
+        if self.dtype == DType::F16 {
+            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
+            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
+            let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
+            let rhs_f32_l = Layout::contiguous(rhs_l.shape().clone());
+            let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
+            let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
+            return out_f32.to_dtype(&out_l, DType::F16);
         }
         if self.dtype != DType::F32
             && self.dtype != DType::F16

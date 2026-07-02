@@ -15,7 +15,10 @@ layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 // follow Rust `as` semantics (saturating, NaN -> 0) to match the Candle CPU
 // reference; integer -> integer conversions truncate like Rust `as`.
 D_TYPE convert_value(A_TYPE v) {
-#if defined(DATA_D_BF16)
+#if defined(DATA_A_BF16) && defined(DST_VIA_F32)
+    // BF16 stored as uint16_t → proper conversion via bf16_to_fp32
+    return D_TYPE(bf16_to_fp32(uint32_t(v)));
+#elif defined(DATA_D_BF16)
     return D_TYPE(fp32_to_bf16(float(v)));
 #elif defined(DST_SAT_U8)
     const float f = float(v);

@@ -498,6 +498,7 @@ struct VulkanInner {
     max_push_constants_size: u32,
     robust_buffer_access: bool,
     vulkan_memory_model: bool,
+    non_coherent_atom_size: u64,
     device: ash::Device,
     driver_pipeline_cache: vk::PipelineCache,
     queue_family_index: u32,
@@ -1983,11 +1984,11 @@ impl VulkanDevice {
         if bytes.len() > buffer.size {
             crate::bail!("vulkan write larger than buffer")
         }
-        let allocation = buffer
+        let alloc_guard = buffer
             .allocation
             .lock()
             .map_err(|e| Error::wrap(e.to_string()))?;
-        let allocation = allocation
+        let allocation = alloc_guard
             .as_ref()
             .ok_or_else(|| Error::msg("freed vulkan allocation"))?;
         unsafe {
@@ -2009,10 +2010,15 @@ impl VulkanDevice {
             if bytes.len() < buffer.size {
                 std::ptr::write_bytes(mapped_ptr.add(bytes.len()), 0, buffer.size - bytes.len());
             }
+            let atom = self.inner.non_coherent_atom_size.max(1);
+            let atom_mask = atom - 1;
+            let flush_offset = allocation.offset() & !atom_mask;
+            let flush_end = (allocation.offset() + buffer.size as u64 + atom_mask) & !atom_mask;
+            let flush_size = flush_end.saturating_sub(flush_offset);
             let range = vk::MappedMemoryRange::default()
                 .memory(allocation.memory())
-                .offset(allocation.offset())
-                .size(buffer.size as u64);
+                .offset(flush_offset)
+                .size(flush_size);
             self.inner
                 .device
                 .flush_mapped_memory_ranges(&[range])
@@ -2025,18 +2031,23 @@ impl VulkanDevice {
     }
 
     fn map_read_host_buffer(&self, buffer: &VulkanBuffer) -> Result<Vec<u8>> {
-        let allocation = buffer
+        let alloc_guard = buffer
             .allocation
             .lock()
             .map_err(|e| Error::wrap(e.to_string()))?;
-        let allocation = allocation
+        let allocation = alloc_guard
             .as_ref()
             .ok_or_else(|| Error::msg("freed vulkan allocation"))?;
         unsafe {
+            let atom = self.inner.non_coherent_atom_size.max(1);
+            let atom_mask = atom - 1;
+            let flush_offset = allocation.offset() & !atom_mask;
+            let flush_end = (allocation.offset() + buffer.size as u64 + atom_mask) & !atom_mask;
+            let flush_size = flush_end.saturating_sub(flush_offset);
             let range = vk::MappedMemoryRange::default()
                 .memory(allocation.memory())
-                .offset(allocation.offset())
-                .size(buffer.size as u64);
+                .offset(flush_offset)
+                .size(flush_size);
             self.inner
                 .device
                 .invalidate_mapped_memory_ranges(&[range])
@@ -2850,6 +2861,8 @@ fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
         (DType::F16, DType::I64) => "convert_f16_i64",
         (DType::F16, DType::BF16) => "convert_f16_bf16",
         (DType::BF16, DType::BF16) => "convert_bf16_bf16",
+        (DType::BF16, DType::F32) => "convert_bf16_f32",
+        (DType::BF16, DType::F16) => "convert_bf16_f16",
         (DType::U8, DType::F32) => "convert_u8_f32",
         (DType::U8, DType::F16) => "convert_u8_f16",
         (DType::U8, DType::U32) => "convert_u8_u32",
@@ -3157,83 +3170,6 @@ impl VulkanStorage {
         }
         Ok(dst)
     }
-
-    fn run_bf16_to_dtype_via_get_rows(&self, layout: &Layout, dtype: DType) -> Result<Self> {
-        if self.dtype != DType::BF16 {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan to_dtype").bt());
-        }
-        if !layout.is_contiguous() || layout.start_offset() != 0 {
-            let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
-            self.copy_strided_src(&mut materialized, 0, layout)?;
-            let contiguous = Layout::contiguous(layout.shape());
-            return materialized.run_bf16_to_dtype_via_get_rows(&contiguous, dtype);
-        }
-
-        let elem_count = layout.shape().elem_count();
-        let cols = layout.dims().last().copied().unwrap_or(1).max(1);
-        let rows = elem_count.div_ceil(cols);
-        let rows_u32: u32 = rows.try_into()?;
-        let cols_u32: u32 = cols.try_into()?;
-
-        let ids = CpuStorage::U32((0..rows_u32).collect());
-        let ids = self.device.storage_from_cpu_storage(&ids)?;
-        let ids_layout = Layout::contiguous(Shape::from(rows));
-        let src_layout = Layout::contiguous(Shape::from((rows, cols)));
-        let dst = unsafe { self.device.alloc_uninit(layout.shape(), dtype)? };
-        let params = GgmlBinaryParams {
-            ne: (rows * cols).try_into()?,
-            ne00: cols_u32,
-            ne01: rows_u32,
-            ne02: 1,
-            ne03: 1,
-            nb00: 1,
-            nb01: cols_u32,
-            nb02: 0,
-            nb03: 0,
-            ne10: rows_u32,
-            ne11: 1,
-            ne12: 1,
-            ne13: 1,
-            nb10: 1,
-            nb11: 0,
-            nb12: 0,
-            nb13: 0,
-            ne20: cols_u32,
-            ne21: rows_u32,
-            ne22: 1,
-            ne23: 1,
-            nb20: 1,
-            nb21: cols_u32,
-            nb22: 0,
-            nb23: 0,
-            misalign_offsets: 0,
-            param1: 0.0,
-            param2: 0.0,
-            param3: 0,
-        };
-        let bindings = [
-            VulkanBinding::Storage(&self.buffer),
-            VulkanBinding::Storage(&ids.buffer),
-            VulkanBinding::Storage(&dst.buffer),
-        ];
-        let spirv_name = match dtype {
-            DType::F16 => "get_rows_bf16",
-            DType::F32 => "get_rows_bf16_f32",
-            _ => unreachable!(),
-        };
-        let spirv = candle_vulkan_kernels::spirv(spirv_name)
-            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
-        self.device.run_compute_3d(
-            spirv,
-            &bindings,
-            Some(any_as_bytes(&params)),
-            (cols_u32.div_ceil(512), rows_u32, 1),
-        )?;
-        let _ = ids_layout;
-        let _ = src_layout;
-        Ok(dst)
-    }
-
     fn materialize_to_f32(&self, layout: &Layout) -> Result<Self> {
         if self.dtype == DType::F32 {
             if layout.is_contiguous() && layout.start_offset() == 0 {
@@ -5448,7 +5384,7 @@ impl VulkanStorage {
             &bindings,
             Some(any_as_bytes(&params)),
             (
-                right_size.div_ceil(512).try_into()?,
+                right_size.div_ceil(128).try_into()?,
                 ids_len.try_into()?,
                 left_size.try_into()?,
             ),
@@ -5797,6 +5733,16 @@ impl VulkanStorage {
             let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
             let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
             return out_f32.to_dtype(&out_l, DType::BF16);
+        }
+        // ponytail: F16 — upconvert to F32 for matmul, matching wgpu fix.
+        if self.dtype == DType::F16 {
+            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
+            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
+            let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
+            let rhs_f32_l = Layout::contiguous(rhs_l.shape().clone());
+            let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
+            let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
+            return out_f32.to_dtype(&out_l, DType::F16);
         }
         if self.dtype != DType::F32
             && self.dtype != DType::F16
@@ -7709,10 +7655,7 @@ impl BackendStorage for VulkanStorage {
         self.run_cmp_u8(rhs, lhs_l, rhs_l, op)
     }
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
-        if self.dtype == DType::BF16 && (dtype == DType::F16 || dtype == DType::F32) {
-            return self.run_bf16_to_dtype_via_get_rows(layout, dtype);
-        }
-        if self.dtype == DType::BF16 {
+        if self.dtype == DType::BF16 && !matches!(dtype, DType::F16 | DType::F32 | DType::BF16) {
             // No direct bf16 -> integer kernel exists; decompose into the
             // native bf16 -> f32 path followed by the native f32 -> dst cast,
             // keeping the whole chain on the GPU.
@@ -8424,6 +8367,11 @@ impl BackendDevice for VulkanDevice {
             .max_push_constants_size
             .max(1);
         let vendor_id = physical_device_properties.properties.vendor_id;
+        let non_coherent_atom_size = physical_device_properties
+            .properties
+            .limits
+            .non_coherent_atom_size
+            .max(1);
         let subgroup_arithmetic = subgroup_properties
             .supported_operations
             .contains(vk::SubgroupFeatureFlags::ARITHMETIC)
@@ -8621,6 +8569,7 @@ impl BackendDevice for VulkanDevice {
                 max_push_constants_size,
                 robust_buffer_access,
                 vulkan_memory_model,
+                non_coherent_atom_size,
                 device,
                 driver_pipeline_cache,
                 queue_family_index,

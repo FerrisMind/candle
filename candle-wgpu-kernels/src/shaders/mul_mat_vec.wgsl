@@ -25,7 +25,12 @@ fn sbyte_of(v: u32, b: u32) -> i32 {
 #define SRC1_TYPE vec4<SRC1_INNER_TYPE>
 
 fn inner_dot(src0_val: SRC0_TYPE, src1_val: SRC1_TYPE) -> f32 {
-    return f32(dot(SRC1_TYPE(src0_val), src1_val));
+    // ponytail: f32 accumulation — dot(vec4<f16>) computes in f16 precision,
+    // losing significant bits. Cast each element to f32 first.
+    return f32(src0_val.x) * f32(src1_val.x)
+         + f32(src0_val.y) * f32(src1_val.y)
+         + f32(src0_val.z) * f32(src1_val.z)
+         + f32(src0_val.w) * f32(src1_val.w);
 }
 #endif
 

@@ -165,3 +165,8 @@ required-features = ["symphonia"]
 [[example]]
 name = "bert_single_file_binary"
 required-features = ["buildtime-download"]
+
+[[example]]
+name = "debug_vulkan"
+required-features = ["vulkan"]
+

@@ -435,11 +435,11 @@ impl DecoderLayer {
 
     fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let h = self.ln1.forward(x)?;
-        let h = self.self_attn.forward(&h, mask, offset)?;
-        let x = (x + h)?;
-        let h2 = self.ln2.forward(&x)?;
-        let h2 = h2.apply(&self.mlp)?;
-        x + h2
+        let attn_out = self.self_attn.forward(&h, mask, offset)?;
+        let x = (x + &attn_out)?;
+        let ln2_out = self.ln2.forward(&x)?;
+        let mlp_out = ln2_out.apply(&self.mlp)?;
+        Ok((x + &mlp_out)?)
     }
 
     fn clear_kv_cache(&mut self) {
