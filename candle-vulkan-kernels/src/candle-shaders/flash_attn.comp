@@ -10,10 +10,10 @@
 // Computes: O = softmax(Q * K^T * scale + causal_mask) * V
 // Uses online softmax to avoid materializing the full attention matrix.
 // Handles GQA: num_heads may differ from num_kv_heads.
+// Supports different QK and V head dimensions (D_v can differ from D_qk).
 //
 // Each thread processes one Q row across all KV positions.
-// Q is read from global memory on-the-fly (no register spill for 128-dim).
-// O accumulator fits in registers (128 floats x 4 bytes = 512 bytes/thread).
+// Q is read from global memory on-the-fly.
 //
 // INPUT_F16: Q/K/V buffers are float16_t (saves 2x VRAM vs F32).
 //            BF16 inputs are converted to F16 before dispatch.
@@ -42,7 +42,8 @@ layout(binding = 3) writeonly buffer OBuf { float data_o[]; };
 layout(push_constant) uniform params {
     uint seq_q;
     uint seq_kv;
-    uint head_dim;
+    uint head_dim;      // Q/K head dimension
+    uint head_dim_v;    // V head dimension (output dimension)
     uint num_heads;
     uint num_kv_heads;
     uint batch_size;
@@ -59,6 +60,7 @@ void main() {
     if (global_idx >= total_q_rows) return;
 
     const uint D = head_dim;
+    const uint Dv = head_dim_v;
     const uint bh = global_idx / seq_q;
     const uint s = global_idx % seq_q;
     const uint b = bh / num_heads;
@@ -69,20 +71,25 @@ void main() {
 
     const uint q_base = (b * num_heads + h_q) * seq_q * D;
     const uint k_base = (b * num_kv_heads + h_kv) * seq_kv * D;
+    const uint v_base = (b * num_kv_heads + h_kv) * seq_kv * Dv;
+    const uint o_base = (b * num_heads + h_q) * seq_q * Dv;
 
     // Online softmax state
     float m = -1e30;
     float l = 0.0;
 
-    // Output accumulator
+    // Output accumulator (max Dv is 128)
     float o_acc[128];
-    for (uint d = 0; d < D; d++) {
+    for (uint d = 0; d < Dv; d++) {
         o_acc[d] = 0.0;
     }
 
     // Iterate over KV positions
     for (uint kv = 0u; kv < seq_kv; kv++) {
-        if (causal != 0u && kv > s) continue;
+        // Standard causal mask: Q position s can attend to KV positions up to s + offset,
+        // where offset = seq_kv - seq_q (handles cross-attention with padding).
+        const uint causal_limit = s + (seq_kv - seq_q);
+        if (causal != 0u && kv > causal_limit) continue;
 
         // Compute score = dot(Q[s], K[kv]) * scale
         float score = 0.0;
@@ -97,8 +104,8 @@ void main() {
         float w = exp(score - m_new);
 
         // Rescale accumulator and add V contribution
-        for (uint d = 0u; d < D; d++) {
-            o_acc[d] = o_acc[d] * exp_diff + w * READ_V(k_base + kv * D + d);
+        for (uint d = 0u; d < Dv; d++) {
+            o_acc[d] = o_acc[d] * exp_diff + w * READ_V(v_base + kv * Dv + d);
         }
 
         l = l * exp_diff + w;
@@ -107,7 +114,7 @@ void main() {
 
     // Normalize and write output
     float inv_l = (l > 0.0) ? (1.0 / l) : 0.0;
-    for (uint d = 0u; d < D; d++) {
-        data_o[q_base + s * D + d] = o_acc[d] * inv_l;
+    for (uint d = 0; d < Dv; d++) {
+        data_o[o_base + s * Dv + d] = o_acc[d] * inv_l;
     }
 }

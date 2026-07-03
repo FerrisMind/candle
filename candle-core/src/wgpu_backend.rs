@@ -6374,6 +6374,110 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn(
+        q: &WgpuStorage,
+        q_layout: &Layout,
+        k: &WgpuStorage,
+        k_layout: &Layout,
+        v: &WgpuStorage,
+        v_layout: &Layout,
+        scale: f32,
+        causal: bool,
+    ) -> Result<WgpuStorage> {
+        use crate::DType;
+
+        let ensure_contiguous = |src: &WgpuStorage, l: &Layout| -> Result<(WgpuStorage, Layout)> {
+            if !l.is_contiguous() || l.start_offset() != 0 {
+                let shape_ref = l.shape();
+                let mut tmp = unsafe { src.device.alloc_uninit(shape_ref, src.dtype)? };
+                src.copy_strided_src(&mut tmp, 0, l)?;
+                Ok((tmp, Layout::contiguous(shape_ref.clone())))
+            } else {
+                Ok((src.try_clone(l)?, l.clone()))
+            }
+        };
+
+        let (q_buf, q_l) = ensure_contiguous(q, q_layout)?;
+        let (k_buf, k_l) = ensure_contiguous(k, k_layout)?;
+        let (v_buf, v_l) = ensure_contiguous(v, v_layout)?;
+
+        let dims_q = q_l.dims();
+        let (b, h, seq_q, head_dim) = if dims_q.len() == 4 {
+            (dims_q[0], dims_q[1], dims_q[2], dims_q[3])
+        } else {
+            return Err(Error::Msg("flash_attn expects 4D Q tensor [B,H,S,D]".into()).bt());
+        };
+        let seq_kv = k_l.dims()[2];
+        let head_dim_v = v_l.dims()[3];
+
+        let out_shape = Shape::from_dims(&[b, h, seq_q, head_dim_v]);
+        let dst = unsafe { q.device.alloc_uninit(&out_shape, DType::F32)? };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FlashAttnParams {
+            seq_q: u32,
+            seq_kv: u32,
+            head_dim: u32,
+            head_dim_v: u32,
+            num_heads: u32,
+            num_kv_heads: u32,
+            batch_size: u32,
+            scale: f32,
+            causal: u32,
+        }
+
+        let params = FlashAttnParams {
+            seq_q: seq_q as u32,
+            seq_kv: seq_kv as u32,
+            head_dim: head_dim as u32,
+            head_dim_v: head_dim_v as u32,
+            num_heads: h as u32,
+            num_kv_heads: k_l.dims()[1] as u32,
+            batch_size: b as u32,
+            scale,
+            causal: if causal { 1 } else { 0 },
+        };
+
+        let param_buffer = q.device.inner.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("candle-wgpu-flash-attn-params"),
+            size: std::mem::size_of::<FlashAttnParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        q.device.inner.queue.write_buffer(&param_buffer, 0, any_as_bytes(&params));
+
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, false),
+            uniform_entry(4),
+        ];
+        let bindings = [
+            buffer_binding(0, &q_buf.buffer),
+            buffer_binding(1, &k_buf.buffer),
+            buffer_binding(2, &v_buf.buffer),
+            buffer_binding(3, &dst.buffer),
+            buffer_binding(4, &param_buffer),
+        ];
+
+        let shader_source = candle_wgpu_kernels::get("flash_attn_simple.wgsl")
+            .ok_or_else(|| Error::Msg("wgpu flash_attn_simple shader not found".into()).bt())?
+            .source();
+        let total_q_rows = (b * h * seq_q) as u32;
+        q.device.run_compute_linear(
+            shader_source,
+            &entries,
+            &bindings,
+            total_q_rows,
+            "candle-wgpu-flash-attn",
+        )?;
+
+        Ok(dst)
+    }
+
     pub fn ggml_rope(
         &self,
         layout: &Layout,

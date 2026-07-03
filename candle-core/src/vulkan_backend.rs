@@ -5286,17 +5286,19 @@ impl VulkanStorage {
 
         let (q_buf, q_l) = ensure_contiguous(q, q_layout)?;
         let (k_buf, k_l) = ensure_contiguous(k, k_layout)?;
-        let (v_buf, _v_l) = ensure_contiguous(v, v_layout)?;
+        let (v_buf, v_l) = ensure_contiguous(v, v_layout)?;
 
         let dims_q = q_l.dims();
+        let dims_v = v_l.dims();
         let (b, h, seq_q, head_dim) = if dims_q.len() == 4 {
             (dims_q[0], dims_q[1], dims_q[2], dims_q[3])
         } else {
             return Err(Error::Msg("flash_attn expects 4D Q tensor [B,H,S,D]".into()).bt());
         };
         let seq_kv = k_l.dims()[2];
+        let head_dim_v = dims_v[3];
 
-        let out_shape = Shape::from_dims(&[b, h, seq_q, head_dim]);
+        let out_shape = Shape::from_dims(&[b, h, seq_q, head_dim_v]);
         let dst = unsafe { q_buf.device.alloc_uninit(&out_shape, DType::F32)? };
 
         #[repr(C)]
@@ -5305,6 +5307,7 @@ impl VulkanStorage {
             seq_q: u32,
             seq_kv: u32,
             head_dim: u32,
+            head_dim_v: u32,
             num_heads: u32,
             num_kv_heads: u32,
             batch_size: u32,
@@ -5316,6 +5319,7 @@ impl VulkanStorage {
             seq_q: seq_q as u32,
             seq_kv: seq_kv as u32,
             head_dim: head_dim as u32,
+            head_dim_v: head_dim_v as u32,
             num_heads: h as u32,
             num_kv_heads: k_l.dims()[1] as u32,
             batch_size: b as u32,
@@ -5332,7 +5336,7 @@ impl VulkanStorage {
 
         let shader_name = if use_f16 { "flash_attn_f16" } else { "flash_attn" };
         let spirv = candle_vulkan_kernels::spirv(shader_name)
-            .ok_or_else(|| Error::Msg(format!("vulkan shader {shader_name} not generated").into()).bt())?;
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {shader_name} not generated")).bt())?;
 
         let total_q_rows = (b * h * seq_q) as u32;
         let workgroup_size = 256u32;

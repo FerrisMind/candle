@@ -282,11 +282,11 @@ impl Qwen3Attention {
             return self.forward_cpu_flash_attn(&q, &k, &v, offset, b, l);
         }
         #[cfg(feature = "flash-attn")]
-        if !on_cpu {
+        if !on_cpu && !x.device().is_vulkan() && !x.device().is_wgpu() {
             return self.forward_flash_attn(&q, &k, &v, offset, b, l);
         }
 
-        if x.device().is_vulkan() {
+        if x.device().is_vulkan() || x.device().is_wgpu() {
             let scale = 1.0 / (self.head_dim as f32).sqrt();
             let ctx = candle_nn::ops::sdpa(
                 &q,
