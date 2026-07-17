@@ -507,6 +507,8 @@ pub fn matmul_coop_64_shader() -> Option<&'static str> {
     get("mul_mat_coop_64.wgsl").map(|m| m.source())
 }
 
+
+
 pub fn matmul_fast_shader(dtype: DType, vectorized: bool) -> Option<String> {
     let source = get("mul_mat_reg_tile.wgsl")?
         .source()

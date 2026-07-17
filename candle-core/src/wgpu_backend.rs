@@ -1886,6 +1886,7 @@ impl WgpuDevice {
     }
 
     /// Elementwise hot path with `var<immediate>` params (no uniform buffer).
+    #[allow(clippy::too_many_arguments)]
     fn run_compute_linear_immediates(
         &self,
         shader: &str,
@@ -2089,7 +2090,9 @@ fn dtype_cache_tag(dtype: DType) -> u8 {
 /// the shader string on every dispatch (was a dominant host-path cost).
 fn cached_shader_source(kind: u8, op: &str, dtype: DType, build: impl FnOnce() -> Result<String>) -> Result<Arc<str>> {
     use std::hash::{Hash, Hasher};
-    static CACHE: OnceLock<Mutex<HashMap<(u8, u64, u8), Arc<str>>>> = OnceLock::new();
+    type ShaderCacheKey = (u8, u64, u8);
+    type ShaderCache = Mutex<HashMap<ShaderCacheKey, Arc<str>>>;
+    static CACHE: OnceLock<ShaderCache> = OnceLock::new();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     op.hash(&mut hasher);
     let key = (kind, hasher.finish(), dtype_cache_tag(dtype));
@@ -8439,8 +8442,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 if coop_ok {
                     use_warptile = true;
                     // 128×64 dual-MMA + dbuf for large squares and tall/wide.
-                    // Rejected on RTX 3060: coop64 skinny, BK=64 panel,
-                    // N-coalesced BT, 128×32/256-thread tall occupancy variant.
+                    // Rejected on RTX 3060 vs dual (tall): coop64@512, BK64@512,
+                    // pad N-coalesce, materialize Bᵀ, Vulkan-style 128-thread
+                    // 64×64 BK=64 (~2×), K-panel=32 dual (~2×).
                     if m.max(n) >= 512 && m.min(n) >= 64 {
                         matmul_label = "candle-wgpu-matmul-coop";
                         candle_wgpu_kernels::matmul_coop_shader().ok_or_else(|| {
