@@ -538,6 +538,8 @@ struct WgpuInner {
     queue: wgpu::Queue,
     features: wgpu::Features,
     limits: wgpu::Limits,
+    /// Cached `CANDLE_WGPU_COOP_MATMUL` (default true when hardware allows).
+    coop_matmul_enabled: bool,
     seed_value: RwLock<u64>,
     pipeline_cache: Mutex<HashMap<WgpuPipelineCacheKey, Arc<WgpuCachedPipeline>>>,
     buffer_registry: Mutex<HashMap<usize, Weak<wgpu::Buffer>>>,
@@ -586,10 +588,20 @@ enum WgpuBindingKindKey {
     Uniform,
 }
 
+/// Pipeline cache key — hash the WGSL source instead of cloning it on every
+/// dispatch (coopmat shaders are multi-KB; string clone dominated host path).
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct WgpuPipelineCacheKey {
-    shader: String,
+    shader_hash: u64,
+    shader_len: usize,
     entries: Vec<(u32, WgpuBindingKindKey)>,
+}
+
+fn wgpu_shader_cache_key(shader: &str) -> (u64, usize) {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    shader.hash(&mut hasher);
+    (hasher.finish(), shader.len())
 }
 
 #[derive(Debug)]
@@ -1235,8 +1247,10 @@ impl WgpuDevice {
         workgroups: (u32, u32, u32),
         label: &'static str,
     ) -> Result<()> {
+        let (shader_hash, shader_len) = wgpu_shader_cache_key(shader);
         let cache_key = WgpuPipelineCacheKey {
-            shader: shader.to_owned(),
+            shader_hash,
+            shader_len,
             entries: entries
                 .iter()
                 .map(|entry| {
@@ -7682,17 +7696,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let mut use_warptile = false;
         let shader: &str = match self.dtype {
             DType::F32 => {
-                // Prefer warptile (64×64 / BK=32 / 128 thr) for large dense F32 —
-                // closer to ggml-vulkan mul_mm occupancy than 32×32 reg-tile.
-                // Fall back to reg-tile for medium shapes, naive for tiny.
-                // Cooperative matrix: Ampere+ Vulkan exposes 16×16 f16 A/B → f32 C
-                // (not f32 8×8). Mixed-precision is fine for large GEMMs; small
-                // shapes stay on full-f32 warptile so tight smoke tols pass.
-                // Disable with CANDLE_WGPU_COOP_MATMUL=0.
-                let coop_disabled = std::env::var("CANDLE_WGPU_COOP_MATMUL")
-                    .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
-                    .unwrap_or(false);
-                let coop_ok = !coop_disabled
+                // Cooperative matrix: Ampere+ Vulkan exposes 16×16 f16 A/B → f32 C.
+                // Mixed-precision for large GEMMs; small squares stay full-f32 warptile.
+                let coop_ok = self.device.inner.coop_matmul_enabled
                     && self
                         .device
                         .inner
@@ -7716,22 +7722,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 if coop_ok {
                     matmul_label = "candle-wgpu-matmul-coop";
                     use_warptile = true;
-                    shader_storage = candle_wgpu_kernels::matmul_coop_shader()
-                        .ok_or_else(|| {
-                            Error::Msg("wgpu shader mul_mat_coop.wgsl not embedded".into()).bt()
-                        })?
-                        .to_string();
-                    &shader_storage
+                    // Static WGSL — no per-call String alloc.
+                    candle_wgpu_kernels::matmul_coop_shader().ok_or_else(|| {
+                        Error::Msg("wgpu shader mul_mat_coop.wgsl not embedded".into()).bt()
+                    })?
                 } else if m >= 64 && n >= 64 && k >= 64 && params.stride_1k == 1 {
-                    // Warptile supports non-unit stride_0k (virtual B^T of contig RHS).
                     matmul_label = "candle-wgpu-matmul-warptile";
                     use_warptile = true;
-                    shader_storage = candle_wgpu_kernels::matmul_warptile_shader()
-                        .ok_or_else(|| {
-                            Error::Msg("wgpu shader mul_mat_warptile.wgsl not embedded".into()).bt()
-                        })?
-                        .to_string();
-                    &shader_storage
+                    candle_wgpu_kernels::matmul_warptile_shader().ok_or_else(|| {
+                        Error::Msg("wgpu shader mul_mat_warptile.wgsl not embedded".into()).bt()
+                    })?
                 } else if m.max(n) >= 32 && k >= 32 {
                     matmul_label = "candle-wgpu-matmul-fast";
                     use_reg_tile = true;
@@ -10504,6 +10504,10 @@ impl BackendDevice for WgpuDevice {
             ..Default::default()
         }))
         .map_err(Error::wrap)?;
+        // Cache env once — env::var on every matmul was measurable host cost.
+        let coop_matmul_enabled = std::env::var("CANDLE_WGPU_COOP_MATMUL")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
         Ok(Self {
             inner: Arc::new(WgpuInner {
                 ordinal,
@@ -10516,6 +10520,7 @@ impl BackendDevice for WgpuDevice {
                 queue,
                 features: required_features,
                 limits: adapter_limits,
+                coop_matmul_enabled,
                 seed_value: RwLock::new(299_792_458),
                 pipeline_cache: Mutex::new(HashMap::new()),
                 buffer_registry: Mutex::new(HashMap::new()),
