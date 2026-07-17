@@ -2213,12 +2213,6 @@ fn binary_shader(op: &str, dtype: DType) -> Result<Arc<str>> {
     })
 }
 
-fn binary_shader_immediate(op: &str, dtype: DType) -> Result<Arc<str>> {
-    cached_shader_source(3, op, dtype, || {
-        let base = binary_shader(op, dtype)?;
-        Ok(rewrite_params_to_immediate(&base))
-    })
-}
 
 // Integer binary ops for the dtypes the stock binary.wgsl cannot express.
 // U32 is native; U8 packs four bytes per u32 word (one thread per output
@@ -10594,64 +10588,33 @@ impl BackendStorage for WgpuStorage {
             _ => count,
         };
         let param_bytes = any_as_bytes(&params);
-        let use_imm = self
-            .device
-            .inner
-            .features
-            .contains(wgpu::Features::IMMEDIATES)
-            && (param_bytes.len() as u32) <= self.device.inner.limits.max_immediate_size
-            && matches!(self.dtype, DType::F32 | DType::F16);
-        if use_imm {
-            let shader = binary_shader_immediate(B::NAME, self.dtype)?;
-            let imm_size = (param_bytes.len() as u32).next_multiple_of(4).max(16);
-            let entries = [
-                storage_entry(0, false),
-                storage_entry(1, false),
-                storage_entry(2, false),
-            ];
-            let bindings = [
-                buffer_binding(0, &self.buffer),
-                buffer_binding(1, &rhs.buffer),
-                buffer_binding(2, &dst.buffer),
-            ];
-            match self.device.run_compute_linear_immediates(
-                &shader,
-                &entries,
-                &bindings,
-                work_items as u32,
-                param_bytes,
-                imm_size,
-                "candle-wgpu-binary",
-            ) {
-                Ok(()) => Ok(dst),
-                Err(err) => Err(err),
-            }
-        } else {
-            let slot = self.device.inner.uniform_dyn_slot;
-            let param_buffer = self.device.uniform_dyn_buffer()?;
-            let entries = [
-                storage_entry(0, false),
-                storage_entry(1, false),
-                storage_entry(2, false),
-                uniform_entry_dyn(3, slot),
-            ];
-            let bindings = [
-                buffer_binding(0, &self.buffer),
-                buffer_binding(1, &rhs.buffer),
-                buffer_binding(2, &dst.buffer),
-                uniform_binding_dyn(3, &param_buffer, slot)?,
-            ];
-            match self.device.run_compute_linear_deferred_uniform(
-                &binary_shader(B::NAME, self.dtype)?,
-                &entries,
-                &bindings,
-                work_items as u32,
-                param_bytes,
-                "candle-wgpu-binary",
-            ) {
-                Ok(()) => Ok(dst),
-                Err(err) => Err(err),
-            }
+        // Prefer dyn-uniform for full BinaryParams (~80 B): measured set_immediates
+        // of large payloads does not beat coalesced deferred write on RTX 3060.
+        // Unary still uses IMMEDIATES (smaller params, clear win).
+        let slot = self.device.inner.uniform_dyn_slot;
+        let param_buffer = self.device.uniform_dyn_buffer()?;
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry_dyn(3, slot),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &rhs.buffer),
+            buffer_binding(2, &dst.buffer),
+            uniform_binding_dyn(3, &param_buffer, slot)?,
+        ];
+        match self.device.run_compute_linear_deferred_uniform(
+            &binary_shader(B::NAME, self.dtype)?,
+            &entries,
+            &bindings,
+            work_items as u32,
+            param_bytes,
+            "candle-wgpu-binary",
+        ) {
+            Ok(()) => Ok(dst),
+            Err(err) => Err(err),
         }
     }
     fn where_cond(
