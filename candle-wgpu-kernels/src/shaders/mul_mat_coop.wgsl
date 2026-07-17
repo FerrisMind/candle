@@ -48,8 +48,6 @@ const TK: u32 = 16u;
 const WG_M: u32 = 64u;
 const WG_N: u32 = 64u;
 const SG_M: u32 = 4u;
-const SG_N: u32 = 4u;
-const NUM_SG: u32 = 16u;
 
 var<workgroup> tile_bt: array<f16, 1024>; // 64*16
 var<workgroup> tile_a: array<f16, 1024>;  // 64*16
@@ -102,7 +100,6 @@ fn main(
     var acc = coopLoadT<coop_mat16x16<f32, C>>(&tile_c[c_base], 16u);
 
     for (var k0 = 0u; k0 < params.k; k0 += TK) {
-        // 1024 elems / 512 thr = 2 loads each for BT and A.
         for (var i = 0u; i < 2u; i++) {
             let elem = tid * 2u + i;
             let r = elem / TK;
