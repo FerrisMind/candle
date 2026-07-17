@@ -934,6 +934,8 @@ impl WgpuDevice {
     }
 
     fn create_storage_buffer(&self, size: usize, label: &'static str) -> wgpu::Buffer {
+        // Flush in-flight encodes so newly created buffers cannot race with
+        // pending command buffers (required for correctness on multi-op graphs).
         let _ = self.flush_active_batch("alloc");
         let _ = self.cleanup_pending_submissions(false);
         self.prune_buffer_registry();
