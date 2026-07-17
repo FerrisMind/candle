@@ -57,7 +57,14 @@ enum VulkanArgsortDType {
 /// GEMMs route to the tiled `matmul_f32_f32` shader so one dispatch covers the
 /// whole tile grid instead of `m / 8` host-side dispatches.
 fn vulkan_dense_gemm_prefers_tiled(m: usize, n: usize, k: usize) -> bool {
-    let _ = (n, k);
+    // Warptile mul_mm.comp (LOAD_VEC_BATCH=2, BK=32) is wrong when K is not a
+    // multiple of 8 for some N (notably N=64/96/128 with K=1500 — Whisper
+    // encoder attention w@v). Force the matvec path until the tile edge case
+    // is fixed; results must stay correct over speed for real models.
+    if !k.is_multiple_of(8) {
+        return false;
+    }
+    let _ = n;
     m > VULKAN_DENSE_MUL_MAT_VEC_MAX_ROWS
 }
 
@@ -3849,9 +3856,23 @@ impl VulkanStorage {
                 }
                 .bt()
             })?;
-        if lhs_layout.start_offset() != 0 || rhs_layout.start_offset() != 0 {
+        // Contiguous views may still have start_offset != 0 (e.g. qkv.i(1) after
+        // contiguous-looking slice). Never drop the offset: materialize to a dense
+        // buffer starting at 0, otherwise shaders read sibling slices (q vs k).
+        if lhs_layout.start_offset() != 0
+            || rhs_layout.start_offset() != 0
+            || !lhs_layout.is_contiguous()
+            || !rhs_layout.is_contiguous()
+        {
+            let mut lhs_mat =
+                unsafe { self.device.alloc_uninit(lhs_layout.shape(), self.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut lhs_mat, 0, lhs_layout)?;
+            let mut rhs_mat =
+                unsafe { self.device.alloc_uninit(rhs_layout.shape(), rhs.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(rhs, &mut rhs_mat, 0, rhs_layout)?;
             let flat_l = Layout::contiguous(lhs_layout.shape());
-            return self.run_binary_named(rhs, &flat_l, &flat_l, op);
+            let flat_r = Layout::contiguous(rhs_layout.shape());
+            return lhs_mat.run_binary_named(&rhs_mat, &flat_l, &flat_r, op);
         }
         let (lhs_dims, lhs_strides) = dims4_ggml(lhs_layout)?;
         let (rhs_dims, rhs_strides) = dims4_ggml(rhs_layout)?;

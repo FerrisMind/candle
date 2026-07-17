@@ -6,7 +6,7 @@
 //! - 💻 llama2.c [GH Link](https://github.com/karpathy/llama2.c)
 //!
 
-use candle::{DType, Device, Result, Tensor, D};
+use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::linear_no_bias as linear;
 use candle_nn::{embedding, rms_norm, Embedding, Linear, Module, RmsNorm, VarBuilder};
 use std::collections::HashMap;
@@ -149,12 +149,20 @@ struct CausalSelfAttention {
 
 impl CausalSelfAttention {
     fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize, cache: &Cache) -> Result<Tensor> {
-        let (_b_sz, seq_len, _h, _n_embd) = x.dims4()?;
-        let cos = cache.cos.narrow(0, index_pos, seq_len)?.squeeze(2)?;
-        let sin = cache.sin.narrow(0, index_pos, seq_len)?.squeeze(2)?;
-        let x = x.transpose(1, 2)?.contiguous()?;
-        let rope = candle_nn::rotary_emb::rope_slow(&x, &cos, &sin)?;
-        rope.transpose(1, 2)?.contiguous()
+        let (b_sz, seq_len, h, n_embd) = x.dims4()?;
+        let cos = cache.cos.i(index_pos..index_pos + seq_len)?;
+        let sin = cache.sin.i(index_pos..index_pos + seq_len)?;
+        let cos = cos.unsqueeze(1)?;
+        let sin = sin.unsqueeze(1)?;
+        let cos = cos.broadcast_as((b_sz, seq_len, 1, n_embd / 2, 1))?;
+        let sin = sin.broadcast_as((b_sz, seq_len, 1, n_embd / 2, 1))?;
+        let x = x.reshape((b_sz, seq_len, h, n_embd / 2, 2))?;
+        let x0 = x.narrow(D::Minus1, 0, 1)?;
+        let x1 = x.narrow(D::Minus1, 1, 1)?;
+        let dst0 = (x0.broadcast_mul(&cos)? - x1.broadcast_mul(&sin)?)?;
+        let dst1 = (x0.broadcast_mul(&sin)? + x1.broadcast_mul(&cos)?)?;
+        let rope = Tensor::cat(&[&dst0, &dst1], D::Minus1)?.reshape((b_sz, seq_len, h, n_embd))?;
+        Ok(rope)
     }
 
     fn forward(

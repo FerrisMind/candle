@@ -480,7 +480,6 @@ fn layer_norm_wgpu() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn layer_norm_vulkan() -> Result<()> {
     let _guard = gpu_test_guard();
@@ -502,7 +501,6 @@ fn rope_wgpu() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn rope_vulkan() -> Result<()> {
     let _guard = gpu_test_guard();
@@ -524,7 +522,6 @@ fn sdpa_wgpu() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires a usable Vulkan compute device and driver"]
 #[cfg(feature = "vulkan")]
 fn sdpa_vulkan() -> Result<()> {
     let _guard = gpu_test_guard();

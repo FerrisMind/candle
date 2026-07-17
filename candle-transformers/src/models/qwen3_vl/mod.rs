@@ -3,7 +3,6 @@
 use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::VarBuilder;
 use text::Qwen3VLTextModel;
-use vision::Qwen3VLVisionModel;
 
 pub mod config;
 mod conv3d_temporal_2;
@@ -11,6 +10,8 @@ mod text;
 mod vision;
 
 pub use config::Config;
+/// Exposed for backend parity tests (vision tower only).
+pub use vision::Qwen3VLVisionModel;
 
 use crate::models::deepseek2::NonZeroOp;
 

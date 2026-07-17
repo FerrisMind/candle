@@ -248,6 +248,10 @@ struct SoftmaxParams {
     m0: f32,
     m1: f32,
     row_base: u32,
+    /// WebGPU uniform bindings require size multiple of 16.
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 #[repr(C)]
@@ -543,9 +547,13 @@ struct WgpuInner {
     seed_value: RwLock<u64>,
     pipeline_cache: Mutex<HashMap<WgpuPipelineCacheKey, Arc<WgpuCachedPipeline>>>,
     buffer_registry: Mutex<HashMap<usize, Weak<wgpu::Buffer>>>,
-    /// Free storage buffers by size (wgpu_copy_size key). Recycled when the
-    /// last Arc drops via `recycle_storage_buffer` after GPU work completed.
+    /// Free storage buffers by size (wgpu_copy_size key). Only populated after
+    /// GPU drain (`synchronize` / pending cleanup) so recycled buffers are never
+    /// still referenced by in-flight dispatches.
     storage_buffer_pool: Mutex<HashMap<u64, Vec<Arc<wgpu::Buffer>>>>,
+    /// Dropped storage buffers waiting for GPU drain before pool reuse.
+    /// Immediate pool push was unsafe with elementwise `skip_retain` batches.
+    storage_pool_pending: Mutex<Vec<Arc<wgpu::Buffer>>>,
     pending_submissions: Mutex<Vec<WgpuPendingSubmission>>,
     active_batch: Mutex<Option<WgpuActiveBatch>>,
     /// Ring of reusable uniform buffers (avoids per-dispatch create_buffer).
@@ -1138,7 +1146,12 @@ impl WgpuDevice {
         }
     }
 
-    /// Return a free storage buffer to the size-class pool (last-owner path).
+    /// Schedule a free storage buffer for pool reuse after the next GPU drain.
+    ///
+    /// Must not push into `storage_buffer_pool` immediately: elementwise hot
+    /// paths may leave in-flight dispatches holding the wgpu buffer without an
+    /// Arc retain (`skip_retain`). Immediate reuse rewrites data under those
+    /// dispatches and corrupts multi-layer graphs (e.g. ConvMixer batch-norm).
     fn recycle_storage_buffer(&self, buffer: &Arc<wgpu::Buffer>) {
         // Hot-ring buffers are permanent; never put them in the free pool.
         if let Ok(rings) = self.inner.hot_rings.lock() {
@@ -1148,11 +1161,29 @@ impl WgpuDevice {
                 }
             }
         }
-        let key = buffer.size();
+        if let Ok(mut pending) = self.inner.storage_pool_pending.lock() {
+            if pending.len() < 512 {
+                pending.push(Arc::clone(buffer));
+            }
+        }
+    }
+
+    /// Promote deferred pool recycles into the free size-class pool (GPU idle).
+    fn flush_storage_pool_pending(&self) {
+        let pending = match self.inner.storage_pool_pending.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => return,
+        };
+        if pending.is_empty() {
+            return;
+        }
         if let Ok(mut pool) = self.inner.storage_buffer_pool.lock() {
-            let bucket = pool.entry(key).or_default();
-            if bucket.len() < 64 {
-                bucket.push(Arc::clone(buffer));
+            for buffer in pending {
+                let key = buffer.size();
+                let bucket = pool.entry(key).or_default();
+                if bucket.len() < 64 {
+                    bucket.push(buffer);
+                }
             }
         }
     }
@@ -1438,31 +1469,28 @@ impl WgpuDevice {
                 }
             }
         }
-        {
+        // One compute pass per dispatch. Folding dependent elementwise ops into
+        // a single pass races when dst of op N is src of op N+1 (no implicit
+        // buffer barrier inside a WebGPU compute pass). Separate passes restore
+        // write→read ordering required by BatchNorm-style broadcast chains and
+        // multi-layer models (ConvMixer). Independent microbench batches still
+        // share one encoder/submit.
+        for d in &batch.pending_dispatches {
             let mut pass = batch
                 .encoder
                 .begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("candle-wgpu-batch-pass"),
                     timestamp_writes: None,
                 });
-            // Skip redundant set_pipeline when consecutive dispatches share one
-            // (common for elementwise batch20 of the same op).
-            let mut last_pipe: usize = 0;
-            for d in &batch.pending_dispatches {
-                let pipe_key = std::ptr::from_ref(d.pipeline.as_ref()) as usize;
-                if pipe_key != last_pipe {
-                    pass.set_pipeline(&d.pipeline.pipeline);
-                    last_pipe = pipe_key;
-                }
-                if d.use_immediates && d.deferred_uniform_len > 0 {
-                    let n = d.deferred_uniform_len as usize;
-                    pass.set_immediates(0, &d.deferred_uniform[..n]);
-                    pass.set_bind_group(0, &d.bind_group, &[]);
-                } else {
-                    pass.set_bind_group(0, &d.bind_group, &d.dynamic_offsets);
-                }
-                pass.dispatch_workgroups(d.workgroups.0, d.workgroups.1, d.workgroups.2);
+            pass.set_pipeline(&d.pipeline.pipeline);
+            if d.use_immediates && d.deferred_uniform_len > 0 {
+                let n = d.deferred_uniform_len as usize;
+                pass.set_immediates(0, &d.deferred_uniform[..n]);
+                pass.set_bind_group(0, &d.bind_group, &[]);
+            } else {
+                pass.set_bind_group(0, &d.bind_group, &d.dynamic_offsets);
             }
+            pass.dispatch_workgroups(d.workgroups.0, d.workgroups.1, d.workgroups.2);
         }
         batch.pending_dispatches.clear();
     }
@@ -1838,16 +1866,11 @@ impl WgpuDevice {
             self.flush_active_batch("batch_limit")?;
         }
         self.ensure_active_batch()?;
-        // Hot elementwise: BindGroup + CommandBuffer keep buffer lifetimes;
-        // skip retain_from_bindings (registry lock + HashSet) on the warm path.
-        let skip_retain = use_immediates
-            || deferred_uniform_bytes.is_some()
-            || (!dynamic_offsets.is_empty() && bindings.len() >= 3);
-        let retained_buffers = if skip_retain {
-            Vec::new()
-        } else {
-            self.retain_from_bindings(bindings)
-        };
+        // Always retain storage Arcs for the lifetime of the submission.
+        // Skipping retain (warm path) dropped BindGroups at encode time and left
+        // intermediate chain results without an Arc while GPU work was still
+        // in-flight when tensors dropped early — corrupting BN broadcast chains.
+        let retained_buffers = self.retain_from_bindings(bindings);
         let mut deferred_uniform = [0u8; 256];
         let deferred_uniform_len = if let Some(bytes) = deferred_uniform_bytes {
             let n = bytes.len().min(256);
@@ -6998,6 +7021,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 m0: 0.0,
                 m1: 0.0,
                 row_base: 0,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
             };
             let param_buffer = self
                 .device
@@ -7038,6 +7064,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
         let (dims, strides) = dims4(layout)?;
         let count = layout.shape().elem_count();
+        let row_elems = layout.dims()[layout.dims().len() - 1];
+        // Softmax of a length-1 row is identically 1 for finite inputs. The
+        // workgroup soft_max shader with WG_SIZE=256 and ne0=1 left inactive
+        // lanes at -1e30 and produced all-zeros on some Windows/NVIDIA drivers
+        // (breaks decode seq_len=1). Fill ones matches CPU for finite values.
+        if row_elems == 1 {
+            let zeros = self.device.zeros_impl(layout.shape(), self.dtype)?;
+            return zeros.run_scale(&Layout::contiguous(layout.shape()), 0.0, 1.0);
+        }
         let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
         let dst_strides = contiguous_strides(dims);
         let params = SoftmaxParams {
@@ -7066,6 +7101,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             m0: 0.0,
             m1: 0.0,
             row_base: 0,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         let param_buffer = self
             .device
@@ -7090,7 +7128,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let shader = candle_wgpu_kernels::softmax_shader(WG_SIZE)
             .ok_or_else(|| Error::Msg("wgpu shader soft_max.wgsl not embedded".into()).bt())?;
         let elem_size = self.dtype.size_in_bytes();
-        let row_elems = layout.dims()[layout.dims().len() - 1];
         let row_bytes = row_elems * elem_size;
         let total_bytes = count * elem_size;
         let max_binding_bytes = self.device.inner.limits.max_storage_buffer_binding_size as usize;
@@ -8443,10 +8480,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     && params.stride_1k == 1;
                 if coop_ok {
                     use_warptile = true;
-                    // 128×64 dual-MMA + dbuf K-major virtual-Bᵀ (best on RTX 3060).
-                    // Rejected vs dual for tall: coop64@512, BK64 panels, pad
-                    // N-coalesce, materialize Bᵀ (~6×), Vulkan-style 128-thread
-                    // 64×64 (~2×), K-panel=32 (~2×), N-major BT shared (~1.7×).
+                    // 128×64 dual-MMA + dbuf (best measured for squares + tall).
                     if m.max(n) >= 512 && m.min(n) >= 64 {
                         matmul_label = "candle-wgpu-matmul-coop";
                         candle_wgpu_kernels::matmul_coop_shader().ok_or_else(|| {
@@ -10605,9 +10639,10 @@ impl BackendStorage for WgpuStorage {
             && rhs_layout.is_contiguous()
             && lhs_layout.dims() == rhs_layout.dims();
         let shader = binary_shader_ex(B::NAME, self.dtype, contig)?;
-        // Prefer dyn-uniform for full BinaryParams (~80 B).
+        // Eager write into the permanent dyn-uniform ring (not deferred-to-encode
+        // and not a stack-local Buffer that dies before submit).
+        let (param_buffer, param_off) = self.device.write_uniform_slot(param_bytes)?;
         let slot = self.device.inner.uniform_dyn_slot;
-        let param_buffer = self.device.uniform_dyn_buffer()?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -10620,19 +10655,31 @@ impl BackendStorage for WgpuStorage {
             buffer_binding(2, &dst.buffer),
             uniform_binding_dyn(3, &param_buffer, slot)?,
         ];
-        match self.device.run_compute_linear_deferred_uniform(
+        let (wg_x, wg_y) = linear_dispatch_workgroups(&self.device, work_items as u32);
+        match self.device.run_compute_xyz(
             &shader,
             &entries,
             &bindings,
-            work_items as u32,
-            param_bytes,
+            (wg_x, wg_y, 1),
+            &[param_off],
+            None,
             if contig {
                 "candle-wgpu-binary-contig"
             } else {
                 "candle-wgpu-binary"
             },
         ) {
-            Ok(()) => Ok(dst),
+            Ok(()) => {
+                // GPU fence after every binary. Required on Windows/wgpu for correct
+                // multi-step chains: silu (`x/(exp(-x)+1)`) then mul, BatchNorm
+                // broadcast, residual streams. Skipping the fence for contig ops
+                // produced silent wrong logits on llama2_c / Qwen3 (dst appeared
+                // correct only after an intervening host readback). Map 4 bytes of
+                // dst as a lightweight completion fence, not data validation.
+                let _ = self.device.read_buffer(&dst.buffer, 4)?;
+                let _ = contig; // retained for label selection above
+                Ok(dst)
+            }
             Err(err) => Err(err),
         }
     }
@@ -11330,6 +11377,7 @@ impl BackendDevice for WgpuDevice {
                 pipeline_cache: Mutex::new(HashMap::new()),
                 buffer_registry: Mutex::new(HashMap::new()),
                 storage_buffer_pool: Mutex::new(HashMap::new()),
+                storage_pool_pending: Mutex::new(Vec::new()),
                 pending_submissions: Mutex::new(Vec::new()),
                 active_batch: Mutex::new(None),
                 uniform_ring: Mutex::new((Vec::new(), 0)),
@@ -11465,6 +11513,8 @@ impl BackendDevice for WgpuDevice {
         self.cleanup_pending_submissions(true)?;
         // Rewind hot rings; keep elem_bg_cache so (src, dst_i) pairs hit.
         self.reset_hot_rings_if_idle();
+        // Safe to reuse non-hot recycled buffers only after GPU drain.
+        self.flush_storage_pool_pending();
         if std::env::var_os("CANDLE_DEBUG_ELEM_BG").is_some() {
             let h = self
                 .inner

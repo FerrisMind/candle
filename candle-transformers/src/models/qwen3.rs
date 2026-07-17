@@ -36,84 +36,36 @@ pub struct Config {
 pub(crate) struct Qwen3RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
-    positions: Tensor,
-    head_dim: usize,
-    rope_theta: f32,
 }
 
 impl Qwen3RotaryEmbedding {
     pub(crate) fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
         let dim = cfg.head_dim;
         let max_seq_len = cfg.max_position_embeddings;
-        let inv_freq: Vec<f32> = (0..dim)
+        let inv_freq: Vec<_> = (0..dim)
             .step_by(2)
             .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
-        let half_dim = inv_freq.len();
-        let mut sin_f32 = Vec::with_capacity(max_seq_len * half_dim);
-        let mut cos_f32 = Vec::with_capacity(max_seq_len * half_dim);
-        for pos in 0..max_seq_len {
-            let p = pos as f32;
-            for &f in &inv_freq {
-                let v = p * f;
-                sin_f32.push(v.sin());
-                cos_f32.push(v.cos());
-            }
-        }
-        let sin = Tensor::from_vec(sin_f32, (max_seq_len, half_dim), dev)?.to_dtype(dtype)?;
-        let cos = Tensor::from_vec(cos_f32, (max_seq_len, half_dim), dev)?.to_dtype(dtype)?;
-        let positions = Tensor::arange(0i32, max_seq_len as i32, dev)?;
+        let inv_freq_len = inv_freq.len();
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(DType::F32)?;
+        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
+            .to_dtype(DType::F32)?
+            .reshape((max_seq_len, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
         Ok(Self {
-            sin,
-            cos,
-            positions,
-            head_dim: cfg.head_dim,
-            rope_theta: cfg.rope_theta as f32,
+            sin: freqs.sin()?.to_dtype(dtype)?,
+            cos: freqs.cos()?.to_dtype(dtype)?,
         })
     }
 
     /// Apply RoPE (q, k shape: B x H x L x D)
     pub(crate) fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
-        let q = q.contiguous()?;
-        let k = k.contiguous()?;
-        if q.device().is_wgpu() || q.device().is_vulkan() {
-            // ggml rope shaders expect positions on i2 and GPT-NeoX pairing.
-            const GGML_ROPE_TYPE_NEOX: u32 = 2;
-            let (_, _, seq_len, _) = q.dims4()?;
-            let positions = if q.device().is_vulkan() {
-                self.positions
-                    .narrow(0, offset, seq_len)?
-                    .force_contiguous()?
-            } else {
-                self.positions.narrow(0, offset, seq_len)?
-            };
-            let q_ggml = q.transpose(1, 2)?;
-            let k_ggml = k.transpose(1, 2)?;
-            let q_embed = candle_nn::rotary_emb::rope_ggml(
-                &q_ggml,
-                &positions,
-                self.head_dim,
-                self.rope_theta,
-                GGML_ROPE_TYPE_NEOX,
-            )?
-            .transpose(1, 2)?;
-            let k_embed = candle_nn::rotary_emb::rope_ggml(
-                &k_ggml,
-                &positions,
-                self.head_dim,
-                self.rope_theta,
-                GGML_ROPE_TYPE_NEOX,
-            )?
-            .transpose(1, 2)?;
-            Ok((q_embed, k_embed))
-        } else {
-            let (_, _, seq_len, _) = q.dims4()?;
-            let cos = self.cos.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
-            let sin = self.sin.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
-            let q_embed = candle_nn::rotary_emb::rope(&q, &cos, &sin)?;
-            let k_embed = candle_nn::rotary_emb::rope(&k, &cos, &sin)?;
-            Ok((q_embed, k_embed))
-        }
+        let (_, _, seq_len, _) = q.dims4()?;
+        let cos = self.cos.narrow(0, offset, seq_len)?;
+        let sin = self.sin.narrow(0, offset, seq_len)?;
+        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        Ok((q_embed, k_embed))
     }
 }
 
@@ -273,7 +225,6 @@ impl Qwen3Attention {
         // 6. Attention dispatch: auto-select best available path
         //    - CPU (no flash-attn feature): fused CPU flash kernel
         //    - GPU (flash-attn feature):    CUDA flash attention
-        //    - Vulkan:                      fused GPU flash attention via sdpa
         //    - Fallback:                    standard matmul attention
         let on_cpu = x.device().is_cpu();
 
@@ -282,22 +233,8 @@ impl Qwen3Attention {
             return self.forward_cpu_flash_attn(&q, &k, &v, offset, b, l);
         }
         #[cfg(feature = "flash-attn")]
-        if !on_cpu && !x.device().is_vulkan() && !x.device().is_wgpu() {
+        if !on_cpu {
             return self.forward_flash_attn(&q, &k, &v, offset, b, l);
-        }
-
-        if x.device().is_vulkan() || x.device().is_wgpu() {
-            let scale = 1.0 / (self.head_dim as f32).sqrt();
-            let ctx = candle_nn::ops::sdpa(
-                &q,
-                &k,
-                &v,
-                None,
-                l > 1,
-                scale,
-                1.0,
-            )?;
-            return ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj);
         }
 
         self.forward_standard_attn(&q, &k, &v, attn_mask, b, l)
@@ -395,21 +332,18 @@ impl Qwen3Attention {
         b: usize,
         l: usize,
     ) -> Result<Tensor> {
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        // GQA repeat_kv
         let k = repeat_kv(k.clone(), self.num_kv_groups)?.contiguous()?;
         let v = repeat_kv(v.clone(), self.num_kv_groups)?.contiguous()?;
+
+        // Attention score
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
         if let Some(m) = attn_mask {
-            let scores_dtype = scores.dtype();
-            let mask = if m.dtype() != scores_dtype {
-                m.to_dtype(scores_dtype)?
-            } else {
-                m.clone()
-            };
-            scores = scores.broadcast_add(&mask)?;
-        };
+            scores = scores.broadcast_add(m)?;
+        }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?;
+        let ctx = probs.matmul(&v)?; // (B, H, L, D)
 
         // Output proj
         ctx.transpose(1, 2)?
@@ -450,11 +384,11 @@ impl DecoderLayer {
 
     fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let h = self.ln1.forward(x)?;
-        let attn_out = self.self_attn.forward(&h, mask, offset)?;
-        let x = (x + &attn_out)?;
-        let ln2_out = self.ln2.forward(&x)?;
-        let mlp_out = ln2_out.apply(&self.mlp)?;
-        Ok((x + &mlp_out)?)
+        let h = self.self_attn.forward(&h, mask, offset)?;
+        let x = (x + h)?;
+        let h2 = self.ln2.forward(&x)?;
+        let h2 = h2.apply(&self.mlp)?;
+        x + h2
     }
 
     fn clear_kv_cache(&mut self) {

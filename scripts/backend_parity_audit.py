@@ -376,25 +376,114 @@ def main() -> int:
     miss_w = sum(1 for r in rows if r["wgpu"] != "yes")
     cuda_req = sum(1 for r in rows if r["cuda"] == "yes")
 
-    # Optional curated manifest counts
+    # Optional curated manifest counts + schema v2 validation
+    ALLOWED_STATUSES = {
+        "Native",
+        "Optimized",
+        "GPUEmulated",
+        "UnsupportedBySpecification",
+        "UnsupportedByHardware",
+        "CudaSpecific",
+        "Missing",
+        "Verified",
+    }
+    PROFILE_FIELDS = (
+        "vulkan_status",
+        "native_webgpu_status",
+        "portable_webgpu_status",
+    )
     manifest_counts = None
     manifest_path = args.manifest or (root / "docs" / "backend-parity-manifest.json")
     if manifest_path.is_file():
         try:
-            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and "ops" in raw:
+                data = raw["ops"]
+                schema_version = raw.get("schema_version", 1)
+            else:
+                data = raw
+                schema_version = 1
+
             def count_status(key: str) -> Dict[str, int]:
                 out: Dict[str, int] = {}
                 for item in data:
                     st = item.get(key, "unknown")
                     out[st] = out.get(st, 0) + 1
                 return out
+
+            # Enforce vocabulary + three profiles on schema v2 (and soft on v1 if fields present)
+            for item in data:
+                op_name = item.get("op", "<unknown>")
+                for field in PROFILE_FIELDS:
+                    if field not in item:
+                        if schema_version >= 2:
+                            failures.append(
+                                f"manifest op '{op_name}' missing required profile field '{field}'"
+                            )
+                        continue
+                    st = item[field]
+                    if st not in ALLOWED_STATUSES:
+                        failures.append(
+                            f"manifest op '{op_name}' field '{field}' has unknown status {st!r}"
+                        )
+                    if st == "Verified" and not item.get("tests"):
+                        # policy/meta rows may use Verified with structural evidence
+                        if not str(op_name).startswith("edge::") and op_name not in (
+                            "cpu_fallback_policy",
+                        ):
+                            failures.append(
+                                f"manifest op '{op_name}' is Verified on {field} but has no tests[]"
+                            )
+                    # Portable Verified must not be claimed from native-only smoke evidence.
+                    if field == "portable_webgpu_status" and st == "Verified":
+                        portable_tests = item.get("portable_tests") or []
+                        tests = item.get("tests") or []
+                        has_portable_evidence = bool(portable_tests) or any(
+                            any(
+                                tag in str(t).lower()
+                                for tag in (
+                                    "wasm",
+                                    "portable",
+                                    "browser",
+                                    "candle-wasm",
+                                )
+                            )
+                            for t in tests
+                        )
+                        if not has_portable_evidence:
+                            failures.append(
+                                f"manifest op '{op_name}' portable_webgpu_status is Verified "
+                                "but lacks portable/WASM/browser test evidence "
+                                "(native wgpu smokes are not portable Verified)"
+                            )
+                    if st == "Optimized" and not item.get("bench"):
+                        failures.append(
+                            f"manifest op '{op_name}' is Optimized on {field} but bench is false"
+                        )
+
+            # Every CUDA-required storage op must appear in curated manifest
+            manifest_ops = {item.get("op") for item in data}
+            for r in rows:
+                if r["cuda"] == "yes" and r["op"] not in manifest_ops:
+                    failures.append(
+                        f"CUDA-required op '{r['op']}' missing from parity manifest"
+                    )
+
             manifest_counts = {
+                "schema_version": schema_version,
                 "vulkan": count_status("vulkan_status"),
+                "native_webgpu": count_status("native_webgpu_status")
+                if data and "native_webgpu_status" in data[0]
+                else count_status("wgpu_status"),
+                "portable_webgpu": count_status("portable_webgpu_status")
+                if data and "portable_webgpu_status" in data[0]
+                else {},
                 "wgpu": count_status("wgpu_status"),
                 "rows": len(data),
             }
         except Exception as e:  # noqa: BLE001
             print(f"WARN: could not load manifest: {e}", file=sys.stderr)
+            failures.append(f"manifest load error: {e}")
 
     if args.json:
         payload = {
@@ -429,8 +518,10 @@ def main() -> int:
         if manifest_counts:
             print()
             print(f"Curated manifest ({manifest_path}): {manifest_counts['rows']} rows")
-            print(f"  Vulkan: {manifest_counts['vulkan']}")
-            print(f"  WGPU:   {manifest_counts['wgpu']}")
+            print(f"  schema: {manifest_counts.get('schema_version')}")
+            print(f"  Vulkan:          {manifest_counts['vulkan']}")
+            print(f"  Native WebGPU:   {manifest_counts.get('native_webgpu')}")
+            print(f"  Portable WebGPU: {manifest_counts.get('portable_webgpu')}")
         print()
         if failures:
             print(f"FAILURES ({len(failures)}):")
@@ -440,6 +531,11 @@ def main() -> int:
             print(
                 "OK: every CUDA-required BackendStorage op has a non-immediate "
                 "impl on Vulkan and/or WGPU (both when required)."
+            )
+            print(
+                "OK: parity manifest uses allowed three-profile statuses "
+                "(Native/Optimized/GPUEmulated/UnsupportedBySpecification/"
+                "UnsupportedByHardware/CudaSpecific/Missing/Verified)."
             )
             print(
                 "Note: depth gaps (dtype/layout/perf) are tracked in "

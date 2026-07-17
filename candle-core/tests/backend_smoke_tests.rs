@@ -25,6 +25,7 @@ fn assert_expected_gpu_name(actual: &str, backend: &str) {
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[allow(dead_code)] // used by identity checks under multi-feature CI matrices
 fn assert_expected_backend_name(actual: &str, backend: &str, env_var: &str) {
     if let Some(expected) = std::env::var_os(env_var) {
         let expected = expected.to_string_lossy().to_ascii_lowercase();
@@ -4321,7 +4322,9 @@ fn smoke_f32_extended_unary_ops(device: &Device) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+/// Mirror of Vulkan q8_1-rhs matvec routing. Only meaningful with the `vulkan`
+/// feature; under pure `wgpu` builds always returns false (no Vulkan device).
+#[cfg(feature = "vulkan")]
 fn vulkan_uses_q8_1_rhs(device: &Device, dtype: GgmlDType, n: usize, k: usize) -> bool {
     const VULKAN_VENDOR_ID_NVIDIA: u32 = 0x10DE;
     const VULKAN_VENDOR_ID_AMD: u32 = 0x1002;
@@ -4439,6 +4442,11 @@ fn vulkan_uses_q8_1_rhs(device: &Device, dtype: GgmlDType, n: usize, k: usize) -
         }
     };
     candle_vulkan_kernels::spirv(&shader_name).is_some()
+}
+
+#[cfg(not(feature = "vulkan"))]
+fn vulkan_uses_q8_1_rhs(_device: &Device, _dtype: GgmlDType, _n: usize, _k: usize) -> bool {
+    false
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]

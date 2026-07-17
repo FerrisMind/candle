@@ -3,7 +3,7 @@ mod support;
 use candle::{quantized::gguf_file, DType, Device, Result, Tensor};
 use candle_nn::{Module, VarBuilder};
 use candle_transformers::models::{
-    bert, convmixer, llama2_c, llama2_c_weights, quantized_qwen3, whisper,
+    bert, convmixer, llama2_c, llama2_c_weights, quantized_qwen3, qwen3, whisper,
 };
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -61,8 +61,9 @@ fn run_public_model_matrix(device: &Device) -> Result<()> {
     }
 
     let requested_cases = requested_case_names();
-    let cases: [(&str, ModelCaseFn); 6] = [
+    let cases: [(&str, ModelCaseFn); 7] = [
         ("dense_causal_decoder_case", dense_causal_decoder_case),
+        ("dense_qwen3_safetensors_case", dense_qwen3_safetensors_case),
         ("quantized_causal_gguf_case", quantized_causal_gguf_case),
         ("quantized_qwen3_multi_quant_case", quantized_qwen3_multi_quant_case),
         ("encoder_only_text_case", encoder_only_text_case),
@@ -83,7 +84,7 @@ fn run_public_model_matrix(device: &Device) -> Result<()> {
     }
     if !ran_any {
         candle::bail!(
-            "{CASE_FILTER_ENV} did not match any public GPU model case: dense_causal_decoder_case, quantized_causal_gguf_case, quantized_qwen3_multi_quant_case, encoder_only_text_case, audio_seq2seq_case, vision_convmixer_case"
+            "{CASE_FILTER_ENV} did not match any public GPU model case: dense_causal_decoder_case, dense_qwen3_safetensors_case, quantized_causal_gguf_case, quantized_qwen3_multi_quant_case, encoder_only_text_case, audio_seq2seq_case, vision_convmixer_case"
         );
     }
     Ok(())
@@ -246,9 +247,53 @@ fn encoder_only_text_case(device: &Device) -> Result<()> {
 }
 
 #[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
+fn dense_qwen3_safetensors_case(device: &Device) -> Result<()> {
+    let (config_path, weights_path) = qwen3_safetensors_paths()?;
+    let cpu = Device::Cpu;
+    let config: qwen3::Config = serde_json::from_str(&std::fs::read_to_string(&config_path)?)
+        .map_err(|err| candle::Error::msg(format!("failed to parse Qwen3 config: {err}")))?;
+    // F32 for CPU↔GPU parity (source weights are bf16 on disk).
+    let cpu_vb = unsafe {
+        VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&weights_path), DType::F32, &cpu)?
+    };
+    let dev_vb =
+        unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device)? };
+    let mut cpu_model = qwen3::ModelForCausalLM::new(&config, cpu_vb)?;
+    let mut dev_model = qwen3::ModelForCausalLM::new(&config, dev_vb)?;
+
+    let ids = [1u32, 2, 3, 4];
+    let ids_cpu = Tensor::from_slice(&ids, (1, ids.len()), &cpu)?;
+    let ids_dev = Tensor::from_slice(&ids, (1, ids.len()), device)?;
+    let prefill_cpu = cpu_model.forward(&ids_cpu, 0)?;
+    let prefill_dev = dev_model.forward(&ids_dev, 0)?;
+    assert_close_tensors(
+        &prefill_dev,
+        &prefill_cpu,
+        5e-2,
+        5e-2,
+        "qwen3_dense_prefill_logits",
+    )?;
+
+    let next_token = [5u32];
+    let next_cpu = Tensor::from_slice(&next_token, (1, 1), &cpu)?;
+    let next_dev = Tensor::from_slice(&next_token, (1, 1), device)?;
+    let decode_cpu = cpu_model.forward(&next_cpu, ids.len())?;
+    let decode_dev = dev_model.forward(&next_dev, ids.len())?;
+    assert_close_tensors(
+        &decode_dev,
+        &decode_cpu,
+        5e-2,
+        5e-2,
+        "qwen3_dense_decode_logits",
+    )?;
+    Ok(())
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn quantized_causal_gguf_case(device: &Device) -> Result<()> {
     let model_path = qwen3_gguf_path()?;
     let cpu = Device::Cpu;
+    println!("using GGUF {model_path:?} on {}", backend_name(device));
 
     let mut cpu_model = load_quantized_qwen3_model(&model_path, &cpu)?;
     let mut dev_model = load_quantized_qwen3_model(&model_path, device)?;
@@ -283,9 +328,7 @@ fn quantized_causal_gguf_case(device: &Device) -> Result<()> {
 #[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn quantized_qwen3_multi_quant_case(device: &Device) -> Result<()> {
     let cpu = Device::Cpu;
-    // Test multiple GGUF quantization types to exercise different dequant paths.
-    // Q2_K is omitted — not available locally; Q4_0 exercises a different packing
-    // layout than Q4_K_M and is available on disk.
+    // Exercise distinct GGUF dequant packing paths present under CANDLE_QWEN3_GGUF_DIR.
     let quant_types: &[(&str, &str)] = &[
         ("Q4_K_M", "Qwen3-0.6B-Q4_K_M.gguf"),
         ("Q4_0", "Qwen3-0.6B-Q4_0.gguf"),
@@ -293,20 +336,20 @@ fn quantized_qwen3_multi_quant_case(device: &Device) -> Result<()> {
         ("Q6_K", "Qwen3-0.6B-Q6_K.gguf"),
         ("Q8_0", "Qwen3-0.6B-Q8_0.gguf"),
     ];
-    let gguf_dir = std::path::PathBuf::from(
-        std::env::var_os("CANDLE_QWEN3_GGUF_DIR")
-            .unwrap_or_else(|| "/home/mod479711/Downloads/models/Qwen3-0.6B-GGUF".into()),
-    );
+    let gguf_dir = qwen3_gguf_dir();
+    println!("GGUF dir {gguf_dir:?} on {}", backend_name(device));
     let ids = [1u32, 2, 3, 4];
     let ids_cpu = Tensor::from_slice(&ids, (1, ids.len()), &cpu)?;
     let next_token = [5u32];
     let next_cpu = Tensor::from_slice(&next_token, (1, 1), &cpu)?;
+    let mut ran = 0usize;
     for &(quant_name, filename) in quant_types {
         let path = gguf_dir.join(filename);
         if !path.exists() {
             println!("skipping {quant_name}: {path:?} not found");
             continue;
         }
+        ran += 1;
         println!("testing {quant_name} on {}", backend_name(device));
         let start = Instant::now();
         let mut cpu_model = load_quantized_qwen3_model(&path, &cpu)?;
@@ -333,6 +376,11 @@ fn quantized_qwen3_multi_quant_case(device: &Device) -> Result<()> {
             "{quant_name} passed in {:.2?}; fallback count: {}",
             start.elapsed(),
             fallback_count(device),
+        );
+    }
+    if ran == 0 {
+        candle::bail!(
+            "quantized_qwen3_multi_quant_case: no GGUF files found under {gguf_dir:?}; set CANDLE_QWEN3_GGUF_DIR"
         );
     }
     Ok(())
@@ -450,11 +498,50 @@ fn load_llama2_c_model(
 }
 
 #[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
+fn qwen3_gguf_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("CANDLE_QWEN3_GGUF_DIR") {
+        return PathBuf::from(path);
+    }
+    let local = PathBuf::from(r"C:\Users\PC\Documents\models\unsloth\Qwen3-0.6B-GGUF");
+    if local.is_dir() {
+        return local;
+    }
+    PathBuf::from("/home/mod479711/Downloads/models/Qwen3-0.6B-GGUF")
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn qwen3_gguf_path() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("CANDLE_QWEN3_GGUF_PATH") {
         return Ok(PathBuf::from(path));
     }
+    let local = qwen3_gguf_dir().join("Qwen3-0.6B-Q4_K_M.gguf");
+    if local.is_file() {
+        return Ok(local);
+    }
     download_model_artifact("unsloth/Qwen3-0.6B-GGUF", "main", "Qwen3-0.6B-Q4_K_M.gguf")
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
+fn qwen3_safetensors_paths() -> Result<(PathBuf, PathBuf)> {
+    if let (Some(cfg), Some(wts)) = (
+        std::env::var_os("CANDLE_QWEN3_CONFIG_PATH"),
+        std::env::var_os("CANDLE_QWEN3_SAFETENSORS_PATH"),
+    ) {
+        return Ok((PathBuf::from(cfg), PathBuf::from(wts)));
+    }
+    if let Some(dir) = std::env::var_os("CANDLE_QWEN3_DENSE_DIR") {
+        let dir = PathBuf::from(dir);
+        return Ok((dir.join("config.json"), dir.join("model.safetensors")));
+    }
+    let local = PathBuf::from(r"C:\Users\PC\Documents\models\unsloth\Qwen3-0.6B");
+    let config = local.join("config.json");
+    let weights = local.join("model.safetensors");
+    if config.is_file() && weights.is_file() {
+        return Ok((config, weights));
+    }
+    let config = download_model_artifact("unsloth/Qwen3-0.6B", "main", "config.json")?;
+    let weights = download_model_artifact("unsloth/Qwen3-0.6B", "main", "model.safetensors")?;
+    Ok((config, weights))
 }
 
 #[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]

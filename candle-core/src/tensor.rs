@@ -2556,6 +2556,14 @@ impl Tensor {
         if self.device().same_device(device) {
             Ok(self.clone())
         } else {
+            // Views may be stride-contiguous yet start mid-buffer (e.g. after
+            // `i(1)` on a stacked qkv tensor). Uploading the full shared storage
+            // while keeping start_offset makes some backends (Vulkan binary)
+            // ignore the offset and read sibling data. Always materialize a
+            // dense offset-0 buffer before a cross-device transfer.
+            if self.layout().start_offset() != 0 || !self.is_contiguous() {
+                return self.force_contiguous()?.to_device(device);
+            }
             let storage = match (&*self.storage(), device) {
                 (Storage::Cpu(storage), Device::Cuda(cuda)) => {
                     Storage::Cuda(cuda.storage_from_cpu_storage(storage)?)

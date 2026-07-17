@@ -1,0 +1,266 @@
+//! Stage-by-stage llama2_c block0 trace: CPU vs WGPU.
+use candle::{Device, Result, Tensor, D, DType};
+use candle_nn::{ops, Module};
+use candle_transformers::models::{llama2_c, llama2_c_weights};
+use std::fs::File;
+use std::path::PathBuf;
+
+fn maxdiff(a: &Tensor, b: &Tensor) -> Result<f32> {
+    let va = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let vb = b
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok(va
+        .iter()
+        .zip(vb.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max))
+}
+
+fn report(label: &str, a: &Tensor, b: &Tensor) -> Result<()> {
+    let md = maxdiff(a, b)?;
+    let va = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let vb = b
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let n = va.len().min(4);
+    println!(
+        "{label:28} maxdiff={md:.6e} cpu={:?} gpu={:?}",
+        &va[..n],
+        &vb[..n]
+    );
+    Ok(())
+}
+
+fn find(p: &std::path::Path, name: &str) -> Option<PathBuf> {
+    if p.is_file() && p.file_name()?.to_str()? == name {
+        return Some(p.to_path_buf());
+    }
+    if p.is_dir() {
+        for e in std::fs::read_dir(p).ok()? {
+            if let Ok(e) = e {
+                if let Some(f) = find(&e.path(), name) {
+                    return Some(f);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn silu(xs: &Tensor) -> Result<Tensor> {
+    xs / (xs.neg()?.exp()? + 1.0)?
+}
+
+fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor> {
+    let shape = mask.shape();
+    let on_true = Tensor::new(on_true, on_false.device())?.broadcast_as(shape.dims())?;
+    mask.where_cond(&on_true, on_false)
+}
+
+#[test]
+fn llama_trace_block0() -> Result<()> {
+    let hub = PathBuf::from(std::env::var("USERPROFILE").unwrap()).join(".cache/huggingface/hub");
+    let model_path = find(&hub, "stories15M.bin").expect("stories15M.bin");
+    let cpu = Device::Cpu;
+    let wg = Device::new_wgpu(0)?;
+
+    let load_vb = |device: &Device| -> Result<(candle_nn::VarBuilder, llama2_c::Config, llama2_c::Cache)> {
+        let mut file = File::open(&model_path)?;
+        let config = llama2_c::Config::from_reader(&mut file)?;
+        let weights =
+            llama2_c_weights::TransformerWeights::from_reader(&mut file, &config, device)?;
+        let vb = weights.var_builder(&config, device)?;
+        let cache = llama2_c::Cache::new(false, &config, vb.pp("rot"))?;
+        Ok((vb, config, cache))
+    };
+
+    let (vb_c, cfg, cache_c) = load_vb(&cpu)?;
+    let (vb_g, _, cache_g) = load_vb(&wg)?;
+    let head_dim = cfg.dim / cfg.n_heads;
+    let seq_len = 1usize; // isolate no-mask path first
+    let ids: Vec<u32> = vec![1];
+    let ids_c = Tensor::from_slice(&ids, (1, seq_len), &cpu)?;
+    let ids_g = Tensor::from_slice(&ids, (1, seq_len), &wg)?;
+
+    let emb_c = candle_nn::embedding(cfg.vocab_size, cfg.dim, vb_c.pp("model.embed_tokens"))?;
+    let emb_g = candle_nn::embedding(cfg.vocab_size, cfg.dim, vb_g.pp("model.embed_tokens"))?;
+    let x_c = emb_c.forward(&ids_c)?;
+    let x_g = emb_g.forward(&ids_g)?;
+    wg.synchronize()?;
+    report("embed", &x_c, &x_g)?;
+
+    let rms1_c =
+        candle_nn::rms_norm(cfg.dim, cfg.norm_eps, vb_c.pp("model.layers.0.input_layernorm"))?;
+    let rms1_g =
+        candle_nn::rms_norm(cfg.dim, cfg.norm_eps, vb_g.pp("model.layers.0.input_layernorm"))?;
+    let n_c = rms1_c.forward(&x_c)?;
+    let n_g = rms1_g.forward(&x_g)?;
+    wg.synchronize()?;
+    report("rms1", &n_c, &n_g)?;
+
+    let q_c = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_c.pp("model.layers.0.self_attn.q_proj"))?
+        .forward(&n_c)?;
+    let q_g = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_g.pp("model.layers.0.self_attn.q_proj"))?
+        .forward(&n_g)?;
+    let k_c = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_c.pp("model.layers.0.self_attn.k_proj"))?
+        .forward(&n_c)?;
+    let k_g = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_g.pp("model.layers.0.self_attn.k_proj"))?
+        .forward(&n_g)?;
+    let v_c = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_c.pp("model.layers.0.self_attn.v_proj"))?
+        .forward(&n_c)?;
+    let v_g = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_g.pp("model.layers.0.self_attn.v_proj"))?
+        .forward(&n_g)?;
+    wg.synchronize()?;
+    report("q_proj", &q_c, &q_g)?;
+    report("k_proj", &k_c, &k_g)?;
+    report("v_proj", &v_c, &v_g)?;
+
+    let reshape_heads = |t: &Tensor| -> Result<Tensor> {
+        t.reshape((1, seq_len, cfg.n_heads, head_dim))?
+            .transpose(1, 2)?
+            .contiguous()
+    };
+    // apply_rotary_emb does reshape (b,s,h,hd) then transpose to (b,h,s,hd) inside
+    let q4_c = q_c.reshape((1, seq_len, cfg.n_heads, head_dim))?;
+    let q4_g = q_g.reshape((1, seq_len, cfg.n_heads, head_dim))?;
+    let k4_c = k_c.reshape((1, seq_len, cfg.n_heads, head_dim))?;
+    let k4_g = k_g.reshape((1, seq_len, cfg.n_heads, head_dim))?;
+    let mut v4_c = v_c.reshape((1, seq_len, cfg.n_heads, head_dim))?;
+    let mut v4_g = v_g.reshape((1, seq_len, cfg.n_heads, head_dim))?;
+
+    let rope_in = |x: &Tensor, cos: &Tensor, sin: &Tensor| -> Result<Tensor> {
+        let x = x.transpose(1, 2)?.contiguous()?;
+        let rope = candle_nn::rotary_emb::rope_slow(&x, cos, sin)?;
+        rope.transpose(1, 2)?.contiguous()
+    };
+    let cos_c = cache_c.cos.narrow(0, 0, seq_len)?.squeeze(2)?;
+    let sin_c = cache_c.sin.narrow(0, 0, seq_len)?.squeeze(2)?;
+    let cos_g = cache_g.cos.narrow(0, 0, seq_len)?.squeeze(2)?;
+    let sin_g = cache_g.sin.narrow(0, 0, seq_len)?.squeeze(2)?;
+    report("cos", &cos_c, &cos_g)?;
+    report("sin", &sin_c, &sin_g)?;
+
+    let q_c = rope_in(&q4_c, &cos_c, &sin_c)?;
+    let q_g = rope_in(&q4_g, &cos_g, &sin_g)?;
+    let k_c = rope_in(&k4_c, &cos_c, &sin_c)?;
+    let k_g = rope_in(&k4_g, &cos_g, &sin_g)?;
+    wg.synchronize()?;
+    report("q_rope", &q_c, &q_g)?;
+    report("k_rope", &k_c, &k_g)?;
+
+    let q_c = q_c.transpose(1, 2)?.contiguous()?;
+    let q_g = q_g.transpose(1, 2)?.contiguous()?;
+    let k_c = k_c.transpose(1, 2)?.contiguous()?;
+    let k_g = k_g.transpose(1, 2)?.contiguous()?;
+    let v_c = v4_c.transpose(1, 2)?.contiguous()?;
+    let v_g = v4_g.transpose(1, 2)?.contiguous()?;
+    wg.synchronize()?;
+    report("q_bhsd", &q_c, &q_g)?;
+    report("v_bhsd", &v_c, &v_g)?;
+
+    let att_c = (q_c.matmul(&k_c.t()?)? / (head_dim as f64).sqrt())?;
+    let att_g = (q_g.matmul(&k_g.t()?)? / (head_dim as f64).sqrt())?;
+    wg.synchronize()?;
+    report("att_scores", &att_c, &att_g)?;
+
+    // seq_len=1: no mask
+    let att_c = ops::softmax(&att_c, D::Minus1)?;
+    let att_g = ops::softmax(&att_g, D::Minus1)?;
+    wg.synchronize()?;
+    report("att_softmax", &att_c, &att_g)?;
+
+    let y_c = att_c.matmul(&v_c.contiguous()?)?;
+    let y_g = att_g.matmul(&v_g.contiguous()?)?;
+    wg.synchronize()?;
+    report("attn_out", &y_c, &y_g)?;
+
+    let y_c = y_c.transpose(1, 2)?.reshape(&[1, seq_len, cfg.dim])?;
+    let y_g = y_g.transpose(1, 2)?.reshape(&[1, seq_len, cfg.dim])?;
+    let o_c = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_c.pp("model.layers.0.self_attn.o_proj"))?
+        .forward(&y_c)?;
+    let o_g = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_g.pp("model.layers.0.self_attn.o_proj"))?
+        .forward(&y_g)?;
+    wg.synchronize()?;
+    report("o_proj", &o_c, &o_g)?;
+
+    let h_c = (&o_c + &x_c)?;
+    let h_g = (&o_g + &x_g)?;
+    wg.synchronize()?;
+    report("residual1", &h_c, &h_g)?;
+
+    let rms2_c = candle_nn::rms_norm(
+        cfg.dim,
+        cfg.norm_eps,
+        vb_c.pp("model.layers.0.post_attention_layernorm"),
+    )?;
+    let rms2_g = candle_nn::rms_norm(
+        cfg.dim,
+        cfg.norm_eps,
+        vb_g.pp("model.layers.0.post_attention_layernorm"),
+    )?;
+    let n2_c = rms2_c.forward(&h_c)?;
+    let n2_g = rms2_g.forward(&h_g)?;
+    wg.synchronize()?;
+    report("rms2", &n2_c, &n2_g)?;
+
+    let g_c = candle_nn::linear_no_bias(cfg.dim, cfg.hidden_dim, vb_c.pp("model.layers.0.mlp.gate_proj"))?
+        .forward(&n2_c)?;
+    let g_g = candle_nn::linear_no_bias(cfg.dim, cfg.hidden_dim, vb_g.pp("model.layers.0.mlp.gate_proj"))?
+        .forward(&n2_g)?;
+    let u_c = candle_nn::linear_no_bias(cfg.dim, cfg.hidden_dim, vb_c.pp("model.layers.0.mlp.up_proj"))?
+        .forward(&n2_c)?;
+    let u_g = candle_nn::linear_no_bias(cfg.dim, cfg.hidden_dim, vb_g.pp("model.layers.0.mlp.up_proj"))?
+        .forward(&n2_g)?;
+    wg.synchronize()?;
+    report("gate", &g_c, &g_g)?;
+    report("up", &u_c, &u_g)?;
+
+    let m_c = (silu(&g_c)? * u_c)?;
+    let m_g = (silu(&g_g)? * u_g)?;
+    wg.synchronize()?;
+    report("silu*up", &m_c, &m_g)?;
+
+    let d_c = candle_nn::linear_no_bias(cfg.hidden_dim, cfg.dim, vb_c.pp("model.layers.0.mlp.down_proj"))?
+        .forward(&m_c)?;
+    let d_g = candle_nn::linear_no_bias(cfg.hidden_dim, cfg.dim, vb_g.pp("model.layers.0.mlp.down_proj"))?
+        .forward(&m_g)?;
+    wg.synchronize()?;
+    report("down", &d_c, &d_g)?;
+
+    let out_c = (&d_c + &h_c)?;
+    let out_g = (&d_g + &h_g)?;
+    wg.synchronize()?;
+    report("block0_out", &out_c, &out_g)?;
+
+    // Compare against real model forward (one block equivalent via full model n_layers still runs all)
+    let (m_c, mut c_c) = {
+        let mut file = File::open(&model_path)?;
+        let config = llama2_c::Config::from_reader(&mut file)?;
+        let weights = llama2_c_weights::TransformerWeights::from_reader(&mut file, &config, &cpu)?;
+        let vb = weights.var_builder(&config, &cpu)?;
+        let cache = llama2_c::Cache::new(false, &config, vb.pp("rot"))?;
+        (llama2_c::Llama::load(vb, config)?, cache)
+    };
+    let (m_g, mut c_g) = {
+        let mut file = File::open(&model_path)?;
+        let config = llama2_c::Config::from_reader(&mut file)?;
+        let weights = llama2_c_weights::TransformerWeights::from_reader(&mut file, &config, &wg)?;
+        let vb = weights.var_builder(&config, &wg)?;
+        let cache = llama2_c::Cache::new(false, &config, vb.pp("rot"))?;
+        (llama2_c::Llama::load(vb, config)?, cache)
+    };
+    let y_c = m_c.forward(&ids_c, 0, &mut c_c)?;
+    let y_g = m_g.forward(&ids_g, 0, &mut c_g)?;
+    wg.synchronize()?;
+    report("full_model_logits", &y_c, &y_g)?;
+
+    // force use of reshape_heads / masked_fill so compiler keeps them if needed
+    let _ = reshape_heads;
+    let _ = masked_fill;
+    Ok(())
+}

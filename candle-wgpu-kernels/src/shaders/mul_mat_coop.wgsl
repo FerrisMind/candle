@@ -5,9 +5,11 @@
 //   ti = sg % 4, tj = sg / 4 — each warp owns TWO 16×16 C tiles along M.
 // Double-buffered K panels: after coopLoad, tiles live in registers so the
 // next panel can fill the alternate buffer with one barrier per K-step.
-// Rejected on RTX 3060: Dual-K pair schedule; N-coalesced BT without pad
-// (~1.5×); padded STRIDE=TK+4 N-coalesced (~1.6× large/tall); tall B^T
-// materialize (~6×); coop64 skinny; BK=64 multi-MMA panel.
+// Rejected on RTX 3060 vs this dual (tall 64×4096): Dual-K pair schedule;
+// N-coalesced BT ± pad (~1.5–1.6×); B^T materialize (~6×); coop64 skinny;
+// BK=64 multi-MMA; Vulkan-style 128-thr 64×64 (~2×); K-panel=32 (~2×);
+// N-major BT (~1.7×); coop-256 occupancy (~1.37×); 2-phase coalesce+xpose
+// (~1.4×); interior no-bounds load branch (~1.1× worse large).
 //
 // Binding (warptile convention):
 //   src0 = B^T / virtual B^T (params.m = candle N)
@@ -71,6 +73,7 @@ fn load_panels(
     let base_bt = buf * PANEL_BT;
     let base_a = buf * PANEL_A;
     // K-major BT fill (elem = n_local*TK + k_local).
+    // Interior-only variants (no bounds checks) measured slower on RTX 3060.
     for (var i = 0u; i < 4u; i++) {
         let elem = tid * 4u + i;
         let r = elem / TK;
