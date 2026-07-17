@@ -137,8 +137,14 @@ fn main(
 ) {
     let linear = (wid.x + wid.y * num_wg.x) * WG_SIZE + lid.x;
     if (linear < params.ne) {
+#ifdef CONTIG
+        // Contiguous same-shape: skip broadcast index arithmetic (hot path).
+        let src0_i = params.offset_src0 + linear;
+        let src1_i = params.offset_src1 + linear;
+#else
         let src0_i = params.offset_src0 + src0_index(linear);
         let src1_i = params.offset_src1 + src1_index(linear);
+#endif
         update(params.offset_dst + linear, src0_i, src1_i);
     }
 }

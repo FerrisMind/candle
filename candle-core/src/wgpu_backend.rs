@@ -2185,8 +2185,9 @@ fn unary_shader_immediate(op: &str, dtype: DType) -> Result<Arc<str>> {
     })
 }
 
-fn binary_shader(op: &str, dtype: DType) -> Result<Arc<str>> {
-    cached_shader_source(1, op, dtype, || {
+fn binary_shader_ex(op: &str, dtype: DType, contig: bool) -> Result<Arc<str>> {
+    let kind = if contig { 6u8 } else { 1u8 };
+    cached_shader_source(kind, op, dtype, || {
         if dtype == DType::BF16 {
             return Ok(bf16_binary_wgsl(op));
         }
@@ -2212,10 +2213,11 @@ fn binary_shader(op: &str, dtype: DType) -> Result<Arc<str>> {
             "sub" => candle_wgpu_kernels::BinaryOp::Sub,
             _ => return Err(Error::Msg(format!("wgpu backend op {op} not implemented")).bt()),
         };
-        Ok(candle_wgpu_kernels::shader(
+        Ok(candle_wgpu_kernels::shader_ex(
             candle_wgpu_kernels::ShaderOp::Binary(op),
             wgpu_kernel_dtype(dtype)?,
             WG_SIZE,
+            contig,
         ))
     })
 }
@@ -10596,9 +10598,14 @@ impl BackendStorage for WgpuStorage {
             _ => count,
         };
         let param_bytes = any_as_bytes(&params);
-        // Prefer dyn-uniform for full BinaryParams (~80 B): measured set_immediates
-        // of large payloads does not beat coalesced deferred write on RTX 3060.
-        // Unary still uses IMMEDIATES (smaller params, clear win).
+        // Contiguous same-shape: CONTIG shader skips broadcast index math.
+        let contig = matches!(self.dtype, DType::F32 | DType::F16)
+            && matches!(B::NAME, "add" | "sub" | "mul" | "div")
+            && lhs_layout.is_contiguous()
+            && rhs_layout.is_contiguous()
+            && lhs_layout.dims() == rhs_layout.dims();
+        let shader = binary_shader_ex(B::NAME, self.dtype, contig)?;
+        // Prefer dyn-uniform for full BinaryParams (~80 B).
         let slot = self.device.inner.uniform_dyn_slot;
         let param_buffer = self.device.uniform_dyn_buffer()?;
         let entries = [
@@ -10614,12 +10621,16 @@ impl BackendStorage for WgpuStorage {
             uniform_binding_dyn(3, &param_buffer, slot)?,
         ];
         match self.device.run_compute_linear_deferred_uniform(
-            &binary_shader(B::NAME, self.dtype)?,
+            &shader,
             &entries,
             &bindings,
             work_items as u32,
             param_bytes,
-            "candle-wgpu-binary",
+            if contig {
+                "candle-wgpu-binary-contig"
+            } else {
+                "candle-wgpu-binary"
+            },
         ) {
             Ok(()) => Ok(dst),
             Err(err) => Err(err),

@@ -157,6 +157,11 @@ impl BinaryOp {
 }
 
 pub fn shader(op: ShaderOp, dtype: DType, workgroup_size: u32) -> String {
+    shader_ex(op, dtype, workgroup_size, false)
+}
+
+/// `contig`: for binary ops, skip broadcast index arithmetic (unit-stride hot path).
+pub fn shader_ex(op: ShaderOp, dtype: DType, workgroup_size: u32, contig: bool) -> String {
     let source = match op {
         ShaderOp::Unary(_) => UNARY_WGSL.source(),
         ShaderOp::Binary(_) => BINARY_WGSL.source(),
@@ -177,7 +182,12 @@ pub fn shader(op: ShaderOp, dtype: DType, workgroup_size: u32) -> String {
     }
     match op {
         ShaderOp::Unary(op) => defines.push(op.define().to_string()),
-        ShaderOp::Binary(op) => defines.push(op.define().to_string()),
+        ShaderOp::Binary(op) => {
+            defines.push(op.define().to_string());
+            if contig {
+                defines.push("CONTIG".to_string());
+            }
+        }
     }
     preprocess(source, &defines, &replacements, dtype)
 }

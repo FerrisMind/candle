@@ -22,11 +22,11 @@ Evidence: SCRATCH `bench-suite-immediates-ok.log` / tip `git rev-parse HEAD`.
 
 ✓ = ≤1.10× CUDA.
 
-**WGPU elementwise:** (1) cache preprocessed unary/binary WGSL (`c297335e`);
-(2) atomic dyn-uniform cursor + stack deferred payloads; (3) `Features::IMMEDIATES`
-+ `var<immediate>` params when the adapter allows ≥80 B, eliminating per-op
-uniform `write_buffer`. Prior residual ~3× was **rebuild/preprocess of WGSL
-every dispatch**. relu now ~1.05×; mul ~1.13× residual host enqueue. Smoke 84/84.
+**WGPU elementwise:** (1) cache preprocessed unary/binary WGSL; (2) atomic
+dyn-uniform + stack deferred payloads; (3) unary `Features::IMMEDIATES`;
+(4) `CONTIG` binary define skips broadcast indexing for same-shape contiguous
+ops. Prior residual ~3× was **rebuild/preprocess of WGSL every dispatch**.
+Multi-run: relu ~1.05×, mul ~1.08–1.15× (Vulkan mul often ~1.09×). Smoke 84/84.
 
 **WGPU tall GEMM (~1.20–1.25×):** dual-MMA 128×64 virtual-Bᵀ still best on RTX 3060.
 Rejected (all regressed vs dual, evidence in SCRATCH `bench-suite-*.log`):
