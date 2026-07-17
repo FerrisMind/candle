@@ -487,9 +487,9 @@ pub fn matmul_warptile_shader() -> Option<&'static str> {
     get("mul_mat_warptile.wgsl").map(|m| m.source())
 }
 
-/// Cooperative-matrix (tensor-core) F32 GEMM: 8×8 tiles, workgroup size 32.
+/// Cooperative-matrix GEMM tile (f16 A/B → f32 C on Ampere+): 16×16×16.
 pub fn matmul_coop_tile_shape() -> (u32, u32, u32) {
-    (8, 8, 8)
+    (16, 16, 16)
 }
 
 pub fn matmul_coop_shader() -> Option<&'static str> {

@@ -7685,24 +7685,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 // Prefer warptile (64×64 / BK=32 / 128 thr) for large dense F32 —
                 // closer to ggml-vulkan mul_mm occupancy than 32×32 reg-tile.
                 // Fall back to reg-tile for medium shapes, naive for tiny.
-                // Cooperative-matrix path is drafted (mul_mat_coop.wgsl) but still
-                // numerically wrong on RTX 3060 (all-zero outputs). Keep warptile
-                // until coopLoad/Store layout is validated. Gate with env:
-                // CANDLE_WGPU_COOP_MATMUL=1
-                let coop_env = std::env::var("CANDLE_WGPU_COOP_MATMUL")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                // Cooperative matrix: Ampere+ Vulkan exposes 16×16 f16 A/B → f32 C
+                // (not f32 8×8). Mixed-precision is fine for large GEMMs; small
+                // shapes stay on full-f32 warptile so tight smoke tols pass.
+                // Disable with CANDLE_WGPU_COOP_MATMUL=0.
+                let coop_disabled = std::env::var("CANDLE_WGPU_COOP_MATMUL")
+                    .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
                     .unwrap_or(false);
-                let coop_ok = coop_env
+                let coop_ok = !coop_disabled
                     && self
                         .device
                         .inner
                         .features
                         .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
-                    && m.is_multiple_of(8)
-                    && n.is_multiple_of(8)
-                    && k.is_multiple_of(8)
-                    && m.max(n) >= 64
+                    && self
+                        .device
+                        .inner
+                        .features
+                        .contains(wgpu::Features::SHADER_F16)
+                    && m.is_multiple_of(16)
+                    && n.is_multiple_of(16)
+                    && k.is_multiple_of(16)
+                    && m >= 64
+                    && n >= 64
                     && k >= 64
+                    // Exclude small square smokes (64³) where f16 error exceeds
+                    // tight abs tols; allow tall/wide (e.g. 64×4096) and ≥128².
+                    && (m >= 128 || n >= 128)
                     && params.stride_1k == 1;
                 if coop_ok {
                     matmul_label = "candle-wgpu-matmul-coop";

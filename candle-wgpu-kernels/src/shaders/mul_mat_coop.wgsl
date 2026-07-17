@@ -1,12 +1,19 @@
-// Dense F32 GEMM via wgpu cooperative matrix (8x8 tensor-core tiles).
-// Requires: enable wgpu_cooperative_matrix + Features::EXPERIMENTAL_COOPERATIVE_MATRIX.
-// Workgroup = one subgroup (32) computing one 8x8 output tile; K stepped by 8.
+// Dense F32 GEMM via wgpu cooperative matrix on hardware that supports
+// 16x16 f16 A/B with f32 accumulator (NVIDIA Ampere+ Vulkan path).
 //
-// Binding convention matches warptile/reg_tile:
-//   src0 = B^T (params.m = candle N rows, K cols) or physical (K,N) via stride_0k
-//   src1 = A   (params.n = candle M rows, K cols)
+// Query: Adapter::cooperative_matrix_properties() — RTX 3060 reports:
+//   m=16 n=16 k=16 ab=F16 cr=F32 (and related 16x8 variants).
+// There is NO f32 8x8 config on this GPU; using unsupported sizes yields zeros.
+//
+// Binding convention (same as warptile):
+//   src0 = B^T or virtual B^T via stride_0k  (params.m = candle N)
+//   src1 = A                                 (params.n = candle M)
 //   dst[col * params.m + row]
+//
+// Math: C[m,n] = sum A[m,k]*B[k,n] = (B^T * A^T)[n,m]
+// Stage panels in f16 (tensor-core inputs), accumulate in f32.
 
+enable f16;
 enable wgpu_cooperative_matrix;
 
 struct MulMatParams {
@@ -37,21 +44,24 @@ struct MulMatParams {
 @group(0) @binding(2) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(3) var<uniform> params: MulMatParams;
 
-const TM: u32 = 8u;
-const TN: u32 = 8u;
-const TK: u32 = 8u;
+const TM: u32 = 16u; // along params.m (candle N)
+const TN: u32 = 16u; // along params.n (candle M)
+const TK: u32 = 16u;
+const TILE: u32 = 256u; // 16*16
 
-// Stage tiles in workgroup memory for coopLoad (contiguous 8x8, stride 8).
-var<workgroup> tile_a: array<f32, 64>; // src0 panel (B^T): 8 rows x 8 k
-var<workgroup> tile_b: array<f32, 64>; // src1 panel (A):   8 rows x 8 k
+// f16 staging for A/B roles; f32 staging for C result.
+var<workgroup> tile_bt: array<f16, TILE>; // B^T : N x K row-major
+var<workgroup> tile_a: array<f16, TILE>;  // A   : M x K row-major
+var<workgroup> tile_c: array<f32, TILE>;  // C   : N x M row-major
 
-@compute @workgroup_size(32)
+// 16×16 WG: one lane per tile element (matches official wgpu coopmat example).
+@compute @workgroup_size(16, 16, 1)
 fn main(
     @builtin(workgroup_id) wg_id: vec3<u32>,
-    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(num_workgroups) num_wg: vec3<u32>,
 ) {
-    let tid = local_id.x;
+    let tid = lid.y * 16u + lid.x;
 
     let tiles_m = (params.m + TM - 1u) / TM;
     let tiles_n = (params.n + TN - 1u) / TN;
@@ -80,69 +90,50 @@ fn main(
     let src0_batch = params.offset_src0 + src03_idx * params.stride_03 + src02_idx * params.stride_02;
     let src1_batch = params.offset_src1 + src13_idx * params.stride_13 + src12_idx * params.stride_12;
 
-    // Accumulator C = A * B style in coop roles: we multiply left=src0 rows, right=src1.
-    // Using role C for acc, A for src0 tile, B for src1 tile.
-    var acc: coop_mat8x8<f32, C>;
-    // Zero by loading a zeroed tile once at start.
-    if (tid < 64u) {
-        tile_a[tid] = 0.0;
-    }
+    tile_c[tid] = 0.0;
     workgroupBarrier();
-    acc = coopLoad<coop_mat8x8<f32, C>>(&tile_a[0], 8u);
+    var acc = coopLoadT<coop_mat16x16<f32, C>>(&tile_c[0], 16u);
 
     for (var k0 = 0u; k0 < params.k; k0 += TK) {
-        // Fill 8x8 tiles (64 elems) with 32 threads × 2 loads.
-        for (var i = 0u; i < 2u; i++) {
-            let elem = tid * 2u + i;
-            let r = elem / TK;
-            let c = elem % TK;
-            let gr0 = row_base + r;
-            let gk = k0 + c;
-            var v0 = 0.0;
-            if (gr0 < params.m && gk < params.k) {
-                v0 = src0[src0_batch + gr0 * params.stride_01 + gk * params.stride_0k];
-            }
-            tile_a[r * TK + c] = v0;
+        let r = tid / TK;
+        let c = tid % TK;
 
-            let gr1 = col_base + r;
-            var v1 = 0.0;
-            if (gr1 < params.n && gk < params.k) {
-                v1 = src1[src1_batch + gr1 * params.stride_11 + gk * params.stride_1k];
-            }
-            tile_b[r * TK + c] = v1;
+        let gr_n = row_base + r;
+        let gk = k0 + c;
+        var v_bt: f16 = 0.0h;
+        if (gr_n < params.m && gk < params.k) {
+            v_bt = f16(src0[src0_batch + gr_n * params.stride_01 + gk * params.stride_0k]);
         }
+        tile_bt[r * TK + c] = v_bt;
+
+        let gr_m = col_base + r;
+        var v_a: f16 = 0.0h;
+        if (gr_m < params.n && gk < params.k) {
+            v_a = f16(src1[src1_batch + gr_m * params.stride_11 + gk * params.stride_1k]);
+        }
+        tile_a[r * TK + c] = v_a;
+
         workgroupBarrier();
 
-        let a_mat = coopLoad<coop_mat8x8<f32, A>>(&tile_a[0], 8u);
-        // B is loaded as transposed relative to row-major K-inner storage so
-        // MMA does (8xm)×(kx8) correctly: tile_b is row=global_n, col=k → load T.
-        let b_mat = coopLoadT<coop_mat8x8<f32, B>>(&tile_b[0], 8u);
+        let a_mat = coopLoadT<coop_mat16x16<f16, A>>(&tile_bt[0], 16u);
+        let b_mat = coopLoad<coop_mat16x16<f16, B>>(&tile_a[0], 16u);
         acc = coopMultiplyAdd(a_mat, b_mat, acc);
 
         workgroupBarrier();
     }
 
-    // Store acc into tile_a then scatter to dst.
-    coopStore(acc, &tile_a[0], 8u);
+    coopStoreT(acc, &tile_c[0], 16u);
     workgroupBarrier();
 
     let dst2_stride = params.m * params.n;
     let dst3_stride = dst2_stride * params.bs02 * params.broadcast2;
     let dst_batch = params.offset_dst + dst3_idx * dst3_stride + dst2_idx * dst2_stride;
 
-    for (var i = 0u; i < 2u; i++) {
-        let elem = tid * 2u + i;
-        let r = elem % TM; // row along params.m
-        let c = elem / TM; // col along params.n  — depends on store layout
-        // coopStore writes row-major with stride 8: index = row * 8 + col
-        // We stored with stride 8 as (row_m, col_n) → idx = r * 8 + c if r is row.
-        // Parse as row-major: r = elem / 8, c = elem % 8
-        let rr = elem / TN;
-        let cc = elem % TN;
-        let global_row = row_base + rr;
-        let global_col = col_base + cc;
-        if (global_row < params.m && global_col < params.n) {
-            dst[dst_batch + global_col * params.m + global_row] = tile_a[rr * TN + cc];
-        }
+    let n_local = tid / TN;
+    let m_local = tid % TN;
+    let global_row = row_base + n_local;
+    let global_col = col_base + m_local;
+    if (global_row < params.m && global_col < params.n) {
+        dst[dst_batch + global_col * params.m + global_row] = tile_c[n_local * TN + m_local];
     }
 }
