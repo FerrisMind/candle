@@ -1,9 +1,11 @@
-//! Microbench: dense F32 matmul latency for CUDA / Vulkan / WGPU.
+//! Microbench: CUDA / Vulkan / WGPU steady-state latency.
 //!
 //! Reports:
-//! - `sync`: one matmul + device.synchronize() per sample (steady-state, cold host path)
-//! - `batch`: N matmuls then one synchronize; per-matmul = total/N (amortized host)
-use candle_core::{Device, DType, Result, Tensor};
+//! - `sync`: one op + device.synchronize() per sample
+//! - `batch`: N ops then one synchronize; per-op = total/N
+//!
+//! Default: dense F32 matmul shapes. Pass `--suite` for unary/binary/softmax too.
+use candle_core::{D, Device, DType, Result, Tensor};
 use std::time::Instant;
 
 fn median_ms(mut v: Vec<f64>) -> f64 {
@@ -11,17 +13,18 @@ fn median_ms(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
-fn bench_matmul_sync(dev: &Device, m: usize, n: usize, k: usize, iters: usize) -> Result<f64> {
-    let a = Tensor::randn(0f32, 1.0, (m, k), dev)?;
-    let b = Tensor::randn(0f32, 1.0, (k, n), dev)?;
+fn bench_op_sync<F>(dev: &Device, iters: usize, mut f: F) -> Result<f64>
+where
+    F: FnMut() -> Result<Tensor>,
+{
     for _ in 0..5 {
-        let _ = a.matmul(&b)?;
+        let _ = f()?;
         dev.synchronize()?;
     }
     let mut times = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t0 = Instant::now();
-        let c = a.matmul(&b)?;
+        let c = f()?;
         dev.synchronize()?;
         let _ = c.dtype();
         times.push(t0.elapsed().as_secs_f64() * 1000.0);
@@ -29,29 +32,21 @@ fn bench_matmul_sync(dev: &Device, m: usize, n: usize, k: usize, iters: usize) -
     Ok(median_ms(times))
 }
 
-fn bench_matmul_batch(
-    dev: &Device,
-    m: usize,
-    n: usize,
-    k: usize,
-    iters: usize,
-    batch: usize,
-) -> Result<f64> {
-    let a = Tensor::randn(0f32, 1.0, (m, k), dev)?;
-    let b = Tensor::randn(0f32, 1.0, (k, n), dev)?;
+fn bench_op_batch<F>(dev: &Device, iters: usize, batch: usize, mut f: F) -> Result<f64>
+where
+    F: FnMut() -> Result<Tensor>,
+{
     for _ in 0..3 {
         for _ in 0..batch {
-            let _ = a.matmul(&b)?;
+            let _ = f()?;
         }
         dev.synchronize()?;
     }
     let mut times = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t0 = Instant::now();
-        // Drop each result immediately so we measure kernel+dispatch, not
-        // allocator pressure from retaining `batch` full outputs.
         for _ in 0..batch {
-            let c = a.matmul(&b)?;
+            let c = f()?;
             std::mem::drop(c);
         }
         dev.synchronize()?;
@@ -60,35 +55,75 @@ fn bench_matmul_batch(
     Ok(median_ms(times))
 }
 
-fn run_backend(name: &str, dev: &Device, shapes: &[(usize, usize, usize)], iters: usize) -> Result<()> {
+fn emit(name: &str, op: &str, mode: &str, ms: f64) {
+    println!("{name},{op},{mode},{ms:.4}");
+}
+
+fn run_matmul(name: &str, dev: &Device, shapes: &[(usize, usize, usize)], iters: usize) -> Result<()> {
     let batch = 20usize;
     for &(m, n, k) in shapes {
-        let sync_ms = bench_matmul_sync(dev, m, n, k, iters)?;
-        let batch_ms = bench_matmul_batch(dev, m, n, k, iters, batch)?;
-        println!("{name},{m},{n},{k},sync,{sync_ms:.4}");
-        println!("{name},{m},{n},{k},batch{batch},{batch_ms:.4}");
+        let a = Tensor::randn(0f32, 1.0, (m, k), dev)?;
+        let b = Tensor::randn(0f32, 1.0, (k, n), dev)?;
+        let tag = format!("matmul_{m}x{n}x{k}");
+        let sync_ms = bench_op_sync(dev, iters, || a.matmul(&b))?;
+        let batch_ms = bench_op_batch(dev, iters, batch, || a.matmul(&b))?;
+        emit(name, &tag, "sync", sync_ms);
+        emit(name, &tag, &format!("batch{batch}"), batch_ms);
     }
     Ok(())
 }
 
+fn run_suite_ops(name: &str, dev: &Device, iters: usize) -> Result<()> {
+    let batch = 20usize;
+    let x = Tensor::randn(0f32, 1.0, (1024, 1024), dev)?;
+    let y = Tensor::randn(0f32, 1.0, (1024, 1024), dev)?;
+    let sync_ms = bench_op_sync(dev, iters, || x.relu())?;
+    let batch_ms = bench_op_batch(dev, iters, batch, || x.relu())?;
+    emit(name, "relu_1024", "sync", sync_ms);
+    emit(name, "relu_1024", &format!("batch{batch}"), batch_ms);
+
+    let sync_ms = bench_op_sync(dev, iters, || x.mul(&y))?;
+    let batch_ms = bench_op_batch(dev, iters, batch, || x.mul(&y))?;
+    emit(name, "mul_1024", "sync", sync_ms);
+    emit(name, "mul_1024", &format!("batch{batch}"), batch_ms);
+
+    let sync_ms = bench_op_sync(dev, iters, || x.sum_keepdim(D::Minus1))?;
+    let batch_ms = bench_op_batch(dev, iters, batch, || x.sum_keepdim(D::Minus1))?;
+    emit(name, "sum_last_1024", "sync", sync_ms);
+    emit(name, "sum_last_1024", &format!("batch{batch}"), batch_ms);
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let suite = args.iter().any(|a| a == "--suite");
+    let matmul_only = args.iter().any(|a| a == "--matmul-only") || !suite;
     let shapes = [(256usize, 256, 256), (1024, 1024, 1024), (64, 4096, 4096)];
     let iters = 20usize;
-    println!("backend,m,n,k,mode,median_ms");
+    println!("backend,op,mode,median_ms");
+    let run = |name: &str, dev: &Device| -> Result<()> {
+        if matmul_only || suite {
+            run_matmul(name, dev, &shapes, iters)?;
+        }
+        if suite {
+            run_suite_ops(name, dev, iters)?;
+        }
+        Ok(())
+    };
     #[cfg(feature = "cuda")]
     {
         let cuda = Device::new_cuda(0)?;
-        run_backend("cuda", &cuda, &shapes, iters)?;
+        run("cuda", &cuda)?;
     }
     #[cfg(feature = "vulkan")]
     {
         let vk = Device::new_vulkan(0)?;
-        run_backend("vulkan", &vk, &shapes, iters)?;
+        run("vulkan", &vk)?;
     }
     #[cfg(feature = "wgpu")]
     {
         let wg = Device::new_wgpu(0)?;
-        run_backend("wgpu", &wg, &shapes, iters)?;
+        run("wgpu", &wg)?;
     }
     let _ = DType::F32;
     Ok(())

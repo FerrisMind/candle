@@ -549,9 +549,18 @@ struct WgpuInner {
     uniform_ring: Mutex<(Vec<wgpu::Buffer>, usize)>,
 }
 
+struct WgpuPendingDispatch {
+    pipeline: Arc<WgpuCachedPipeline>,
+    bind_group: wgpu::BindGroup,
+    workgroups: (u32, u32, u32),
+}
+
 struct WgpuActiveBatch {
     encoder: wgpu::CommandEncoder,
     retained_buffers: Vec<Arc<wgpu::Buffer>>,
+    /// Deferred dispatches encoded into one compute pass at flush time.
+    /// One pass per batch cuts WGPU host overhead vs begin/end pass per op.
+    pending_dispatches: Vec<WgpuPendingDispatch>,
     dispatch_count: u32,
 }
 
@@ -559,6 +568,7 @@ impl std::fmt::Debug for WgpuActiveBatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WgpuActiveBatch")
             .field("retained_buffers", &self.retained_buffers.len())
+            .field("pending_dispatches", &self.pending_dispatches.len())
             .field("dispatch_count", &self.dispatch_count)
             .finish_non_exhaustive()
     }
@@ -1113,6 +1123,7 @@ impl WgpuDevice {
         Ok(WgpuActiveBatch {
             encoder,
             retained_buffers: Vec::new(),
+            pending_dispatches: Vec::new(),
             dispatch_count: 0,
         })
     }
@@ -1154,12 +1165,34 @@ impl WgpuDevice {
             }
             return Ok(false);
         }
+        // Encode all deferred dispatches into a single compute pass.
+        let WgpuActiveBatch {
+            mut encoder,
+            retained_buffers,
+            pending_dispatches,
+            dispatch_count: _,
+        } = batch;
+        if !pending_dispatches.is_empty() {
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("candle-wgpu-batch-pass"),
+                    timestamp_writes: None,
+                });
+                for d in &pending_dispatches {
+                    pass.set_pipeline(&d.pipeline.pipeline);
+                    pass.set_bind_group(0, &d.bind_group, &[]);
+                    pass.dispatch_workgroups(d.workgroups.0, d.workgroups.1, d.workgroups.2);
+                }
+            }
+            // bind_groups + pipelines drop after pass ends
+            drop(pending_dispatches);
+        }
         let completed = Arc::new(AtomicBool::new(false));
         let done = completed.clone();
         self.inner
             .queue
             .on_submitted_work_done(move || done.store(true, Ordering::Release));
-        self.inner.queue.submit([batch.encoder.finish()]);
+        self.inner.queue.submit([encoder.finish()]);
         const MAX_IN_FLIGHT_SUBMISSIONS: usize = 32;
         let mut pending = self
             .inner
@@ -1176,7 +1209,7 @@ impl WgpuDevice {
                 .map_err(|e| Error::wrap(e.to_string()))?;
         }
         pending.push(WgpuPendingSubmission {
-            retained_buffers: batch.retained_buffers,
+            retained_buffers,
             completed,
         });
         let _ = reason;
@@ -1380,15 +1413,11 @@ impl WgpuDevice {
                 .as_mut()
                 .ok_or_else(|| Error::msg("wgpu active batch missing after ensure"))?;
             Self::retain_buffers_into(batch, retained_buffers);
-            let mut pass = batch
-                .encoder
-                .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some(label),
-                    timestamp_writes: None,
-                });
-            pass.set_pipeline(&cached.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+            batch.pending_dispatches.push(WgpuPendingDispatch {
+                pipeline: cached,
+                bind_group,
+                workgroups,
+            });
             batch.dispatch_count += 1;
         }
         Ok(())
