@@ -8441,10 +8441,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     && params.stride_1k == 1;
                 if coop_ok {
                     use_warptile = true;
-                    // 128×64 dual-MMA + dbuf for large squares and tall/wide.
-                    // Rejected on RTX 3060 vs dual (tall): coop64@512, BK64@512,
-                    // pad N-coalesce, materialize Bᵀ, Vulkan-style 128-thread
-                    // 64×64 BK=64 (~2×), K-panel=32 dual (~2×).
+                    // 128×64 dual-MMA + dbuf K-major virtual-Bᵀ (best on RTX 3060).
+                    // Rejected vs dual for tall: coop64@512, BK64 panels, pad
+                    // N-coalesce, materialize Bᵀ (~6×), Vulkan-style 128-thread
+                    // 64×64 (~2×), K-panel=32 (~2×), N-major BT shared (~1.7×).
                     if m.max(n) >= 512 && m.min(n) >= 64 {
                         matmul_label = "candle-wgpu-matmul-coop";
                         candle_wgpu_kernels::matmul_coop_shader().ok_or_else(|| {
