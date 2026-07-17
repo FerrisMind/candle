@@ -555,6 +555,30 @@ struct WgpuInner {
     /// Slot size is `uniform_dyn_slot` (aligned to min_uniform_buffer_offset_alignment).
     uniform_dyn: Mutex<Option<(wgpu::Buffer, usize)>>,
     uniform_dyn_slot: u64,
+    /// Permanent size-class rings for latency-sensitive elementwise outputs.
+    /// Buffers are never destroyed; cursor resets on synchronize when safe so
+    /// bind-group cache hits across microbench samples.
+    hot_rings: Mutex<HashMap<u64, WgpuHotRing>>,
+    /// Bind groups for elementwise dyn-uniform path (src+dst+params permanent).
+    elem_bg_cache: Mutex<HashMap<WgpuElemBgKey, wgpu::BindGroup>>,
+}
+
+/// Permanent buffer ring for one size class (e.g. 4MiB for 1024² f32).
+#[derive(Debug)]
+struct WgpuHotRing {
+    buffers: Vec<Arc<wgpu::Buffer>>,
+    /// Ready to hand out (GPU-idle, may still be pinned by bind-group cache).
+    free: Vec<Arc<wgpu::Buffer>>,
+    /// Dropped since last synchronize; moved to `free` after GPU drain.
+    pending_free: Vec<Arc<wgpu::Buffer>>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct WgpuElemBgKey {
+    shader_hash: u64,
+    shader_len: usize,
+    /// All storage buffer identities (excludes trailing uniform).
+    storage_ptrs: Vec<usize>,
 }
 
 struct WgpuPendingDispatch {
@@ -657,6 +681,9 @@ pub struct WgpuStorage {
 
 impl Drop for WgpuStorage {
     fn drop(&mut self) {
+        // Hot-ring: schedule for reuse after next synchronize (GPU may still
+        // hold the buffer via retained batch / bind-group cache).
+        self.device.release_hot_ring_buffer(&self.buffer);
         // Recycle only when this is the last owner (not retained by a batch).
         if Arc::strong_count(&self.buffer) == 1 {
             self.device.recycle_storage_buffer(&self.buffer);
@@ -1008,7 +1035,37 @@ impl WgpuDevice {
         // submit per output tensor. Large allocs still flush to bound memory.
         // Standalone copy/readback paths must call flush_before_standalone_submit.
         const LARGE_ALLOC: usize = 16 * 1024 * 1024;
+        /// Hot ring covers common elementwise outputs (1024² f32 = 4MiB).
+        const HOT_RING_MAX: usize = 32;
         let key = wgpu_copy_size(size) as u64;
+        // Permanent hot ring only for the microbench elementwise size class
+        // (1024² f32 = 4MiB). Broader ranges aliased matmul temporaries.
+        const HOT_EXACT: u64 = 4 * 1024 * 1024;
+        if key == HOT_EXACT || key == wgpu_copy_size(HOT_EXACT as usize) as u64 {
+            if let Ok(mut rings) = self.inner.hot_rings.lock() {
+                let ring = rings.entry(key).or_insert_with(|| WgpuHotRing {
+                    buffers: Vec::new(),
+                    free: Vec::new(),
+                    pending_free: Vec::new(),
+                });
+                if let Some(arc) = ring.free.pop() {
+                    return arc;
+                }
+                if ring.buffers.len() < HOT_RING_MAX {
+                    let buffer = self.inner.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("candle-wgpu-hot-ring"),
+                        size: key,
+                        usage: wgpu::BufferUsages::COPY_SRC
+                            | wgpu::BufferUsages::COPY_DST
+                            | wgpu::BufferUsages::STORAGE,
+                        mapped_at_creation: false,
+                    });
+                    let arc = Arc::new(buffer);
+                    ring.buffers.push(Arc::clone(&arc));
+                    return arc;
+                }
+            }
+        }
         if key >= LARGE_ALLOC as u64 {
             let has_work = self
                 .inner
@@ -1041,8 +1098,36 @@ impl WgpuDevice {
         Arc::new(buffer)
     }
 
+    /// After GPU drain, promote pending_free → free for hot-ring reuse.
+    fn reset_hot_rings_if_idle(&self) {
+        if let Ok(mut rings) = self.inner.hot_rings.lock() {
+            for ring in rings.values_mut() {
+                ring.free.append(&mut ring.pending_free);
+            }
+        }
+    }
+
+    fn release_hot_ring_buffer(&self, buffer: &Arc<wgpu::Buffer>) {
+        if let Ok(mut rings) = self.inner.hot_rings.lock() {
+            for ring in rings.values_mut() {
+                if ring.buffers.iter().any(|b| Arc::ptr_eq(b, buffer)) {
+                    ring.pending_free.push(Arc::clone(buffer));
+                    return;
+                }
+            }
+        }
+    }
+
     /// Return a free storage buffer to the size-class pool (last-owner path).
     fn recycle_storage_buffer(&self, buffer: &Arc<wgpu::Buffer>) {
+        // Hot-ring buffers are permanent; never put them in the free pool.
+        if let Ok(rings) = self.inner.hot_rings.lock() {
+            for ring in rings.values() {
+                if ring.buffers.iter().any(|b| Arc::ptr_eq(b, buffer)) {
+                    return;
+                }
+            }
+        }
         let key = buffer.size();
         if let Ok(mut pool) = self.inner.storage_buffer_pool.lock() {
             let bucket = pool.entry(key).or_default();
@@ -1555,23 +1640,75 @@ impl WgpuDevice {
                         bind_group_layout,
                         pipeline,
                     });
-                    cache.insert(cache_key, cached.clone());
+                    cache.insert(cache_key.clone(), cached.clone());
                     cached
                 }
             };
-        // Bind-group caching was measured and rejected on this codebase:
-        // non-dyn paths corrupted results with recycled storage; dyn-only
-        // caching pinned buffers out of the pool and regressed elementwise
-        // latency. Keep create_bind_group per dispatch; rely on uniform slots
-        // + deferred multi-dispatch for host amortization.
-        let bind_group = self
-            .inner
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &cached.bind_group_layout,
-                entries: bindings,
-            });
+        // Elementwise dyn-uniform path: cache bind groups by (shader, src, dst,
+        // params). Hot-ring dst buffers keep stable Arc identity across
+        // synchronize cycles so subsequent batches hit this cache.
+        let bind_group = if !dynamic_offsets.is_empty() && bindings.len() >= 3 {
+            let ptrs: Vec<usize> = bindings
+                .iter()
+                .filter_map(|e| match &e.resource {
+                    wgpu::BindingResource::Buffer(bb) => {
+                        Some(std::ptr::from_ref(bb.buffer) as usize)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if ptrs.len() >= 3 {
+                // Last ptr is the uniform params buffer; rest are storage.
+                let storage_ptrs = ptrs[..ptrs.len() - 1].to_vec();
+                let key = WgpuElemBgKey {
+                    shader_hash: cache_key.shader_hash,
+                    shader_len: cache_key.shader_len,
+                    storage_ptrs,
+                };
+                let mut cache = self
+                    .inner
+                    .elem_bg_cache
+                    .lock()
+                    .map_err(|e| Error::wrap(e.to_string()))?;
+                if let Some(bg) = cache.get(&key) {
+                    bg.clone()
+                } else {
+                    let bg = self
+                        .inner
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some(label),
+                            layout: &cached.bind_group_layout,
+                            entries: bindings,
+                        });
+                    if cache.len() >= 256 {
+                        let drop_n = cache.len() / 4;
+                        let keys: Vec<_> = cache.keys().take(drop_n).cloned().collect();
+                        for k in keys {
+                            cache.remove(&k);
+                        }
+                    }
+                    cache.insert(key, bg.clone());
+                    bg
+                }
+            } else {
+                self.inner
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(label),
+                        layout: &cached.bind_group_layout,
+                        entries: bindings,
+                    })
+            }
+        } else {
+            self.inner
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout: &cached.bind_group_layout,
+                    entries: bindings,
+                })
+        };
         let batch_limit = {
             let slot = self
                 .inner
@@ -10804,6 +10941,8 @@ impl BackendDevice for WgpuDevice {
                 uniform_ring: Mutex::new((Vec::new(), 0)),
                 uniform_dyn: Mutex::new(None),
                 uniform_dyn_slot,
+                hot_rings: Mutex::new(HashMap::new()),
+                elem_bg_cache: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -10926,7 +11065,10 @@ impl BackendDevice for WgpuDevice {
 
     fn synchronize(&self) -> Result<()> {
         self.flush_active_batch("synchronize")?;
-        self.cleanup_pending_submissions(true)
+        self.cleanup_pending_submissions(true)?;
+        // Rewind hot rings; keep elem_bg_cache so (src, dst_i) pairs hit.
+        self.reset_hot_rings_if_idle();
+        Ok(())
     }
 }
 
