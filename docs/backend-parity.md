@@ -2,8 +2,24 @@
 
 Date: 2026-07-17  
 Baseline CUDA commit: `b51db4c11751ee1e765398b1847e73f151a5e412`  
+Work branch tip (perf): see `git rev-parse HEAD` on `feat/vulkan-webgpu-cuda-parity`  
 Machine-readable inventory: [`backend-parity-manifest.json`](./backend-parity-manifest.json)  
 Related snapshots: [`../cuda-wgpu-vulkan-parity-matrix.md`](../cuda-wgpu-vulkan-parity-matrix.md), [`../wgpu-vulkan-parity-audit.md`](../wgpu-vulkan-parity-audit.md)
+
+## Perf snapshot (RTX 3060, release, batch20 median_ms)
+
+Harness: `cargo run -p candle-core --example backend_parity_microbench --features cuda,vulkan,wgpu --release -- --suite`
+
+| op | CUDA | Vulkan | WGPU | Vulkan×CUDA | WGPU×CUDA |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| matmul 256³ | 0.032 | 0.021 | 0.030 | 0.66 ✓ | 0.93 ✓ |
+| matmul 1024³ | 0.306 | 0.211 | 0.238 | 0.69 ✓ | 0.78 ✓ |
+| matmul 64×4096×4096 | 0.283 | 0.254 | 0.350 | 0.90 ✓ | **1.24** |
+| relu 1024² | 0.035 | 0.035 | 0.106 | 1.01 ✓ | **3.05** |
+| mul 1024² | 0.045 | 0.049 | 0.136 | 1.09 ✓ | **3.05** |
+| sum_last 1024² | 0.100 | 0.024 | 0.038 | 0.24 ✓ | 0.38 ✓ |
+
+✓ = ≤1.10× CUDA. WGPU elementwise gap is host `create_bind_group` per unique dst (bind-group cache and storage arena prototypes measured; arena needs full `byte_offset` plumbing before re-enable).
 
 ## Scope
 
