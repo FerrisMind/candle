@@ -1,8 +1,7 @@
 // Dense F32 GEMM via wgpu cooperative matrix (Ampere+ Vulkan).
 // Hardware: 16x16 f16 A/B, f32 C (RTX 3060 cooperative_matrix_properties).
 //
-// Workgroup = 512 threads = 16 warps. Each warp owns one 16x16 output tile
-// inside a 64x64 (params.m x params.n) block:
+// Workgroup = 512 threads = 16 warps, 64x64 output block (best measured):
 //   ti = sg % 4, tj = sg / 4
 // Shared K-panels loaded by all lanes; each warp MMAs its C tile.
 //
