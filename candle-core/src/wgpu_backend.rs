@@ -552,9 +552,17 @@ struct WgpuInner {
     uniform_ring: Mutex<(Vec<wgpu::Buffer>, usize)>,
 }
 
+struct WgpuPendingDispatch {
+    pipeline: Arc<WgpuCachedPipeline>,
+    bind_group: wgpu::BindGroup,
+    workgroups: (u32, u32, u32),
+}
+
 struct WgpuActiveBatch {
     encoder: wgpu::CommandEncoder,
     retained_buffers: Vec<Arc<wgpu::Buffer>>,
+    /// Compute dispatches held until encode_pending_dispatches (one pass).
+    pending_dispatches: Vec<WgpuPendingDispatch>,
     dispatch_count: u32,
 }
 
@@ -562,6 +570,7 @@ impl std::fmt::Debug for WgpuActiveBatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WgpuActiveBatch")
             .field("retained_buffers", &self.retained_buffers.len())
+            .field("pending_dispatches", &self.pending_dispatches.len())
             .field("dispatch_count", &self.dispatch_count)
             .finish_non_exhaustive()
     }
@@ -962,11 +971,20 @@ impl WgpuDevice {
         }
     }
 
-    /// Flush the active compute batch before any standalone `queue.submit`.
-    /// Without this, copies / staging submits race unsubmitted compute and
-    /// produce zeros. Alloc itself does NOT flush — that was the main host
-    /// tax for elementwise batching.
+    /// Encode deferred computes then submit the active batch before any
+    /// standalone `queue.submit`. Without this, copies race unsubmitted work.
     fn flush_before_standalone_submit(&self) -> Result<()> {
+        // Encode any deferred dispatches onto the encoder first, then submit.
+        {
+            let mut slot = self
+                .inner
+                .active_batch
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            if let Some(batch) = slot.as_mut() {
+                Self::encode_pending_dispatches(batch);
+            }
+        }
         let _ = self.flush_active_batch("standalone_submit")?;
         Ok(())
     }
@@ -1170,8 +1188,30 @@ impl WgpuDevice {
         Ok(WgpuActiveBatch {
             encoder,
             retained_buffers: Vec::new(),
+            pending_dispatches: Vec::new(),
             dispatch_count: 0,
         })
+    }
+
+    /// Fold deferred computes into one compute pass on the batch encoder.
+    fn encode_pending_dispatches(batch: &mut WgpuActiveBatch) {
+        if batch.pending_dispatches.is_empty() {
+            return;
+        }
+        {
+            let mut pass = batch
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("candle-wgpu-batch-pass"),
+                    timestamp_writes: None,
+                });
+            for d in &batch.pending_dispatches {
+                pass.set_pipeline(&d.pipeline.pipeline);
+                pass.set_bind_group(0, &d.bind_group, &[]);
+                pass.dispatch_workgroups(d.workgroups.0, d.workgroups.1, d.workgroups.2);
+            }
+        }
+        batch.pending_dispatches.clear();
     }
 
     fn retain_buffers_into(batch: &mut WgpuActiveBatch, buffers: Vec<Arc<wgpu::Buffer>>) {
@@ -1200,7 +1240,7 @@ impl WgpuDevice {
         let Some(batch) = batch else {
             return Ok(false);
         };
-        if batch.dispatch_count == 0 {
+        if batch.dispatch_count == 0 && batch.pending_dispatches.is_empty() {
             let mut slot = self
                 .inner
                 .active_batch
@@ -1211,6 +1251,8 @@ impl WgpuDevice {
             }
             return Ok(false);
         }
+        let mut batch = batch;
+        Self::encode_pending_dispatches(&mut batch);
         let completed = Arc::new(AtomicBool::new(false));
         let done = completed.clone();
         self.inner
@@ -1439,20 +1481,13 @@ impl WgpuDevice {
                 .as_mut()
                 .ok_or_else(|| Error::msg("wgpu active batch missing after ensure"))?;
             Self::retain_buffers_into(batch, retained_buffers);
-            // Encode each dispatch immediately so copies/other encoder ops stay
-            // correctly ordered. Submit batching (no small-alloc flush) still
-            // amortizes queue.submit across many ops.
-            {
-                let mut pass = batch
-                    .encoder
-                    .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some(label),
-                        timestamp_writes: None,
-                    });
-                pass.set_pipeline(&cached.pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
-            }
+            // Defer into one compute pass at encode/flush time — fewer
+            // begin_compute_pass calls on elementwise batches.
+            batch.pending_dispatches.push(WgpuPendingDispatch {
+                pipeline: cached,
+                bind_group,
+                workgroups,
+            });
             batch.dispatch_count += 1;
         }
         Ok(())
