@@ -9,23 +9,24 @@ Related snapshots: [`../cuda-wgpu-vulkan-parity-matrix.md`](../cuda-wgpu-vulkan-
 ## Perf snapshot (RTX 3060, release, batch20 median_ms)
 
 Harness: `cargo run -p candle-core --example backend_parity_microbench --features cuda,vulkan,wgpu --release -- --suite`  
-Evidence: SCRATCH `bench-suite-hostpath-final.log` / tip `c297335e` (+ later comment-only commits).
+Evidence: SCRATCH `bench-suite-immediates-ok.log` / tip `git rev-parse HEAD`.
 
 | op | CUDA | Vulkan | WGPU | Vulkan×CUDA | WGPU×CUDA |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| matmul 256³ | ~0.031 | ~0.021 | ~0.023 | **0.7 ✓** | **0.75 ✓** |
-| matmul 1024³ | ~0.30 | ~0.21 | ~0.22 | **0.7 ✓** | **0.74 ✓** |
-| matmul 64×4096×4096 | ~0.28 | ~0.25 | ~0.34 | **0.90 ✓** | **~1.20** |
-| relu 1024² | ~0.035 | ~0.035 | ~0.038 | **1.01 ✓** | **~1.09 ✓** |
-| mul 1024² | ~0.044 | ~0.048 | ~0.050 | **1.09 ✓** | **~1.13** |
-| sum_last 1024² | ~0.10 | ~0.023 | ~0.038 | **0.23 ✓** | **0.38 ✓** |
+| matmul 256³ | ~0.019 | ~0.022 | ~0.024 | **~1.1 ✓** | **~1.2** |
+| matmul 1024³ | ~0.32 | ~0.22 | ~0.23 | **0.7 ✓** | **0.72 ✓** |
+| matmul 64×4096×4096 | ~0.29 | ~0.26 | ~0.34 | **0.90 ✓** | **~1.20** |
+| relu 1024² | ~0.034 | ~0.038 | ~0.036 | **~1.1 ✓** | **~1.05 ✓** |
+| mul 1024² | ~0.043 | ~0.051 | ~0.049 | **~1.2** | **~1.13** |
+| sum_last 1024² | ~0.10 | ~0.025 | ~0.039 | **0.25 ✓** | **0.39 ✓** |
 
 ✓ = ≤1.10× CUDA.
 
-**WGPU elementwise:** host path fixed in `c297335e` — cache preprocessed unary/binary WGSL
-(`Arc<str>` by op+dtype) + atomic dyn-uniform ring cursor. Prior residual ~3× was
-**rebuild/preprocess of WGSL every dispatch**, not GPU. Remaining mul ~1.13× is
-near-threshold host enqueue tax. Smoke 84/84 after change.
+**WGPU elementwise:** (1) cache preprocessed unary/binary WGSL (`c297335e`);
+(2) atomic dyn-uniform cursor + stack deferred payloads; (3) `Features::IMMEDIATES`
++ `var<immediate>` params when the adapter allows ≥80 B, eliminating per-op
+uniform `write_buffer`. Prior residual ~3× was **rebuild/preprocess of WGSL
+every dispatch**. relu now ~1.05×; mul ~1.13× residual host enqueue. Smoke 84/84.
 
 **WGPU tall GEMM (~1.20×):** dual-MMA coop still best on RTX 3060. Rejected:
 coop64-for-skinny, BK=64 multi-MMA panel, N-coalesced BT loads, 128×32/256-thread

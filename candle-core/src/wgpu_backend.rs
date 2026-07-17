@@ -589,12 +589,14 @@ struct WgpuPendingDispatch {
     pipeline: Arc<WgpuCachedPipeline>,
     bind_group: wgpu::BindGroup,
     workgroups: (u32, u32, u32),
-    /// Pre-resolved dynamic offsets (storage + uniform). When
-    /// `deferred_uniform_len > 0`, the last slot is filled at encode time.
+    /// Pre-resolved dynamic offsets (storage + uniform). Empty when using
+    /// immediates (`use_immediates`).
     dynamic_offsets: smallvec::SmallVec<[u32; 4]>,
-    /// Stack-friendly deferred uniform payload (slot ≤ 256). len=0 means none.
+    /// Stack-friendly deferred uniform/immediate payload (≤ 256). len=0 = none.
     deferred_uniform: [u8; 256],
     deferred_uniform_len: u16,
+    /// When true, write payload via `set_immediates` instead of dyn uniform.
+    use_immediates: bool,
 }
 
 struct WgpuActiveBatch {
@@ -648,6 +650,7 @@ struct WgpuPipelineCacheKey {
     shader_hash: u64,
     shader_len: usize,
     entries: Vec<(u32, WgpuBindingKindKey)>,
+    immediate_size: u32,
 }
 
 fn wgpu_shader_cache_key(shader: &str) -> (u64, usize) {
@@ -1393,9 +1396,8 @@ impl WgpuDevice {
         if batch.pending_dispatches.is_empty() {
             return;
         }
-        // Bulk-write deferred uniforms: coalesce consecutive ring slots into
-        // one queue.write_buffer when possible (elementwise batch20 common case).
-        // Ring cursor is monotonic, so pending slots are already in offset order.
+        // Bulk-write deferred uniforms (non-immediate): coalesce consecutive
+        // ring slots. Ring cursor is monotonic → already offset-ordered.
         let slot = device.inner.uniform_dyn_slot as usize;
         if let Ok(guard) = device.inner.uniform_dyn.lock() {
             if let Some(ref ubuf) = *guard {
@@ -1403,7 +1405,7 @@ impl WgpuDevice {
                 let n = batch.pending_dispatches.len();
                 while i < n {
                     let d0 = &batch.pending_dispatches[i];
-                    if d0.deferred_uniform_len == 0 {
+                    if d0.deferred_uniform_len == 0 || d0.use_immediates {
                         i += 1;
                         continue;
                     }
@@ -1414,7 +1416,7 @@ impl WgpuDevice {
                     let mut j = i + 1;
                     while j < n {
                         let dj = &batch.pending_dispatches[j];
-                        if dj.deferred_uniform_len == 0 {
+                        if dj.deferred_uniform_len == 0 || dj.use_immediates {
                             break;
                         }
                         let off = *dj.dynamic_offsets.last().unwrap_or(&0) as u64;
@@ -1448,7 +1450,13 @@ impl WgpuDevice {
                     pass.set_pipeline(&d.pipeline.pipeline);
                     last_pipe = pipe_key;
                 }
-                pass.set_bind_group(0, &d.bind_group, &d.dynamic_offsets);
+                if d.use_immediates && d.deferred_uniform_len > 0 {
+                    let n = d.deferred_uniform_len as usize;
+                    pass.set_immediates(0, &d.deferred_uniform[..n]);
+                    pass.set_bind_group(0, &d.bind_group, &[]);
+                } else {
+                    pass.set_bind_group(0, &d.bind_group, &d.dynamic_offsets);
+                }
                 pass.dispatch_workgroups(d.workgroups.0, d.workgroups.1, d.workgroups.2);
             }
         }
@@ -1621,6 +1629,32 @@ impl WgpuDevice {
         deferred_uniform_bytes: Option<&[u8]>,
         label: &'static str,
     ) -> Result<()> {
+        self.run_compute_xyz_ex(
+            shader,
+            entries,
+            bindings,
+            workgroups,
+            dynamic_offsets,
+            deferred_uniform_bytes,
+            0,
+            false,
+            label,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_compute_xyz_ex(
+        &self,
+        shader: &str,
+        entries: &[wgpu::BindGroupLayoutEntry],
+        bindings: &[wgpu::BindGroupEntry<'_>],
+        workgroups: (u32, u32, u32),
+        dynamic_offsets: &[u32],
+        deferred_uniform_bytes: Option<&[u8]>,
+        immediate_size: u32,
+        use_immediates: bool,
+        label: &'static str,
+    ) -> Result<()> {
         let (shader_hash, shader_len) = wgpu_shader_cache_key(shader);
         let entry_keys: Vec<(u32, WgpuBindingKindKey)> = entries
             .iter()
@@ -1653,6 +1687,7 @@ impl WgpuDevice {
             shader_hash,
             shader_len,
             entries: entry_keys,
+            immediate_size,
         };
         let cached = {
             let mut cache = self
@@ -1683,7 +1718,7 @@ impl WgpuDevice {
                         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                             label: Some(label),
                             bind_group_layouts: &[Some(&bind_group_layout)],
-                            immediate_size: 0,
+                            immediate_size,
                         });
                 let pipeline =
                     self.inner
@@ -1704,10 +1739,11 @@ impl WgpuDevice {
                 cached
             }
         };
-        // Elementwise dyn-uniform path: cache bind groups by (shader, src, dst,
-        // params). Hot-ring dst buffers keep stable Arc identity across
-        // synchronize cycles so subsequent batches hit this cache.
-        let bind_group = if !dynamic_offsets.is_empty() && bindings.len() >= 3 {
+        // Elementwise path: cache bind groups by (shader, storage ptrs).
+        // Dyn-uniform: storage + trailing uniform. Immediates: storage only.
+        let cacheable = use_immediates
+            || (!dynamic_offsets.is_empty() && bindings.len() >= 3);
+        let bind_group = if cacheable {
             let ptrs: Vec<usize> = bindings
                 .iter()
                 .filter_map(|e| match &e.resource {
@@ -1720,9 +1756,15 @@ impl WgpuDevice {
                     }
                 })
                 .collect();
-            if ptrs.len() >= 3 {
+            let storage_ptrs = if use_immediates {
+                ptrs
+            } else if ptrs.len() >= 3 {
                 // Last ptr is the uniform params buffer; rest are storage.
-                let storage_ptrs = ptrs[..ptrs.len() - 1].to_vec();
+                ptrs[..ptrs.len() - 1].to_vec()
+            } else {
+                Vec::new()
+            };
+            if !storage_ptrs.is_empty() {
                 let key = WgpuElemBgKey {
                     shader_hash,
                     shader_len,
@@ -1794,7 +1836,8 @@ impl WgpuDevice {
         self.ensure_active_batch()?;
         // Hot elementwise: BindGroup + CommandBuffer keep buffer lifetimes;
         // skip retain_from_bindings (registry lock + HashSet) on the warm path.
-        let skip_retain = deferred_uniform_bytes.is_some()
+        let skip_retain = use_immediates
+            || deferred_uniform_bytes.is_some()
             || (!dynamic_offsets.is_empty() && bindings.len() >= 3);
         let retained_buffers = if skip_retain {
             Vec::new()
@@ -1831,10 +1874,36 @@ impl WgpuDevice {
                 dynamic_offsets: dynamic_offsets.iter().copied().collect(),
                 deferred_uniform,
                 deferred_uniform_len,
+                use_immediates,
             });
             batch.dispatch_count += 1;
         }
         Ok(())
+    }
+
+    /// Elementwise hot path with `var<immediate>` params (no uniform buffer).
+    fn run_compute_linear_immediates(
+        &self,
+        shader: &str,
+        entries: &[wgpu::BindGroupLayoutEntry],
+        bindings: &[wgpu::BindGroupEntry<'_>],
+        total_items: u32,
+        immediate_bytes: &[u8],
+        immediate_size: u32,
+        label: &'static str,
+    ) -> Result<()> {
+        let (wg_x, wg_y) = linear_dispatch_workgroups(self, total_items);
+        self.run_compute_xyz_ex(
+            shader,
+            entries,
+            bindings,
+            (wg_x, wg_y, 1),
+            &[],
+            Some(immediate_bytes),
+            immediate_size,
+            true,
+            label,
+        )
     }
 
     /// Elementwise hot path: reserve uniform slot, defer the write until encode.
@@ -2033,6 +2102,36 @@ fn cached_shader_source(kind: u8, op: &str, dtype: DType, build: impl FnOnce() -
     Ok(s)
 }
 
+fn rewrite_params_to_immediate(source: &str) -> String {
+    // Stock unary/binary templates bind params as a uniform. When IMMEDIATES is
+    // available, drop group/binding and use var<immediate> (push-constant style).
+    let mut out = source.to_string();
+    // Match multi-line `@group(0) @binding(N)\nvar<uniform> params: Params;`
+    // or single-line variants. Be careful not to leave a stray `@group(0)`.
+    for binding in 0..8u32 {
+        for sep in ["\n", "\r\n", " "] {
+            let pattern =
+                format!("@group(0) @binding({binding}){sep}var<uniform> params: Params;");
+            if out.contains(&pattern) {
+                return out.replace(&pattern, "var<immediate> params: Params;");
+            }
+        }
+    }
+    // Fallback: strip any @group/@binding lines immediately before the uniform.
+    if let Some(start) = out.find("var<uniform> params: Params;") {
+        let before = &out[..start];
+        let line_start = before
+            .rfind("@group(0)")
+            .or_else(|| before.rfind("@binding"))
+            .unwrap_or(start);
+        out.replace_range(
+            line_start..start + "var<uniform> params: Params;".len(),
+            "var<immediate> params: Params;",
+        );
+    }
+    out
+}
+
 fn unary_shader(op: &str, dtype: DType) -> Result<Arc<str>> {
     cached_shader_source(0, op, dtype, || {
         if op == "recip" {
@@ -2072,6 +2171,13 @@ fn unary_shader(op: &str, dtype: DType) -> Result<Arc<str>> {
     })
 }
 
+fn unary_shader_immediate(op: &str, dtype: DType) -> Result<Arc<str>> {
+    cached_shader_source(2, op, dtype, || {
+        let base = unary_shader(op, dtype)?;
+        Ok(rewrite_params_to_immediate(&base))
+    })
+}
+
 fn binary_shader(op: &str, dtype: DType) -> Result<Arc<str>> {
     cached_shader_source(1, op, dtype, || {
         if dtype == DType::BF16 {
@@ -2104,6 +2210,13 @@ fn binary_shader(op: &str, dtype: DType) -> Result<Arc<str>> {
             wgpu_kernel_dtype(dtype)?,
             WG_SIZE,
         ))
+    })
+}
+
+fn binary_shader_immediate(op: &str, dtype: DType) -> Result<Arc<str>> {
+    cached_shader_source(3, op, dtype, || {
+        let base = binary_shader(op, dtype)?;
+        Ok(rewrite_params_to_immediate(&base))
     })
 }
 
@@ -4482,26 +4595,60 @@ impl WgpuStorage {
             _pad0: 0,
             _pad1: 0,
         };
-        let slot = self.device.inner.uniform_dyn_slot;
-        let param_buffer = self.device.uniform_dyn_buffer()?;
-        let entries = [
-            storage_entry(0, false),
-            storage_entry(1, false),
-            uniform_entry_dyn(2, slot),
-        ];
-        let bindings = [
-            buffer_binding(0, &self.buffer),
-            buffer_binding(1, &dst.buffer),
-            uniform_binding_dyn(2, &param_buffer, slot)?,
-        ];
-        self.device.run_compute_linear_deferred_uniform(
-            shader,
-            &entries,
-            &bindings,
-            count as u32,
-            any_as_bytes(&params),
-            label,
-        )?;
+        let param_bytes = any_as_bytes(&params);
+        let use_imm = self
+            .device
+            .inner
+            .features
+            .contains(wgpu::Features::IMMEDIATES)
+            && (param_bytes.len() as u32)
+                <= self.device.inner.limits.max_immediate_size
+            && !label.contains("clamp")
+            && !label.contains("fill");
+        if use_imm {
+            // Immediate path: storage-only bind group + set_immediates.
+            let imm_shader = if shader.contains("var<uniform> params") {
+                rewrite_params_to_immediate(shader)
+            } else {
+                shader.to_string()
+            };
+            let imm_size = (param_bytes.len() as u32).next_multiple_of(4).max(16);
+            let entries = [storage_entry(0, false), storage_entry(1, false)];
+            let bindings = [
+                buffer_binding(0, &self.buffer),
+                buffer_binding(1, &dst.buffer),
+            ];
+            self.device.run_compute_linear_immediates(
+                &imm_shader,
+                &entries,
+                &bindings,
+                count as u32,
+                param_bytes,
+                imm_size,
+                label,
+            )?;
+        } else {
+            let slot = self.device.inner.uniform_dyn_slot;
+            let param_buffer = self.device.uniform_dyn_buffer()?;
+            let entries = [
+                storage_entry(0, false),
+                storage_entry(1, false),
+                uniform_entry_dyn(2, slot),
+            ];
+            let bindings = [
+                buffer_binding(0, &self.buffer),
+                buffer_binding(1, &dst.buffer),
+                uniform_binding_dyn(2, &param_buffer, slot)?,
+            ];
+            self.device.run_compute_linear_deferred_uniform(
+                shader,
+                &entries,
+                &bindings,
+                count as u32,
+                param_bytes,
+                label,
+            )?;
+        }
         Ok(dst)
     }
 
@@ -10308,7 +10455,16 @@ impl BackendStorage for WgpuStorage {
             let (src, src_l) = self.materialize_rank_gt4_compact(layout)?;
             return src.unary_impl::<B>(&src_l);
         }
-        let shader = unary_shader(B::NAME, self.dtype)?;
+        let use_imm = self
+            .device
+            .inner
+            .features
+            .contains(wgpu::Features::IMMEDIATES);
+        let shader = if use_imm {
+            unary_shader_immediate(B::NAME, self.dtype)?
+        } else {
+            unary_shader(B::NAME, self.dtype)?
+        };
         self.run_unary_like(layout, &shader, "candle-wgpu-unary")
     }
     fn binary_impl<B: BinaryOpT>(
@@ -10432,35 +10588,70 @@ impl BackendStorage for WgpuStorage {
             b_ne3: rhs_dims[3],
             _pad0: 0,
         };
-        let slot = self.device.inner.uniform_dyn_slot;
-        let param_buffer = self.device.uniform_dyn_buffer()?;
-        let entries = [
-            storage_entry(0, false),
-            storage_entry(1, false),
-            storage_entry(2, false),
-            uniform_entry_dyn(3, slot),
-        ];
-        let bindings = [
-            buffer_binding(0, &self.buffer),
-            buffer_binding(1, &rhs.buffer),
-            buffer_binding(2, &dst.buffer),
-            uniform_binding_dyn(3, &param_buffer, slot)?,
-        ];
         let work_items = match self.dtype {
             DType::U8 => count.div_ceil(4),
             DType::BF16 => count.div_ceil(2),
             _ => count,
         };
-        match self.device.run_compute_linear_deferred_uniform(
-            &binary_shader(B::NAME, self.dtype)?,
-            &entries,
-            &bindings,
-            work_items as u32,
-            any_as_bytes(&params),
-            "candle-wgpu-binary",
-        ) {
-            Ok(()) => Ok(dst),
-            Err(err) => Err(err),
+        let param_bytes = any_as_bytes(&params);
+        let use_imm = self
+            .device
+            .inner
+            .features
+            .contains(wgpu::Features::IMMEDIATES)
+            && (param_bytes.len() as u32) <= self.device.inner.limits.max_immediate_size
+            && matches!(self.dtype, DType::F32 | DType::F16);
+        if use_imm {
+            let shader = binary_shader_immediate(B::NAME, self.dtype)?;
+            let imm_size = (param_bytes.len() as u32).next_multiple_of(4).max(16);
+            let entries = [
+                storage_entry(0, false),
+                storage_entry(1, false),
+                storage_entry(2, false),
+            ];
+            let bindings = [
+                buffer_binding(0, &self.buffer),
+                buffer_binding(1, &rhs.buffer),
+                buffer_binding(2, &dst.buffer),
+            ];
+            match self.device.run_compute_linear_immediates(
+                &shader,
+                &entries,
+                &bindings,
+                work_items as u32,
+                param_bytes,
+                imm_size,
+                "candle-wgpu-binary",
+            ) {
+                Ok(()) => Ok(dst),
+                Err(err) => Err(err),
+            }
+        } else {
+            let slot = self.device.inner.uniform_dyn_slot;
+            let param_buffer = self.device.uniform_dyn_buffer()?;
+            let entries = [
+                storage_entry(0, false),
+                storage_entry(1, false),
+                storage_entry(2, false),
+                uniform_entry_dyn(3, slot),
+            ];
+            let bindings = [
+                buffer_binding(0, &self.buffer),
+                buffer_binding(1, &rhs.buffer),
+                buffer_binding(2, &dst.buffer),
+                uniform_binding_dyn(3, &param_buffer, slot)?,
+            ];
+            match self.device.run_compute_linear_deferred_uniform(
+                &binary_shader(B::NAME, self.dtype)?,
+                &entries,
+                &bindings,
+                work_items as u32,
+                param_bytes,
+                "candle-wgpu-binary",
+            ) {
+                Ok(()) => Ok(dst),
+                Err(err) => Err(err),
+            }
         }
     }
     fn where_cond(
@@ -11075,7 +11266,8 @@ impl BackendDevice for WgpuDevice {
         let optional = wgpu::Features::SHADER_F16
             | wgpu::Features::SUBGROUP
             | wgpu::Features::SUBGROUP_BARRIER
-            | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
+            | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
+            | wgpu::Features::IMMEDIATES;
         let required_features =
             wgpu::Features::SHADER_F64 | (adapter_features & optional);
         // SAFETY: cooperative matrix is experimental; we only enable it when
@@ -11088,14 +11280,31 @@ impl BackendDevice for WgpuDevice {
         } else {
             wgpu::ExperimentalFeatures::disabled()
         };
+        // Request push-constant-style immediates when the adapter advertises a
+        // non-zero max (elementwise UnaryParams=48 B, BinaryParams=80 B).
+        let mut required_features = required_features;
+        let mut required_limits = adapter_limits.clone();
+        if required_features.contains(wgpu::Features::IMMEDIATES) {
+            if adapter_limits.max_immediate_size >= 80 {
+                required_limits.max_immediate_size =
+                    adapter_limits.max_immediate_size.min(256).max(80);
+            } else if adapter_limits.max_immediate_size >= 48 {
+                // Unary only; binary falls back to dyn uniform.
+                required_limits.max_immediate_size = adapter_limits.max_immediate_size;
+            } else {
+                // Feature bit without usable size — drop it.
+                required_features.remove(wgpu::Features::IMMEDIATES);
+            }
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("candle-wgpu"),
             required_features,
-            required_limits: adapter_limits.clone(),
+            required_limits: required_limits.clone(),
             experimental_features,
             ..Default::default()
         }))
         .map_err(Error::wrap)?;
+        let adapter_limits = required_limits;
         // Cache env once — env::var on every matmul was measurable host cost.
         let coop_matmul_enabled = std::env::var("CANDLE_WGPU_COOP_MATMUL")
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
