@@ -962,30 +962,38 @@ impl WgpuDevice {
         }
     }
 
+    /// Flush the active compute batch before any standalone `queue.submit`.
+    /// Without this, copies / staging submits race unsubmitted compute and
+    /// produce zeros. Alloc itself does NOT flush — that was the main host
+    /// tax for elementwise batching.
+    fn flush_before_standalone_submit(&self) -> Result<()> {
+        let _ = self.flush_active_batch("standalone_submit")?;
+        Ok(())
+    }
+
     fn create_storage_buffer(&self, size: usize, label: &'static str) -> wgpu::Buffer {
-        // Flush when the active batch has work. Required for correctness with
-        // multi-step smoke paths (dependent ops / copies / readback); skipping
-        // it produced zero-filled results (14 smoke failures). Tradeoff: one
-        // queue.submit per output allocation when chaining ops — dominant host
-        // cost for small WGPU elementwise vs CUDA.
-        let has_work = self
-            .inner
-            .active_batch
-            .lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|b| b.dispatch_count > 0))
-            .unwrap_or(false);
-        if has_work {
-            let _ = self.flush_active_batch("alloc");
-        }
-        let _ = self.cleanup_pending_submissions(false);
-        self.prune_buffer_registry();
+        // Do not flush the active batch on every small alloc — that forced one
+        // submit per output tensor. Large allocs still flush to bound memory.
+        // Standalone copy/readback paths must call flush_before_standalone_submit.
+        const LARGE_ALLOC: usize = 16 * 1024 * 1024;
         let key = wgpu_copy_size(size) as u64;
+        if key >= LARGE_ALLOC as u64 {
+            let has_work = self
+                .inner
+                .active_batch
+                .lock()
+                .ok()
+                .and_then(|slot| slot.as_ref().map(|b| b.dispatch_count > 0))
+                .unwrap_or(false);
+            if has_work {
+                let _ = self.flush_active_batch("large_alloc");
+            }
+            let _ = self.cleanup_pending_submissions(false);
+            self.prune_buffer_registry();
+        }
         if let Ok(mut pool) = self.inner.storage_buffer_pool.lock() {
             if let Some(bucket) = pool.get_mut(&key) {
                 if let Some(arc) = bucket.pop() {
-                    // Detach from pool Arc; caller re-registers a fresh Arc.
-                    // Safety: sole owner from pool; clone buffer handle via Arc.
                     return arc.as_ref().clone();
                 }
             }
@@ -1066,6 +1074,7 @@ impl WgpuDevice {
                 .write_buffer(&buffer, off as u64, &zeros[..n]);
             off += n;
         }
+        let _ = self.flush_before_standalone_submit();
         let _ = self.inner.queue.submit([]);
         buffer
     }
@@ -1262,6 +1271,8 @@ impl WgpuDevice {
                         label: Some("candle-wgpu-readback"),
                     });
             encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, copy_size as u64);
+            // synchronize() already flushed; keep for call paths that skip it.
+            let _ = self.flush_before_standalone_submit();
             self.inner.queue.submit([encoder.finish()]);
 
             let slice = staging.slice(..);
@@ -8846,6 +8857,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 0,
                 wgpu_copy_size(size) as u64,
             );
+            self.device.flush_before_standalone_submit()?;
             self.device.inner.queue.submit([encoder.finish()]);
             return Ok(dst);
         }
@@ -9420,6 +9432,7 @@ impl BackendStorage for WgpuStorage {
                 .inner
                 .queue
                 .on_submitted_work_done(move || done.store(true, Ordering::Release));
+            self.device.flush_before_standalone_submit()?;
             self.device.inner.queue.submit([encoder.finish()]);
             if let Ok(mut pending) = self.device.inner.pending_submissions.lock() {
                 pending.push(WgpuPendingSubmission {
@@ -10406,6 +10419,7 @@ impl BackendStorage for WgpuStorage {
             dst_byte_offset as u64,
             size as u64,
         );
+        self.device.flush_before_standalone_submit()?;
         self.device.inner.queue.submit([encoder.finish()]);
         Ok(())
     }
@@ -10449,6 +10463,7 @@ impl BackendStorage for WgpuStorage {
                 (d2 * elem_size) as u64,
             );
         }
+        self.device.flush_before_standalone_submit()?;
         self.device.inner.queue.submit([encoder.finish()]);
         Ok(())
     }
