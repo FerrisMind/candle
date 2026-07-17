@@ -924,5 +924,12 @@ pub fn rope_thd(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     if !sin.is_contiguous() {
         candle::bail!("sin has to be contiguous in rope")
     }
+    // Keep WGPU/Vulkan on the tensor-composed path (no custom-op CPU fallthrough).
+    // Layout is (B, T, H, D) — transpose to (B, H, T, D), apply rope, transpose back.
+    if xs.device().is_wgpu() || xs.device().is_vulkan() {
+        let x = xs.transpose(1, 2)?.contiguous()?;
+        let y = rope(&x, cos, sin)?;
+        return y.transpose(1, 2)?.contiguous();
+    }
     xs.apply_op3_no_bwd(cos, sin, &RotaryEmbThd)
 }

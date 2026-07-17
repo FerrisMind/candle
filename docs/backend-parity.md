@@ -17,7 +17,7 @@ This audit inventories the **CUDA tensor-operation surface** defined by:
 | CUDA kernels | `candle-kernels/src/*.cu` (+ `mmq_gguf/`, `moe/`) |
 | Vulkan | `candle-core/src/vulkan_backend.rs` + `candle-vulkan-kernels` |
 | WebGPU | `candle-core/src/wgpu_backend.rs` + `candle-wgpu-kernels` |
-| Quantized | `candle-core/src/quantized/` (CPU fallback counters live here) |
+| Quantized | `candle-core/src/quantized/` (CPU recovery removed; GPU dequant+dense on specialized-kernel miss) |
 
 **CUDA does not implement** (trait defaults / explicit bail) and is **out of CUDA-parity scope**:
 
@@ -54,7 +54,7 @@ Notes:
 
 - Both backends **implement every CUDA `BackendStorage` method** with a non-immediate stub for the methods CUDA implements; remaining work is **depth** (dtypes, layouts, performance), not blank methods.
 - `missing` is zero at the trait-method level; residual holes appear as **dtype/layout/perf** inside `partial` rows (e.g. f8e4m3, full F16 GEMM, native Q8K MMQ).
-- Quantized paths still use **explicit CPU fallback** (`record_{vulkan,wgpu}_cpu_fallback`) on failure; dense storage ops generally **error** instead of silently falling back.
+- Quantized paths no longer use **CPU result recovery**: missing specialized kernels fall through to **GPU dequant + dense matmul/index_select**. Fallback counters remain for diagnostics but production paths do not increment them.
 
 ### Status breakdown by family
 

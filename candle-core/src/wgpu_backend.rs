@@ -7650,12 +7650,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             DType::F32 => {
                 // Register-tiled F32 GEMM with f32 workgroup memory
                 // (FLOAT_ACC_SHMEM). Residual edges are masked in the shader.
+                // Prefer vectorized tile loads when M is a multiple of 4 (VEC_SIZE).
                 if m.max(n) >= 32 && k >= 32 {
                     matmul_label = "candle-wgpu-matmul-fast";
                     use_reg_tile = true;
+                    let vectorized = m.is_multiple_of(4) && n.is_multiple_of(4);
                     shader_storage = candle_wgpu_kernels::matmul_fast_shader(
                         wgpu_kernel_dtype(DType::F32)?,
-                        false,
+                        vectorized,
                     )
                     .ok_or_else(|| {
                         Error::Msg("wgpu shader mul_mat_reg_tile.wgsl not embedded".into()).bt()
