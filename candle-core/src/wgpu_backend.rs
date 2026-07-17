@@ -10347,13 +10347,49 @@ impl BackendDevice for WgpuDevice {
 
     fn new(ordinal: usize) -> Result<Self> {
         let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        instance_desc.backends = wgpu::Backends::all();
+        // Prefer native Vulkan under wgpu when available — DX12 compute has
+        // historically shown higher dispatch/overhead for our GEMM kernels on
+        // NVIDIA Windows. Fall back to all backends if Vulkan is unavailable.
+        let backend_pref = std::env::var("CANDLE_WGPU_BACKENDS")
+            .ok()
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|| "vulkan,primary".into());
+        instance_desc.backends = if backend_pref.contains("all") {
+            wgpu::Backends::all()
+        } else if backend_pref.contains("dx12") && !backend_pref.contains("vulkan") {
+            wgpu::Backends::DX12
+        } else if backend_pref.contains("vulkan") && !backend_pref.contains("dx12") {
+            wgpu::Backends::VULKAN
+        } else {
+            // Default: try Vulkan first by restricting enumeration order later;
+            // keep all backends so we can fall back.
+            wgpu::Backends::all()
+        };
         let backends = instance_desc.backends;
         let instance = wgpu::Instance::new(instance_desc);
         let mut adapters = pollster::block_on(instance.enumerate_adapters(backends));
+        if adapters.is_empty() && backends != wgpu::Backends::all() {
+            // Fallback if preferred backend had no adapters.
+            let mut fallback = wgpu::InstanceDescriptor::new_without_display_handle();
+            fallback.backends = wgpu::Backends::all();
+            let fb_backends = fallback.backends;
+            let fb_instance = wgpu::Instance::new(fallback);
+            adapters = pollster::block_on(fb_instance.enumerate_adapters(fb_backends));
+        }
         if adapters.is_empty() {
             crate::bail!("no wgpu adapters found")
         }
+        // Prefer Vulkan adapters over DX12/GL when multiple backends enumerate.
+        adapters.sort_by_key(|a| {
+            let b = a.get_info().backend;
+            match b {
+                wgpu::Backend::Vulkan => 0u8,
+                wgpu::Backend::Metal => 1,
+                wgpu::Backend::Dx12 => 2,
+                wgpu::Backend::Gl => 3,
+                _ => 4,
+            }
+        });
         let requested_name = std::env::var("CANDLE_WGPU_ADAPTER_NAME")
             .ok()
             .map(|name| name.trim().to_owned())
