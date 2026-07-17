@@ -1273,8 +1273,15 @@ impl WgpuDevice {
                     label: Some("candle-wgpu-batch-pass"),
                     timestamp_writes: None,
                 });
+            // Skip redundant set_pipeline when consecutive dispatches share one
+            // (common for elementwise batch20 of the same op).
+            let mut last_pipe: usize = 0;
             for d in &batch.pending_dispatches {
-                pass.set_pipeline(&d.pipeline.pipeline);
+                let pipe_key = std::ptr::from_ref(d.pipeline.as_ref()) as usize;
+                if pipe_key != last_pipe {
+                    pass.set_pipeline(&d.pipeline.pipeline);
+                    last_pipe = pipe_key;
+                }
                 pass.set_bind_group(0, &d.bind_group, &d.dynamic_offsets);
                 pass.dispatch_workgroups(d.workgroups.0, d.workgroups.1, d.workgroups.2);
             }
