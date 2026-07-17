@@ -7685,8 +7685,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 // Prefer warptile (64×64 / BK=32 / 128 thr) for large dense F32 —
                 // closer to ggml-vulkan mul_mm occupancy than 32×32 reg-tile.
                 // Fall back to reg-tile for medium shapes, naive for tiny.
-                // Warptile supports non-unit stride_0k (virtual B^T of contig RHS).
-                if m >= 64 && n >= 64 && k >= 64 && params.stride_1k == 1 {
+                // Cooperative-matrix path is drafted (mul_mat_coop.wgsl) but still
+                // numerically wrong on RTX 3060 (all-zero outputs). Keep warptile
+                // until coopLoad/Store layout is validated. Gate with env:
+                // CANDLE_WGPU_COOP_MATMUL=1
+                let coop_env = std::env::var("CANDLE_WGPU_COOP_MATMUL")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                let coop_ok = coop_env
+                    && self
+                        .device
+                        .inner
+                        .features
+                        .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+                    && m.is_multiple_of(8)
+                    && n.is_multiple_of(8)
+                    && k.is_multiple_of(8)
+                    && m.max(n) >= 64
+                    && k >= 64
+                    && params.stride_1k == 1;
+                if coop_ok {
+                    matmul_label = "candle-wgpu-matmul-coop";
+                    use_warptile = true;
+                    shader_storage = candle_wgpu_kernels::matmul_coop_shader()
+                        .ok_or_else(|| {
+                            Error::Msg("wgpu shader mul_mat_coop.wgsl not embedded".into()).bt()
+                        })?
+                        .to_string();
+                    &shader_storage
+                } else if m >= 64 && n >= 64 && k >= 64 && params.stride_1k == 1 {
+                    // Warptile supports non-unit stride_0k (virtual B^T of contig RHS).
                     matmul_label = "candle-wgpu-matmul-warptile";
                     use_warptile = true;
                     shader_storage = candle_wgpu_kernels::matmul_warptile_shader()
@@ -7865,8 +7893,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let dst_bind = storage_layout_binding(&dst, &dst_layout, 2)?;
             let bindings = [rhs_bind, lhs_bind, dst_bind, buffer_binding(3, &param_buffer)];
             let total_wg = if use_warptile {
+                // Coop uses 8×8 tiles; warptile uses 64×64 — pick by label.
+                let (bm, bn, _) = if matmul_label.contains("coop") {
+                    candle_wgpu_kernels::matmul_coop_tile_shape()
+                } else {
+                    candle_wgpu_kernels::matmul_warptile_tile_shape()
+                };
                 // BM along candle N (params.m), BN along candle M (params.n).
-                let (bm, bn, _) = candle_wgpu_kernels::matmul_warptile_tile_shape();
                 n.div_ceil(bm as usize)
                     .checked_mul(m.div_ceil(bn as usize))
                     .and_then(|v| v.checked_mul(b))
@@ -10435,12 +10468,30 @@ impl BackendDevice for WgpuDevice {
                 adapter_info.name
             )));
         }
+        // Request optional accelerate features when the adapter exposes them.
+        // EXPERIMENTAL_COOPERATIVE_MATRIX enables tensor-core 8×8 f32 MMA on
+        // Vulkan (NVIDIA/AMD) for dense GEMM warptile paths.
+        let optional = wgpu::Features::SHADER_F16
+            | wgpu::Features::SUBGROUP
+            | wgpu::Features::SUBGROUP_BARRIER
+            | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
         let required_features =
-            wgpu::Features::SHADER_F64 | (adapter_features & wgpu::Features::SHADER_F16);
+            wgpu::Features::SHADER_F64 | (adapter_features & optional);
+        // SAFETY: cooperative matrix is experimental; we only enable it when
+        // the adapter advertises EXPERIMENTAL_COOPERATIVE_MATRIX and fall back
+        // to software warptile otherwise. Report bugs to gfx-rs/wgpu if hit.
+        let experimental_features = if required_features
+            .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        {
+            unsafe { wgpu::ExperimentalFeatures::enabled() }
+        } else {
+            wgpu::ExperimentalFeatures::disabled()
+        };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("candle-wgpu"),
             required_features,
             required_limits: adapter_limits.clone(),
+            experimental_features,
             ..Default::default()
         }))
         .map_err(Error::wrap)?;

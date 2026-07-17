@@ -487,6 +487,15 @@ pub fn matmul_warptile_shader() -> Option<&'static str> {
     get("mul_mat_warptile.wgsl").map(|m| m.source())
 }
 
+/// Cooperative-matrix (tensor-core) F32 GEMM: 8×8 tiles, workgroup size 32.
+pub fn matmul_coop_tile_shape() -> (u32, u32, u32) {
+    (8, 8, 8)
+}
+
+pub fn matmul_coop_shader() -> Option<&'static str> {
+    get("mul_mat_coop.wgsl").map(|m| m.source())
+}
+
 pub fn matmul_fast_shader(dtype: DType, vectorized: bool) -> Option<String> {
     let source = get("mul_mat_reg_tile.wgsl")?
         .source()
