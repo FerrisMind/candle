@@ -7733,9 +7733,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     && params.stride_1k == 1;
                 if coop_ok {
                     use_warptile = true;
-                    // 128×64 dual-MMA wins on large squares (1024³ ~1.18× CUDA);
-                    // 64×64 stays better for mid squares (256³) and tall-skinny.
-                    if m >= 512 && n >= 512 {
+                    // 128×64 dual-MMA + double-buffer wins on large squares and
+                    // tall/wide shapes with one long dim (e.g. 64×4096). Keep
+                    // 64×64 for mid squares (256³) where dual under-fills.
+                    if m.max(n) >= 512 && m.min(n) >= 64 {
                         matmul_label = "candle-wgpu-matmul-coop";
                         candle_wgpu_kernels::matmul_coop_shader().ok_or_else(|| {
                             Error::Msg("wgpu shader mul_mat_coop.wgsl not embedded".into()).bt()

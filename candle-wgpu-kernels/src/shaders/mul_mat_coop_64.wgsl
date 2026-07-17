@@ -3,7 +3,9 @@
 //
 // Workgroup = 512 threads = 16 warps, 64x64 output block:
 //   ti = sg % 4, tj = sg / 4
-// Used for tall/wide residual GEMMs; large squares use mul_mat_coop.wgsl (128×64).
+// Double-buffered K panels: one barrier per K-step after MMA+prefetch.
+// Used for mid-size and tall/wide residual GEMMs; large squares use
+// mul_mat_coop.wgsl (128×64 dual-MMA).
 //
 // Binding (warptile convention):
 //   src0 = B^T / virtual B^T (params.m = candle N)
@@ -47,10 +49,43 @@ const TK: u32 = 16u;
 const WG_M: u32 = 64u;
 const WG_N: u32 = 64u;
 const SG_M: u32 = 4u;
+const PANEL: u32 = WG_M * TK; // 1024
 
-var<workgroup> tile_bt: array<f16, 1024>; // 64*16
-var<workgroup> tile_a: array<f16, 1024>;  // 64*16
+var<workgroup> tile_bt: array<f16, 2048>; // 2 * PANEL
+var<workgroup> tile_a: array<f16, 2048>;
 var<workgroup> tile_c: array<f32, 4096>;  // 16 * 256
+
+fn load_k_panel(
+    tid: u32,
+    row_base: u32,
+    col_base: u32,
+    k0: u32,
+    buf: u32,
+    src0_batch: u32,
+    src1_batch: u32,
+) {
+    let base = buf * PANEL;
+    for (var i = 0u; i < 2u; i++) {
+        let elem = tid * 2u + i;
+        let r = elem / TK;
+        let c = elem % TK;
+        let sh = base + elem;
+        let gr_n = row_base + r;
+        let gk = k0 + c;
+        var v_bt: f16 = 0.0h;
+        if (gr_n < params.m && gk < params.k) {
+            v_bt = f16(src0[src0_batch + gr_n * params.stride_01 + gk * params.stride_0k]);
+        }
+        tile_bt[sh] = v_bt;
+
+        let gr_m = col_base + r;
+        var v_a: f16 = 0.0h;
+        if (gr_m < params.n && gk < params.k) {
+            v_a = f16(src1[src1_batch + gr_m * params.stride_11 + gk * params.stride_1k]);
+        }
+        tile_a[sh] = v_a;
+    }
+}
 
 @compute @workgroup_size(512)
 fn main(
@@ -95,42 +130,28 @@ fn main(
     for (var i = 0u; i < 8u; i++) {
         tile_c[c_base + lane * 8u + i] = 0.0;
     }
+
+    load_k_panel(tid, row_base, col_base, 0u, 0u, src0_batch, src1_batch);
     workgroupBarrier();
     var acc = coopLoadT<coop_mat16x16<f32, C>>(&tile_c[c_base], 16u);
 
-    // Note: do not branch around coop ops on non-provably-uniform predicates
-    // (naga UniformityRequirements::COOP_OPS). Bounds checks on loads are OK.
+    var buf = 0u;
     for (var k0 = 0u; k0 < params.k; k0 += TK) {
-        for (var i = 0u; i < 2u; i++) {
-            let elem = tid * 2u + i;
-            let r = elem / TK;
-            let c = elem % TK;
-            let gr_n = row_base + r;
-            let gk = k0 + c;
-            var v_bt: f16 = 0.0h;
-            if (gr_n < params.m && gk < params.k) {
-                v_bt = f16(src0[src0_batch + gr_n * params.stride_01 + gk * params.stride_0k]);
-            }
-            tile_bt[elem] = v_bt;
-
-            let gr_m = col_base + r;
-            var v_a: f16 = 0.0h;
-            if (gr_m < params.n && gk < params.k) {
-                v_a = f16(src1[src1_batch + gr_m * params.stride_11 + gk * params.stride_1k]);
-            }
-            tile_a[elem] = v_a;
-        }
-        workgroupBarrier();
-
-        let a_mat = coopLoadT<coop_mat16x16<f16, A>>(&tile_bt[(ti * TM) * TK], 16u);
-        let b_mat = coopLoad<coop_mat16x16<f16, B>>(&tile_a[(tj * TN) * TK], 16u);
+        let base = buf * PANEL;
+        let a_mat = coopLoadT<coop_mat16x16<f16, A>>(&tile_bt[base + (ti * TM) * TK], TK);
+        let b_mat = coopLoad<coop_mat16x16<f16, B>>(&tile_a[base + (tj * TN) * TK], TK);
         acc = coopMultiplyAdd(a_mat, b_mat, acc);
 
+        let next_k = k0 + TK;
+        let next_buf = 1u - buf;
+        if (next_k < params.k) {
+            load_k_panel(tid, row_base, col_base, next_k, next_buf, src0_batch, src1_batch);
+        }
         workgroupBarrier();
+        buf = next_buf;
     }
 
     coopStoreT(acc, &tile_c[c_base], 16u);
-    workgroupBarrier();
 
     let dst2_stride = params.m * params.n;
     let dst3_stride = dst2_stride * params.bs02 * params.broadcast2;
