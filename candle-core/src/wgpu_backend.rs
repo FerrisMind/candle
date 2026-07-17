@@ -1389,22 +1389,34 @@ impl WgpuDevice {
         if batch.pending_dispatches.is_empty() {
             return;
         }
-        // Bulk-write deferred uniforms before the pass (one queue.write_buffer
-        // stream instead of N per-op writes on the hot elementwise path).
+        // Bulk-write deferred uniforms: coalesce consecutive ring slots into
+        // one queue.write_buffer when possible (elementwise batch20 common case).
         let slot = device.inner.uniform_dyn_slot as usize;
         if let Ok(guard) = device.inner.uniform_dyn.lock() {
             if let Some((ref ubuf, _)) = *guard {
+                let mut pending: Vec<(u64, Vec<u8>)> = Vec::new();
                 for d in &mut batch.pending_dispatches {
                     if let Some(bytes) = d.deferred_uniform_bytes.take() {
                         let off = *d.dynamic_offsets.last().unwrap_or(&0) as u64;
-                        if bytes.len() < slot {
-                            let mut padded = vec![0u8; slot];
-                            padded[..bytes.len()].copy_from_slice(&bytes);
-                            device.inner.queue.write_buffer(ubuf, off, &padded);
-                        } else {
-                            device.inner.queue.write_buffer(ubuf, off, &bytes);
-                        }
+                        let mut padded = vec![0u8; slot];
+                        let n = bytes.len().min(slot);
+                        padded[..n].copy_from_slice(&bytes[..n]);
+                        pending.push((off, padded));
                     }
+                }
+                pending.sort_by_key(|(off, _)| *off);
+                let mut i = 0;
+                while i < pending.len() {
+                    let start_off = pending[i].0;
+                    let mut blob = pending[i].1.clone();
+                    let mut j = i + 1;
+                    while j < pending.len() && pending[j].0 == start_off + (j - i) as u64 * slot as u64
+                    {
+                        blob.extend_from_slice(&pending[j].1);
+                        j += 1;
+                    }
+                    device.inner.queue.write_buffer(ubuf, start_off, &blob);
+                    i = j;
                 }
             }
         }
