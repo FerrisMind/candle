@@ -113,6 +113,7 @@ impl CudaDevice {
         &self,
         src: &Src,
     ) -> Result<Vec<T>> {
+        self.check_capture_copy("clone_dtoh")?;
         self.stream.clone_dtoh(src).w()
     }
 
@@ -137,6 +138,7 @@ impl CudaDevice {
         src: &Src,
         dst: &mut Dst,
     ) -> Result<()> {
+        self.check_capture_copy("memcpy_dtoh")?;
         self.stream.memcpy_dtoh(src, dst).w()
     }
 

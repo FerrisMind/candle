@@ -189,6 +189,27 @@ pub struct BlockQ8K {
 }
 const _: () = assert!(4 + QK_K + QK_K / 16 * 2 == std::mem::size_of::<BlockQ8K>());
 
+/// 8 Q4K blocks packed in interleaved format facilitating 8-column GEMV.
+/// Currently only compiled on AArch64 (with dotprod enabled).
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[derive(
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
+#[repr(C)]
+pub(crate) struct BlockQ4Kx8 {
+    pub(crate) d: [f16; 8],
+    pub(crate) dmin: [f16; 8],
+    pub(crate) scales: [u8; 96],
+    pub(crate) qs: [u8; 1024],
+}
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+const _: () = assert!(std::mem::size_of::<BlockQ4Kx8>() == 1152);
+
 impl GgmlType for BlockQ4_0 {
     const DTYPE: GgmlDType = GgmlDType::Q4_0;
     const BLCK_SIZE: usize = QK4_0;
@@ -677,6 +698,23 @@ impl GgmlType for BlockQ8_0 {
         return super::simd128::vec_dot_q8_0_q8_0(n, xs, ys);
 
         Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    #[allow(unreachable_code)]
+    fn vec_dot_4(
+        n: usize,
+        xs0: &[Self],
+        xs1: &[Self],
+        xs2: &[Self],
+        xs3: &[Self],
+        ys: &[Self::VecDotType],
+    ) -> (f32, f32, f32, f32) {
+        #[cfg(target_feature = "neon")]
+        return super::neon::vec_dot_4_q8_0_q8_0(n, xs0, xs1, xs2, xs3, ys);
+
+        let (d0, d1) = Self::vec_dot_2(n, xs0, xs1, ys);
+        let (d2, d3) = Self::vec_dot_2(n, xs2, xs3, ys);
+        (d0, d1, d2, d3)
     }
 
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
@@ -1403,6 +1441,23 @@ impl GgmlType for BlockQ4K {
         Self::vec_dot_unopt(n, xs, ys)
     }
 
+    #[allow(unreachable_code)]
+    fn vec_dot_4(
+        n: usize,
+        xs0: &[Self],
+        xs1: &[Self],
+        xs2: &[Self],
+        xs3: &[Self],
+        ys: &[Self::VecDotType],
+    ) -> (f32, f32, f32, f32) {
+        #[cfg(target_feature = "neon")]
+        return super::neon::vec_dot_4_q4k_q8k(n, xs0, xs1, xs2, xs3, ys);
+
+        let (d0, d1) = Self::vec_dot_2(n, xs0, xs1, ys);
+        let (d2, d3) = Self::vec_dot_2(n, xs2, xs3, ys);
+        (d0, d1, d2, d3)
+    }
+
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
         debug_assert!(
             n.is_multiple_of(QK_K),
@@ -1961,6 +2016,23 @@ impl GgmlType for BlockQ6K {
         Self::vec_dot_unopt(n, xs, ys)
     }
 
+    #[allow(unreachable_code)]
+    fn vec_dot_4(
+        n: usize,
+        xs0: &[Self],
+        xs1: &[Self],
+        xs2: &[Self],
+        xs3: &[Self],
+        ys: &[Self::VecDotType],
+    ) -> (f32, f32, f32, f32) {
+        #[cfg(target_feature = "neon")]
+        return super::neon::vec_dot_4_q6k_q8k(n, xs0, xs1, xs2, xs3, ys);
+
+        let (d0, d1) = Self::vec_dot_2(n, xs0, xs1, ys);
+        let (d2, d3) = Self::vec_dot_2(n, xs2, xs3, ys);
+        (d0, d1, d2, d3)
+    }
+
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
         debug_assert!(
             n.is_multiple_of(QK_K),
@@ -2269,12 +2341,10 @@ impl GgmlType for BlockQ8K {
                 y.d = 0f32;
                 y.qs.fill(0)
             } else {
-                let iscale = -128f32 / max;
+                let iscale = -127f32 / max;
                 for (j, q) in y.qs.iter_mut().enumerate() {
-                    // ggml uses nearest_int with bit magic here, maybe we want the same
-                    // but we would have to test and benchmark it.
                     let v = (iscale * xs[j]).round();
-                    *q = v.min(127.) as i8
+                    *q = v.clamp(-128., 127.) as i8
                 }
                 for j in 0..QK_K / 16 {
                     let mut sum = 0i32;

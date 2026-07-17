@@ -72,6 +72,7 @@ half = { version = "2.5.0", features = [
     "num-traits",
     "use-intrinsics",
     "rand_distr",
+    "zerocopy"
 ] }
 float8 = { version = "0.7.0", features = ["num-traits", "rand_distr"] }
 hound = "3.5.1"

@@ -7,6 +7,22 @@ const CUTLASS_COMMIT: &str = "7d49e6c7e2f8896c47f586706e67e1fb215529dc";
 
 const KERNEL_FILES: [&str; 37] = [
     "kernels/flash_api.cu",
+    "kernels/flash_fwd_splitkv_hdim512_fp16_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim512_bf16_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim512_fp16_causal_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim512_bf16_causal_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim64_fp16_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim128_fp16_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim256_fp16_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim64_bf16_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim128_bf16_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim256_bf16_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim64_fp16_causal_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim128_fp16_causal_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim256_fp16_causal_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim64_bf16_causal_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim128_bf16_causal_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim256_bf16_causal_sm80.cu",
     "kernels/flash_fwd_hdim128_fp16_sm80.cu",
     "kernels/flash_fwd_hdim160_fp16_sm80.cu",
     "kernels/flash_fwd_hdim192_fp16_sm80.cu",
@@ -44,6 +60,44 @@ const KERNEL_FILES: [&str; 37] = [
     "kernels/flash_fwd_hdim64_bf16_causal_sm80.cu",
     "kernels/flash_fwd_hdim96_bf16_causal_sm80.cu",
 ];
+
+const HEADER_FILES: [&str; 18] = [
+    "kernels/alibi.h",
+    "kernels/block_info.h",
+    "kernels/dropout.h",
+    "kernels/error.h",
+    "kernels/flash.h",
+    "kernels/flash_fwd_kernel.h",
+    "kernels/flash_fwd_launch_template.h",
+    "kernels/hardware_info.h",
+    "kernels/kernel_helpers.h",
+    "kernels/kernel_traits.h",
+    "kernels/kernel_traits_sm90.h",
+    "kernels/kernels.h",
+    "kernels/mask.h",
+    "kernels/philox.cuh",
+    "kernels/rotary.h",
+    "kernels/softmax.h",
+    "kernels/static_switch.h",
+    "kernels/utils.h",
+];
+
+fn update_hash(hash: &mut u64, bytes: &[u8]) {
+    const FNV_PRIME: u64 = 1099511628211;
+    for &byte in bytes {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+}
+
+fn header_hash() -> Result<u64> {
+    let mut hash = 14695981039346656037;
+    for file in HEADER_FILES {
+        update_hash(&mut hash, file.as_bytes());
+        update_hash(&mut hash, &fs::read(file)?);
+    }
+    Ok(hash)
+}
 
 fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=build.rs");
