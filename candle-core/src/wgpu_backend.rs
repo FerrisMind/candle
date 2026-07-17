@@ -543,6 +543,9 @@ struct WgpuInner {
     seed_value: RwLock<u64>,
     pipeline_cache: Mutex<HashMap<WgpuPipelineCacheKey, Arc<WgpuCachedPipeline>>>,
     buffer_registry: Mutex<HashMap<usize, Weak<wgpu::Buffer>>>,
+    /// Free storage buffers by size (wgpu_copy_size key). Recycled when the
+    /// last Arc drops via `recycle_storage_buffer` after GPU work completed.
+    storage_buffer_pool: Mutex<HashMap<u64, Vec<Arc<wgpu::Buffer>>>>,
     pending_submissions: Mutex<Vec<WgpuPendingSubmission>>,
     active_batch: Mutex<Option<WgpuActiveBatch>>,
     /// Ring of reusable uniform buffers (avoids per-dispatch create_buffer).
@@ -633,6 +636,15 @@ pub struct WgpuStorage {
     device: WgpuDevice,
     count: usize,
     dtype: DType,
+}
+
+impl Drop for WgpuStorage {
+    fn drop(&mut self) {
+        // Recycle only when this is the last owner (not retained by a batch).
+        if Arc::strong_count(&self.buffer) == 1 {
+            self.device.recycle_storage_buffer(&self.buffer);
+        }
+    }
 }
 
 impl WgpuDevice {
@@ -968,14 +980,35 @@ impl WgpuDevice {
         }
         let _ = self.cleanup_pending_submissions(false);
         self.prune_buffer_registry();
+        let key = wgpu_copy_size(size) as u64;
+        if let Ok(mut pool) = self.inner.storage_buffer_pool.lock() {
+            if let Some(bucket) = pool.get_mut(&key) {
+                if let Some(arc) = bucket.pop() {
+                    // Detach from pool Arc; caller re-registers a fresh Arc.
+                    // Safety: sole owner from pool; clone buffer handle via Arc.
+                    return arc.as_ref().clone();
+                }
+            }
+        }
         self.inner.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
-            size: wgpu_copy_size(size) as u64,
+            size: key,
             usage: wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         })
+    }
+
+    /// Return a free storage buffer to the size-class pool (last-owner path).
+    fn recycle_storage_buffer(&self, buffer: &Arc<wgpu::Buffer>) {
+        let key = buffer.size();
+        if let Ok(mut pool) = self.inner.storage_buffer_pool.lock() {
+            let bucket = pool.entry(key).or_default();
+            if bucket.len() < 64 {
+                bucket.push(Arc::clone(buffer));
+            }
+        }
     }
 
     /// Write params into a ring-buffered uniform and return the buffer handle.
@@ -1096,7 +1129,20 @@ impl WgpuDevice {
             .pending_submissions
             .lock()
             .map_err(|e| Error::wrap(e.to_string()))?;
-        pending.retain(|submission| !submission.completed.load(Ordering::Acquire));
+        let mut keep = Vec::with_capacity(pending.len());
+        for submission in pending.drain(..) {
+            if submission.completed.load(Ordering::Acquire) {
+                // GPU finished — recycle sole-owner storage buffers.
+                for buf in submission.retained_buffers {
+                    if Arc::strong_count(&buf) == 1 {
+                        self.recycle_storage_buffer(&buf);
+                    }
+                }
+            } else {
+                keep.push(submission);
+            }
+        }
+        *pending = keep;
         if wait {
             self.prune_buffer_registry();
         }
@@ -10571,6 +10617,7 @@ impl BackendDevice for WgpuDevice {
                 seed_value: RwLock::new(299_792_458),
                 pipeline_cache: Mutex::new(HashMap::new()),
                 buffer_registry: Mutex::new(HashMap::new()),
+                storage_buffer_pool: Mutex::new(HashMap::new()),
                 pending_submissions: Mutex::new(Vec::new()),
                 active_batch: Mutex::new(None),
                 uniform_ring: Mutex::new((Vec::new(), 0)),
