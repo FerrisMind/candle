@@ -6139,7 +6139,9 @@ impl VulkanStorage {
         // Prefer a larger BM (128) on big aligned NVIDIA GEMMs for better L2
         // reuse; fall back to 64x64 for residual/small shapes.
         let warp = self.device.inner.subgroup_size.max(1);
-        let large_aligned = f32_aligned && m.max(n) >= 512 && k >= 512;
+        // Only use BM=128 when both output dims fill the tile; tall-skinny
+        // GEMMs (e.g. m=64, n=4096) stay on 64x64 to avoid wasted warps.
+        let large_aligned = f32_aligned && m >= 128 && n >= 128 && k >= 512;
         let (bm, bn, wm, wn, wmiter, tm, tn, block_mult, dispatch_n, dispatch_m) =
             if large_aligned {
                 // BM=128, BN=64, WM=32, WN=32 => (BM/WM)*(BN/WN)=8 warps
