@@ -6160,6 +6160,7 @@ impl VulkanStorage {
                 )
             } else {
                 // BM=BN=64, WM=WN=32 => 4 warps
+                // (BN=128/256 for tall-skinny measured neutral/worse on RTX 3060.)
                 (
                     64u32,
                     64u32,

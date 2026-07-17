@@ -48,12 +48,13 @@ fn bench_matmul_batch(
     let mut times = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t0 = Instant::now();
-        let mut last = a.matmul(&b)?;
-        for _ in 1..batch {
-            last = a.matmul(&b)?;
+        // Drop each result immediately so we measure kernel+dispatch, not
+        // allocator pressure from retaining `batch` full outputs.
+        for _ in 0..batch {
+            let c = a.matmul(&b)?;
+            std::mem::drop(c);
         }
         dev.synchronize()?;
-        let _ = last.dtype();
         times.push(t0.elapsed().as_secs_f64() * 1000.0 / batch as f64);
     }
     Ok(median_ms(times))

@@ -7564,9 +7564,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             )
         };
 
-        // Warptile (large F32) binds contiguous (K,N) RHS as a virtual B^T via
-        // stride_0k — measured faster than materializing on RTX 3060 even when
-        // that makes K loads strided (saves a full matrix copy every matmul).
+        // Large F32 GEMM binds contiguous (K,N) RHS as a virtual B^T via
+        // stride_0k — measured faster than materializing on RTX 3060 (including
+        // coopmat path; a full B^T of 4096² is far costlier than strided loads).
         let will_use_warptile = self.dtype == DType::F32 && m >= 64 && n >= 64 && k >= 64;
         let rhs_skip_transpose = will_use_warptile
             && rhs_l.is_contiguous()
