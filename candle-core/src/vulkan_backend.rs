@@ -5934,7 +5934,8 @@ impl VulkanStorage {
             && rhs_l.dims().len() == rank
             && rhs_l.dims()[rank - 2] == k
             && rhs_l.dims()[rank - 1] == n
-            && vulkan_spirv_exists("matmul_f32_f32_virtual_fp32");
+            && (vulkan_spirv_exists("matmul_f32_f32_virtual_cm1")
+                || vulkan_spirv_exists("matmul_f32_f32_virtual_fp32"));
 
         let rhs_t_src_layout = rhs_l.transpose(rank - 2, rank - 1)?;
         let rhs_t_contiguous = if rhs_virtual_bt
@@ -6146,6 +6147,14 @@ impl VulkanStorage {
         let f32_aligned =
             m.is_multiple_of(64) && n.is_multiple_of(64) && k.is_multiple_of(32);
         let spirv_name = match self.dtype {
+            // Tall-skinny virtual B^T: prefer coopmat when available.
+            DType::F32
+                if rhs_virtual_bt
+                    && self.device.inner.cooperative_matrix
+                    && vulkan_spirv_exists("matmul_f32_f32_virtual_cm1") =>
+            {
+                "matmul_f32_f32_virtual_cm1"
+            }
             DType::F32 if rhs_virtual_bt => "matmul_f32_f32_virtual_fp32",
             // Cooperative-matrix path (Ampere+): f16 A/B → f32 C (same mixed
             // precision as WGPU coop). Skip tiny squares (64³) for tight abs tols.
@@ -6185,6 +6194,7 @@ impl VulkanStorage {
         // coincides when BM==BN and produced max_abs ~1e2 on 1024³.
         let warp = self.device.inner.subgroup_size.max(1);
         let use_cm1 = spirv_name.contains("_cm1");
+        // Virtual-BT coopmat also needs 16×16 tile constants.
         // BM covers params.M (= candle N). Prefer BM=128 when candle N is wide
         // enough (squares and tall-skinny like 64×4096). BN stays 64 so candle M
         // can be as small as 64. Dispatch axes are (ceil(N/BM), ceil(M/BN)).
