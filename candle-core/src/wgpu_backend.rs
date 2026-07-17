@@ -7564,20 +7564,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             )
         };
 
-        // Prefer materializing B^T so the reg-tile path can use unit-K + VEC loads.
-        // Virtual B^T via stride_0k (skip materialize) is available for non-contig
-        // residual cases but disables vectorized tile loads, so it is not used for
-        // the common contiguous (K, N) RHS.
+        // Warptile (large F32) binds contiguous (K,N) RHS as a virtual B^T via
+        // stride_0k — measured faster than materializing on RTX 3060 even when
+        // that makes K loads strided (saves a full matrix copy every matmul).
+        let will_use_warptile = self.dtype == DType::F32 && m >= 64 && n >= 64 && k >= 64;
+        let rhs_skip_transpose = will_use_warptile
+            && rhs_l.is_contiguous()
+            && rhs_l.start_offset() == 0
+            && rhs_l.dims().len() == rank
+            && rhs_l.dims()[rank - 2] == k
+            && rhs_l.dims()[rank - 1] == n;
+
         let rhs_t_src_layout = rhs_l.transpose(rank - 2, rank - 1)?;
-        let rhs_t_materialized =
-            if rhs_t_src_layout.is_contiguous() && rhs_t_src_layout.start_offset() == 0 {
-                None
-            } else {
-                let rhs_t_shape = rhs_t_src_layout.shape().clone();
-                let mut tmp = unsafe { rhs.device.alloc_uninit(&rhs_t_shape, rhs.dtype)? };
-                rhs.copy_strided_src(&mut tmp, 0, &rhs_t_src_layout)?;
-                Some(tmp)
-            };
+        let rhs_t_materialized = if rhs_skip_transpose
+            || (rhs_t_src_layout.is_contiguous() && rhs_t_src_layout.start_offset() == 0)
+        {
+            None
+        } else {
+            let rhs_t_shape = rhs_t_src_layout.shape().clone();
+            let mut tmp = unsafe { rhs.device.alloc_uninit(&rhs_t_shape, rhs.dtype)? };
+            rhs.copy_strided_src(&mut tmp, 0, &rhs_t_src_layout)?;
+            Some(tmp)
+        };
+        // Physical (...,K,N): B^T[n_i,k_i] @ k_i*N + n_i → stride_01=1, stride_0k=N.
+        // Contiguous B^T (...,N,K): stride_01=K, stride_0k=1.
         let (rhs_t, rhs_t_layout, stride_0k, stride_01_rhs) =
             if let Some(ref tmp) = rhs_t_materialized {
                 (
@@ -7586,6 +7596,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     1,
                     k,
                 )
+            } else if rhs_skip_transpose {
+                (rhs, rhs_l.clone(), n, 1)
             } else {
                 (rhs, rhs_t_src_layout.clone(), 1, k)
             };
@@ -7612,11 +7624,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         } else {
             b * m * k
         };
-        // Batch strides from the bound B^T view.
+        // Batch strides from the bound RHS view (physical K,N or B^T).
+        // Rank-2 batch stride is always k*n elements (same for either layout).
         let rhs_stride_batch_inner = if rank >= 3 {
             rhs_view_stride[rank - 3]
         } else {
-            n * k
+            k * n
         };
         let rhs_stride_batch_outer = if rank >= 4 {
             rhs_view_stride[rank - 4]
@@ -7672,8 +7685,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 // Prefer warptile (64×64 / BK=32 / 128 thr) for large dense F32 —
                 // closer to ggml-vulkan mul_mm occupancy than 32×32 reg-tile.
                 // Fall back to reg-tile for medium shapes, naive for tiny.
-                if m >= 64 && n >= 64 && k >= 64 && params.stride_0k == 1 && params.stride_1k == 1
-                {
+                // Warptile supports non-unit stride_0k (virtual B^T of contig RHS).
+                if m >= 64 && n >= 64 && k >= 64 && params.stride_1k == 1 {
                     matmul_label = "candle-wgpu-matmul-warptile";
                     use_warptile = true;
                     shader_storage = candle_wgpu_kernels::matmul_warptile_shader()

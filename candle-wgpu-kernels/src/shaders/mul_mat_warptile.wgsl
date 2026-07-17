@@ -1,9 +1,10 @@
 // Dense F32 warptile GEMM inspired by ggml-vulkan mul_mm (non-coopmat path).
 // Workgroup: 128 threads covering a 64x64 output tile with BK=32.
 // Per-thread register tile: TM=4 x TN=8 (=32 outputs); 128*32 = 4096 = 64*64.
+// Inner K loop steps by 4 to cut loop overhead.
 //
 // Binding convention matches mul_mat_reg_tile:
-//   src0 = B^T  (params.m rows = candle N, K cols)
+//   src0 = B^T  (params.m rows = candle N, K cols)  — or physical (K,N) via stride_0k
 //   src1 = A    (params.n rows = candle M, K cols)
 //   dst[col * params.m + row] with col=candle M, row=candle N
 
@@ -93,12 +94,11 @@ fn main(
         }
     }
 
-    let loads_a = (BM * BK) / TOTAL_THREADS; // 16
-    let loads_b = (BN * BK) / TOTAL_THREADS; // 16
+    let loads_per = (BM * BK) / TOTAL_THREADS; // 16
 
     for (var k0 = 0u; k0 < params.k; k0 += BK) {
-        for (var i = 0u; i < loads_a; i++) {
-            let elem = tid * loads_a + i;
+        for (var i = 0u; i < loads_per; i++) {
+            let elem = tid * loads_per + i;
             let r = elem / BK;
             let c = elem % BK;
             let gr = row_base + r;
@@ -109,8 +109,8 @@ fn main(
             }
             sh_a[r * BK_PAD + c] = v;
         }
-        for (var i = 0u; i < loads_b; i++) {
-            let elem = tid * loads_b + i;
+        for (var i = 0u; i < loads_per; i++) {
+            let elem = tid * loads_per + i;
             let r = elem / BK;
             let c = elem % BK;
             let gr = col_base + r;
@@ -125,19 +125,39 @@ fn main(
         workgroupBarrier();
 
         let k_end = min(BK, params.k - k0);
-        for (var kk = 0u; kk < k_end; kk++) {
+        var kk = 0u;
+        for (; kk + 4u <= k_end; kk += 4u) {
+            var a0: array<f32, TM>;
+            var a1: array<f32, TM>;
+            var a2: array<f32, TM>;
+            var a3: array<f32, TM>;
+            for (var tm = 0u; tm < TM; tm++) {
+                let base = (local_m * TM + tm) * BK_PAD + kk;
+                a0[tm] = sh_a[base];
+                a1[tm] = sh_a[base + 1u];
+                a2[tm] = sh_a[base + 2u];
+                a3[tm] = sh_a[base + 3u];
+            }
+            for (var tn = 0u; tn < TN; tn++) {
+                let base = (local_n * TN + tn) * BK_PAD + kk;
+                let b0 = sh_b[base];
+                let b1 = sh_b[base + 1u];
+                let b2 = sh_b[base + 2u];
+                let b3 = sh_b[base + 3u];
+                for (var tm = 0u; tm < TM; tm++) {
+                    acc[tm][tn] += a0[tm] * b0 + a1[tm] * b1 + a2[tm] * b2 + a3[tm] * b3;
+                }
+            }
+        }
+        for (; kk < k_end; kk++) {
             var a_reg: array<f32, TM>;
             for (var tm = 0u; tm < TM; tm++) {
                 a_reg[tm] = sh_a[(local_m * TM + tm) * BK_PAD + kk];
             }
-            var b_reg: array<f32, TN>;
             for (var tn = 0u; tn < TN; tn++) {
-                b_reg[tn] = sh_b[(local_n * TN + tn) * BK_PAD + kk];
-            }
-            for (var tm = 0u; tm < TM; tm++) {
-                let av = a_reg[tm];
-                for (var tn = 0u; tn < TN; tn++) {
-                    acc[tm][tn] += av * b_reg[tn];
+                let bv = sh_b[(local_n * TN + tn) * BK_PAD + kk];
+                for (var tm = 0u; tm < TM; tm++) {
+                    acc[tm][tn] += a_reg[tm] * bv;
                 }
             }
         }

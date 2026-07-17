@@ -6141,6 +6141,7 @@ impl VulkanStorage {
         let warp = self.device.inner.subgroup_size.max(1);
         // Only use BM=128 when both output dims fill the tile; tall-skinny
         // GEMMs (e.g. m=64, n=4096) stay on 64x64 to avoid wasted warps.
+        // (Tried BN=128 for wide shapes; measured regression on RTX 3060.)
         let large_aligned = f32_aligned && m >= 128 && n >= 128 && k >= 512;
         let (bm, bn, wm, wn, wmiter, tm, tn, block_mult, dispatch_n, dispatch_m) =
             if large_aligned {
