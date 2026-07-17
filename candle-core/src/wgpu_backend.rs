@@ -590,10 +590,11 @@ struct WgpuPendingDispatch {
     bind_group: wgpu::BindGroup,
     workgroups: (u32, u32, u32),
     /// Pre-resolved dynamic offsets (storage + uniform). When
-    /// `deferred_uniform_bytes` is set, the last slot is filled at encode time.
-    dynamic_offsets: Vec<u32>,
-    /// Uniform payload deferred until encode (avoids per-op queue.write_buffer).
-    deferred_uniform_bytes: Option<Vec<u8>>,
+    /// `deferred_uniform_len > 0`, the last slot is filled at encode time.
+    dynamic_offsets: smallvec::SmallVec<[u32; 4]>,
+    /// Stack-friendly deferred uniform payload (slot ≤ 256). len=0 means none.
+    deferred_uniform: [u8; 256],
+    deferred_uniform_len: u16,
 }
 
 struct WgpuActiveBatch {
@@ -1394,28 +1395,36 @@ impl WgpuDevice {
         }
         // Bulk-write deferred uniforms: coalesce consecutive ring slots into
         // one queue.write_buffer when possible (elementwise batch20 common case).
+        // Ring cursor is monotonic, so pending slots are already in offset order.
         let slot = device.inner.uniform_dyn_slot as usize;
         if let Ok(guard) = device.inner.uniform_dyn.lock() {
             if let Some(ref ubuf) = *guard {
-                let mut pending: Vec<(u64, Vec<u8>)> = Vec::new();
-                for d in &mut batch.pending_dispatches {
-                    if let Some(bytes) = d.deferred_uniform_bytes.take() {
-                        let off = *d.dynamic_offsets.last().unwrap_or(&0) as u64;
-                        let mut padded = vec![0u8; slot];
-                        let n = bytes.len().min(slot);
-                        padded[..n].copy_from_slice(&bytes[..n]);
-                        pending.push((off, padded));
-                    }
-                }
-                pending.sort_by_key(|(off, _)| *off);
                 let mut i = 0;
-                while i < pending.len() {
-                    let start_off = pending[i].0;
-                    let mut blob = pending[i].1.clone();
+                let n = batch.pending_dispatches.len();
+                while i < n {
+                    let d0 = &batch.pending_dispatches[i];
+                    if d0.deferred_uniform_len == 0 {
+                        i += 1;
+                        continue;
+                    }
+                    let start_off = *d0.dynamic_offsets.last().unwrap_or(&0) as u64;
+                    let mut blob = vec![0u8; slot];
+                    let n0 = (d0.deferred_uniform_len as usize).min(slot);
+                    blob[..n0].copy_from_slice(&d0.deferred_uniform[..n0]);
                     let mut j = i + 1;
-                    while j < pending.len() && pending[j].0 == start_off + (j - i) as u64 * slot as u64
-                    {
-                        blob.extend_from_slice(&pending[j].1);
+                    while j < n {
+                        let dj = &batch.pending_dispatches[j];
+                        if dj.deferred_uniform_len == 0 {
+                            break;
+                        }
+                        let off = *dj.dynamic_offsets.last().unwrap_or(&0) as u64;
+                        if off != start_off + (j - i) as u64 * slot as u64 {
+                            break;
+                        }
+                        let mut pad = vec![0u8; slot];
+                        let nj = (dj.deferred_uniform_len as usize).min(slot);
+                        pad[..nj].copy_from_slice(&dj.deferred_uniform[..nj]);
+                        blob.extend_from_slice(&pad);
                         j += 1;
                     }
                     device.inner.queue.write_buffer(ubuf, start_off, &blob);
@@ -1609,7 +1618,7 @@ impl WgpuDevice {
         bindings: &[wgpu::BindGroupEntry<'_>],
         workgroups: (u32, u32, u32),
         dynamic_offsets: &[u32],
-        deferred_uniform_bytes: Option<Vec<u8>>,
+        deferred_uniform_bytes: Option<&[u8]>,
         label: &'static str,
     ) -> Result<()> {
         let (shader_hash, shader_len) = wgpu_shader_cache_key(shader);
@@ -1792,6 +1801,14 @@ impl WgpuDevice {
         } else {
             self.retain_from_bindings(bindings)
         };
+        let mut deferred_uniform = [0u8; 256];
+        let deferred_uniform_len = if let Some(bytes) = deferred_uniform_bytes {
+            let n = bytes.len().min(256);
+            deferred_uniform[..n].copy_from_slice(&bytes[..n]);
+            n as u16
+        } else {
+            0
+        };
         {
             let mut slot = self
                 .inner
@@ -1805,15 +1822,15 @@ impl WgpuDevice {
                 Self::retain_buffers_into(batch, retained_buffers);
             }
             // BindGroup holds buffer refs until encode; CommandBuffer after.
-            // Also retain BindGroup-owned buffers via the bind_group field.
             // Defer into one compute pass at encode/flush time — fewer
             // begin_compute_pass calls on elementwise batches.
             batch.pending_dispatches.push(WgpuPendingDispatch {
                 pipeline: cached,
                 bind_group,
                 workgroups,
-                dynamic_offsets: dynamic_offsets.to_vec(),
-                deferred_uniform_bytes,
+                dynamic_offsets: dynamic_offsets.iter().copied().collect(),
+                deferred_uniform,
+                deferred_uniform_len,
             });
             batch.dispatch_count += 1;
         }
@@ -1853,7 +1870,7 @@ impl WgpuDevice {
             bindings,
             (wg_x, wg_y, 1),
             &[off],
-            Some(uniform_bytes.to_vec()),
+            Some(uniform_bytes),
             label,
         )
     }
@@ -8235,7 +8252,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         };
         let slot = self.device.inner.uniform_dyn_slot;
         let param_buffer = self.device.uniform_dyn_buffer()?;
-        let param_bytes = any_as_bytes(&params).to_vec();
+        let param_bytes = any_as_bytes(&params);
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -8455,7 +8472,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     &batch_bindings,
                     (wg_x, wg_y, 1),
                     &[off],
-                    Some(any_as_bytes(&dispatch_params).to_vec()),
+                    Some(any_as_bytes(&dispatch_params)),
                     matmul_label,
                 )?;
             }
