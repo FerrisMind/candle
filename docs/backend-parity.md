@@ -9,22 +9,27 @@ Related snapshots: [`../cuda-wgpu-vulkan-parity-matrix.md`](../cuda-wgpu-vulkan-
 ## Perf snapshot (RTX 3060, release, batch20 median_ms)
 
 Harness: `cargo run -p candle-core --example backend_parity_microbench --features cuda,vulkan,wgpu --release -- --suite`  
-Evidence: SCRATCH `bench-suite-matmul-dyn.log` / tip `a1e9480d`.
+Evidence: SCRATCH `bench-suite-hostpath-final.log` / tip `c297335e` (+ later comment-only commits).
 
 | op | CUDA | Vulkan | WGPU | Vulkan×CUDA | WGPU×CUDA |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| matmul 256³ | ~0.03 | ~0.021 | ~0.029 | **0.7 ✓** | **~1.0 ✓** |
-| matmul 1024³ | ~0.30 | ~0.21 | ~0.23 | **0.7 ✓** | **0.76 ✓** |
-| matmul 64×4096×4096 | ~0.28 | ~0.25 | ~0.34 | **0.90 ✓** | **~1.22** |
-| relu 1024² | ~0.034 | ~0.035 | ~0.103 | **1.03 ✓** | **~3.0** |
-| mul 1024² | ~0.043 | ~0.048 | ~0.131 | **1.12** | **~3.0** |
+| matmul 256³ | ~0.031 | ~0.021 | ~0.023 | **0.7 ✓** | **0.75 ✓** |
+| matmul 1024³ | ~0.30 | ~0.21 | ~0.22 | **0.7 ✓** | **0.74 ✓** |
+| matmul 64×4096×4096 | ~0.28 | ~0.25 | ~0.34 | **0.90 ✓** | **~1.20** |
+| relu 1024² | ~0.035 | ~0.035 | ~0.038 | **1.01 ✓** | **~1.09 ✓** |
+| mul 1024² | ~0.044 | ~0.048 | ~0.050 | **1.09 ✓** | **~1.13** |
 | sum_last 1024² | ~0.10 | ~0.023 | ~0.038 | **0.23 ✓** | **0.38 ✓** |
 
 ✓ = ≤1.10× CUDA.
 
-**WGPU elementwise (~3×):** host path. With LIFO hot-ring free list (`a1e61517`), `CANDLE_DEBUG_ELEM_BG=1` reports **~96%** bind-group cache hits (`hits=928 misses=42`). Residual ~3× vs CUDA (Vulkan ~1.0× on same GPU) is therefore **non-BG** wgpu host/dispatch overhead. Tried: freelist arena (RO/RW validation conflict); hot-ring + BG cache.
+**WGPU elementwise:** host path fixed in `c297335e` — cache preprocessed unary/binary WGSL
+(`Arc<str>` by op+dtype) + atomic dyn-uniform ring cursor. Prior residual ~3× was
+**rebuild/preprocess of WGSL every dispatch**, not GPU. Remaining mul ~1.13× is
+near-threshold host enqueue tax. Smoke 84/84 after change.
 
-**WGPU tall GEMM (~1.22×):** dual-MMA coop path; further tile/load work remaining.
+**WGPU tall GEMM (~1.20×):** dual-MMA coop still best on RTX 3060. Rejected:
+coop64-for-skinny, BK=64 multi-MMA panel, N-coalesced BT loads, 128×32/256-thread
+tall occupancy variant (all regressed 1.1–3× vs dual).
 
 ## Scope
 

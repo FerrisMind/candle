@@ -8276,9 +8276,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     && params.stride_1k == 1;
                 if coop_ok {
                     use_warptile = true;
-                    // 128×64 dual-MMA + dbuf for large squares and tall/wide
-                    // (64×4096). Measured worse alternatives on RTX 3060:
-                    // coop64 skinny, BK=64 multi-MMA panel, N-coalesced BT loads.
+                    // 128×64 dual-MMA + dbuf for large squares and tall/wide.
+                    // Rejected on RTX 3060: coop64 skinny, BK=64 panel,
+                    // N-coalesced BT, 128×32/256-thread tall occupancy variant.
                     if m.max(n) >= 512 && m.min(n) >= 64 {
                         matmul_label = "candle-wgpu-matmul-coop";
                         candle_wgpu_kernels::matmul_coop_shader().ok_or_else(|| {
