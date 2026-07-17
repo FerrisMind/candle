@@ -437,6 +437,12 @@ struct MulMatParams {
     bs03: u32,
     broadcast2: u32,
     broadcast3: u32,
+    /// Inner K stride for src0 (1 = contiguous K). Used by reg-tile GEMM.
+    stride_0k: u32,
+    /// Inner K stride for src1 (1 = contiguous K). Used by reg-tile GEMM.
+    stride_1k: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 #[repr(C)]
@@ -7558,8 +7564,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             )
         };
 
+        // Prefer materializing B^T so the reg-tile path can use unit-K + VEC loads.
+        // Virtual B^T via stride_0k (skip materialize) is available for non-contig
+        // residual cases but disables vectorized tile loads, so it is not used for
+        // the common contiguous (K, N) RHS.
         let rhs_t_src_layout = rhs_l.transpose(rank - 2, rank - 1)?;
-        let rhs_t_contiguous =
+        let rhs_t_materialized =
             if rhs_t_src_layout.is_contiguous() && rhs_t_src_layout.start_offset() == 0 {
                 None
             } else {
@@ -7568,17 +7578,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 rhs.copy_strided_src(&mut tmp, 0, &rhs_t_src_layout)?;
                 Some(tmp)
             };
-        let (rhs_t, rhs_t_layout) = if let Some(rhs_t_contiguous) = rhs_t_contiguous.as_ref() {
-            (
-                rhs_t_contiguous,
-                Layout::contiguous(rhs_t_src_layout.shape().clone()),
-            )
-        } else {
-            (rhs, rhs_t_src_layout.clone())
-        };
+        let (rhs_t, rhs_t_layout, stride_0k, stride_01_rhs) =
+            if let Some(ref tmp) = rhs_t_materialized {
+                (
+                    tmp,
+                    Layout::contiguous(rhs_t_src_layout.shape().clone()),
+                    1,
+                    k,
+                )
+            } else {
+                (rhs, rhs_t_src_layout.clone(), 1, k)
+            };
 
         let lhs_stride = lhs_layout.stride();
-        let rhs_t_stride = rhs_t_layout.stride();
+        let rhs_view_stride = rhs_t_layout.stride();
         let bs02 = if rank >= 3 {
             lhs_layout.dims()[rank - 3]
         } else {
@@ -7599,13 +7612,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         } else {
             b * m * k
         };
+        // Batch strides from the bound B^T view.
         let rhs_stride_batch_inner = if rank >= 3 {
-            rhs_t_stride[rank - 3]
+            rhs_view_stride[rank - 3]
         } else {
             n * k
         };
         let rhs_stride_batch_outer = if rank >= 4 {
-            rhs_t_stride[rank - 4]
+            rhs_view_stride[rank - 4]
         } else {
             b * n * k
         };
@@ -7613,6 +7627,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let dst_shape = Shape::from(vec![b, m, n]);
         let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
         let dst_layout = Layout::contiguous(dst_shape);
+        // Contiguous LHS (..., M, K) has unit K stride.
+        let lhs_k_stride = 1usize;
         let params = MulMatParams {
             offset_src0: 0,
             offset_src1: 0,
@@ -7620,7 +7636,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             m: n.try_into()?,
             n: m.try_into()?,
             k: k.try_into()?,
-            stride_01: k.try_into()?,
+            stride_01: stride_01_rhs.try_into()?,
             stride_11: lhs_stride[rank - 2].try_into()?,
             stride_02: rhs_stride_batch_inner.try_into()?,
             stride_12: lhs_stride_batch_inner.try_into()?,
@@ -7630,6 +7646,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             bs03: bs03.try_into()?,
             broadcast2: 1,
             broadcast3: 1,
+            stride_0k: stride_0k.try_into()?,
+            stride_1k: lhs_k_stride.try_into()?,
+            _pad0: 0,
+            _pad1: 0,
         };
         let param_buffer = self
             .device
@@ -7646,15 +7666,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let shader_storage;
         let matmul_label: &'static str;
         let mut use_reg_tile = false;
+        let mut use_warptile = false;
         let shader: &str = match self.dtype {
             DType::F32 => {
-                // Register-tiled F32 GEMM with f32 workgroup memory
-                // (FLOAT_ACC_SHMEM). Residual edges are masked in the shader.
-                // Prefer vectorized tile loads when M is a multiple of 4 (VEC_SIZE).
-                if m.max(n) >= 32 && k >= 32 {
+                // Prefer warptile (64×64 / BK=32 / 128 thr) for large dense F32 —
+                // closer to ggml-vulkan mul_mm occupancy than 32×32 reg-tile.
+                // Fall back to reg-tile for medium shapes, naive for tiny.
+                if m >= 64 && n >= 64 && k >= 64 && params.stride_0k == 1 && params.stride_1k == 1
+                {
+                    matmul_label = "candle-wgpu-matmul-warptile";
+                    use_warptile = true;
+                    shader_storage = candle_wgpu_kernels::matmul_warptile_shader()
+                        .ok_or_else(|| {
+                            Error::Msg("wgpu shader mul_mat_warptile.wgsl not embedded".into()).bt()
+                        })?
+                        .to_string();
+                    &shader_storage
+                } else if m.max(n) >= 32 && k >= 32 {
                     matmul_label = "candle-wgpu-matmul-fast";
                     use_reg_tile = true;
-                    let vectorized = m.is_multiple_of(4) && n.is_multiple_of(4);
+                    // VEC loads assume contiguous K (unit stride_0k / stride_1k).
+                    let vectorized = m.is_multiple_of(4)
+                        && n.is_multiple_of(4)
+                        && params.stride_0k == 1
+                        && params.stride_1k == 1;
                     shader_storage = candle_wgpu_kernels::matmul_fast_shader(
                         wgpu_kernel_dtype(DType::F32)?,
                         vectorized,
@@ -7816,7 +7851,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let lhs_bind = storage_layout_binding(lhs, &lhs_layout, 1)?;
             let dst_bind = storage_layout_binding(&dst, &dst_layout, 2)?;
             let bindings = [rhs_bind, lhs_bind, dst_bind, buffer_binding(3, &param_buffer)];
-            let total_wg = if use_reg_tile {
+            let total_wg = if use_warptile {
+                // BM along candle N (params.m), BN along candle M (params.n).
+                let (bm, bn, _) = candle_wgpu_kernels::matmul_warptile_tile_shape();
+                n.div_ceil(bm as usize)
+                    .checked_mul(m.div_ceil(bn as usize))
+                    .and_then(|v| v.checked_mul(b))
+                    .ok_or_else(|| {
+                        Error::Msg("wgpu backend op matmul warptile workgroup overflow".into()).bt()
+                    })?
+                    .try_into()?
+            } else if use_reg_tile {
                 // params.m/n are swapped relative to candle (m,n): see MulMatParams above.
                 let (tile_m, tile_n, wg_size_m, wg_size_n, _) =
                     candle_wgpu_kernels::matmul_fast_tile_shape();
@@ -8851,6 +8896,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             bs03: 1,
             broadcast2: batch_inner.try_into()?,
             broadcast3: batch_outer.try_into()?,
+            stride_0k: 1,
+            stride_1k: 1,
+            _pad0: 0,
+            _pad1: 0,
         };
         let param_buffer = storage
             .device
@@ -8997,6 +9046,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             bs03: 1,
             broadcast2: batch_inner.try_into()?,
             broadcast3: batch_outer.try_into()?,
+            stride_0k: 1,
+            stride_1k: 1,
+            _pad0: 0,
+            _pad1: 0,
         };
         let param_buffer = storage
             .device

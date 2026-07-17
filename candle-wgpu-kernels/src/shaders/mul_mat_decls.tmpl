@@ -62,7 +62,9 @@ fn init_shmem_src0(thread_id: u32, batch_offset: u32, offset_m: u32, k_outer: u3
         let tile_k = elem_idx % TILE_K;
         let global_m = offset_m + tile_m;
         let global_k = k_outer + tile_k;
-        let src0_idx = batch_offset + global_m * params.stride_01 + global_k;
+        // stride_0k defaults to 1 (contiguous K). Non-unit enables virtual B^T
+        // of a contiguous (K, N) RHS without a materialize pass.
+        let src0_idx = batch_offset + global_m * params.stride_01 + global_k * params.stride_0k;
         let src0_val = select( // taking a slight performance hit to avoid oob
             SRC0_TYPE(0.0),
             src0[src0_idx/VEC_SIZE],
@@ -80,7 +82,7 @@ fn init_shmem_src1(thread_id: u32, batch_offset: u32, offset_n: u32, k_outer: u3
         let tile_k = elem_idx % TILE_K;
         let global_n = offset_n + tile_n;
         let global_k = k_outer + tile_k;
-        let src1_idx = batch_offset + global_n * params.stride_11 + global_k;
+        let src1_idx = batch_offset + global_n * params.stride_11 + global_k * params.stride_1k;
         let src1_val = select(
             SRC1_TYPE(0.0),
             src1[src1_idx/VEC_SIZE],

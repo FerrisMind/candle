@@ -33,7 +33,13 @@ struct MulMatParams {
     bs02: u32,
     bs03: u32,
     broadcast2: u32,
-    broadcast3: u32
+    broadcast3: u32,
+    // Inner K strides (1 for contiguous-K storage). Non-unit stride_0k lets
+    // src0 be a contiguous (K, N) matrix viewed as (N, K) without materialize.
+    stride_0k: u32,
+    stride_1k: u32,
+    _pad0: u32,
+    _pad1: u32,
 };
 
 @group(0) @binding(0) var<storage, read_write> src0: array<SRC0_TYPE>; // M rows, K columns
@@ -106,6 +112,12 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
     let offset_n = wg_n * WORKGROUP_SIZE_N * TILE_N;
 
     var acc: array<array<f32, TILE_N>, TILE_M>;
+    // WGSL function-scope vars are indeterminate until written; zero acc.
+    for (var tm = 0u; tm < TILE_M; tm++) {
+        for (var tn = 0u; tn < TILE_N; tn++) {
+            acc[tm][tn] = 0.0;
+        }
+    }
 
     for (var k_outer = 0u; k_outer < params.k; k_outer += TILE_K) {
 

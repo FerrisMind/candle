@@ -52,6 +52,9 @@ pub enum QuantizedDType {
     Q8_K,
 }
 
+// 4×4 register tile × 8×8 threads = 32×32 output tile per workgroup.
+// TILE_K=8 is the measured sweet spot on RTX 3060 (TILE_K=16/32 and 8×8
+// per-thread tiles both regressed). Keep stride_0k/1k hooks for future paths.
 const MUL_MAT_TILE_M: u32 = 4;
 const MUL_MAT_TILE_N: u32 = 4;
 const MUL_MAT_WG_SIZE_M: u32 = 8;
@@ -471,6 +474,17 @@ pub fn matmul_fast_tile_shape() -> (u32, u32, u32, u32, u32) {
         MUL_MAT_WG_SIZE_N,
         MUL_MAT_REG_TILE_K_FLOAT,
     )
+}
+
+/// Warptile F32 GEMM: 64×64 output tile, BK=32, 128 threads (TM=4×TN=8).
+/// Prefer for large dense F32 problems (m,n ≥ 64, k ≥ 64).
+pub fn matmul_warptile_tile_shape() -> (u32, u32, u32) {
+    // (BM along params.m / candle N, BN along params.n / candle M, BK)
+    (64, 64, 32)
+}
+
+pub fn matmul_warptile_shader() -> Option<&'static str> {
+    get("mul_mat_warptile.wgsl").map(|m| m.source())
 }
 
 pub fn matmul_fast_shader(dtype: DType, vectorized: bool) -> Option<String> {
