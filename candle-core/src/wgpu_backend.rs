@@ -561,6 +561,8 @@ struct WgpuInner {
     hot_rings: Mutex<HashMap<u64, WgpuHotRing>>,
     /// Bind groups for elementwise dyn-uniform path (src+dst+params permanent).
     elem_bg_cache: Mutex<HashMap<WgpuElemBgKey, wgpu::BindGroup>>,
+    elem_bg_hits: std::sync::atomic::AtomicU64,
+    elem_bg_misses: std::sync::atomic::AtomicU64,
 }
 
 /// Permanent buffer ring for one size class (e.g. 4MiB for 1024² f32).
@@ -1654,7 +1656,10 @@ impl WgpuDevice {
                     wgpu::BindingResource::Buffer(bb) => {
                         Some(std::ptr::from_ref(bb.buffer) as usize)
                     }
-                    _ => None,
+                    other => {
+                        let _ = other;
+                        None
+                    }
                 })
                 .collect();
             if ptrs.len() >= 3 {
@@ -1671,8 +1676,14 @@ impl WgpuDevice {
                     .lock()
                     .map_err(|e| Error::wrap(e.to_string()))?;
                 if let Some(bg) = cache.get(&key) {
+                    self.inner
+                        .elem_bg_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     bg.clone()
                 } else {
+                    self.inner
+                        .elem_bg_misses
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let bg = self
                         .inner
                         .device
@@ -10943,6 +10954,8 @@ impl BackendDevice for WgpuDevice {
                 uniform_dyn_slot,
                 hot_rings: Mutex::new(HashMap::new()),
                 elem_bg_cache: Mutex::new(HashMap::new()),
+                elem_bg_hits: std::sync::atomic::AtomicU64::new(0),
+                elem_bg_misses: std::sync::atomic::AtomicU64::new(0),
             }),
         })
     }
@@ -11068,6 +11081,17 @@ impl BackendDevice for WgpuDevice {
         self.cleanup_pending_submissions(true)?;
         // Rewind hot rings; keep elem_bg_cache so (src, dst_i) pairs hit.
         self.reset_hot_rings_if_idle();
+        if std::env::var_os("CANDLE_DEBUG_ELEM_BG").is_some() {
+            let h = self
+                .inner
+                .elem_bg_hits
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let m = self
+                .inner
+                .elem_bg_misses
+                .load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!("candle-wgpu elem_bg hits={h} misses={m}");
+        }
         Ok(())
     }
 }
