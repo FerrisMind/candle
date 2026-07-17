@@ -77,6 +77,17 @@ fn generate_spirv_with_ggml_generator(
         &shaders_dir.join("feature-tests").join("integer_dot.comp"),
         &out_dir.join("feature-test-integer-dot.spv"),
     );
+    let coopmat_support = glslc_supports_feature(
+        &glslc,
+        &shaders_dir.join("feature-tests").join("coopmat.comp"),
+        &out_dir.join("feature-test-coopmat.spv"),
+    );
+    let coopmat2_support = glslc_supports_feature(
+        &glslc,
+        &shaders_dir.join("feature-tests").join("coopmat2.comp"),
+        &out_dir.join("feature-test-coopmat2.spv"),
+    );
+    println!("cargo:warning=glslc features: integer_dot={integer_dot_support} coopmat={coopmat_support} coopmat2={coopmat2_support}");
     let generator = out_dir.join(if cfg!(windows) {
         "vulkan-shaders-gen.exe"
     } else {
@@ -85,7 +96,11 @@ fn generate_spirv_with_ggml_generator(
     compile_generator(
         &shaders_dir.join("vulkan-shaders-gen.cpp"),
         &generator,
-        integer_dot_support,
+        GeneratorFeatures {
+            integer_dot: integer_dot_support,
+            coopmat: coopmat_support,
+            coopmat2: coopmat2_support,
+        },
     )?;
 
     let spv_dir = out_dir.join("spv");
@@ -774,16 +789,39 @@ fn glslc_supports_feature(glslc: &str, source: &Path, output: &Path) -> bool {
     )
 }
 
+#[derive(Clone, Copy)]
+struct GeneratorFeatures {
+    integer_dot: bool,
+    coopmat: bool,
+    coopmat2: bool,
+}
+
+impl GeneratorFeatures {
+    fn cpp_defines(self) -> Vec<&'static str> {
+        let mut d = Vec::new();
+        if self.integer_dot {
+            d.push("GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT");
+        }
+        if self.coopmat {
+            d.push("GGML_VULKAN_COOPMAT_GLSLC_SUPPORT");
+        }
+        if self.coopmat2 {
+            d.push("GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT");
+        }
+        d
+    }
+}
+
 fn compile_generator(
     source: &Path,
     output: &Path,
-    integer_dot_support: bool,
+    features: GeneratorFeatures,
 ) -> std::io::Result<()> {
     let mut errors = Vec::new();
 
     // Prefer an explicit CXX when provided.
     if let Ok(cxx) = env::var("CXX") {
-        match try_compile_with_unix_style(&cxx, source, output, integer_dot_support) {
+        match try_compile_with_unix_style(&cxx, source, output, features) {
             Ok(()) => return Ok(()),
             Err(err) => errors.push(err),
         }
@@ -791,7 +829,7 @@ fn compile_generator(
 
     // Unix-style compilers (also available via MinGW/LLVM on Windows).
     for compiler in ["c++", "g++", "clang++"] {
-        match try_compile_with_unix_style(compiler, source, output, integer_dot_support) {
+        match try_compile_with_unix_style(compiler, source, output, features) {
             Ok(()) => return Ok(()),
             Err(err) => errors.push(err),
         }
@@ -801,7 +839,7 @@ fn compile_generator(
     // are set. Vulkan-shaders-gen is a host tool and does not need CUDA.
     #[cfg(windows)]
     {
-        match try_compile_with_msvc(source, output, integer_dot_support) {
+        match try_compile_with_msvc(source, output, features) {
             Ok(()) => return Ok(()),
             Err(err) => errors.push(err),
         }
@@ -818,12 +856,12 @@ fn try_compile_with_unix_style(
     compiler: &str,
     source: &Path,
     output: &Path,
-    integer_dot_support: bool,
+    features: GeneratorFeatures,
 ) -> Result<(), String> {
     let mut cmd = Command::new(compiler);
     cmd.arg("-std=c++17").arg(source).arg("-o").arg(output);
-    if integer_dot_support {
-        cmd.arg("-DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT");
+    for def in features.cpp_defines() {
+        cmd.arg(format!("-D{def}"));
     }
     match cmd.output() {
         Ok(output_result) if output_result.status.success() => Ok(()),
@@ -840,16 +878,16 @@ fn try_compile_with_unix_style(
 fn try_compile_with_msvc(
     source: &Path,
     output: &Path,
-    integer_dot_support: bool,
+    features: GeneratorFeatures,
 ) -> Result<(), String> {
     let vcvars = find_vcvars64().ok_or_else(|| {
         "cl/msvc: could not locate VC\\Auxiliary\\Build\\vcvars64.bat (Visual Studio)".to_string()
     })?;
-    let define = if integer_dot_support {
-        " /DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
-    } else {
-        ""
-    };
+    let define: String = features
+        .cpp_defines()
+        .into_iter()
+        .map(|d| format!(" /D{d}"))
+        .collect();
 
     // MSVC's cl.exe historically fails to open source files when the path
     // contains non-ASCII characters (e.g. Cyrillic user profile dirs) under

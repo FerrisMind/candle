@@ -486,6 +486,8 @@ struct VulkanInner {
     physical_device: vk::PhysicalDevice,
     vendor_id: u32,
     integer_dot_product: bool,
+    /// VK_KHR_cooperative_matrix enabled (tensor-core style GEMM shaders).
+    cooperative_matrix: bool,
     subgroup_arithmetic: bool,
     subgroup_size: u32,
     subgroup_size_control: bool,
@@ -776,6 +778,7 @@ impl std::fmt::Debug for VulkanInner {
             .field("physical_device", &self.physical_device)
             .field("vendor_id", &self.vendor_id)
             .field("integer_dot_product", &self.integer_dot_product)
+            .field("cooperative_matrix", &self.cooperative_matrix)
             .field("subgroup_arithmetic", &self.subgroup_arithmetic)
             .field("subgroup_size", &self.subgroup_size)
             .field("subgroup_size_control", &self.subgroup_size_control)
@@ -6144,6 +6147,10 @@ impl VulkanStorage {
             m.is_multiple_of(64) && n.is_multiple_of(64) && k.is_multiple_of(32);
         let spirv_name = match self.dtype {
             DType::F32 if rhs_virtual_bt => "matmul_f32_f32_virtual_fp32",
+            // NOTE: matmul_f32_f32_aligned_cm1 is generated when glslc supports
+            // coopmat, but needs coopmat-specific TM/TN/WM specialization
+            // (warptile TM=4/TN=2 yields WNITER=0 → host crash). Wire up once
+            // tile constants match hardware (e.g. 16×16 f16 on Ampere).
             DType::F32 if f32_aligned && vulkan_spirv_exists("matmul_f32_f32_aligned_fp32") => {
                 "matmul_f32_f32_aligned_fp32"
             }
@@ -8444,6 +8451,7 @@ impl BackendDevice for VulkanDevice {
         let entry = unsafe { ash::Entry::load() }.map_err(Error::wrap)?;
         let app_name = CString::new("candle-vulkan").map_err(Error::wrap)?;
         let subgroup_size_control_ext = c"VK_EXT_subgroup_size_control";
+        let cooperative_matrix_ext = vk::KHR_COOPERATIVE_MATRIX_NAME;
         let app_info = vk::ApplicationInfo::default()
             .application_name(&app_name)
             .application_version(0)
@@ -8530,6 +8538,9 @@ impl BackendDevice for VulkanDevice {
         let has_subgroup_size_control_ext = device_extensions.iter().any(|ext| unsafe {
             CStr::from_ptr(ext.extension_name.as_ptr()) == subgroup_size_control_ext
         });
+        let has_cooperative_matrix_ext = device_extensions.iter().any(|ext| unsafe {
+            CStr::from_ptr(ext.extension_name.as_ptr()) == cooperative_matrix_ext
+        });
         let mut subgroup_properties = vk::PhysicalDeviceSubgroupProperties::default();
         let mut subgroup_size_control_properties =
             vk::PhysicalDeviceSubgroupSizeControlPropertiesEXT::default();
@@ -8582,11 +8593,16 @@ impl BackendDevice for VulkanDevice {
         let mut integer_dot_features = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
         let mut subgroup_size_control_features =
             vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT::default();
+        let mut cooperative_matrix_features =
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
         let mut physical_features2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut vulkan11_features)
             .push_next(&mut vulkan12_features)
             .push_next(&mut subgroup_size_control_features)
             .push_next(&mut integer_dot_features);
+        if has_cooperative_matrix_ext {
+            physical_features2 = physical_features2.push_next(&mut cooperative_matrix_features);
+        }
         unsafe {
             instance.get_physical_device_features2(physical_device, &mut physical_features2);
         }
@@ -8641,6 +8657,9 @@ impl BackendDevice for VulkanDevice {
         let integer_dot_product = integer_dot_features.shader_integer_dot_product == vk::TRUE
             && integer_dot_properties.integer_dot_product4x8_bit_packed_signed_accelerated
                 == vk::TRUE;
+        let cooperative_matrix = has_cooperative_matrix_ext
+            && cooperative_matrix_features.cooperative_matrix == vk::TRUE
+            && vulkan_spirv_exists("matmul_f32_f32_aligned_cm1");
         let subgroup_size_control = has_subgroup_size_control_ext
             && subgroup_size_control_features.subgroup_size_control == vk::TRUE;
         let compute_full_subgroups = subgroup_size_control
@@ -8687,6 +8706,11 @@ impl BackendDevice for VulkanDevice {
         if integer_dot_product {
             enabled_integer_dot.shader_integer_dot_product = vk::TRUE;
         }
+        let mut enabled_cooperative_matrix =
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+        if cooperative_matrix {
+            enabled_cooperative_matrix.cooperative_matrix = vk::TRUE;
+        }
         let mut enabled_subgroup_size_control =
             vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT::default();
         if subgroup_size_control {
@@ -8713,6 +8737,9 @@ impl BackendDevice for VulkanDevice {
         if has_subgroup_size_control_ext {
             enabled_extension_names.push(subgroup_size_control_ext.as_ptr());
         }
+        if cooperative_matrix {
+            enabled_extension_names.push(cooperative_matrix_ext.as_ptr());
+        }
         let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_features(&enabled_features)
@@ -8724,6 +8751,9 @@ impl BackendDevice for VulkanDevice {
         }
         if integer_dot_product {
             device_info = device_info.push_next(&mut enabled_integer_dot);
+        }
+        if cooperative_matrix {
+            device_info = device_info.push_next(&mut enabled_cooperative_matrix);
         }
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
             .map_err(Error::wrap)?;
@@ -8755,6 +8785,7 @@ impl BackendDevice for VulkanDevice {
                 physical_device,
                 vendor_id,
                 integer_dot_product,
+                cooperative_matrix,
                 subgroup_arithmetic,
                 subgroup_size,
                 subgroup_size_control,
