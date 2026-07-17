@@ -6134,18 +6134,51 @@ impl VulkanStorage {
         // ggml `m_warptile` layout: {BLOCK_SIZE, BM, BN, (BK), WM, WN, WMITER,
         // TM, TN, (TK), WARP}. The thread count must satisfy
         // `BLOCK_SIZE / WARP == (BM / WM) * (BN / WN)` so the warp grid covers
-        // the whole BM x BN output tile; with BM=BN=64 and WM=WN=32 that means
-        // four warps, i.e. BLOCK_SIZE = 4 * WARP.
+        // the whole BM x BN output tile.
+        //
+        // Prefer a larger BM (128) on big aligned NVIDIA GEMMs for better L2
+        // reuse; fall back to 64x64 for residual/small shapes.
         let warp = self.device.inner.subgroup_size.max(1);
+        let large_aligned = f32_aligned && m.max(n) >= 512 && k >= 512;
+        let (bm, bn, wm, wn, wmiter, tm, tn, block_mult, dispatch_n, dispatch_m) =
+            if large_aligned {
+                // BM=128, BN=64, WM=32, WN=32 => (BM/WM)*(BN/WN)=8 warps
+                (
+                    128u32,
+                    64u32,
+                    32u32,
+                    32u32,
+                    2u32,
+                    4u32,
+                    2u32,
+                    8u32,
+                    n.div_ceil(64),
+                    m.div_ceil(128),
+                )
+            } else {
+                // BM=BN=64, WM=WN=32 => 4 warps
+                (
+                    64u32,
+                    64u32,
+                    32u32,
+                    32u32,
+                    2u32,
+                    4u32,
+                    2u32,
+                    4u32,
+                    n.div_ceil(64),
+                    m.div_ceil(64),
+                )
+            };
         let spec = [
-            (0, warp * 4),
-            (1, 64),
-            (2, 64),
-            (4, 32),
-            (5, 32),
-            (6, 2),
-            (7, 4),
-            (8, 2),
+            (0, warp * block_mult),
+            (1, bm),
+            (2, bn),
+            (4, wm),
+            (5, wn),
+            (6, wmiter),
+            (7, tm),
+            (8, tn),
             (10, warp),
         ];
         self.device.run_compute_specialized(
@@ -6153,8 +6186,8 @@ impl VulkanStorage {
             &bindings,
             Some(any_as_bytes(&params)),
             (
-                n.div_ceil(64).try_into()?,
-                m.div_ceil(64).try_into()?,
+                dispatch_n.try_into()?,
+                dispatch_m.try_into()?,
                 b.try_into()?,
             ),
             Some(&spec),
