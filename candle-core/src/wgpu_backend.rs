@@ -7617,10 +7617,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let shader: &str = match self.dtype {
             DType::F32 => {
                 // Register-tiled F32 GEMM with f32 workgroup memory
-                // (FLOAT_ACC_SHMEM). Require tile-aligned dims for residual-edge
-                // correctness under tight smoke tolerances.
-                let tile_ok = m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(32);
-                if tile_ok && m.max(n) >= 64 {
+                // (FLOAT_ACC_SHMEM). Residual edges are masked in the shader.
+                if m.max(n) >= 32 && k >= 32 {
                     matmul_label = "candle-wgpu-matmul-fast";
                     use_reg_tile = true;
                     shader_storage = candle_wgpu_kernels::matmul_fast_shader(
