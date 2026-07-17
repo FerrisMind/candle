@@ -587,7 +587,11 @@ struct WgpuPendingDispatch {
     pipeline: Arc<WgpuCachedPipeline>,
     bind_group: wgpu::BindGroup,
     workgroups: (u32, u32, u32),
+    /// Pre-resolved dynamic offsets (storage + uniform). When
+    /// `deferred_uniform_bytes` is set, the last slot is filled at encode time.
     dynamic_offsets: Vec<u32>,
+    /// Uniform payload deferred until encode (avoids per-op queue.write_buffer).
+    deferred_uniform_bytes: Option<Vec<u8>>,
 }
 
 struct WgpuActiveBatch {
@@ -1019,7 +1023,7 @@ impl WgpuDevice {
                 .lock()
                 .map_err(|e| Error::wrap(e.to_string()))?;
             if let Some(batch) = slot.as_mut() {
-                Self::encode_pending_dispatches(batch);
+                Self::encode_pending_dispatches(self, batch);
             }
         }
         let _ = self.flush_active_batch("standalone_submit")?;
@@ -1188,23 +1192,10 @@ impl WgpuDevice {
         Ok(buf)
     }
 
-    /// Write params into a single large uniform buffer at a rotating slot.
-    /// Returns `(buffer, dynamic_offset)` for use with `uniform_entry_dyn` /
-    /// `uniform_binding_dyn` and `set_bind_group(..., &[offset])`.
-    fn write_uniform_slot(&self, bytes: &[u8]) -> Result<(wgpu::Buffer, u32)> {
+    /// Ensure the dyn uniform ring exists and return a clone of the buffer.
+    fn uniform_dyn_buffer(&self) -> Result<wgpu::Buffer> {
         const RING_SLOTS: usize = 256;
         let slot = self.inner.uniform_dyn_slot;
-        if bytes.len() as u64 > slot {
-            // Oversized: fall back to a dedicated buffer (no dynamic offset).
-            let buf = self.inner.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-uniform-large"),
-                size: wgpu_copy_size(bytes.len()) as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.inner.queue.write_buffer(&buf, 0, bytes);
-            return Ok((buf, 0));
-        }
         let mut guard = self
             .inner
             .uniform_dyn
@@ -1219,19 +1210,60 @@ impl WgpuDevice {
             });
             *guard = Some((buf, 0));
         }
-        let (buf, cursor) = guard.as_mut().unwrap();
+        Ok(guard.as_ref().unwrap().0.clone())
+    }
+
+    /// Reserve the next dyn-uniform slot without writing (fill at encode time).
+    fn reserve_uniform_slot(&self) -> Result<u32> {
+        const RING_SLOTS: usize = 256;
+        let slot = self.inner.uniform_dyn_slot;
+        let mut guard = self
+            .inner
+            .uniform_dyn
+            .lock()
+            .map_err(|e| Error::wrap(e.to_string()))?;
+        if guard.is_none() {
+            let buf = self.inner.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-uniform-dyn"),
+                size: slot * RING_SLOTS as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            *guard = Some((buf, 0));
+        }
+        let (_buf, cursor) = guard.as_mut().unwrap();
         let idx = *cursor % RING_SLOTS;
         *cursor = idx + 1;
-        let offset = idx as u64 * slot;
+        Ok((idx as u64 * slot) as u32)
+    }
+
+    /// Write params into a single large uniform buffer at a rotating slot.
+    /// Returns `(buffer, dynamic_offset)` for use with `uniform_entry_dyn` /
+    /// `uniform_binding_dyn` and `set_bind_group(..., &[offset])`.
+    fn write_uniform_slot(&self, bytes: &[u8]) -> Result<(wgpu::Buffer, u32)> {
+        let slot = self.inner.uniform_dyn_slot;
+        if bytes.len() as u64 > slot {
+            // Oversized: fall back to a dedicated buffer (no dynamic offset).
+            let buf = self.inner.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-uniform-large"),
+                size: wgpu_copy_size(bytes.len()) as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.inner.queue.write_buffer(&buf, 0, bytes);
+            return Ok((buf, 0));
+        }
+        let offset = self.reserve_uniform_slot()?;
+        let buf = self.uniform_dyn_buffer()?;
         // Bind group covers the full slot; pad so the entire range is defined.
         if (bytes.len() as u64) < slot {
             let mut padded = vec![0u8; slot as usize];
             padded[..bytes.len()].copy_from_slice(bytes);
-            self.inner.queue.write_buffer(buf, offset, &padded);
+            self.inner.queue.write_buffer(&buf, offset as u64, &padded);
         } else {
-            self.inner.queue.write_buffer(buf, offset, bytes);
+            self.inner.queue.write_buffer(&buf, offset as u64, bytes);
         }
-        Ok((buf.clone(), offset as u32))
+        Ok((buf, offset))
     }
 
     fn create_zeroed_storage_buffer(&self, size: usize, label: &'static str) -> wgpu::Buffer {
@@ -1353,9 +1385,28 @@ impl WgpuDevice {
     }
 
     /// Fold deferred computes into one compute pass on the batch encoder.
-    fn encode_pending_dispatches(batch: &mut WgpuActiveBatch) {
+    fn encode_pending_dispatches(device: &WgpuDevice, batch: &mut WgpuActiveBatch) {
         if batch.pending_dispatches.is_empty() {
             return;
+        }
+        // Bulk-write deferred uniforms before the pass (one queue.write_buffer
+        // stream instead of N per-op writes on the hot elementwise path).
+        let slot = device.inner.uniform_dyn_slot as usize;
+        if let Ok(guard) = device.inner.uniform_dyn.lock() {
+            if let Some((ref ubuf, _)) = *guard {
+                for d in &mut batch.pending_dispatches {
+                    if let Some(bytes) = d.deferred_uniform_bytes.take() {
+                        let off = *d.dynamic_offsets.last().unwrap_or(&0) as u64;
+                        if bytes.len() < slot {
+                            let mut padded = vec![0u8; slot];
+                            padded[..bytes.len()].copy_from_slice(&bytes);
+                            device.inner.queue.write_buffer(ubuf, off, &padded);
+                        } else {
+                            device.inner.queue.write_buffer(ubuf, off, &bytes);
+                        }
+                    }
+                }
+            }
         }
         {
             let mut pass = batch
@@ -1418,7 +1469,7 @@ impl WgpuDevice {
             return Ok(false);
         }
         let mut batch = batch;
-        Self::encode_pending_dispatches(&mut batch);
+        Self::encode_pending_dispatches(self, &mut batch);
         let completed = Arc::new(AtomicBool::new(false));
         let done = completed.clone();
         self.inner
@@ -1520,7 +1571,7 @@ impl WgpuDevice {
     ) -> Result<()> {
         let max_per_dim = wgpu_dispatch_wg_cap(self);
         let (wg_x, wg_y) = compute_2d_workgroups(workgroups, max_per_dim);
-        self.run_compute_xyz(shader, entries, bindings, (wg_x, wg_y, 1), &[], label)
+        self.run_compute_xyz(shader, entries, bindings, (wg_x, wg_y, 1), &[], None, label)
     }
 
     fn run_compute_linear(
@@ -1532,7 +1583,7 @@ impl WgpuDevice {
         label: &'static str,
     ) -> Result<()> {
         let (wg_x, wg_y) = linear_dispatch_workgroups(self, total_items);
-        self.run_compute_xyz(shader, entries, bindings, (wg_x, wg_y, 1), &[], label)
+        self.run_compute_xyz(shader, entries, bindings, (wg_x, wg_y, 1), &[], None, label)
     }
 
     fn run_compute_linear_dyn(
@@ -1551,6 +1602,7 @@ impl WgpuDevice {
             bindings,
             (wg_x, wg_y, 1),
             dynamic_offsets,
+            None,
             label,
         )
     }
@@ -1562,6 +1614,7 @@ impl WgpuDevice {
         bindings: &[wgpu::BindGroupEntry<'_>],
         workgroups: (u32, u32, u32),
         dynamic_offsets: &[u32],
+        deferred_uniform_bytes: Option<Vec<u8>>,
         label: &'static str,
     ) -> Result<()> {
         let (shader_hash, shader_len) = wgpu_shader_cache_key(shader);
@@ -1738,7 +1791,15 @@ impl WgpuDevice {
             self.flush_active_batch("batch_limit")?;
         }
         self.ensure_active_batch()?;
-        let retained_buffers = self.retain_from_bindings(bindings);
+        // Hot elementwise: BindGroup + CommandBuffer keep buffer lifetimes;
+        // skip retain_from_bindings (registry lock + HashSet) on the warm path.
+        let skip_retain = deferred_uniform_bytes.is_some()
+            || (!dynamic_offsets.is_empty() && bindings.len() >= 3);
+        let retained_buffers = if skip_retain {
+            Vec::new()
+        } else {
+            self.retain_from_bindings(bindings)
+        };
         {
             let mut slot = self
                 .inner
@@ -1748,7 +1809,11 @@ impl WgpuDevice {
             let batch = slot
                 .as_mut()
                 .ok_or_else(|| Error::msg("wgpu active batch missing after ensure"))?;
-            Self::retain_buffers_into(batch, retained_buffers);
+            if !retained_buffers.is_empty() {
+                Self::retain_buffers_into(batch, retained_buffers);
+            }
+            // BindGroup holds buffer refs until encode; CommandBuffer after.
+            // Also retain BindGroup-owned buffers via the bind_group field.
             // Defer into one compute pass at encode/flush time — fewer
             // begin_compute_pass calls on elementwise batches.
             batch.pending_dispatches.push(WgpuPendingDispatch {
@@ -1756,10 +1821,49 @@ impl WgpuDevice {
                 bind_group,
                 workgroups,
                 dynamic_offsets: dynamic_offsets.to_vec(),
+                deferred_uniform_bytes,
             });
             batch.dispatch_count += 1;
         }
         Ok(())
+    }
+
+    /// Elementwise hot path: reserve uniform slot, defer the write until encode.
+    fn run_compute_linear_deferred_uniform(
+        &self,
+        shader: &str,
+        entries: &[wgpu::BindGroupLayoutEntry],
+        bindings: &[wgpu::BindGroupEntry<'_>],
+        total_items: u32,
+        uniform_bytes: &[u8],
+        label: &'static str,
+    ) -> Result<()> {
+        let slot_size = self.inner.uniform_dyn_slot;
+        if uniform_bytes.len() as u64 > slot_size {
+            let (buf, off) = self.write_uniform_slot(uniform_bytes)?;
+            let _ = buf;
+            let (wg_x, wg_y) = linear_dispatch_workgroups(self, total_items);
+            return self.run_compute_xyz(
+                shader,
+                entries,
+                bindings,
+                (wg_x, wg_y, 1),
+                &[off],
+                None,
+                label,
+            );
+        }
+        let off = self.reserve_uniform_slot()?;
+        let (wg_x, wg_y) = linear_dispatch_workgroups(self, total_items);
+        self.run_compute_xyz(
+            shader,
+            entries,
+            bindings,
+            (wg_x, wg_y, 1),
+            &[off],
+            Some(uniform_bytes.to_vec()),
+            label,
+        )
     }
 }
 
@@ -4326,9 +4430,7 @@ impl WgpuStorage {
             _pad1: 0,
         };
         let slot = self.device.inner.uniform_dyn_slot;
-        let (param_buffer, dyn_off) = self
-            .device
-            .write_uniform_slot(any_as_bytes(&params))?;
+        let param_buffer = self.device.uniform_dyn_buffer()?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -4339,12 +4441,12 @@ impl WgpuStorage {
             buffer_binding(1, &dst.buffer),
             uniform_binding_dyn(2, &param_buffer, slot)?,
         ];
-        self.device.run_compute_linear_dyn(
+        self.device.run_compute_linear_deferred_uniform(
             shader,
             &entries,
             &bindings,
             count as u32,
-            &[dyn_off],
+            any_as_bytes(&params),
             label,
         )?;
         Ok(dst)
@@ -7178,6 +7280,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 &bindings,
                 (wg_x, wg_y, 1),
                 &[],
+                None,
                 "candle-wgpu-rms-norm-bf16-inplace",
             )?;
             return Ok(WgpuStorage {
@@ -7206,6 +7309,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             &bindings,
             (wg_x, wg_y, 1),
             &[],
+            None,
             "candle-wgpu-rms-norm",
         )?;
         Ok(dst)
@@ -7363,6 +7467,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             &bindings,
             (wg_x, wg_y, 1),
             &[],
+            None,
             "candle-wgpu-layernorm",
         )?;
         Ok(dst)
@@ -8317,6 +8422,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     &batch_bindings,
                     (wg_x, wg_y, 1),
                     &[],
+                    None,
                     matmul_label,
                 )?;
             }
@@ -8362,7 +8468,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let max_per_dim = wgpu_dispatch_wg_cap(&self.device);
             let (wg_x, wg_y) = compute_2d_workgroups(total_wg, max_per_dim);
             self.device
-                .run_compute_xyz(shader, &entries, &bindings, (wg_x, wg_y, 1), &[], matmul_label)?;
+                .run_compute_xyz(shader, &entries, &bindings, (wg_x, wg_y, 1), &[], None, matmul_label)?;
         }
         drop(lhs_contiguous);
         Ok(dst)
@@ -9436,6 +9542,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             &bindings,
             (wg_x, wg_y, 1),
             &[],
+            None,
             "candle-wgpu-quant-matmul",
         )?;
         drop(src_contiguous);
@@ -9582,6 +9689,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             &bindings,
             (wg_x, wg_y, 1),
             &[],
+            None,
             "candle-wgpu-quant-matvec",
         )?;
         drop(src_contiguous);
@@ -10262,9 +10370,7 @@ impl BackendStorage for WgpuStorage {
             _pad0: 0,
         };
         let slot = self.device.inner.uniform_dyn_slot;
-        let (param_buffer, dyn_off) = self
-            .device
-            .write_uniform_slot(any_as_bytes(&params))?;
+        let param_buffer = self.device.uniform_dyn_buffer()?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -10282,12 +10388,12 @@ impl BackendStorage for WgpuStorage {
             DType::BF16 => count.div_ceil(2),
             _ => count,
         };
-        match self.device.run_compute_linear_dyn(
+        match self.device.run_compute_linear_deferred_uniform(
             &binary_shader(B::NAME, self.dtype)?,
             &entries,
             &bindings,
             work_items as u32,
-            &[dyn_off],
+            any_as_bytes(&params),
             "candle-wgpu-binary",
         ) {
             Ok(()) => Ok(dst),
