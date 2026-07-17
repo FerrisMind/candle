@@ -6170,14 +6170,11 @@ impl VulkanStorage {
         // A previous BM=128 path used (ceil(N/BN), ceil(M/BM)) which only
         // coincides when BM==BN and produced max_abs ~1e2 on 1024³.
         let warp = self.device.inner.subgroup_size.max(1);
-        // Prefer BM=128 on big aligned squares for L2 reuse; tall-skinny
-        // (min dim < 128) stays on 64×64.
-        let large_aligned = f32_aligned
-            && !rhs_virtual_bt
-            && m >= 128
-            && n >= 128
-            && k >= 512;
-        let (bm, bn, wm, wn, wmiter, tm, tn, block_mult) = if large_aligned {
+        // BM covers params.M (= candle N). Prefer BM=128 when candle N is wide
+        // enough (squares and tall-skinny like 64×4096). BN stays 64 so candle M
+        // can be as small as 64. Dispatch axes are (ceil(N/BM), ceil(M/BN)).
+        let wide_n = n >= 512 && k >= 512 && m >= 64 && (f32_aligned || rhs_virtual_bt);
+        let (bm, bn, wm, wn, wmiter, tm, tn, block_mult) = if wide_n {
             // BM=128, BN=64, WM=32, WN=32 => (BM/WM)*(BN/WN)=8 warps
             (128u32, 64u32, 32u32, 32u32, 2u32, 4u32, 2u32, 8u32)
         } else {
