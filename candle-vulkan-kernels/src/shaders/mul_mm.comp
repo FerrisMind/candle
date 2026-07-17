@@ -119,6 +119,7 @@ layout (constant_id = 10) const uint WARP = 32;
 
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 // Larger K panels for virtual B^T hide more latency per barrier on tall GEMMs.
+// BK=64 beats 32; BK=128 regressed (~0.48 vs 0.38 ms) — shared pressure.
 #ifdef VIRTUAL_BT
 #define BK 64
 #define BK_STEP 4
