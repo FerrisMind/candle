@@ -487,9 +487,10 @@ pub fn matmul_warptile_shader() -> Option<&'static str> {
     get("mul_mat_warptile.wgsl").map(|m| m.source())
 }
 
-/// Cooperative-matrix GEMM tile (f16 A/B → f32 C on Ampere+): 16×16×16.
+/// Cooperative-matrix GEMM workgroup tile (f16 A/B → f32 C): 64×64 (m×n), K=16.
+/// Sixteen warps each own a 16×16 output sub-tile.
 pub fn matmul_coop_tile_shape() -> (u32, u32, u32) {
-    (16, 16, 16)
+    (64, 64, 16)
 }
 
 pub fn matmul_coop_shader() -> Option<&'static str> {
