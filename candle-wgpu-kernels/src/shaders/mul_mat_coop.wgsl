@@ -2,8 +2,9 @@
 // Hardware: 16x16 f16 A/B, f32 C (RTX 3060 cooperative_matrix_properties).
 //
 // Workgroup = 512 threads = 16 warps, 128×64 output block:
-//   ti = sg % 4, tj = sg / 4  — each warp owns TWO 16×16 C tiles along M
-//   (rows of B^T / candle N). Shared A panel is reused across both MMA steps.
+//   ti = sg % 4, tj = sg / 4 — each warp owns TWO 16×16 C tiles along M.
+// Double-buffered K panels: after coopLoad, tiles live in registers so the
+// next panel can fill the alternate buffer with one barrier per K-step.
 // Tall/wide residual shapes use mul_mat_coop_64.wgsl (64×64).
 //
 // Binding (warptile convention):
@@ -49,10 +50,49 @@ const WG_M: u32 = 128u;
 const WG_N: u32 = 64u;
 const SG_M: u32 = 4u;
 const TILES_PER_WARP_M: u32 = 2u;
+const PANEL_BT: u32 = WG_M * TK; // 2048
+const PANEL_A: u32 = WG_N * TK;  // 1024
 
-var<workgroup> tile_bt: array<f16, 2048>; // 128*16
-var<workgroup> tile_a: array<f16, 1024>;  // 64*16
-var<workgroup> tile_c: array<f32, 4096>;  // reuse for sequential store of 2 tiles
+var<workgroup> tile_bt: array<f16, 4096>; // 2 * PANEL_BT
+var<workgroup> tile_a: array<f16, 2048>;  // 2 * PANEL_A
+var<workgroup> tile_c: array<f32, 4096>;
+
+fn load_panels(
+    tid: u32,
+    row_base: u32,
+    col_base: u32,
+    k0: u32,
+    buf: u32,
+    src0_batch: u32,
+    src1_batch: u32,
+) {
+    let base_bt = buf * PANEL_BT;
+    let base_a = buf * PANEL_A;
+    for (var i = 0u; i < 4u; i++) {
+        let elem = tid * 4u + i;
+        let r = elem / TK;
+        let c = elem % TK;
+        let gr_n = row_base + r;
+        let gk = k0 + c;
+        var v_bt: f16 = 0.0h;
+        if (gr_n < params.m && gk < params.k) {
+            v_bt = f16(src0[src0_batch + gr_n * params.stride_01 + gk * params.stride_0k]);
+        }
+        tile_bt[base_bt + elem] = v_bt;
+    }
+    for (var i = 0u; i < 2u; i++) {
+        let elem = tid * 2u + i;
+        let r = elem / TK;
+        let c = elem % TK;
+        let gr_m = col_base + r;
+        let gk = k0 + c;
+        var v_a: f16 = 0.0h;
+        if (gr_m < params.n && gk < params.k) {
+            v_a = f16(src1[src1_batch + gr_m * params.stride_11 + gk * params.stride_1k]);
+        }
+        tile_a[base_a + elem] = v_a;
+    }
+}
 
 @compute @workgroup_size(512)
 fn main(
@@ -97,55 +137,37 @@ fn main(
     for (var i = 0u; i < 8u; i++) {
         tile_c[c_base + lane * 8u + i] = 0.0;
     }
+
+    load_panels(tid, row_base, col_base, 0u, 0u, src0_batch, src1_batch);
     workgroupBarrier();
     var acc0 = coopLoadT<coop_mat16x16<f32, C>>(&tile_c[c_base], 16u);
     var acc1 = coopLoadT<coop_mat16x16<f32, C>>(&tile_c[c_base], 16u);
 
+    var buf = 0u;
     for (var k0 = 0u; k0 < params.k; k0 += TK) {
-        // Load 128×16 B^T panel: 512 thr × 4 = 2048.
-        for (var i = 0u; i < 4u; i++) {
-            let elem = tid * 4u + i;
-            let r = elem / TK;
-            let c = elem % TK;
-            let gr_n = row_base + r;
-            let gk = k0 + c;
-            var v_bt: f16 = 0.0h;
-            if (gr_n < params.m && gk < params.k) {
-                v_bt = f16(src0[src0_batch + gr_n * params.stride_01 + gk * params.stride_0k]);
-            }
-            tile_bt[elem] = v_bt;
-        }
-        // Load 64×16 A panel: 512 thr × 2 = 1024.
-        for (var i = 0u; i < 2u; i++) {
-            let elem = tid * 2u + i;
-            let r = elem / TK;
-            let c = elem % TK;
-            let gr_m = col_base + r;
-            let gk = k0 + c;
-            var v_a: f16 = 0.0h;
-            if (gr_m < params.n && gk < params.k) {
-                v_a = f16(src1[src1_batch + gr_m * params.stride_11 + gk * params.stride_1k]);
-            }
-            tile_a[elem] = v_a;
-        }
-        workgroupBarrier();
-
-        let b_mat = coopLoad<coop_mat16x16<f16, B>>(&tile_a[(tj * TN) * TK], 16u);
-        let row0 = (ti * TM * TILES_PER_WARP_M) * TK;
+        let base_bt = buf * PANEL_BT;
+        let base_a = buf * PANEL_A;
+        let b_mat = coopLoad<coop_mat16x16<f16, B>>(&tile_a[base_a + (tj * TN) * TK], 16u);
+        let row0 = base_bt + (ti * TM * TILES_PER_WARP_M) * TK;
         let row1 = row0 + TM * TK;
         let a0 = coopLoadT<coop_mat16x16<f16, A>>(&tile_bt[row0], 16u);
         acc0 = coopMultiplyAdd(a0, b_mat, acc0);
         let a1 = coopLoadT<coop_mat16x16<f16, A>>(&tile_bt[row1], 16u);
         acc1 = coopMultiplyAdd(a1, b_mat, acc1);
 
+        let next_k = k0 + TK;
+        let next_buf = 1u - buf;
+        if (next_k < params.k) {
+            load_panels(tid, row_base, col_base, next_k, next_buf, src0_batch, src1_batch);
+        }
         workgroupBarrier();
+        buf = next_buf;
     }
 
     let dst2_stride = params.m * params.n;
     let dst3_stride = dst2_stride * params.bs02 * params.broadcast2;
     let dst_batch = params.offset_dst + dst3_idx * dst3_stride + dst2_idx * dst2_stride;
 
-    // Per-warp tile_c slots do not alias — no cross-warp barrier between stores.
     coopStoreT(acc0, &tile_c[c_base], 16u);
     for (var i = 0u; i < 8u; i++) {
         let elem = lane * 8u + i;
