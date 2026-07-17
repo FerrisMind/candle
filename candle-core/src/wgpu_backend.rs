@@ -7608,10 +7608,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             storage_entry(2, false),
             uniform_entry(3),
         ];
+        // Register-tiled GEMM (mul_mat_reg_tile) is dramatically faster than the
+        // naive mul_mat.wgsl path for large dense F32/F16 problems. It reuses the
+        // f16 workgroup cache path and therefore requires SHADER_F16.
         let shader_storage;
         let matmul_label: &'static str;
+        let mut use_reg_tile = false;
         let shader: &str = match self.dtype {
             DType::F32 => {
+                // Note: mul_mat_reg_tile currently stages through f16 workgroup
+                // memory, which is not accurate enough for F32 vs CPU reference.
+                // Keep the naive F32 path until a true f32-shmem tile variant lands.
                 matmul_label = "candle-wgpu-matmul";
                 shader_storage = candle_wgpu_kernels::matmul_f32_shader().ok_or_else(|| {
                     Error::Msg("wgpu shader mul_mat.wgsl not embedded".into()).bt()
@@ -7619,11 +7626,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 &shader_storage
             }
             DType::F16 => {
-                matmul_label = "candle-wgpu-matmul";
-                shader_storage = candle_wgpu_kernels::matmul_f16_shader().ok_or_else(|| {
-                    Error::Msg("wgpu shader mul_mat.wgsl not embedded".into()).bt()
-                })?;
-                &shader_storage
+                // f16 reg-tile is valid (shmem is f16). Restrict to tile-aligned
+                // dims for residual-edge correctness under tight smoke tols.
+                let tile_ok = m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(32);
+                if self
+                    .device
+                    .inner
+                    .features
+                    .contains(wgpu::Features::SHADER_F16)
+                    && tile_ok
+                    && m.max(n) >= 64
+                {
+                    matmul_label = "candle-wgpu-matmul-fast";
+                    use_reg_tile = true;
+                    shader_storage = candle_wgpu_kernels::matmul_fast_shader(
+                        wgpu_kernel_dtype(DType::F16)?,
+                        false,
+                    )
+                    .ok_or_else(|| {
+                        Error::Msg("wgpu shader mul_mat_reg_tile.wgsl not embedded".into()).bt()
+                    })?;
+                    &shader_storage
+                } else {
+                    matmul_label = "candle-wgpu-matmul";
+                    shader_storage = candle_wgpu_kernels::matmul_f16_shader().ok_or_else(|| {
+                        Error::Msg("wgpu shader mul_mat.wgsl not embedded".into()).bt()
+                    })?;
+                    &shader_storage
+                }
             }
             DType::BF16 => {
                 matmul_label = "candle-wgpu-matmul-bf16";
@@ -7740,7 +7770,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let lhs_bind = storage_layout_binding(lhs, &lhs_layout, 1)?;
             let dst_bind = storage_layout_binding(&dst, &dst_layout, 2)?;
             let bindings = [rhs_bind, lhs_bind, dst_bind, buffer_binding(3, &param_buffer)];
-            let total_wg = (b * m * n).try_into().map(|v: u32| v.div_ceil(WG_SIZE))?;
+            let total_wg = if use_reg_tile {
+                // params.m/n are swapped relative to candle (m,n): see MulMatParams above.
+                let (tile_m, tile_n, wg_size_m, wg_size_n, _) =
+                    candle_wgpu_kernels::matmul_fast_tile_shape();
+                let tile_m_s = (tile_m * wg_size_m) as usize;
+                let tile_n_s = (tile_n * wg_size_n) as usize;
+                // params.m == n (cols), params.n == m (rows)
+                m.div_ceil(tile_n_s)
+                    .checked_mul(n.div_ceil(tile_m_s))
+                    .and_then(|v| v.checked_mul(b))
+                    .ok_or_else(|| {
+                        Error::Msg("wgpu backend op matmul workgroup overflow".into()).bt()
+                    })?
+                    .try_into()?
+            } else {
+                (b * m * n).try_into().map(|v: u32| v.div_ceil(WG_SIZE))?
+            };
             let max_per_dim = wgpu_dispatch_wg_cap(&self.device);
             let (wg_x, wg_y) = compute_2d_workgroups(total_wg, max_per_dim);
             self.device
