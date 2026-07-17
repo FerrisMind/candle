@@ -405,12 +405,6 @@ fn set_thread_affinity() {
     // On non‑macOS platforms we currently leave thread affinity untouched.
 }
 
-#[cfg(not(target_os = "macos"))]
-#[inline(always)]
-fn set_thread_affinity() {
-    // On non‑macOS platforms we currently leave thread affinity untouched.
-}
-
 pub fn has_accelerate() -> bool {
     cfg!(feature = "accelerate")
 }

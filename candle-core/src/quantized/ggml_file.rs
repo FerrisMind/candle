@@ -3,7 +3,6 @@
 use super::{k_quants, GgmlDType, QStorage};
 use crate::{Device, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
-use std::borrow::Cow;
 use std::collections::HashMap;
 
 // https://github.com/ggerganov/llama.cpp/blob/468ea24fb4633a0d681f7ac84089566c1c6190cb/llama.h#L37
@@ -124,20 +123,41 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
     dims: Vec<usize>,
     device: &Device,
 ) -> Result<super::QTensor> {
+    let raw_data_ptr = raw_data.as_ptr();
+    let n_blocks = size_in_bytes / std::mem::size_of::<T>();
+    let data = unsafe { std::slice::from_raw_parts(raw_data_ptr as *const T, n_blocks) };
     let data: QStorage = match device {
-        Device::Wgpu(_) | Device::Vulkan(_) => {
-            QStorage::from_data(Cow::Borrowed(&raw_data[..size_in_bytes]), device, T::DTYPE)?
+        Device::Cpu => QStorage::Cpu(Box::new(data.to_vec())),
+        Device::Metal(metal) => super::metal::load_quantized(metal, data)?,
+        Device::Cuda(cuda) => super::cuda::load_quantized(cuda, data)?,
+        #[cfg(feature = "wgpu")]
+        Device::Wgpu(_) => {
+            // Build via byte path so alignment/unaligned GGML loads stay correct.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    data.as_ptr() as *const u8,
+                    std::mem::size_of_val(data),
+                )
+            };
+            QStorage::from_data(std::borrow::Cow::Borrowed(bytes), device, T::DTYPE)?
         }
-        Device::Cpu | Device::Metal(_) | Device::Cuda(_) => {
-            let raw_data_ptr = raw_data.as_ptr();
-            let n_blocks = size_in_bytes / std::mem::size_of::<T>();
-            let data = unsafe { std::slice::from_raw_parts(raw_data_ptr as *const T, n_blocks) };
-            match device {
-                Device::Cpu => QStorage::Cpu(Box::new(data.to_vec())),
-                Device::Metal(metal) => super::metal::load_quantized(metal, data)?,
-                Device::Cuda(cuda) => super::cuda::load_quantized(cuda, data)?,
-                Device::Wgpu(_) | Device::Vulkan(_) => unreachable!(),
-            }
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(_) => {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    data.as_ptr() as *const u8,
+                    std::mem::size_of_val(data),
+                )
+            };
+            QStorage::from_data(std::borrow::Cow::Borrowed(bytes), device, T::DTYPE)?
+        }
+        #[cfg(not(feature = "wgpu"))]
+        Device::Wgpu(_) => {
+            crate::bail!("ggml load on wgpu requires the candle-core `wgpu` feature")
+        }
+        #[cfg(not(feature = "vulkan"))]
+        Device::Vulkan(_) => {
+            crate::bail!("ggml load on vulkan requires the candle-core `vulkan` feature")
         }
     };
     super::QTensor::new(data, dims)

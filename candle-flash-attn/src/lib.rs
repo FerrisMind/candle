@@ -142,7 +142,7 @@ impl FlashAttn {
 
         let elem_count = out_shape.elem_count();
         let mut dst = unsafe { dev.alloc::<T>(elem_count)? };
-        let mut softmax_lse = dev.alloc_zeros::<f32>(b_sz * 128 * num_heads * seqlen_q)?;
+        let mut softmax_lse = dev.alloc_zeros::<f32>(b_sz * num_heads * seqlen_q)?;
 
         let is_bf16 = if is_bf16 { 1 } else { 0 };
 
@@ -556,14 +556,44 @@ impl FlashAttnVarLen {
         }
 
         let (total_q, num_heads, head_size_og) = q_l.shape().dims3()?;
-        let (total_k, num_heads_k, _head_size_og) = k_l.shape().dims3()?;
-        let expected_kv = (total_k, num_heads_k, head_size_og);
-        if expected_kv != k_l.shape().dims3()? {
-            candle::bail!("shape mismatch q {:?} and k {:?}", q_l.shape(), k_l.shape())
-        }
-        if expected_kv != v_l.shape().dims3()? {
-            candle::bail!("shape mismatch q {:?} and v {:?}", q_l.shape(), v_l.shape())
-        }
+        let (num_heads_k, page_block_size) = if paged {
+            let (_, page_block_size, num_heads_k, k_head_size) = k_l.shape().dims4()?;
+            let expected_v = k_l.shape().dims4()?;
+            if expected_v != v_l.shape().dims4()? {
+                candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
+            }
+            if k_head_size != head_size_og {
+                candle::bail!("shape mismatch q {:?} and k {:?}", q_l.shape(), k_l.shape())
+            }
+            let Some(page_block_size_arg) = self.page_block_size else {
+                candle::bail!("paged flash-attn requires page_block_size")
+            };
+            if page_block_size_arg != page_block_size {
+                candle::bail!(
+                    "page_block_size {page_block_size_arg} does not match k shape {:?}",
+                    k_l.shape()
+                )
+            }
+            if page_block_size % 32 != 0 {
+                candle::bail!(
+                    "paged flash-attn requires page_block_size to be a multiple of 32 (got {page_block_size})"
+                )
+            }
+            if head_size_og > 512 {
+                candle::bail!("paged flash-attn supports head sizes up to 512 (got {head_size_og})")
+            }
+            (num_heads_k, page_block_size_arg)
+        } else {
+            let (total_k, num_heads_k, _head_size_og) = k_l.shape().dims3()?;
+            let expected_kv = (total_k, num_heads_k, head_size_og);
+            if expected_kv != k_l.shape().dims3()? {
+                candle::bail!("shape mismatch q {:?} and k {:?}", q_l.shape(), k_l.shape())
+            }
+            if expected_kv != v_l.shape().dims3()? {
+                candle::bail!("shape mismatch q {:?} and v {:?}", q_l.shape(), v_l.shape())
+            }
+            (num_heads_k, 0)
+        };
         if head_size_og > 512 {
             candle::bail!("only supports head dimension at most 512 (got {head_size_og})")
         }

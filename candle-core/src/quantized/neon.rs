@@ -25,7 +25,7 @@ unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
             b = in(vreg) b,
             options(nostack, nomem),
         );
-        return acc;
+        acc
     }
     #[cfg(not(target_feature = "dotprod"))]
     {
@@ -33,6 +33,77 @@ unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
         let p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
         vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))
     }
+}
+
+/// Two SDOT ops into one accumulator
+#[inline(always)]
+unsafe fn vdotq_s32_pair(a0: int8x16_t, b0: int8x16_t, a1: int8x16_t, b1: int8x16_t) -> int32x4_t {
+    #[cfg(target_feature = "dotprod")]
+    {
+        let mut acc: int32x4_t = vdupq_n_s32(0);
+        core::arch::asm!(
+            "sdot {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
+            "sdot {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
+            acc = inout(vreg) acc,
+            a0 = in(vreg) a0,
+            b0 = in(vreg) b0,
+            a1 = in(vreg) a1,
+            b1 = in(vreg) b1,
+            options(nostack, nomem),
+        );
+        acc
+    }
+    #[cfg(not(target_feature = "dotprod"))]
+    {
+        let p0 = vmull_s8(vget_low_s8(a0), vget_low_s8(b0));
+        let p1 = vmull_s8(vget_high_s8(a0), vget_high_s8(b0));
+        let p2 = vmull_s8(vget_low_s8(a1), vget_low_s8(b1));
+        let p3 = vmull_s8(vget_high_s8(a1), vget_high_s8(b1));
+        vaddq_s32(
+            vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+            vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)),
+        )
+    }
+}
+
+/// Accumulating SDOT: acc += dot4(a, b) for each lane.
+#[cfg(target_feature = "dotprod")]
+#[inline(always)]
+unsafe fn sdot_acc(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    let mut out = acc;
+    core::arch::asm!(
+        "sdot {out:v}.4s, {a:v}.16b, {b:v}.16b",
+        out = inout(vreg) out,
+        a   = in(vreg) a,
+        b   = in(vreg) b,
+        options(nostack, nomem),
+    );
+    out
+}
+
+/// Decode one `BlockQ4Kx8` sub-block entry into two `int16x8_t` vectors: `(mins, scales)`, each holding values 0-63.
+/// See [llama.cpp](https://github.com/ggml-org/llama.cpp/blob/f8cc15f163e784c58fe13aee58ebc03055bb0c40/ggml/src/ggml-cpu/arch/arm/repack.cpp#L29)
+#[cfg(target_feature = "dotprod")]
+#[inline(always)]
+unsafe fn decode_q4kx8_scales(scales_in: *const u8) -> (int16x8_t, int16x8_t) {
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+    // Direct unaligned reads avoid the copy_nonoverlapping stack round-trip.
+    let sm0 = (scales_in as *const u32).read_unaligned();
+    let sm1 = (scales_in.add(4) as *const u32).read_unaligned();
+    let sm2 = (scales_in.add(8) as *const u32).read_unaligned();
+    let mins_0_3 = sm1 & KMASK1;
+    let mins_4_7 = ((sm2 >> 4) & KMASK2) | (((sm1 >> 6) & KMASK3) << 4);
+    let out_mins = vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_u32(vcreate_u32(
+        (mins_0_3 as u64) | ((mins_4_7 as u64) << 32),
+    ))));
+    let sc_0 = sm0 & KMASK1;
+    let sc_1 = (sm2 & KMASK2) | (((sm0 >> 6) & KMASK3) << 4);
+    let out_scales = vmovl_s8(vreinterpret_s8_u8(vreinterpret_u8_u32(vcreate_u32(
+        (sc_0 as u64) | ((sc_1 as u64) << 32),
+    ))));
+    (out_mins, out_scales)
 }
 
 /// Merge two per-lane (abs_max, signed_val) accumulator pairs.
@@ -1065,13 +1136,13 @@ pub(crate) fn quantize_row_q8k(xs: &[f32], ys: &mut [BlockQ8K]) {
                 continue;
             }
 
-            let iscale = -128.0f32 / max_signed;
+            let iscale = -127.0f32 / max_signed;
             let vscale = vdupq_n_f32(iscale);
 
             // Quantize f32 -> i8. Multiply, round-to-nearest, saturating narrow.
             let mut out = y.qs.as_mut_ptr();
             let mut p = chunk.as_ptr();
-            for _ in 0..QK_K / 16 {
+            for j in 0..QK_K / 16 {
                 let f0 = vmulq_f32(vld1q_f32(p), vscale);
                 let f1 = vmulq_f32(vld1q_f32(p.add(4)), vscale);
                 let f2 = vmulq_f32(vld1q_f32(p.add(8)), vscale);
@@ -1085,15 +1156,10 @@ pub(crate) fn quantize_row_q8k(xs: &[f32], ys: &mut [BlockQ8K]) {
                     vqmovn_s32(vcvtaq_s32_f32(f2)),
                     vqmovn_s32(vcvtaq_s32_f32(f3)),
                 );
-                vst1q_s8(out, vcombine_s8(vqmovn_s16(s01), vqmovn_s16(s23)));
+                let q = vcombine_s8(vqmovn_s16(s01), vqmovn_s16(s23));
+                vst1q_s8(out, q);
                 out = out.add(16);
-            }
-
-            // Sum of each 16-element group of quantized values
-            let qp = y.qs.as_ptr();
-            for j in 0..QK_K / 16 {
-                let v = vld1q_s8(qp.add(j * 16));
-                y.bsums[j] = vaddvq_s32(vpaddlq_s16(vpaddlq_s8(v))) as i16;
+                y.bsums[j] = vaddvq_s32(vpaddlq_s16(vpaddlq_s8(q))) as i16;
             }
 
             y.d = 1.0f32 / iscale;

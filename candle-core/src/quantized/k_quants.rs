@@ -807,11 +807,10 @@ impl GgmlType for BlockQ8_1 {
             ys.len(),
             Self::BLCK_SIZE
         );
-        for (block_idx, block) in xs.iter().enumerate() {
-            let scale = f16::to_f32(block.d);
-            let ys = &mut ys[block_idx * Self::BLCK_SIZE..(block_idx + 1) * Self::BLCK_SIZE];
-            for (dst, &q) in ys.iter_mut().zip(block.qs.iter()) {
-                *dst = scale * q as f32;
+        for (block, ys) in xs.iter().zip(ys.chunks_exact_mut(Self::BLCK_SIZE)) {
+            let d = block.d.to_f32();
+            for (dst, &src) in ys.iter_mut().zip(block.qs.iter()) {
+                *dst = src as f32 * d;
             }
         }
     }
@@ -2488,6 +2487,165 @@ pub fn matmul<T: GgmlType>(
                 );
             }
         }
+        Ok(())
+    })
+}
+
+/// Pack Q4K blocks into the 8-column interleaved format for 8 x GEMV
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+pub(crate) fn pack_to_q4kx8(blocks: &[BlockQ4K], n: usize) -> Vec<BlockQ4Kx8> {
+    debug_assert!(n.is_multiple_of(8));
+    debug_assert_eq!(blocks.len() % n, 0);
+    let k_blocks = blocks.len() / n;
+    let n_groups = n / 8;
+    let count = n_groups * k_blocks;
+    let mut packed: Vec<BlockQ4Kx8> = Vec::with_capacity(count);
+    for g in 0..n_groups {
+        for b in 0..k_blocks {
+            let mut p = BlockQ4Kx8 {
+                d: [f16::ZERO; 8],
+                dmin: [f16::ZERO; 8],
+                scales: [0; 96],
+                qs: [0; 1024],
+            };
+
+            let src: [&BlockQ4K; 8] = std::array::from_fn(|i| &blocks[(g * 8 + i) * k_blocks + b]);
+            for (i, s) in src.iter().enumerate() {
+                p.d[i] = s.d;
+                p.dmin[i] = s.dmin;
+            }
+            // Interleave nibbles 8 bytes at a time.
+            for i in 0..128usize {
+                let col = i % 8;
+                let off = (i / 8) * 8;
+                p.qs[i * 8..i * 8 + 8].copy_from_slice(&src[col].qs[off..off + 8]);
+            }
+            // First 48 bytes of scales: lo-nibble scales[0..3] and mins[0..3] for all 8 cols.
+            for i in 0..4usize {
+                let mut s = [0u8; 8];
+                let mut m = [0u8; 8];
+                for j in 0..8 {
+                    s[j] = src[j].scales[i] & 63;
+                    m[j] = src[j].scales[i + 4] & 63;
+                }
+                let b12 = i * 12;
+                p.scales[b12] = (s[0] & 63) + ((s[4] & 48) << 2);
+                p.scales[b12 + 1] = (s[1] & 63) + ((s[5] & 48) << 2);
+                p.scales[b12 + 2] = (s[2] & 63) + ((s[6] & 48) << 2);
+                p.scales[b12 + 3] = (s[3] & 63) + ((s[7] & 48) << 2);
+                p.scales[b12 + 4] = (m[0] & 63) + ((m[4] & 48) << 2);
+                p.scales[b12 + 5] = (m[1] & 63) + ((m[5] & 48) << 2);
+                p.scales[b12 + 6] = (m[2] & 63) + ((m[6] & 48) << 2);
+                p.scales[b12 + 7] = (m[3] & 63) + ((m[7] & 48) << 2);
+                p.scales[b12 + 8] = (s[4] & 15) + ((m[4] & 15) << 4);
+                p.scales[b12 + 9] = (s[5] & 15) + ((m[5] & 15) << 4);
+                p.scales[b12 + 10] = (s[6] & 15) + ((m[6] & 15) << 4);
+                p.scales[b12 + 11] = (s[7] & 15) + ((m[7] & 15) << 4);
+            }
+            // Last 48 bytes of scales: hi-nibble scales[4..7] and mins[4..7] for all 8 cols.
+            for i in 0..4usize {
+                let mut s = [0u8; 8];
+                let mut m = [0u8; 8];
+                for j in 0..8 {
+                    s[j] = ((src[j].scales[i] & 192) >> 2) | (src[j].scales[i + 8] & 15);
+                    m[j] =
+                        ((src[j].scales[i + 4] & 192) >> 2) | ((src[j].scales[i + 8] & 240) >> 4);
+                }
+                let b12 = i * 12 + 48;
+                p.scales[b12] = (s[0] & 63) + ((s[4] & 48) << 2);
+                p.scales[b12 + 1] = (s[1] & 63) + ((s[5] & 48) << 2);
+                p.scales[b12 + 2] = (s[2] & 63) + ((s[6] & 48) << 2);
+                p.scales[b12 + 3] = (s[3] & 63) + ((s[7] & 48) << 2);
+                p.scales[b12 + 4] = (m[0] & 63) + ((m[4] & 48) << 2);
+                p.scales[b12 + 5] = (m[1] & 63) + ((m[5] & 48) << 2);
+                p.scales[b12 + 6] = (m[2] & 63) + ((m[6] & 48) << 2);
+                p.scales[b12 + 7] = (m[3] & 63) + ((m[7] & 48) << 2);
+                p.scales[b12 + 8] = (s[4] & 15) + ((m[4] & 15) << 4);
+                p.scales[b12 + 9] = (s[5] & 15) + ((m[5] & 15) << 4);
+                p.scales[b12 + 10] = (s[6] & 15) + ((m[6] & 15) << 4);
+                p.scales[b12 + 11] = (s[7] & 15) + ((m[7] & 15) << 4);
+            }
+
+            packed.push(p);
+        }
+    }
+    packed
+}
+
+/// Q4K matmul with 8-column `BlockQ4Kx8` interleaved layout.
+///
+/// Currently only enabled on AArch64 (with dotprod enabled).
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+pub(crate) fn matmul_q4k_x8(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    repacked: &[BlockQ4Kx8],
+    dst: &mut [f32],
+) -> crate::Result<()> {
+    use crate::quantized::neon::vec_dot_8_q4k_q8k;
+    debug_assert!(n.is_multiple_of(8));
+    let k_in_blocks = k / QK_K;
+    let n_groups = n / 8;
+
+    thread_local! {
+        static LHS_SCRATCH: std::cell::RefCell<Vec<u64>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    let elem_size = std::mem::size_of::<BlockQ8K>();
+    let required_len = (m * k_in_blocks * elem_size).div_ceil(8);
+
+    LHS_SCRATCH.with(|cell| -> crate::Result<()> {
+        let mut scratch = cell.borrow_mut();
+        if scratch.len() < required_len {
+            scratch.resize(required_len, 0);
+        }
+        let lhs_b: &mut [BlockQ8K] = unsafe {
+            std::slice::from_raw_parts_mut(scratch.as_mut_ptr() as *mut BlockQ8K, m * k_in_blocks)
+        };
+        for row_idx in 0..m {
+            let lhs_row = &lhs[row_idx * k..(row_idx + 1) * k];
+            let lhs_b_mut = &mut lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
+            BlockQ8K::from_float(lhs_row, lhs_b_mut);
+        }
+
+        let pool = crate::utils::barrier_pool();
+        let n_total = pool.n_workers() + 1;
+        let groups_per_thread = n_groups.div_ceil(n_total);
+        let lhs_b: &[BlockQ8K] = lhs_b;
+        let repacked_ptr = repacked.as_ptr() as usize;
+        let x8_block_bytes = std::mem::size_of::<BlockQ4Kx8>();
+
+        for row_idx in 0..m {
+            let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
+            let lhs_row_ptr = lhs_row.as_ptr() as usize;
+            let dst_row_ptr = dst[row_idx * n..(row_idx + 1) * n].as_mut_ptr() as usize;
+
+            pool.execute(|tid| {
+                let start = tid * groups_per_thread;
+                if start >= n_groups {
+                    return;
+                }
+                let end = n_groups.min((tid + 1) * groups_per_thread);
+                let lhs_row: &[BlockQ8K] = unsafe {
+                    std::slice::from_raw_parts(lhs_row_ptr as *const BlockQ8K, k_in_blocks)
+                };
+                let dst_ptr = dst_row_ptr as *mut f32;
+                for g in start..end {
+                    let xs = unsafe {
+                        std::slice::from_raw_parts(
+                            (repacked_ptr + g * k_in_blocks * x8_block_bytes) as *const BlockQ4Kx8,
+                            k_in_blocks,
+                        )
+                    };
+                    let results = vec_dot_8_q4k_q8k(k, xs, lhs_row);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(results.as_ptr(), dst_ptr.add(g * 8), 8);
+                    }
+                }
+            });
+        }
+
         Ok(())
     })
 }

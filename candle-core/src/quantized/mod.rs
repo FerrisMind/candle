@@ -1382,6 +1382,17 @@ impl QTensor {
                 self.dtype().block_size()
             )
         }
+        // WGPU/Vulkan: native quantized gather (no host dequant round-trip).
+        if matches!(
+            &self.storage,
+            QStorage::Wgpu(_) | QStorage::Vulkan(_)
+        ) {
+            let flat_ids = ids.flatten_all()?;
+            let gathered = self.index_select_rows0_f32(&flat_ids)?;
+            let mut out_dims = ids.dims().to_vec();
+            out_dims.push(hidden);
+            return gathered.reshape(out_dims);
+        }
         let mut out_shape = ids.dims().to_vec();
         out_shape.push(hidden);
         let device = self.device();
@@ -1407,6 +1418,7 @@ impl QTensor {
                 }
                 _ => unreachable!("ids were moved to the QTensor device"),
             },
+            QStorage::Wgpu(_) | QStorage::Vulkan(_) => unreachable!("handled above"),
         };
         let none = crate::op::BackpropOp::none();
         Ok(crate::tensor::from_storage(storage, out_shape, none, false))
@@ -1418,15 +1430,6 @@ impl QTensor {
 
     pub fn data(&self) -> Result<Cow<'_, [u8]>> {
         self.storage.data()
-    }
-
-    pub fn embedding(&self, ids: &Tensor) -> Result<Tensor> {
-        let (_, hidden_size) = self.shape.dims2()?;
-        let flat_ids = ids.flatten_all()?;
-        let gathered = self.index_select_rows0_f32(&flat_ids)?;
-        let mut out_dims = ids.dims().to_vec();
-        out_dims.push(hidden_size);
-        gathered.reshape(out_dims)
     }
 
     fn index_select_rows0_f32(&self, ids: &Tensor) -> Result<Tensor> {
