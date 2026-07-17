@@ -6204,36 +6204,20 @@ impl VulkanStorage {
         // WM=WN=32, WMITER=2, TM=TN=TK=16, WARP=32 — matches 16×16 f16 MMA.
         // Warptile (non-cm1): TM=4, TN=2 scalar register tiles.
         let wide_n = n >= 512 && k >= 512 && m >= 64 && (f32_aligned || rhs_virtual_bt);
+        // Medium coopmat tile (ggml m_warptile / coopmat 16×16). Virtual-BT and
+        // aligned cm1 share 64×64 BLOCK=128 after vectorized tall loads.
         let (bm, bn, wm, wn, wmiter, tm, tn, tk, block_size) = if use_cm1 {
-            // Medium coopmat tile (ggml m_warptile with coopmat_m/n/k=16).
-            // Virtual-BT tall-skinny: BM=BN=64 + float4 A + BK=64 + wide B.
-            // After vectorized loads, BM=64 (more WGs along N) beats BM=128
-            // on 64×4096 (~0.26 vs ~0.38 ms batch). 4 warps, BLOCK=128.
-            if rhs_virtual_bt && n >= 512 {
-                (
-                    64u32,
-                    64u32,
-                    32u32,
-                    32u32,
-                    2u32,
-                    16u32,
-                    16u32,
-                    16u32,
-                    128u32,
-                )
-            } else {
-                (
-                    64u32,
-                    64u32,
-                    32u32,
-                    32u32,
-                    2u32,
-                    16u32,
-                    16u32,
-                    16u32,
-                    128u32,
-                )
-            }
+            (
+                64u32,
+                64u32,
+                32u32,
+                32u32,
+                2u32,
+                16u32,
+                16u32,
+                16u32,
+                128u32,
+            )
         } else if wide_n {
             // BM=128, BN=64, WM=32, WN=32, TM=4, TN=2 => 8 warps
             (
