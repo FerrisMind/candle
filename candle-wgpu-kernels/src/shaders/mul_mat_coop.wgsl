@@ -98,6 +98,8 @@ fn main(
     workgroupBarrier();
     var acc = coopLoadT<coop_mat16x16<f32, C>>(&tile_c[c_base], 16u);
 
+    // Note: do not branch around coop ops on non-provably-uniform predicates
+    // (naga UniformityRequirements::COOP_OPS). Bounds checks on loads are OK.
     for (var k0 = 0u; k0 < params.k; k0 += TK) {
         for (var i = 0u; i < 2u; i++) {
             let elem = tid * 2u + i;
