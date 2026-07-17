@@ -1101,10 +1101,14 @@ impl WgpuDevice {
     }
 
     /// After GPU drain, promote pending_free → free for hot-ring reuse.
+    /// Reverse pending so LIFO matches first-alloc order (better BG-cache hits
+    /// when sample N reuses the same dst sequence as sample 1).
     fn reset_hot_rings_if_idle(&self) {
         if let Ok(mut rings) = self.inner.hot_rings.lock() {
             for ring in rings.values_mut() {
-                ring.free.append(&mut ring.pending_free);
+                while let Some(b) = ring.pending_free.pop() {
+                    ring.free.push(b);
+                }
             }
         }
     }
