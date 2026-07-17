@@ -9,7 +9,7 @@ Related snapshots: [`../cuda-wgpu-vulkan-parity-matrix.md`](../cuda-wgpu-vulkan-
 ## Perf snapshot (RTX 3060, release, batch20 median_ms)
 
 Harness: `cargo run -p candle-core --example backend_parity_microbench --features cuda,vulkan,wgpu --release -- --suite`  
-Evidence: `{SCRATCH}/bench-suite-hotring7.log` (session) / tip `a903f1a4`.
+Evidence: SCRATCH `bench-suite-matmul-dyn.log` / tip `a1e9480d`.
 
 | op | CUDA | Vulkan | WGPU | Vulkan×CUDA | WGPU×CUDA |
 | --- | ---: | ---: | ---: | ---: | ---: |
