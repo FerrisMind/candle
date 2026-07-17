@@ -934,9 +934,19 @@ impl WgpuDevice {
     }
 
     fn create_storage_buffer(&self, size: usize, label: &'static str) -> wgpu::Buffer {
-        // Flush in-flight encodes so newly created buffers cannot race with
-        // pending command buffers (required for correctness on multi-op graphs).
-        let _ = self.flush_active_batch("alloc");
+        // Flush only when the active batch has encoded dispatches — empty flush
+        // is free, but avoid the call path noise. Retained Arcs keep buffers
+        // alive across in-flight submits.
+        let has_work = self
+            .inner
+            .active_batch
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|b| b.dispatch_count > 0))
+            .unwrap_or(false);
+        if has_work {
+            let _ = self.flush_active_batch("alloc");
+        }
         let _ = self.cleanup_pending_submissions(false);
         self.prune_buffer_registry();
         self.inner.device.create_buffer(&wgpu::BufferDescriptor {
@@ -10563,9 +10573,16 @@ impl BackendDevice for WgpuDevice {
         let size = byte_len(dtype, count, "wgpu alloc_uninit")?;
         // wgpu can't allocate 0-byte buffers; use a 1-byte dummy for empty shapes.
         let alloc_size = size.max(1);
-        if alloc_size >= 4 * 1024 * 1024 {
-            self.flush_active_batch("large_alloc")?;
-            self.cleanup_pending_submissions(true)?;
+        // 1024² f32 = 4 MiB — common matmul dst size. Waiting here forced a
+        // full GPU stall on every GEMM. Only block for truly large buffers, and
+        // only if there is actually in-flight work.
+        if alloc_size >= 16 * 1024 * 1024 {
+            let flushed = self.flush_active_batch("large_alloc")?;
+            if flushed {
+                self.cleanup_pending_submissions(true)?;
+            } else {
+                self.cleanup_pending_submissions(false)?;
+            }
             self.prune_buffer_registry();
         }
         let buffer =
