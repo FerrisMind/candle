@@ -48,6 +48,12 @@
 #else
 #define LOAD_VEC_BATCH_B 1
 #endif
+// Virtual B^T keeps A unaligned/strided but B (candle LHS) is K-contiguous;
+// force BATCH_B=1 so wide LOAD_VEC_B indexing matches the aligned GEMM path.
+#ifdef VIRTUAL_BT
+#undef LOAD_VEC_BATCH_B
+#define LOAD_VEC_BATCH_B 1
+#endif
 
 #if !defined(TO_FLOAT_TYPE)
 #define TO_FLOAT_TYPE FLOAT_TYPE

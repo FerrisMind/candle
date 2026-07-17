@@ -588,8 +588,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             }
         }
         // Virtual B^T + coopmat (tall-skinny tensor-core path).
+        // B (candle LHS) is K-contiguous — use wide LOAD_VEC_B like the aligned
+        // path. A stays scalar/strided virtual loads (LOAD_VEC_A=1).
         if (!coopmat2 && tname == "f32" && matmul_id_type == MatMulIdType::NONE && coopmat && fp16) {
-            string_to_spv(shader_name + "_f32_f32_virtual", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", "1"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"VIRTUAL_BT", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(shader_name + "_f32_f32_virtual", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"VIRTUAL_BT", "1"}}), fp16, coopmat, coopmat2, f16acc);
         }
 
         if (tname != "f16" && tname != "f32") {

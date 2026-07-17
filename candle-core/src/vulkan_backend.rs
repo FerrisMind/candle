@@ -6206,9 +6206,9 @@ impl VulkanStorage {
         let wide_n = n >= 512 && k >= 512 && m >= 64 && (f32_aligned || rhs_virtual_bt);
         let (bm, bn, wm, wn, wmiter, tm, tn, tk, block_size) = if use_cm1 {
             // Medium coopmat tile (ggml m_warptile with coopmat_m/n/k=16).
-            // Virtual-BT tall-skinny: BM=128 along wide candle-N + coalesced
-            // loads beats BM=64 (measured ~0.60 vs ~0.76 ms on 64×4096 batch).
-            // Needs 8 warps (BLOCK=256): (BM/WM)*(BN/WN) = 4*2.
+            // Virtual-BT tall-skinny: BM=128 along wide candle-N + float4
+            // loads + BK=64. Needs 8 warps (BLOCK=256): (BM/WM)*(BN/WN)=4*2.
+            // BN=32 (more WGs along M) was measured slightly slower on 64×4096.
             if rhs_virtual_bt && n >= 512 {
                 (
                     128u32,
