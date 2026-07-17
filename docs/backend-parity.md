@@ -22,7 +22,7 @@ Evidence: `{SCRATCH}/bench-suite-hotring7.log` (session) / tip `a903f1a4`.
 
 ✓ = ≤1.10× CUDA.
 
-**WGPU elementwise (~3×):** dominated by host path (descriptor/dispatch). Tried and measured: (1) freelist arena — dual storage binds of one buffer fail wgpu RO/RW validation; (2) 4MiB hot-ring + bind-group cache (`a903f1a4`) — correct, modest gain only. Next: single-storage-binding elementwise shaders.
+**WGPU elementwise (~3×):** host path. Evidence with `CANDLE_DEBUG_ELEM_BG=1`: suite shows ~48% bind-group cache hit rate (`hits=928 misses=1012`) after hot-ring reuse — so residual gap is **beyond** `create_bind_group` (wgpu queue/dispatch/Tensor host vs native Vulkan at ~1.0× on the same GPU). Tried: freelist arena (RO/RW validation conflict); hot-ring + BG cache (`a903f1a4`/`74959f76`).
 
 **WGPU tall GEMM (~1.22×):** dual-MMA coop path; further tile/load work remaining.
 
