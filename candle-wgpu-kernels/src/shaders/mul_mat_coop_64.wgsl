@@ -65,6 +65,8 @@ fn load_k_panel(
     src1_batch: u32,
 ) {
     let base = buf * PANEL;
+    // K-major fill for coopLoad. Coalesced virtual-Bᵀ scatter was tried and
+    // regressed dual/64 paths on RTX 3060 (shared-bank conflicts).
     for (var i = 0u; i < 2u; i++) {
         let elem = tid * 2u + i;
         let r = elem / TK;
