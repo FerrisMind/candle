@@ -1586,27 +1586,6 @@ impl WgpuDevice {
         self.run_compute_xyz(shader, entries, bindings, (wg_x, wg_y, 1), &[], None, label)
     }
 
-    fn run_compute_linear_dyn(
-        &self,
-        shader: &str,
-        entries: &[wgpu::BindGroupLayoutEntry],
-        bindings: &[wgpu::BindGroupEntry<'_>],
-        total_items: u32,
-        dynamic_offsets: &[u32],
-        label: &'static str,
-    ) -> Result<()> {
-        let (wg_x, wg_y) = linear_dispatch_workgroups(self, total_items);
-        self.run_compute_xyz(
-            shader,
-            entries,
-            bindings,
-            (wg_x, wg_y, 1),
-            dynamic_offsets,
-            None,
-            label,
-        )
-    }
-
     fn run_compute_xyz(
         &self,
         shader: &str,
@@ -8197,14 +8176,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             _pad0: 0,
             _pad1: 0,
         };
-        let param_buffer = self
-            .device
-            .write_uniform_params(any_as_bytes(&params))?;
+        let slot = self.device.inner.uniform_dyn_slot;
+        let param_buffer = self.device.uniform_dyn_buffer()?;
+        let param_bytes = any_as_bytes(&params).to_vec();
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
             storage_entry(2, false),
-            uniform_entry(3),
+            uniform_entry_dyn(3, slot),
         ];
         // Register-tiled GEMM (mul_mat_reg_tile) is dramatically faster than the
         // naive mul_mat.wgsl path for large dense F32/F16 problems. It reuses the
@@ -8388,10 +8367,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 dispatch_params.offset_src0 = 0;
                 dispatch_params.offset_src1 = 0;
                 dispatch_params.offset_dst = 0;
-                self.device
-                    .inner
-                    .queue
-                    .write_buffer(&param_buffer, 0, any_as_bytes(&dispatch_params));
                 let dst_offset_bytes = (batch_idx as u64)
                     .saturating_mul(matrix_elems_u64)
                     .saturating_mul(elem_size_u64);
@@ -8414,15 +8389,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                         dst_offset_bytes,
                         matrix_elems_u64.saturating_mul(elem_size_u64),
                     )?,
-                    buffer_binding(3, &param_buffer),
+                    uniform_binding_dyn(3, &param_buffer, slot)?,
                 ];
+                let off = self.device.reserve_uniform_slot()?;
                 self.device.run_compute_xyz(
                     shader,
                     &entries,
                     &batch_bindings,
                     (wg_x, wg_y, 1),
-                    &[],
-                    None,
+                    &[off],
+                    Some(any_as_bytes(&dispatch_params).to_vec()),
                     matmul_label,
                 )?;
             }
@@ -8430,7 +8406,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let rhs_bind = storage_layout_binding(rhs_t, &rhs_t_layout, 0)?;
             let lhs_bind = storage_layout_binding(lhs, &lhs_layout, 1)?;
             let dst_bind = storage_layout_binding(&dst, &dst_layout, 2)?;
-            let bindings = [rhs_bind, lhs_bind, dst_bind, buffer_binding(3, &param_buffer)];
+            let bindings = [
+                rhs_bind,
+                lhs_bind,
+                dst_bind,
+                uniform_binding_dyn(3, &param_buffer, slot)?,
+            ];
             let total_wg = if use_warptile {
                 // Coop 128×64 dual / coop 64×64 / warptile 64×64 — pick by label.
                 let (bm, bn, _) = if matmul_label.ends_with("-coop") {
@@ -8467,8 +8448,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             };
             let max_per_dim = wgpu_dispatch_wg_cap(&self.device);
             let (wg_x, wg_y) = compute_2d_workgroups(total_wg, max_per_dim);
-            self.device
-                .run_compute_xyz(shader, &entries, &bindings, (wg_x, wg_y, 1), &[], None, matmul_label)?;
+            let off = self.device.reserve_uniform_slot()?;
+            self.device.run_compute_xyz(
+                shader,
+                &entries,
+                &bindings,
+                (wg_x, wg_y, 1),
+                &[off],
+                Some(param_bytes),
+                matmul_label,
+            )?;
         }
         drop(lhs_contiguous);
         Ok(dst)
