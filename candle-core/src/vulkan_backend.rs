@@ -6162,26 +6162,31 @@ impl VulkanStorage {
         // `BLOCK_SIZE / WARP == (BM / WM) * (BN / WN)` so the warp grid covers
         // the whole BM x BN output tile.
         //
-        // Prefer a larger BM (128) on big aligned NVIDIA GEMMs for better L2
-        // reuse; fall back to 64x64 for residual/small shapes.
+        // mul_mm.comp maps:
+        //   gl_WorkGroupID.x → ir along params.M (= candle N) with tile BM
+        //                      (also encodes K-split when k_split < K)
+        //   gl_WorkGroupID.y → ic along params.N (= candle M) with tile BN
+        // So dispatch must be (ceil(N/BM), ceil(M/BN), batch) — NOT swapped.
+        // A previous BM=128 path used (ceil(N/BN), ceil(M/BM)) which only
+        // coincides when BM==BN and produced max_abs ~1e2 on 1024³.
         let warp = self.device.inner.subgroup_size.max(1);
-        // BM=BN=64, WM=WN=32 => 4 warps. BM=128 was measured faster on some
-        // large squares but produces large numerical errors vs CPU/CUDA on
-        // RTX 3060 with the current aligned SPIR-V specialization constants
-        // (max_abs ~1e2 on 1024³) — keep 64×64 until that path is fixed.
-        // (BN=128/256 for tall-skinny also measured neutral/worse.)
-        let (bm, bn, wm, wn, wmiter, tm, tn, block_mult, dispatch_n, dispatch_m) = (
-            64u32,
-            64u32,
-            32u32,
-            32u32,
-            2u32,
-            4u32,
-            2u32,
-            4u32,
-            n.div_ceil(64),
-            m.div_ceil(64),
-        );
+        // Prefer BM=128 on big aligned squares for L2 reuse; tall-skinny
+        // (min dim < 128) stays on 64×64.
+        let large_aligned = f32_aligned
+            && !rhs_virtual_bt
+            && m >= 128
+            && n >= 128
+            && k >= 512;
+        let (bm, bn, wm, wn, wmiter, tm, tn, block_mult) = if large_aligned {
+            // BM=128, BN=64, WM=32, WN=32 => (BM/WM)*(BN/WN)=8 warps
+            (128u32, 64u32, 32u32, 32u32, 2u32, 4u32, 2u32, 8u32)
+        } else {
+            // BM=BN=64, WM=WN=32 => 4 warps
+            (64u32, 64u32, 32u32, 32u32, 2u32, 4u32, 2u32, 4u32)
+        };
+        // x covers params.M (candle N) with BM; y covers params.N (candle M) with BN.
+        let dispatch_x = n.div_ceil(bm as usize);
+        let dispatch_y = m.div_ceil(bn as usize);
         let spec = [
             (0, warp * block_mult),
             (1, bm),
@@ -6198,8 +6203,8 @@ impl VulkanStorage {
             &bindings,
             Some(any_as_bytes(&params)),
             (
-                dispatch_n.try_into()?,
-                dispatch_m.try_into()?,
+                dispatch_x.try_into()?,
+                dispatch_y.try_into()?,
                 b.try_into()?,
             ),
             Some(&spec),
