@@ -52,13 +52,11 @@ pub enum QuantizedDType {
     Q8_K,
 }
 
-// Larger tiles improve dense F32 throughput vs CUDA/cuBLAS; keep WM*WN*TM*TN
-// within typical register/shared-memory budgets on mid-range GPUs.
-const MUL_MAT_TILE_M: u32 = 8;
-const MUL_MAT_TILE_N: u32 = 8;
+const MUL_MAT_TILE_M: u32 = 4;
+const MUL_MAT_TILE_N: u32 = 4;
 const MUL_MAT_WG_SIZE_M: u32 = 8;
 const MUL_MAT_WG_SIZE_N: u32 = 8;
-const MUL_MAT_REG_TILE_K_FLOAT: u32 = 16;
+const MUL_MAT_REG_TILE_K_FLOAT: u32 = 8;
 const QUANT_MUL_MAT_TILE_M: u32 = MUL_MAT_TILE_M;
 const QUANT_MUL_MAT_TILE_N: u32 = MUL_MAT_TILE_N;
 const QUANT_MUL_MAT_WG_SIZE_M: u32 = MUL_MAT_WG_SIZE_M;
