@@ -6147,10 +6147,17 @@ impl VulkanStorage {
             m.is_multiple_of(64) && n.is_multiple_of(64) && k.is_multiple_of(32);
         let spirv_name = match self.dtype {
             DType::F32 if rhs_virtual_bt => "matmul_f32_f32_virtual_fp32",
-            // NOTE: matmul_f32_f32_aligned_cm1 is generated when glslc supports
-            // coopmat, but needs coopmat-specific TM/TN/WM specialization
-            // (warptile TM=4/TN=2 yields WNITER=0 → host crash). Wire up once
-            // tile constants match hardware (e.g. 16×16 f16 on Ampere).
+            // Cooperative-matrix path (Ampere+): f16 A/B → f32 C (same mixed
+            // precision as WGPU coop). Skip tiny squares (64³) for tight abs tols.
+            DType::F32
+                if f32_aligned
+                    && self.device.inner.cooperative_matrix
+                    && (m >= 128 || n >= 128)
+                    && k >= 64
+                    && vulkan_spirv_exists("matmul_f32_f32_aligned_cm1") =>
+            {
+                "matmul_f32_f32_aligned_cm1"
+            }
             DType::F32 if f32_aligned && vulkan_spirv_exists("matmul_f32_f32_aligned_fp32") => {
                 "matmul_f32_f32_aligned_fp32"
             }
@@ -6177,22 +6184,60 @@ impl VulkanStorage {
         // A previous BM=128 path used (ceil(N/BN), ceil(M/BM)) which only
         // coincides when BM==BN and produced max_abs ~1e2 on 1024³.
         let warp = self.device.inner.subgroup_size.max(1);
+        let use_cm1 = spirv_name.contains("_cm1");
         // BM covers params.M (= candle N). Prefer BM=128 when candle N is wide
         // enough (squares and tall-skinny like 64×4096). BN stays 64 so candle M
         // can be as small as 64. Dispatch axes are (ceil(N/BM), ceil(M/BN)).
+        //
+        // Coopmat (ggml m_warptile style for NVIDIA): BLOCK=128, BM=BN=64,
+        // WM=WN=32, WMITER=2, TM=TN=TK=16, WARP=32 — matches 16×16 f16 MMA.
+        // Warptile (non-cm1): TM=4, TN=2 scalar register tiles.
         let wide_n = n >= 512 && k >= 512 && m >= 64 && (f32_aligned || rhs_virtual_bt);
-        let (bm, bn, wm, wn, wmiter, tm, tn, block_mult) = if wide_n {
-            // BM=128, BN=64, WM=32, WN=32 => (BM/WM)*(BN/WN)=8 warps
-            (128u32, 64u32, 32u32, 32u32, 2u32, 4u32, 2u32, 8u32)
+        let (bm, bn, wm, wn, wmiter, tm, tn, tk, block_size) = if use_cm1 {
+            // Medium coopmat tile (ggml m_warptile with coopmat_m/n/k=16).
+            (
+                64u32,
+                64u32,
+                32u32,
+                32u32,
+                2u32,
+                16u32,
+                16u32,
+                16u32,
+                128u32,
+            )
+        } else if wide_n {
+            // BM=128, BN=64, WM=32, WN=32, TM=4, TN=2 => 8 warps
+            (
+                128u32,
+                64u32,
+                32u32,
+                32u32,
+                2u32,
+                4u32,
+                2u32,
+                1u32,
+                warp * 8,
+            )
         } else {
-            // BM=BN=64, WM=WN=32 => 4 warps
-            (64u32, 64u32, 32u32, 32u32, 2u32, 4u32, 2u32, 4u32)
+            // BM=BN=64 => 4 warps
+            (
+                64u32,
+                64u32,
+                32u32,
+                32u32,
+                2u32,
+                4u32,
+                2u32,
+                1u32,
+                warp * 4,
+            )
         };
         // x covers params.M (candle N) with BM; y covers params.N (candle M) with BN.
         let dispatch_x = n.div_ceil(bm as usize);
         let dispatch_y = m.div_ceil(bn as usize);
-        let spec = [
-            (0, warp * block_mult),
+        let mut spec = vec![
+            (0, block_size),
             (1, bm),
             (2, bn),
             (4, wm),
@@ -6202,7 +6247,20 @@ impl VulkanStorage {
             (8, tn),
             (10, warp),
         ];
-        self.device.run_compute_specialized(
+        // constant_id 9 = TK (only required for coopmat path).
+        if use_cm1 {
+            spec.push((9, tk));
+        }
+        // Coopmat needs a full subgroup of the hardware size (32 on NVIDIA).
+        let (require_full_sg, req_sg) = if use_cm1 {
+            (
+                self.device.inner.compute_full_subgroups,
+                Some(warp),
+            )
+        } else {
+            (false, None)
+        };
+        self.device.run_compute_specialized_with_options(
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
@@ -6211,7 +6269,9 @@ impl VulkanStorage {
                 dispatch_y.try_into()?,
                 b.try_into()?,
             ),
-            Some(&spec),
+            Some(spec.as_slice()),
+            require_full_sg,
+            req_sg,
         )?;
         drop(lhs_contiguous);
         if dst_compute_dtype != self.dtype {

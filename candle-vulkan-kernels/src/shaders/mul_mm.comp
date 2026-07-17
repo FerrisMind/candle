@@ -166,7 +166,14 @@ void main() {
     const uint ir = gl_WorkGroupID.x % blocks_m;
     const uint ik = gl_WorkGroupID.x / blocks_m;
 
+    // For COOPMAT, TM/TN are hardware matrix sizes (e.g. 16) and this ratio is
+    // often zero — the non-coopmat path does not run. Guard the divide so
+    // specialization cannot trap (STATUS_INTEGER_DIVIDE_BY_ZERO on Windows).
+#ifdef COOPMAT
+    const uint WNITER = 1u;
+#else
     const uint WNITER = (WM * WN) / (WARP * TM * TN * WMITER);
+#endif
     const uint WSUBM = WM / WMITER;
     const uint WSUBN = WN / WNITER;
 
