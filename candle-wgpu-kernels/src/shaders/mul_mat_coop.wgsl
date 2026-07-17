@@ -5,10 +5,9 @@
 //   ti = sg % 4, tj = sg / 4 — each warp owns TWO 16×16 C tiles along M.
 // Double-buffered K panels: after coopLoad, tiles live in registers so the
 // next panel can fill the alternate buffer with one barrier per K-step.
-// (Dual-K pair schedule regressed tall GEMM on RTX 3060 — extra barrier +
-// lost cross-warp load/MMA overlap.) N-coalesced BT load maps also regressed
-// (~1.3–1.6×) via shared-bank conflicts on K-major stores; keep elem=tid*4.
-// Tall/wide residual shapes use mul_mat_coop_64.wgsl (64×64).
+// Rejected on RTX 3060: Dual-K pair schedule; N-coalesced BT without pad
+// (~1.5×); padded STRIDE=TK+4 N-coalesced (~1.6× large/tall); tall B^T
+// materialize (~6×); coop64 skinny; BK=64 multi-MMA panel.
 //
 // Binding (warptile convention):
 //   src0 = B^T / virtual B^T (params.m = candle N)
@@ -71,8 +70,7 @@ fn load_panels(
 ) {
     let base_bt = buf * PANEL_BT;
     let base_a = buf * PANEL_A;
-    // K-major BT fill (elem = n_local*TK + k_local). N-coalesced maps measured
-    // slower on RTX 3060 (shared-bank conflicts dominate strided global).
+    // K-major BT fill (elem = n_local*TK + k_local).
     for (var i = 0u; i < 4u; i++) {
         let elem = tid * 4u + i;
         let r = elem / TK;
