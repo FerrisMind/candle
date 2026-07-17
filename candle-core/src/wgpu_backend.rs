@@ -1586,6 +1586,7 @@ impl WgpuDevice {
         self.run_compute_xyz(shader, entries, bindings, (wg_x, wg_y, 1), &[], None, label)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_compute_xyz(
         &self,
         shader: &str,
