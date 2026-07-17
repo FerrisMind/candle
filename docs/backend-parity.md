@@ -28,9 +28,11 @@ Evidence: SCRATCH `bench-suite-immediates-ok.log` / tip `git rev-parse HEAD`.
 uniform `write_buffer`. Prior residual ~3× was **rebuild/preprocess of WGSL
 every dispatch**. relu now ~1.05×; mul ~1.13× residual host enqueue. Smoke 84/84.
 
-**WGPU tall GEMM (~1.20×):** dual-MMA coop still best on RTX 3060. Rejected:
-coop64-for-skinny, BK=64 multi-MMA panel, N-coalesced BT loads, 128×32/256-thread
-tall occupancy variant (all regressed 1.1–3× vs dual).
+**WGPU tall GEMM (~1.20–1.25×):** dual-MMA 128×64 virtual-Bᵀ still best on RTX 3060.
+Rejected (all regressed vs dual): coop64-skinny, BK=64 multi-MMA panel,
+N-coalesced BT (with/without STRIDE pad), 128×32/256-thread tall, materialize
+Bᵀ (~6× worse). Vulkan stays ~0.9× CUDA on the same GPU (BLOCK=128, BK=64,
+coalesced VBT + padded shmem) — open port gap under WGSL coopLoad.
 
 ## Scope
 
