@@ -599,32 +599,26 @@ struct WgpuPipelineCacheKey {
 
 fn wgpu_shader_cache_key(shader: &str) -> (u64, usize) {
     use std::hash::{Hash, Hasher};
-    // Coopmat WGSL sources are multi-KB `'static` strings. Full DefaultHasher
-    // over the source on every dispatch dominated the WGPU single-matmul host
-    // path. Cache by (ptr, len) for the common case; content-hash only once per
-    // unique slice identity (also covers heap-built template strings while the
-    // allocation lives).
-    thread_local! {
-        static LAST: std::cell::Cell<(*const u8, usize, u64)> =
-            const { std::cell::Cell::new((std::ptr::null(), 0, 0)) };
-    }
-    let ptr = shader.as_ptr();
+    // Avoid full multi-KB DefaultHasher on every dispatch (coopmat WGSL), but
+    // never key only on (ptr,len): heap-allocated template strings can reuse
+    // the same address with different content after free (observed as wrong
+    // pipelines on int binary / unary tests). Content-sample head+mid+tail.
     let len = shader.len();
-    if let Some(hash) = LAST.with(|cell| {
-        let (p, l, h) = cell.get();
-        if p == ptr && l == len {
-            Some(h)
-        } else {
-            None
-        }
-    }) {
-        return (hash, len);
-    }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    shader.hash(&mut hasher);
-    let hash = hasher.finish();
-    LAST.with(|cell| cell.set((ptr, len, hash)));
-    (hash, len)
+    len.hash(&mut hasher);
+    if len <= 512 {
+        shader.hash(&mut hasher);
+    } else {
+        let head = 128.min(len);
+        let tail = 128.min(len);
+        let mid = len / 2;
+        let mid0 = mid.saturating_sub(64);
+        let mid1 = (mid + 64).min(len);
+        shader[..head].hash(&mut hasher);
+        shader[mid0..mid1].hash(&mut hasher);
+        shader[len - tail..].hash(&mut hasher);
+    }
+    (hasher.finish(), len)
 }
 
 #[derive(Debug)]
