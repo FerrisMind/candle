@@ -22,7 +22,7 @@ Evidence: `{SCRATCH}/bench-suite-hotring7.log` (session) / tip `a903f1a4`.
 
 ✓ = ≤1.10× CUDA.
 
-**WGPU elementwise (~3×):** host path. Evidence with `CANDLE_DEBUG_ELEM_BG=1`: suite shows ~48% bind-group cache hit rate (`hits=928 misses=1012`) after hot-ring reuse — so residual gap is **beyond** `create_bind_group` (wgpu queue/dispatch/Tensor host vs native Vulkan at ~1.0× on the same GPU). Tried: freelist arena (RO/RW validation conflict); hot-ring + BG cache (`a903f1a4`/`74959f76`).
+**WGPU elementwise (~3×):** host path. With LIFO hot-ring free list (`a1e61517`), `CANDLE_DEBUG_ELEM_BG=1` reports **~96%** bind-group cache hits (`hits=928 misses=42`). Residual ~3× vs CUDA (Vulkan ~1.0× on same GPU) is therefore **non-BG** wgpu host/dispatch overhead. Tried: freelist arena (RO/RW validation conflict); hot-ring + BG cache.
 
 **WGPU tall GEMM (~1.22×):** dual-MMA coop path; further tile/load work remaining.
 
