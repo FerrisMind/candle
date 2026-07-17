@@ -88,3 +88,7 @@ required-features = ["cuda"]
 [[example]]
 name = "backend_parity_microbench"
 required-features = ["vulkan"]
+
+[[example]]
+name = "vk_cuda_matmul_diff"
+required-features = ["cuda", "vulkan"]

@@ -5915,17 +5915,39 @@ impl VulkanStorage {
             )
         };
 
+        // Virtual B^T: bind contiguous physical (K,N) as A without materializing
+        // a full n×k transpose. Big win on tall/wide (avoids 4096² copies); on
+        // large squares the aligned K-contiguous path still wins after a cheap
+        // materialize, so only enable when one output dim is skinny.
+        let rhs_virtual_bt = self.dtype == DType::F32
+            && vulkan_dense_gemm_prefers_tiled(m, n, k)
+            && m >= 64
+            && n >= 64
+            && k >= 64
+            && m.min(n) < 256
+            && m.max(n) >= 512
+            && rhs_l.is_contiguous()
+            && rhs_l.start_offset() == 0
+            && rhs_l.dims().len() == rank
+            && rhs_l.dims()[rank - 2] == k
+            && rhs_l.dims()[rank - 1] == n
+            && vulkan_spirv_exists("matmul_f32_f32_virtual_fp32");
+
         let rhs_t_src_layout = rhs_l.transpose(rank - 2, rank - 1)?;
-        let rhs_t_contiguous =
-            if rhs_t_src_layout.is_contiguous() && rhs_t_src_layout.start_offset() == 0 {
-                None
-            } else {
-                let rhs_t_shape = rhs_t_src_layout.shape().clone();
-                let mut tmp = unsafe { rhs.device.alloc_uninit(&rhs_t_shape, rhs.dtype)? };
-                rhs.copy_strided_src(&mut tmp, 0, &rhs_t_src_layout)?;
-                Some(tmp)
-            };
-        let (rhs_t, rhs_t_layout) = if let Some(rhs_t_contiguous) = rhs_t_contiguous.as_ref() {
+        let rhs_t_contiguous = if rhs_virtual_bt
+            || (rhs_t_src_layout.is_contiguous() && rhs_t_src_layout.start_offset() == 0)
+        {
+            None
+        } else {
+            let rhs_t_shape = rhs_t_src_layout.shape().clone();
+            let mut tmp = unsafe { rhs.device.alloc_uninit(&rhs_t_shape, rhs.dtype)? };
+            rhs.copy_strided_src(&mut tmp, 0, &rhs_t_src_layout)?;
+            Some(tmp)
+        };
+        let (rhs_t, rhs_t_layout) = if rhs_virtual_bt {
+            // Physical (...,K,N) — virtual B^T via stride_a = N in the shader.
+            (rhs, rhs_l.clone())
+        } else if let Some(rhs_t_contiguous) = rhs_t_contiguous.as_ref() {
             (
                 rhs_t_contiguous,
                 Layout::contiguous(rhs_t_src_layout.shape().clone()),
@@ -6088,11 +6110,13 @@ impl VulkanStorage {
                 self.dtype
             };
         let dst = unsafe { self.device.alloc_uninit(&dst_shape, dst_compute_dtype)? };
+        // Contiguous B^T: stride_a = K. Virtual BT from physical (K,N): stride_a = N.
+        let stride_a_val = if rhs_virtual_bt { n } else { k };
         let params = VulkanMatmulParams {
             m: n.try_into()?,
             n: m.try_into()?,
             k: k.try_into()?,
-            stride_a: k.try_into()?,
+            stride_a: stride_a_val.try_into()?,
             stride_b: lhs_stride[rank - 2].try_into()?,
             stride_d: n.try_into()?,
             batch_stride_a: rhs_stride_batch_inner.try_into()?,
@@ -6115,9 +6139,11 @@ impl VulkanStorage {
         // Prefer the aligned tiled variant when M/N are multiples of the 64x64
         // tile and K is a multiple of 32 — this matches ggml-vulkan's aligned
         // GEMM path and avoids residual edge handling overhead.
+        // Virtual BT forces the unaligned virtual kernel (strided-K A loads).
         let f32_aligned =
             m.is_multiple_of(64) && n.is_multiple_of(64) && k.is_multiple_of(32);
         let spirv_name = match self.dtype {
+            DType::F32 if rhs_virtual_bt => "matmul_f32_f32_virtual_fp32",
             DType::F32 if f32_aligned && vulkan_spirv_exists("matmul_f32_f32_aligned_fp32") => {
                 "matmul_f32_f32_aligned_fp32"
             }
@@ -6139,41 +6165,23 @@ impl VulkanStorage {
         // Prefer a larger BM (128) on big aligned NVIDIA GEMMs for better L2
         // reuse; fall back to 64x64 for residual/small shapes.
         let warp = self.device.inner.subgroup_size.max(1);
-        // Only use BM=128 when both output dims fill the tile; tall-skinny
-        // GEMMs (e.g. m=64, n=4096) stay on 64x64 to avoid wasted warps.
-        // (Tried BN=128 for wide shapes; measured regression on RTX 3060.)
-        let large_aligned = f32_aligned && m >= 128 && n >= 128 && k >= 512;
-        let (bm, bn, wm, wn, wmiter, tm, tn, block_mult, dispatch_n, dispatch_m) =
-            if large_aligned {
-                // BM=128, BN=64, WM=32, WN=32 => (BM/WM)*(BN/WN)=8 warps
-                (
-                    128u32,
-                    64u32,
-                    32u32,
-                    32u32,
-                    2u32,
-                    4u32,
-                    2u32,
-                    8u32,
-                    n.div_ceil(64),
-                    m.div_ceil(128),
-                )
-            } else {
-                // BM=BN=64, WM=WN=32 => 4 warps
-                // (BN=128/256 for tall-skinny measured neutral/worse on RTX 3060.)
-                (
-                    64u32,
-                    64u32,
-                    32u32,
-                    32u32,
-                    2u32,
-                    4u32,
-                    2u32,
-                    4u32,
-                    n.div_ceil(64),
-                    m.div_ceil(64),
-                )
-            };
+        // BM=BN=64, WM=WN=32 => 4 warps. BM=128 was measured faster on some
+        // large squares but produces large numerical errors vs CPU/CUDA on
+        // RTX 3060 with the current aligned SPIR-V specialization constants
+        // (max_abs ~1e2 on 1024³) — keep 64×64 until that path is fixed.
+        // (BN=128/256 for tall-skinny also measured neutral/worse.)
+        let (bm, bn, wm, wn, wmiter, tm, tn, block_mult, dispatch_n, dispatch_m) = (
+            64u32,
+            64u32,
+            32u32,
+            32u32,
+            2u32,
+            4u32,
+            2u32,
+            4u32,
+            n.div_ceil(64),
+            m.div_ceil(64),
+        );
         let spec = [
             (0, warp * block_mult),
             (1, bm),

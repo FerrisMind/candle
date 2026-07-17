@@ -239,10 +239,15 @@ void main() {
     uint pos_a =
 #ifdef MUL_MAT_ID
         expert_idx * (p.batch_stride_a / LOAD_VEC_A) +
+        (ir * BM * p.stride_a + start_k) / LOAD_VEC_A;
+#elif defined(VIRTUAL_BT)
+        // Batch base only; K/N addressing is done in load_a_to_shmem via
+        // block/idx_m with stride_a = physical N.
+        batch_idx_a * p.batch_stride_a;
 #else
         batch_idx_a * (p.batch_stride_a / LOAD_VEC_A) +
-#endif
         (ir * BM * p.stride_a + start_k) / LOAD_VEC_A;
+#endif
 #ifdef MUL_MAT_ID
     uint pos_b = 0;
 #else
@@ -286,7 +291,9 @@ void main() {
 
         barrier();
 
+#ifndef VIRTUAL_BT
         pos_a += BK / LOAD_VEC_A;
+#endif
         pos_b += BK / LOAD_VEC_B;
 
 #ifdef COOPMAT

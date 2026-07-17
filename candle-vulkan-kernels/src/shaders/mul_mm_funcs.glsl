@@ -15,6 +15,22 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             buf_a[buf_idx    ] = aa.xy;
             buf_a[buf_idx + 1] = aa.zw;
 #else // LOAD_VEC_BATCH_A == 2
+#ifdef VIRTUAL_BT
+            // Physical B is (K,N) row-major. B^T[n,k] = B[k,n] at k*stride_a + n
+            // with stride_a = N. idx_m = global n; block+row*2 = global k.
+            // pos_a is the batch base only (see mul_mm.comp).
+            const uint k0 = block + row * 2u;
+            const uint idx0 = pos_a + k0 * p.stride_a + idx_m;
+            const uint buf_idx = col * SHMEM_STRIDE + row;
+            if (idx_m < p.M && k0 + 1u < end_k) {
+                buf_a[buf_idx] = FLOAT_TYPEV2(data_a[idx0],
+                                              data_a[idx0 + p.stride_a]);
+            } else if (idx_m < p.M && k0 < end_k) {
+                buf_a[buf_idx] = FLOAT_TYPEV2(data_a[idx0], 0.0f);
+            } else {
+                buf_a[buf_idx] = FLOAT_TYPEV2(0.0f);
+            }
+#else
             const uint idx = pos_a + col * p.stride_a + row * 2;
             const uint buf_idx = col * SHMEM_STRIDE + row;
             if (idx_m < p.M && block + row * 2 + 1 < end_k) {
@@ -25,6 +41,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             } else {
                 buf_a[buf_idx] = FLOAT_TYPEV2(0.0f);
             }
+#endif
 #endif
 #elif defined(DATA_A_BF16)
 #if LOAD_VEC_A == 4
