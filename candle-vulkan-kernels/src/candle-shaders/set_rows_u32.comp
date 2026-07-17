@@ -1,0 +1,30 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+// Scatter-set for 32-bit integer payloads (U32 / I32 bit-identical).
+// Binding layout matches the f32 set_rows path used by VulkanStorage::run_scatter_set_last_dim_f32:
+//   data_a = src values, data_b = ids, data_d = destination.
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+
+    uint i00, i01, i02, i03;
+    get_indices(idx, i00, i01, i02, i03);
+
+    const uint i12 = fastmod(i03, p.ne12);
+    const uint i11 = fastmod(i02, p.ne11);
+    const uint i10 = i01;
+    const uint dst_row = data_b[src1_idx(i10, i11, i12, 0) + get_boffset()];
+
+    const uint src_idx = src0_idx(i00, i01, i02, i03) + get_aoffset();
+    const uint out_idx = dst_idx(i00, dst_row, i02, i03) + get_doffset();
+    data_d[out_idx] = data_a[src_idx];
+}

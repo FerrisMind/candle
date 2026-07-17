@@ -399,6 +399,17 @@ fn generate_candle_spirv_modules(
             ],
         ),
         (
+            "set_rows_u32_i32",
+            candle_shaders_dir.join("set_rows_u32.comp"),
+            &[
+                "A_TYPE=uint",
+                "B_TYPE=uint",
+                "D_TYPE=uint",
+                "FLOAT_TYPE=float",
+                "D_READ_WRITE",
+            ],
+        ),
+        (
             "fill_raw_u8",
             candle_shaders_dir.join("fill_raw.comp"),
             &["D_TYPE=uint8_t", "RAW_CAST=p.value0"],
@@ -768,42 +779,182 @@ fn compile_generator(
     output: &Path,
     integer_dot_support: bool,
 ) -> std::io::Result<()> {
-    let mut compilers = Vec::new();
-    if let Ok(cxx) = env::var("CXX") {
-        compilers.push(cxx);
-    }
-    compilers.extend(
-        if cfg!(windows) {
-            ["g++", "c++", "clang++"]
-        } else {
-            ["c++", "g++", "clang++"]
-        }
-        .into_iter()
-        .map(String::from),
-    );
-
     let mut errors = Vec::new();
-    for compiler in compilers {
-        let mut cmd = Command::new(&compiler);
-        cmd.arg("-std=c++17").arg(source).arg("-o").arg(output);
-        if integer_dot_support {
-            cmd.arg("-DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT");
-        }
-        match cmd.output() {
-            Ok(output_result) if output_result.status.success() => return Ok(()),
-            Ok(output_result) => errors.push(format!(
-                "{compiler}: {}{}",
-                String::from_utf8_lossy(&output_result.stdout),
-                String::from_utf8_lossy(&output_result.stderr)
-            )),
-            Err(err) => errors.push(format!("{compiler}: {err}")),
+
+    // Prefer an explicit CXX when provided.
+    if let Ok(cxx) = env::var("CXX") {
+        match try_compile_with_unix_style(&cxx, source, output, integer_dot_support) {
+            Ok(()) => return Ok(()),
+            Err(err) => errors.push(err),
         }
     }
+
+    // Unix-style compilers (also available via MinGW/LLVM on Windows).
+    for compiler in ["c++", "g++", "clang++"] {
+        match try_compile_with_unix_style(compiler, source, output, integer_dot_support) {
+            Ok(()) => return Ok(()),
+            Err(err) => errors.push(err),
+        }
+    }
+
+    // MSVC on Windows: build through a developer command prompt so INCLUDE/LIB
+    // are set. Vulkan-shaders-gen is a host tool and does not need CUDA.
+    #[cfg(windows)]
+    {
+        match try_compile_with_msvc(source, output, integer_dot_support) {
+            Ok(()) => return Ok(()),
+            Err(err) => errors.push(err),
+        }
+    }
+
     panic!(
         "failed to compile {}:\n{}",
         source.display(),
         errors.join("\n")
     );
+}
+
+fn try_compile_with_unix_style(
+    compiler: &str,
+    source: &Path,
+    output: &Path,
+    integer_dot_support: bool,
+) -> Result<(), String> {
+    let mut cmd = Command::new(compiler);
+    cmd.arg("-std=c++17").arg(source).arg("-o").arg(output);
+    if integer_dot_support {
+        cmd.arg("-DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT");
+    }
+    match cmd.output() {
+        Ok(output_result) if output_result.status.success() => Ok(()),
+        Ok(output_result) => Err(format!(
+            "{compiler}: {}{}",
+            String::from_utf8_lossy(&output_result.stdout),
+            String::from_utf8_lossy(&output_result.stderr)
+        )),
+        Err(err) => Err(format!("{compiler}: {err}")),
+    }
+}
+
+#[cfg(windows)]
+fn try_compile_with_msvc(
+    source: &Path,
+    output: &Path,
+    integer_dot_support: bool,
+) -> Result<(), String> {
+    let vcvars = find_vcvars64().ok_or_else(|| {
+        "cl/msvc: could not locate VC\\Auxiliary\\Build\\vcvars64.bat (Visual Studio)".to_string()
+    })?;
+    let define = if integer_dot_support {
+        " /DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
+    } else {
+        ""
+    };
+
+    // MSVC's cl.exe historically fails to open source files when the path
+    // contains non-ASCII characters (e.g. Cyrillic user profile dirs) under
+    // the system ANSI code page. Compile from %TEMP% (ASCII) and copy the
+    // resulting binary back to OUT_DIR.
+    let temp_root = env::temp_dir().join(format!(
+        "candle-vulkan-shaders-gen-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_root).map_err(|err| format!("cl/msvc: mkdir temp: {err}"))?;
+    let temp_src = temp_root.join("vulkan-shaders-gen.cpp");
+    let temp_exe = temp_root.join("vulkan-shaders-gen.exe");
+    let temp_obj = temp_root.join("vulkan-shaders-gen.obj");
+    let bat_path = temp_root.join("build.bat");
+    fs::copy(source, &temp_src).map_err(|err| format!("cl/msvc: copy source: {err}"))?;
+
+    let bat = format!(
+        "@echo off\r\n\
+         chcp 65001 >nul\r\n\
+         call \"{vcvars}\"\r\n\
+         if errorlevel 1 exit /b 1\r\n\
+         cl /nologo /std:c++17 /EHsc /O2{define} \"{source}\" /Fe:\"{output}\" /Fo:\"{obj}\" /link /SUBSYSTEM:CONSOLE\r\n\
+         exit /b %ERRORLEVEL%\r\n",
+        vcvars = vcvars.display(),
+        define = define,
+        source = temp_src.display(),
+        output = temp_exe.display(),
+        obj = temp_obj.display(),
+    );
+    fs::write(&bat_path, bat).map_err(|err| format!("cl/msvc: write bat: {err}"))?;
+    let output_result = Command::new("cmd")
+        .args(["/C", &bat_path.to_string_lossy()])
+        .output()
+        .map_err(|err| format!("cl/msvc: failed to spawn cmd: {err}"))?;
+
+    let compile_ok = output_result.status.success() && temp_exe.is_file();
+    if compile_ok {
+        if let Some(parent) = output.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::copy(&temp_exe, output).map_err(|err| format!("cl/msvc: copy exe: {err}"))?;
+    }
+    let _ = fs::remove_dir_all(&temp_root);
+
+    if compile_ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "cl/msvc: {}{}",
+            String::from_utf8_lossy(&output_result.stdout),
+            String::from_utf8_lossy(&output_result.stderr)
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn find_vcvars64() -> Option<PathBuf> {
+    if let Ok(path) = env::var("VCVARS64") {
+        let p = PathBuf::from(path);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let candidates = [
+        r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat",
+        r"C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat",
+        r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat",
+        r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat",
+    ];
+    for c in candidates {
+        let p = PathBuf::from(c);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // Fall back to vswhere if present.
+    let vswhere = PathBuf::from(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe");
+    if vswhere.is_file() {
+        if let Ok(out) = Command::new(&vswhere)
+            .args([
+                "-latest",
+                "-products",
+                "*",
+                "-requires",
+                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-find",
+                r"VC\Auxiliary\Build\vcvars64.bat",
+            ])
+            .output()
+        {
+            if out.status.success() {
+                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !path.is_empty() {
+                    let p = PathBuf::from(path);
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn collect_spv(dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {

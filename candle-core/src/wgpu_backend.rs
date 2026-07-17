@@ -9194,6 +9194,22 @@ impl BackendStorage for WgpuStorage {
         if self.dtype == DType::BF16 {
             return self.bf16_unary_via_f32(layout, |src, src_l| src.powf(src_l, e));
         }
+        if self.dtype == DType::F16
+            && !self
+                .device
+                .inner
+                .features
+                .contains(wgpu::Features::SHADER_F16)
+        {
+            let src_f32 = self.materialize_to_f32(layout)?;
+            let contiguous = if layout.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+            } else {
+                Layout::contiguous(layout.shape())
+            };
+            let out_f32 = src_f32.powf(&contiguous, e)?;
+            return out_f32.to_dtype(&contiguous, DType::F16);
+        }
         let shader = custom_unary_wgsl(&format!("pow(x, {:?})", e as f32));
         self.run_unary_like(layout, &shader, "candle-wgpu-powf")
     }
@@ -9377,6 +9393,16 @@ impl BackendStorage for WgpuStorage {
                 Ok(out) => Ok(out),
                 Err(err) => Err(err),
             };
+        }
+        if self.dtype == DType::F16 {
+            let src_f32 = self.materialize_to_f32(layout)?;
+            let contiguous = if layout.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+            } else {
+                Layout::contiguous(layout.shape())
+            };
+            let out_f32 = src_f32.clamp(&contiguous, min, max)?;
+            return out_f32.to_dtype(&contiguous, DType::F16);
         }
         self.run_clamp(layout, min, max)
     }

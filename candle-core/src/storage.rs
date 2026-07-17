@@ -464,12 +464,8 @@ impl Storage {
             Self::Cpu(storage) => c.cpu_fwd(storage, l),
             Self::Cuda(storage) => c.cuda_fwd(storage, l),
             Self::Metal(storage) => c.metal_fwd(storage, l),
-            Self::Wgpu(_) => {
-                Err(Error::Msg(format!("no wgpu implementation for {}", c.name())).bt())
-            }
-            Self::Vulkan(_) => {
-                Err(Error::Msg(format!("no vulkan implementation for {}", c.name())).bt())
-            }
+            Self::Wgpu(storage) => c.wgpu_fwd(storage, l),
+            Self::Vulkan(storage) => c.vulkan_fwd(storage, l),
         }
     }
 
@@ -485,12 +481,8 @@ impl Storage {
             (Self::Cpu(s1), Self::Cpu(s2)) => c.cpu_fwd(s1, l1, s2, l2),
             (Self::Cuda(s1), Self::Cuda(s2)) => c.cuda_fwd(s1, l1, s2, l2),
             (Self::Metal(s1), Self::Metal(s2)) => c.metal_fwd(s1, l1, s2, l2),
-            (Self::Wgpu(_), Self::Wgpu(_)) => {
-                Err(Error::Msg(format!("no wgpu implementation for {}", c.name())).bt())
-            }
-            (Self::Vulkan(_), Self::Vulkan(_)) => {
-                Err(Error::Msg(format!("no vulkan implementation for {}", c.name())).bt())
-            }
+            (Self::Wgpu(s1), Self::Wgpu(s2)) => c.wgpu_fwd(s1, l1, s2, l2),
+            (Self::Vulkan(s1), Self::Vulkan(s2)) => c.vulkan_fwd(s1, l1, s2, l2),
             _ => unreachable!(),
         }
     }
@@ -512,11 +504,9 @@ impl Storage {
             (Self::Metal(s1), Self::Metal(s2), Self::Metal(s3)) => {
                 c.metal_fwd(s1, l1, s2, l2, s3, l3)
             }
-            (Self::Wgpu(_), Self::Wgpu(_), Self::Wgpu(_)) => {
-                Err(Error::Msg(format!("no wgpu implementation for {}", c.name())).bt())
-            }
-            (Self::Vulkan(_), Self::Vulkan(_), Self::Vulkan(_)) => {
-                Err(Error::Msg(format!("no vulkan implementation for {}", c.name())).bt())
+            (Self::Wgpu(s1), Self::Wgpu(s2), Self::Wgpu(s3)) => c.wgpu_fwd(s1, l1, s2, l2, s3, l3),
+            (Self::Vulkan(s1), Self::Vulkan(s2), Self::Vulkan(s3)) => {
+                c.vulkan_fwd(s1, l1, s2, l2, s3, l3)
             }
             _ => unreachable!(),
         }

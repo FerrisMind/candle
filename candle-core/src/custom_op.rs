@@ -347,6 +347,22 @@ pub trait InplaceOp1 {
             format!("no metal implementation for {}", self.name()).into(),
         ))
     }
+
+    /// The forward pass, as run on a wgpu device.
+    fn wgpu_fwd(&self, _storage: &mut WgpuStorage, _layout: &Layout) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no wgpu implementation for {}",
+            self.name()
+        )))
+    }
+
+    /// The forward pass, as run on a vulkan device.
+    fn vulkan_fwd(&self, _storage: &mut VulkanStorage, _layout: &Layout) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no vulkan implementation for {}",
+            self.name()
+        )))
+    }
 }
 
 pub trait InplaceOp2 {
@@ -377,6 +393,34 @@ pub trait InplaceOp2 {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
         ))
+    }
+
+    /// The forward pass, as run on a wgpu device.
+    fn wgpu_fwd(
+        &self,
+        _: &mut WgpuStorage,
+        _: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+    ) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no wgpu implementation for {}",
+            self.name()
+        )))
+    }
+
+    /// The forward pass, as run on a vulkan device.
+    fn vulkan_fwd(
+        &self,
+        _: &mut VulkanStorage,
+        _: &Layout,
+        _: &VulkanStorage,
+        _: &Layout,
+    ) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no vulkan implementation for {}",
+            self.name()
+        )))
     }
 }
 
@@ -425,6 +469,38 @@ pub trait InplaceOp3 {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
         ))
+    }
+
+    /// The forward pass, as run on a wgpu device.
+    fn wgpu_fwd(
+        &self,
+        _: &mut WgpuStorage,
+        _: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+    ) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no wgpu implementation for {}",
+            self.name()
+        )))
+    }
+
+    /// The forward pass, as run on a vulkan device.
+    fn vulkan_fwd(
+        &self,
+        _: &mut VulkanStorage,
+        _: &Layout,
+        _: &VulkanStorage,
+        _: &Layout,
+        _: &VulkanStorage,
+        _: &Layout,
+    ) -> Result<()> {
+        Err(crate::Error::Msg(format!(
+            "no vulkan implementation for {}",
+            self.name()
+        )))
     }
 }
 

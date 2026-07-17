@@ -1087,6 +1087,13 @@ fn vulkan_q8_1_rhs_matvec_shader_name(
     if !vulkan_supports_q8_1_rhs(qdtype) || !vulkan_should_use_mmvq(device, qdtype, n, k) {
         return Ok(None);
     }
+    // Q5_1 multi-column MMVQ (q8_1 rhs) is numerically incorrect on current
+    // ggml-lineage SPIR-V variants (validated against CPU QMatMul / f32-rhs
+    // matvec). Prefer the f32 activation path when more than one column is
+    // processed in a single matvec launch.
+    if qdtype == GgmlDType::Q5_1 && n > 1 && !indexed {
+        return Ok(None);
+    }
     let workgroup = vulkan_dmmv_workgroup(device, qdtype, n, k, true);
     let base_name = if indexed {
         format!("mul_mat_vec_id_{}_q8_1_f32", vulkan_quantized_stem(qdtype)?)
@@ -5608,7 +5615,14 @@ impl VulkanStorage {
         }
         if !matches!(
             self.dtype,
-            DType::F32 | DType::F16 | DType::BF16 | DType::U8 | DType::I64 | DType::F64
+            DType::F32
+                | DType::F16
+                | DType::BF16
+                | DType::U8
+                | DType::U32
+                | DType::I32
+                | DType::I64
+                | DType::F64
         ) || self.dtype != src.dtype
         {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_set").bt());
@@ -5685,8 +5699,14 @@ impl VulkanStorage {
             VulkanBinding::Storage(&ids.buffer),
             VulkanBinding::Storage(&self.buffer),
         ];
-        let spirv = candle_vulkan_kernels::spirv("set_rows_f32_i32").ok_or_else(|| {
-            Error::Msg("vulkan shader set_rows_f32_i32 not generated".into()).bt()
+        // U32/I32 payloads use a dedicated integer set_rows path (bit-identical
+        // for both). Float payloads keep the existing f32 shader.
+        let spirv_name = match self.dtype {
+            DType::U32 | DType::I32 => "set_rows_u32_i32",
+            _ => "set_rows_f32_i32",
+        };
+        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
+            Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
         })?;
         let rows: u32 = (left_size * ids_dim).try_into()?;
         self.device.run_compute(
@@ -7605,6 +7625,16 @@ impl BackendStorage for VulkanStorage {
             if self.dtype == DType::BF16 {
                 return self.bf16_unary_via_f32(layout, |src, src_l| src.powf(src_l, e));
             }
+            if self.dtype == DType::F16 {
+                let src_f32 = self.materialize_to_f32(layout)?;
+                let contiguous = if layout.dims().len() > 4 {
+                    Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+                } else {
+                    Layout::contiguous(layout.shape())
+                };
+                let out_f32 = src_f32.powf(&contiguous, e)?;
+                return out_f32.to_dtype(&contiguous, DType::F16);
+            }
             if self.dtype != DType::F32 {
                 return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan powf").bt());
             }
@@ -7741,6 +7771,16 @@ impl BackendStorage for VulkanStorage {
         let gpu = || -> Result<Self> {
             if self.dtype == DType::BF16 {
                 return self.bf16_unary_via_f32(layout, |src, src_l| src.clamp(src_l, min, max));
+            }
+            if self.dtype == DType::F16 {
+                let src_f32 = self.materialize_to_f32(layout)?;
+                let contiguous = if layout.dims().len() > 4 {
+                    Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+                } else {
+                    Layout::contiguous(layout.shape())
+                };
+                let out_f32 = src_f32.clamp(&contiguous, min, max)?;
+                return out_f32.to_dtype(&contiguous, DType::F16);
             }
             if self.dtype != DType::F32 {
                 return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan clamp").bt());

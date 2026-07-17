@@ -4363,6 +4363,11 @@ fn vulkan_uses_q8_1_rhs(device: &Device, dtype: GgmlDType, n: usize, k: usize) -
     if matches!(dtype, GgmlDType::Q3K | GgmlDType::Q6K) {
         return false;
     }
+    // Mirror vulkan_backend::vulkan_q8_1_rhs_matvec_shader_name: Q5_1 multi-column
+    // MMVQ is disabled because the SPIR-V path is numerically incorrect.
+    if dtype == GgmlDType::Q5_1 && n > 1 {
+        return false;
+    }
     let Ok(vk_device) = device.as_vulkan_device() else {
         return false;
     };
