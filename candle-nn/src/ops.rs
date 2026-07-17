@@ -1,6 +1,7 @@
 //! Tensor ops.
 //!
 
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use candle::backend::BackendStorage;
 use candle::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
 use rayon::prelude::*;
