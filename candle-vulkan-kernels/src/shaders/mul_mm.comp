@@ -112,8 +112,14 @@ layout (constant_id = 9) const uint TK = 1;  // Only needed for coopmat
 layout (constant_id = 10) const uint WARP = 32;
 
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
+// Larger K panels for virtual B^T hide more latency per barrier on tall GEMMs.
+#ifdef VIRTUAL_BT
+#define BK 64
+#define BK_STEP 4
+#else
 #define BK 32
 #define BK_STEP 4
+#endif
 #else
 layout (constant_id = 3) const uint BK = 16;  // Assumed to be 32 if working with a quant
 #define BK_STEP 2
@@ -286,26 +292,48 @@ void main() {
 
     for (uint block = start_k; block < end_k; block += BK) {
 #ifdef VIRTUAL_BT
-        // Coalesced virtual B^T loads: physical A is (K,N) row-major with
-        // stride_a = N. Consecutive threads own consecutive n and the same
-        // k-pair so a warp hits one 128-byte segment of a physical K-row.
-        // Requires BLOCK_SIZE % BM == 0 (true for BM=64/128, BLOCK=128/256).
+        // Coalesced virtual B^T: physical A is (K,N), stride_a = N.
+        // float4 along N issues wide coalesced transactions; interior tiles
+        // skip per-element bounds checks (common for 64x4096 / aligned N).
         {
-            const uint n_local = gl_LocalInvocationID.x % BM;
-            const uint kpair0 = gl_LocalInvocationID.x / BM;
-            const uint kpair_stride = gl_WorkGroupSize.x / BM;
-            const uint global_n = ir * BM + n_local;
-            [[unroll]] for (uint kpair = kpair0; kpair < (BK / 2u); kpair += kpair_stride) {
-                const uint k0 = block + kpair * 2u;
-                const uint buf_idx = n_local * SHMEM_STRIDE + kpair;
-                if (global_n < p.M && k0 + 1u < end_k) {
-                    const uint idx0 = pos_a + k0 * p.stride_a + global_n;
-                    buf_a[buf_idx] = FLOAT_TYPEV2(data_a[idx0], data_a[idx0 + p.stride_a]);
-                } else if (global_n < p.M && k0 < end_k) {
-                    const uint idx0 = pos_a + k0 * p.stride_a + global_n;
-                    buf_a[buf_idx] = FLOAT_TYPEV2(data_a[idx0], 0.0f);
-                } else {
-                    buf_a[buf_idx] = FLOAT_TYPEV2(0.0f);
+            const uint tile_n0 = ir * BM;
+            const bool interior = (tile_n0 + BM <= p.M) && (block + BK <= end_k);
+            const uint vec_n = BM / 4u;
+            const uint n4 = gl_LocalInvocationID.x % vec_n;
+            const uint kpair0 = gl_LocalInvocationID.x / vec_n;
+            const uint kpair_stride = max(1u, gl_WorkGroupSize.x / vec_n);
+            const uint n_base = tile_n0 + n4 * 4u;
+            if (interior) {
+                [[unroll]] for (uint kpair = kpair0; kpair < (BK / 2u); kpair += kpair_stride) {
+                    const uint k0 = block + kpair * 2u;
+                    const uint idx0 = pos_a + k0 * p.stride_a + n_base;
+                    const uint idx1 = idx0 + p.stride_a;
+                    const vec4 v0 = vec4(data_a[idx0], data_a[idx0 + 1u],
+                                         data_a[idx0 + 2u], data_a[idx0 + 3u]);
+                    const vec4 v1 = vec4(data_a[idx1], data_a[idx1 + 1u],
+                                         data_a[idx1 + 2u], data_a[idx1 + 3u]);
+                    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                        buf_a[(n4 * 4u + i) * SHMEM_STRIDE + kpair] =
+                            FLOAT_TYPEV2(FLOAT_TYPE(v0[i]), FLOAT_TYPE(v1[i]));
+                    }
+                }
+            } else {
+                [[unroll]] for (uint kpair = kpair0; kpair < (BK / 2u); kpair += kpair_stride) {
+                    const uint k0 = block + kpair * 2u;
+                    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                        const uint global_n = n_base + i;
+                        const uint buf_idx = (n4 * 4u + i) * SHMEM_STRIDE + kpair;
+                        if (global_n < p.M && k0 + 1u < end_k) {
+                            const uint idx0 = pos_a + k0 * p.stride_a + global_n;
+                            buf_a[buf_idx] = FLOAT_TYPEV2(FLOAT_TYPE(data_a[idx0]),
+                                                          FLOAT_TYPE(data_a[idx0 + p.stride_a]));
+                        } else if (global_n < p.M && k0 < end_k) {
+                            const uint idx0 = pos_a + k0 * p.stride_a + global_n;
+                            buf_a[buf_idx] = FLOAT_TYPEV2(FLOAT_TYPE(data_a[idx0]), FLOAT_TYPE(0.0f));
+                        } else {
+                            buf_a[buf_idx] = FLOAT_TYPEV2(FLOAT_TYPE(0.0f));
+                        }
+                    }
                 }
             }
         }
