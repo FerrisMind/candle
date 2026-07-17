@@ -8136,7 +8136,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             compact.copy_strided_src(self, dst_l.start_offset(), dst_l)?;
             return Ok(());
         }
-        if self.dtype != DType::F32 || self.dtype != src.dtype {
+        // Native F32 and F16 only (F16 uses packed-half CAS, no F32 hub).
+        if self.dtype != src.dtype
+            || !matches!(self.dtype, DType::F32 | DType::F16)
+        {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu scatter_add").bt());
         }
         let rank = dst_l.dims().len();
@@ -8210,8 +8213,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             buffer_binding(2, &self.buffer),
             buffer_binding(3, &param_buffer),
         ];
-        let shader = candle_wgpu_kernels::set_rows_add_f32_shader(WG_SIZE)
-            .ok_or_else(|| Error::Msg("wgpu shader set_rows.wgsl not embedded".into()).bt())?;
+        let shader = match self.dtype {
+            DType::F16 => candle_wgpu_kernels::set_rows_add_f16_shader(WG_SIZE),
+            _ => candle_wgpu_kernels::set_rows_add_f32_shader(WG_SIZE),
+        }
+        .ok_or_else(|| Error::Msg("wgpu shader set_rows.wgsl not embedded".into()).bt())?;
         let rows: u32 = (left_size * ids_dim).try_into()?;
         self.device.run_compute(
             &shader,

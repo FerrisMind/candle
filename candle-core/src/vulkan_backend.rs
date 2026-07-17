@@ -5760,7 +5760,10 @@ impl VulkanStorage {
             compact.copy_strided_src(self, dst_l.start_offset(), dst_l)?;
             return Ok(());
         }
-        if self.dtype != DType::F32 || self.dtype != src.dtype {
+        // Native F32 and F16 only (F16 uses packed-half CAS in set_rows_add_f16_i32).
+        if self.dtype != src.dtype
+            || !matches!(self.dtype, DType::F32 | DType::F16)
+        {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_add").bt());
         }
         let rank = dst_l.dims().len();
@@ -5828,8 +5831,12 @@ impl VulkanStorage {
             VulkanBinding::Storage(&ids.buffer),
             VulkanBinding::Storage(&self.buffer),
         ];
-        let spirv = candle_vulkan_kernels::spirv("set_rows_add_f32_i32").ok_or_else(|| {
-            Error::Msg("vulkan shader set_rows_add_f32_i32 not generated".into()).bt()
+        let spirv_name = match self.dtype {
+            DType::F16 => "set_rows_add_f16_i32",
+            _ => "set_rows_add_f32_i32",
+        };
+        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
+            Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
         })?;
         let rows: u32 = (left_size * ids_dim).try_into()?;
         self.device.run_compute(

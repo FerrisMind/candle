@@ -82,6 +82,26 @@ fn atomic_add_f32(dst_idx: u32, value: f32) {
         }
     }
 }
+
+// Native f16 scatter-add: CAS on the u32 word packing two halves.
+// `f16_elem_idx` is in f16 elements (same indexing as non-atomic f16 set_rows).
+fn atomic_add_f16(f16_elem_idx: u32, value: f16) {
+    let word_idx = f16_elem_idx / 2u;
+    let shift = (f16_elem_idx % 2u) * 16u;
+    let mask = 0xFFFFu << shift;
+    loop {
+        let old_bits = atomicLoad(&dst[word_idx]);
+        let old_h = (old_bits >> shift) & 0xFFFFu;
+        let old_v = f16(unpack2x16float(old_h).x);
+        let new_v = old_v + value;
+        let new_h = pack2x16float(vec2<f32>(f32(new_v), 0.0)) & 0xFFFFu;
+        let new_bits = (old_bits & ~mask) | (new_h << shift);
+        let result = atomicCompareExchangeWeak(&dst[word_idx], old_bits, new_bits);
+        if result.exchanged {
+            return;
+        }
+    }
+}
 #endif
 
 @compute @workgroup_size(WG_SIZE)
@@ -125,7 +145,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let col_idx = (gid.x % elems_per_row);
 #ifdef ADD
+#ifdef ADD_F16
+    atomic_add_f16(i_dst_row/VEC_SIZE + col_idx, f16(src[i_src_row/VEC_SIZE + col_idx]));
+#else
     atomic_add_f32(i_dst_row/VEC_SIZE + col_idx, f32(src[i_src_row/VEC_SIZE + col_idx]));
+#endif
 #else
     dst[i_dst_row/VEC_SIZE + col_idx] = DST_TYPE(src[i_src_row/VEC_SIZE + col_idx]);
 #endif

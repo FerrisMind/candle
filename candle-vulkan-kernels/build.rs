@@ -413,6 +413,19 @@ fn generate_candle_spirv_modules(
                 "D_READ_WRITE",
             ],
         ),
+        // Native f16 scatter-add (packed half CAS into u32 words). No F32 hub.
+        (
+            "set_rows_add_f16_i32",
+            candle_shaders_dir.join("set_rows_add.comp"),
+            &[
+                "A_TYPE=float16_t",
+                "B_TYPE=uint",
+                "D_TYPE=uint",
+                "FLOAT_TYPE=float16_t",
+                "D_READ_WRITE",
+                "SRC_F16",
+            ],
+        ),
         (
             "set_rows_u32_i32",
             candle_shaders_dir.join("set_rows_u32.comp"),

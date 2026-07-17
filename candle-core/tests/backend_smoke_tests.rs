@@ -728,6 +728,26 @@ fn backend_smoke_vulkan_scatter_add_index_add_native_only() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "vulkan")]
+fn backend_smoke_vulkan_f16_scatter_add_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_vulkan_f16_scatter_add_native_only",
+        TestBackend::Vulkan,
+        smoke_f16_scatter_add,
+    )
+}
+
+#[test]
+#[cfg(feature = "wgpu")]
+fn backend_smoke_wgpu_f16_scatter_add_native_only() -> Result<()> {
+    native_required(
+        "backend_smoke_wgpu_f16_scatter_add_native_only",
+        TestBackend::Wgpu,
+        smoke_f16_scatter_add,
+    )
+}
+
+#[test]
 #[cfg(feature = "wgpu")]
 fn backend_smoke_wgpu_shape_indexing_native_only() -> Result<()> {
     native_required(
@@ -1069,6 +1089,7 @@ fn smoke_matmul_conv_pool_family(device: &Device) -> Result<()> {
     smoke_f32_cmp_where(device)?;
     smoke_bf16_cmp_where(device)?;
     smoke_f32_scatter_add_and_index_add(device)?;
+    smoke_f16_scatter_add(device)?;
     Ok(())
 }
 
@@ -4181,6 +4202,53 @@ fn smoke_f32_scatter_add_and_index_add(device: &Device) -> Result<()> {
         base.index_add(&row_ids, &add_rows, 0)?.to_vec2::<f32>()?,
         [[2.0, 3.0, 4.0], [14.0, 15.0, 16.0]]
     );
+    Ok(())
+}
+
+/// Native F16 scatter_add (packed-half CAS) — used by Qwen3-VL DeepStack.
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_f16_scatter_add(device: &Device) -> Result<()> {
+    // last-dim scatter (same layout as the F32 smoke)
+    let dst = Tensor::zeros((1, 5), DType::F16, device)?;
+    let ids = Tensor::from_slice(&[1u32, 1, 3], (1, 3), device)?;
+    let src = Tensor::from_slice(&[1.0f32, 2.5, 4.0], (1, 3), device)?.to_dtype(DType::F16)?;
+    let out = dst
+        .scatter_add(&ids, &src, 1)?
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()?;
+    let expected = [0.0f32, 3.5, 0.0, 4.0, 0.0];
+    for (i, (a, e)) in out[0].iter().zip(expected.iter()).enumerate() {
+        if (a - e).abs() > 1e-2 {
+            candle_core::bail!(
+                "f16 scatter last-dim mismatch at {i}: got {a} expected {e} full={out:?}"
+            );
+        }
+    }
+
+    // dim-0 scatter with full-rank ids (DeepStack-style row inject)
+    let base = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), device)?
+        .to_dtype(DType::F16)?;
+    let row_ids = Tensor::from_slice(&[1u32, 1, 1, 0u32, 0, 0], (2, 3), device)?;
+    let add_rows = Tensor::from_slice(&[10.0f32, 10.0, 10.0, 1.0, 1.0, 1.0], (2, 3), device)?
+        .to_dtype(DType::F16)?;
+    let out = base
+        .scatter_add(&row_ids, &add_rows, 0)?
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()?;
+    // row0 [1,2,3]+[1,1,1]=[2,3,4]; row1 [4,5,6]+[10,10,10]=[14,15,16]
+    let expected = [[2.0f32, 3.0, 4.0], [14.0, 15.0, 16.0]];
+    for r in 0..2 {
+        for c in 0..3 {
+            if (out[r][c] - expected[r][c]).abs() > 1e-2 {
+                candle_core::bail!(
+                    "f16 scatter dim0 mismatch at [{r},{c}]: got {} expected {} full={out:?}",
+                    out[r][c],
+                    expected[r][c]
+                );
+            }
+        }
+    }
+    device.synchronize()?;
     Ok(())
 }
 
