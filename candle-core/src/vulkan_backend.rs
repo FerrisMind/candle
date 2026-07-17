@@ -6112,7 +6112,15 @@ impl VulkanStorage {
             VulkanBinding::Storage(&lhs.buffer),
             VulkanBinding::Storage(&dst.buffer),
         ];
+        // Prefer the aligned tiled variant when M/N are multiples of the 64x64
+        // tile and K is a multiple of 32 — this matches ggml-vulkan's aligned
+        // GEMM path and avoids residual edge handling overhead.
+        let f32_aligned =
+            m.is_multiple_of(64) && n.is_multiple_of(64) && k.is_multiple_of(32);
         let spirv_name = match self.dtype {
+            DType::F32 if f32_aligned && vulkan_spirv_exists("matmul_f32_f32_aligned_fp32") => {
+                "matmul_f32_f32_aligned_fp32"
+            }
             DType::F32 => "matmul_f32_f32_fp32",
             DType::BF16 if dst_compute_dtype == DType::BF16 => "matmul_bf16",
             DType::BF16 => "matmul_bf16_fp32",

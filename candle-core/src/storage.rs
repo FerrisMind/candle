@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static WGPU_CPU_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VULKAN_CPU_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Retained for diagnostic hooks / future sparse recovery paths.
+/// Production quantized GPU paths no longer call these (GPU dequant+dense instead).
+#[allow(dead_code)]
 pub(crate) fn record_wgpu_cpu_fallback(err: &Error) {
     let count = WGPU_CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
@@ -18,6 +21,8 @@ pub(crate) fn record_wgpu_cpu_fallback(err: &Error) {
     }
 }
 
+/// Retained for diagnostic hooks / future sparse recovery paths.
+#[allow(dead_code)]
 pub(crate) fn record_vulkan_cpu_fallback(err: &Error) {
     let count = VULKAN_CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {

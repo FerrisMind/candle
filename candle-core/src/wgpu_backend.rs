@@ -537,6 +537,8 @@ struct WgpuInner {
     buffer_registry: Mutex<HashMap<usize, Weak<wgpu::Buffer>>>,
     pending_submissions: Mutex<Vec<WgpuPendingSubmission>>,
     active_batch: Mutex<Option<WgpuActiveBatch>>,
+    /// Ring of reusable uniform buffers (avoids per-dispatch create_buffer).
+    uniform_ring: Mutex<(Vec<wgpu::Buffer>, usize)>,
 }
 
 struct WgpuActiveBatch {
@@ -925,6 +927,47 @@ impl WgpuDevice {
                 | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         })
+    }
+
+    /// Write params into a ring-buffered uniform and return the buffer handle.
+    /// Ring size is large enough for several in-flight batches before reuse.
+    fn write_uniform_params(&self, bytes: &[u8]) -> Result<wgpu::Buffer> {
+        const RING: usize = 64;
+        const SLOT: u64 = 256;
+        if bytes.len() as u64 > SLOT {
+            // Oversized uniforms: allocate once (rare).
+            let buf = self.inner.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-uniform-large"),
+                size: wgpu_copy_size(bytes.len()) as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.inner.queue.write_buffer(&buf, 0, bytes);
+            return Ok(buf);
+        }
+        let mut ring = self
+            .inner
+            .uniform_ring
+            .lock()
+            .map_err(|e| Error::wrap(e.to_string()))?;
+        if ring.0.is_empty() {
+            ring.0 = (0..RING)
+                .map(|_| {
+                    self.inner.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("candle-wgpu-uniform-ring"),
+                        size: SLOT,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                })
+                .collect();
+            ring.1 = 0;
+        }
+        let idx = ring.1 % ring.0.len();
+        ring.1 = idx + 1;
+        let buf = ring.0[idx].clone();
+        self.inner.queue.write_buffer(&buf, 0, bytes);
+        Ok(buf)
     }
 
     fn create_zeroed_storage_buffer(&self, size: usize, label: &'static str) -> wgpu::Buffer {
@@ -7590,18 +7633,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         };
         let param_buffer = self
             .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-matmul-params"),
-                size: std::mem::size_of::<MulMatParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+            .write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -10325,6 +10357,7 @@ impl BackendDevice for WgpuDevice {
                 buffer_registry: Mutex::new(HashMap::new()),
                 pending_submissions: Mutex::new(Vec::new()),
                 active_batch: Mutex::new(None),
+                uniform_ring: Mutex::new((Vec::new(), 0)),
             }),
         })
     }
