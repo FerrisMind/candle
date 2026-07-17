@@ -285,9 +285,35 @@ void main() {
 #endif
 
     for (uint block = start_k; block < end_k; block += BK) {
+#ifdef VIRTUAL_BT
+        // Coalesced virtual B^T loads: physical A is (K,N) row-major with
+        // stride_a = N. Consecutive threads own consecutive n and the same
+        // k-pair so a warp hits one 128-byte segment of a physical K-row.
+        // Requires BLOCK_SIZE % BM == 0 (true for BM=64/128, BLOCK=128/256).
+        {
+            const uint n_local = gl_LocalInvocationID.x % BM;
+            const uint kpair0 = gl_LocalInvocationID.x / BM;
+            const uint kpair_stride = gl_WorkGroupSize.x / BM;
+            const uint global_n = ir * BM + n_local;
+            [[unroll]] for (uint kpair = kpair0; kpair < (BK / 2u); kpair += kpair_stride) {
+                const uint k0 = block + kpair * 2u;
+                const uint buf_idx = n_local * SHMEM_STRIDE + kpair;
+                if (global_n < p.M && k0 + 1u < end_k) {
+                    const uint idx0 = pos_a + k0 * p.stride_a + global_n;
+                    buf_a[buf_idx] = FLOAT_TYPEV2(data_a[idx0], data_a[idx0 + p.stride_a]);
+                } else if (global_n < p.M && k0 < end_k) {
+                    const uint idx0 = pos_a + k0 * p.stride_a + global_n;
+                    buf_a[buf_idx] = FLOAT_TYPEV2(data_a[idx0], 0.0f);
+                } else {
+                    buf_a[buf_idx] = FLOAT_TYPEV2(0.0f);
+                }
+            }
+        }
+#else
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
         }
+#endif
         [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
 #if !defined(MUL_MAT_ID)
             load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);

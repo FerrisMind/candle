@@ -68,6 +68,9 @@ fn load_panels(
 ) {
     let base_bt = buf * PANEL_BT;
     let base_a = buf * PANEL_A;
+    // K-major BT fill (elem = n_local*TK + k_local). N-major virtual-BT
+    // global loads regress the 128×64 dual-MMA path ~2× on RTX 3060
+    // (shared-bank / coopLoad interaction) despite better DRAM coalescing.
     for (var i = 0u; i < 4u; i++) {
         let elem = tid * 4u + i;
         let r = elem / TK;

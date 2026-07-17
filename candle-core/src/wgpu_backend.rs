@@ -7736,6 +7736,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     // 128×64 dual-MMA + double-buffer wins on large squares and
                     // tall/wide shapes with one long dim (e.g. 64×4096). Keep
                     // 64×64 for mid squares (256³) where dual under-fills.
+                    // (Forcing 64×64 on skinny min-dim regressed 64×4096 ~1.3×.)
                     if m.max(n) >= 512 && m.min(n) >= 64 {
                         matmul_label = "candle-wgpu-matmul-coop";
                         candle_wgpu_kernels::matmul_coop_shader().ok_or_else(|| {

@@ -5922,6 +5922,7 @@ impl VulkanStorage {
         // a full n×k transpose. Big win on tall/wide (avoids 4096² copies); on
         // large squares the aligned K-contiguous path still wins after a cheap
         // materialize, so only enable when one output dim is skinny.
+        // Measured: materializing 4096² for tall is ~4× slower than virtual+cm1.
         let rhs_virtual_bt = self.dtype == DType::F32
             && vulkan_dense_gemm_prefers_tiled(m, n, k)
             && m >= 64
@@ -6205,17 +6206,34 @@ impl VulkanStorage {
         let wide_n = n >= 512 && k >= 512 && m >= 64 && (f32_aligned || rhs_virtual_bt);
         let (bm, bn, wm, wn, wmiter, tm, tn, tk, block_size) = if use_cm1 {
             // Medium coopmat tile (ggml m_warptile with coopmat_m/n/k=16).
-            (
-                64u32,
-                64u32,
-                32u32,
-                32u32,
-                2u32,
-                16u32,
-                16u32,
-                16u32,
-                128u32,
-            )
+            // Virtual-BT tall-skinny: BM=128 along wide candle-N + coalesced
+            // loads beats BM=64 (measured ~0.60 vs ~0.76 ms on 64×4096 batch).
+            // Needs 8 warps (BLOCK=256): (BM/WM)*(BN/WN) = 4*2.
+            if rhs_virtual_bt && n >= 512 {
+                (
+                    128u32,
+                    64u32,
+                    32u32,
+                    32u32,
+                    2u32,
+                    16u32,
+                    16u32,
+                    16u32,
+                    256u32,
+                )
+            } else {
+                (
+                    64u32,
+                    64u32,
+                    32u32,
+                    32u32,
+                    2u32,
+                    16u32,
+                    16u32,
+                    16u32,
+                    128u32,
+                )
+            }
         } else if wide_n {
             // BM=128, BN=64, WM=32, WN=32, TM=4, TN=2 => 8 warps
             (
