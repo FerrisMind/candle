@@ -1047,13 +1047,17 @@ impl WgpuDevice {
         // submit per output tensor. Large allocs still flush to bound memory.
         // Standalone copy/readback paths must call flush_before_standalone_submit.
         const LARGE_ALLOC: usize = 16 * 1024 * 1024;
-        /// Hot ring covers common elementwise outputs (1024² f32 = 4MiB).
+        /// Hot rings for latency-sensitive sizes (stable Arc → BG cache hits).
+        /// 1MiB: tall matmul C/A (64×4096 f32). 4MiB: 1024² elementwise / GEMM C.
         const HOT_RING_MAX: usize = 32;
         let key = wgpu_copy_size(size) as u64;
-        // Permanent hot ring only for the microbench elementwise size class
-        // (1024² f32 = 4MiB). Broader ranges aliased matmul temporaries.
-        const HOT_EXACT: u64 = 4 * 1024 * 1024;
-        if key == HOT_EXACT || key == wgpu_copy_size(HOT_EXACT as usize) as u64 {
+        const HOT_1M: u64 = 1024 * 1024;
+        const HOT_4M: u64 = 4 * 1024 * 1024;
+        let hot = key == HOT_1M
+            || key == HOT_4M
+            || key == wgpu_copy_size(HOT_1M as usize) as u64
+            || key == wgpu_copy_size(HOT_4M as usize) as u64;
+        if hot {
             if let Ok(mut rings) = self.inner.hot_rings.lock() {
                 let ring = rings.entry(key).or_insert_with(|| WgpuHotRing {
                     buffers: Vec::new(),
