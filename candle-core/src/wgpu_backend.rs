@@ -4,8 +4,8 @@ use crate::quantized::GgmlDType;
 use crate::{CpuStorage, DType, Error, Layout, Result, Shape, WithDType};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 const WG_SIZE: u32 = 256;
 /// wgpu validates dispatch dims <= 65535 even when the adapter reports 65536.
@@ -553,7 +553,9 @@ struct WgpuInner {
     uniform_ring: Mutex<(Vec<wgpu::Buffer>, usize)>,
     /// Single large uniform buffer for dynamic-offset slots (elementwise host path).
     /// Slot size is `uniform_dyn_slot` (aligned to min_uniform_buffer_offset_alignment).
-    uniform_dyn: Mutex<Option<(wgpu::Buffer, usize)>>,
+    /// Cursor is atomic so reserve_uniform_slot avoids a Mutex on the hot path.
+    uniform_dyn: Mutex<Option<wgpu::Buffer>>,
+    uniform_dyn_cursor: AtomicUsize,
     uniform_dyn_slot: u64,
     /// Permanent size-class rings for latency-sensitive elementwise outputs.
     /// Buffers are never destroyed; cursor resets on synchronize when safe so
@@ -1208,32 +1210,33 @@ impl WgpuDevice {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            *guard = Some((buf, 0));
+            *guard = Some(buf);
         }
-        Ok(guard.as_ref().unwrap().0.clone())
+        Ok(guard.as_ref().unwrap().clone())
     }
 
     /// Reserve the next dyn-uniform slot without writing (fill at encode time).
+    /// Uses an atomic cursor so elementwise batch20 avoids Mutex on every op.
     fn reserve_uniform_slot(&self) -> Result<u32> {
         const RING_SLOTS: usize = 256;
-        let slot = self.inner.uniform_dyn_slot;
-        let mut guard = self
-            .inner
-            .uniform_dyn
-            .lock()
-            .map_err(|e| Error::wrap(e.to_string()))?;
-        if guard.is_none() {
-            let buf = self.inner.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-uniform-dyn"),
-                size: slot * RING_SLOTS as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            *guard = Some((buf, 0));
+        // Ensure buffer exists once (rare after warm-up).
+        {
+            let guard = self
+                .inner
+                .uniform_dyn
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            if guard.is_none() {
+                drop(guard);
+                let _ = self.uniform_dyn_buffer()?;
+            }
         }
-        let (_buf, cursor) = guard.as_mut().unwrap();
-        let idx = *cursor % RING_SLOTS;
-        *cursor = idx + 1;
+        let slot = self.inner.uniform_dyn_slot;
+        let idx = self
+            .inner
+            .uniform_dyn_cursor
+            .fetch_add(1, Ordering::Relaxed)
+            % RING_SLOTS;
         Ok((idx as u64 * slot) as u32)
     }
 
@@ -1393,7 +1396,7 @@ impl WgpuDevice {
         // one queue.write_buffer when possible (elementwise batch20 common case).
         let slot = device.inner.uniform_dyn_slot as usize;
         if let Ok(guard) = device.inner.uniform_dyn.lock() {
-            if let Some((ref ubuf, _)) = *guard {
+            if let Some(ref ubuf) = *guard {
                 let mut pending: Vec<(u64, Vec<u8>)> = Vec::new();
                 for d in &mut batch.pending_dispatches {
                     if let Some(bytes) = d.deferred_uniform_bytes.take() {
@@ -1619,12 +1622,8 @@ impl WgpuDevice {
                         has_dynamic_offset,
                         ..
                     } => {
-                        if has_dynamic_offset {
-                            // Storage dynamic offsets unused today.
-                            WgpuBindingKindKey::Storage { read_only }
-                        } else {
-                            WgpuBindingKindKey::Storage { read_only }
-                        }
+                        let _ = has_dynamic_offset;
+                        WgpuBindingKindKey::Storage { read_only }
                     }
                     wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -1646,55 +1645,56 @@ impl WgpuDevice {
             shader_len,
             entries: entry_keys,
         };
-        let cached =
-            {
-                let mut cache = self
+        let cached = {
+            let mut cache = self
+                .inner
+                .pipeline_cache
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            if let Some(cached) = cache.get(&cache_key) {
+                cached.clone()
+            } else {
+                let module = self
                     .inner
-                    .pipeline_cache
-                    .lock()
-                    .map_err(|e| Error::wrap(e.to_string()))?;
-                if let Some(cached) = cache.get(&cache_key) {
-                    cached.clone()
-                } else {
-                    let module =
-                        self.inner
-                            .device
-                            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                                label: Some(label),
-                                source: wgpu::ShaderSource::Wgsl(shader.into()),
-                            });
-                    let bind_group_layout = self.inner.device.create_bind_group_layout(
-                        &wgpu::BindGroupLayoutDescriptor {
+                    .device
+                    .create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some(label),
+                        source: wgpu::ShaderSource::Wgsl(shader.into()),
+                    });
+                let bind_group_layout =
+                    self.inner
+                        .device
+                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                             label: Some(label),
                             entries,
-                        },
-                    );
-                    let pipeline_layout =
-                        self.inner
-                            .device
-                            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                                label: Some(label),
-                                bind_group_layouts: &[Some(&bind_group_layout)],
-                                immediate_size: 0,
-                            });
-                    let pipeline = self.inner.device.create_compute_pipeline(
-                        &wgpu::ComputePipelineDescriptor {
+                        });
+                let pipeline_layout =
+                    self.inner
+                        .device
+                        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                            label: Some(label),
+                            bind_group_layouts: &[Some(&bind_group_layout)],
+                            immediate_size: 0,
+                        });
+                let pipeline =
+                    self.inner
+                        .device
+                        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                             label: Some(label),
                             layout: Some(&pipeline_layout),
                             module: &module,
                             entry_point: Some("main"),
                             compilation_options: Default::default(),
                             cache: None,
-                        },
-                    );
-                    let cached = Arc::new(WgpuCachedPipeline {
-                        bind_group_layout,
-                        pipeline,
-                    });
-                    cache.insert(cache_key.clone(), cached.clone());
-                    cached
-                }
-            };
+                        });
+                let cached = Arc::new(WgpuCachedPipeline {
+                    bind_group_layout,
+                    pipeline,
+                });
+                cache.insert(cache_key, cached.clone());
+                cached
+            }
+        };
         // Elementwise dyn-uniform path: cache bind groups by (shader, src, dst,
         // params). Hot-ring dst buffers keep stable Arc identity across
         // synchronize cycles so subsequent batches hit this cache.
@@ -1715,8 +1715,8 @@ impl WgpuDevice {
                 // Last ptr is the uniform params buffer; rest are storage.
                 let storage_ptrs = ptrs[..ptrs.len() - 1].to_vec();
                 let key = WgpuElemBgKey {
-                    shader_hash: cache_key.shader_hash,
-                    shader_len: cache_key.shader_len,
+                    shader_hash,
+                    shader_len,
                     storage_ptrs,
                 };
                 let mut cache = self
@@ -1976,74 +1976,118 @@ fn wgpu_quantized_dtype(dtype: GgmlDType) -> Result<candle_wgpu_kernels::Quantiz
     }
 }
 
-fn unary_shader(op: &str, dtype: DType) -> Result<String> {
-    if op == "recip" {
-        return Ok(custom_unary_wgsl("1.0 / x"));
+fn dtype_cache_tag(dtype: DType) -> u8 {
+    match dtype {
+        DType::U8 => 0,
+        DType::U32 => 1,
+        DType::I16 => 2,
+        DType::I32 => 3,
+        DType::I64 => 4,
+        DType::BF16 => 5,
+        DType::F16 => 6,
+        DType::F32 => 7,
+        DType::F64 => 8,
+        DType::F8E4M3 => 9,
+        DType::F6E2M3 => 10,
+        DType::F6E3M2 => 11,
+        DType::F4 => 12,
+        DType::F8E8M0 => 13,
     }
-    if op == "erf" {
-        return Ok(erf_unary_wgsl());
-    }
-    let op = match op {
-        "abs" => candle_wgpu_kernels::UnaryOp::Abs,
-        "ceil" => candle_wgpu_kernels::UnaryOp::Ceil,
-        "clamp" => candle_wgpu_kernels::UnaryOp::Clamp,
-        "cos" => candle_wgpu_kernels::UnaryOp::Cos,
-        "elu" => candle_wgpu_kernels::UnaryOp::Elu,
-        "exp" => candle_wgpu_kernels::UnaryOp::Exp,
-        "floor" => candle_wgpu_kernels::UnaryOp::Floor,
-        "gelu" => candle_wgpu_kernels::UnaryOp::Gelu,
-        "gelu_erf" => candle_wgpu_kernels::UnaryOp::GeluErf,
-        "log" => candle_wgpu_kernels::UnaryOp::Log,
-        "neg" => candle_wgpu_kernels::UnaryOp::Neg,
-        "relu" => candle_wgpu_kernels::UnaryOp::Relu,
-        "round" => candle_wgpu_kernels::UnaryOp::Round,
-        "sign" => candle_wgpu_kernels::UnaryOp::Sgn,
-        "sigmoid" => candle_wgpu_kernels::UnaryOp::Sigmoid,
-        "silu" => candle_wgpu_kernels::UnaryOp::Silu,
-        "sin" => candle_wgpu_kernels::UnaryOp::Sin,
-        "sqr" => candle_wgpu_kernels::UnaryOp::Square,
-        "sqrt" => candle_wgpu_kernels::UnaryOp::Sqrt,
-        "tanh" => candle_wgpu_kernels::UnaryOp::Tanh,
-        _ => return Err(Error::Msg(format!("wgpu backend op {op} not implemented")).bt()),
-    };
-    Ok(candle_wgpu_kernels::shader(
-        candle_wgpu_kernels::ShaderOp::Unary(op),
-        wgpu_kernel_dtype(dtype)?,
-        WG_SIZE,
-    ))
 }
 
-fn binary_shader(op: &str, dtype: DType) -> Result<String> {
-    if dtype == DType::BF16 {
-        return Ok(bf16_binary_wgsl(op));
-    }
-    if matches!(dtype, DType::U8 | DType::U32 | DType::I32 | DType::I64) {
-        return custom_int_binary_wgsl(op, dtype);
-    }
-    if op == "maximum" {
-        if !matches!(dtype, DType::F32 | DType::F16) {
-            return Err(Error::UnsupportedDTypeForOp(dtype, "wgpu maximum").bt());
+/// Cache preprocessed WGSL so elementwise batch20 does not rebuild/preprocess
+/// the shader string on every dispatch (was a dominant host-path cost).
+fn cached_shader_source(kind: u8, op: &str, dtype: DType, build: impl FnOnce() -> Result<String>) -> Result<Arc<str>> {
+    use std::hash::{Hash, Hasher};
+    static CACHE: OnceLock<Mutex<HashMap<(u8, u64, u8), Arc<str>>>> = OnceLock::new();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    op.hash(&mut hasher);
+    let key = (kind, hasher.finish(), dtype_cache_tag(dtype));
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(s) = guard.get(&key) {
+            return Ok(Arc::clone(s));
         }
-        return custom_binary_wgsl("max(a, b)", dtype);
     }
-    if op == "minimum" {
-        if !matches!(dtype, DType::F32 | DType::F16) {
-            return Err(Error::UnsupportedDTypeForOp(dtype, "wgpu minimum").bt());
+    let s: Arc<str> = build()?.into();
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, Arc::clone(&s));
+    }
+    Ok(s)
+}
+
+fn unary_shader(op: &str, dtype: DType) -> Result<Arc<str>> {
+    cached_shader_source(0, op, dtype, || {
+        if op == "recip" {
+            return Ok(custom_unary_wgsl("1.0 / x"));
         }
-        return custom_binary_wgsl("min(a, b)", dtype);
-    }
-    let op = match op {
-        "add" => candle_wgpu_kernels::BinaryOp::Add,
-        "div" => candle_wgpu_kernels::BinaryOp::Div,
-        "mul" => candle_wgpu_kernels::BinaryOp::Mul,
-        "sub" => candle_wgpu_kernels::BinaryOp::Sub,
-        _ => return Err(Error::Msg(format!("wgpu backend op {op} not implemented")).bt()),
-    };
-    Ok(candle_wgpu_kernels::shader(
-        candle_wgpu_kernels::ShaderOp::Binary(op),
-        wgpu_kernel_dtype(dtype)?,
-        WG_SIZE,
-    ))
+        if op == "erf" {
+            return Ok(erf_unary_wgsl());
+        }
+        let op = match op {
+            "abs" => candle_wgpu_kernels::UnaryOp::Abs,
+            "ceil" => candle_wgpu_kernels::UnaryOp::Ceil,
+            "clamp" => candle_wgpu_kernels::UnaryOp::Clamp,
+            "cos" => candle_wgpu_kernels::UnaryOp::Cos,
+            "elu" => candle_wgpu_kernels::UnaryOp::Elu,
+            "exp" => candle_wgpu_kernels::UnaryOp::Exp,
+            "floor" => candle_wgpu_kernels::UnaryOp::Floor,
+            "gelu" => candle_wgpu_kernels::UnaryOp::Gelu,
+            "gelu_erf" => candle_wgpu_kernels::UnaryOp::GeluErf,
+            "log" => candle_wgpu_kernels::UnaryOp::Log,
+            "neg" => candle_wgpu_kernels::UnaryOp::Neg,
+            "relu" => candle_wgpu_kernels::UnaryOp::Relu,
+            "round" => candle_wgpu_kernels::UnaryOp::Round,
+            "sign" => candle_wgpu_kernels::UnaryOp::Sgn,
+            "sigmoid" => candle_wgpu_kernels::UnaryOp::Sigmoid,
+            "silu" => candle_wgpu_kernels::UnaryOp::Silu,
+            "sin" => candle_wgpu_kernels::UnaryOp::Sin,
+            "sqr" => candle_wgpu_kernels::UnaryOp::Square,
+            "sqrt" => candle_wgpu_kernels::UnaryOp::Sqrt,
+            "tanh" => candle_wgpu_kernels::UnaryOp::Tanh,
+            _ => return Err(Error::Msg(format!("wgpu backend op {op} not implemented")).bt()),
+        };
+        Ok(candle_wgpu_kernels::shader(
+            candle_wgpu_kernels::ShaderOp::Unary(op),
+            wgpu_kernel_dtype(dtype)?,
+            WG_SIZE,
+        ))
+    })
+}
+
+fn binary_shader(op: &str, dtype: DType) -> Result<Arc<str>> {
+    cached_shader_source(1, op, dtype, || {
+        if dtype == DType::BF16 {
+            return Ok(bf16_binary_wgsl(op));
+        }
+        if matches!(dtype, DType::U8 | DType::U32 | DType::I32 | DType::I64) {
+            return custom_int_binary_wgsl(op, dtype);
+        }
+        if op == "maximum" {
+            if !matches!(dtype, DType::F32 | DType::F16) {
+                return Err(Error::UnsupportedDTypeForOp(dtype, "wgpu maximum").bt());
+            }
+            return custom_binary_wgsl("max(a, b)", dtype);
+        }
+        if op == "minimum" {
+            if !matches!(dtype, DType::F32 | DType::F16) {
+                return Err(Error::UnsupportedDTypeForOp(dtype, "wgpu minimum").bt());
+            }
+            return custom_binary_wgsl("min(a, b)", dtype);
+        }
+        let op = match op {
+            "add" => candle_wgpu_kernels::BinaryOp::Add,
+            "div" => candle_wgpu_kernels::BinaryOp::Div,
+            "mul" => candle_wgpu_kernels::BinaryOp::Mul,
+            "sub" => candle_wgpu_kernels::BinaryOp::Sub,
+            _ => return Err(Error::Msg(format!("wgpu backend op {op} not implemented")).bt()),
+        };
+        Ok(candle_wgpu_kernels::shader(
+            candle_wgpu_kernels::ShaderOp::Binary(op),
+            wgpu_kernel_dtype(dtype)?,
+            WG_SIZE,
+        ))
+    })
 }
 
 // Integer binary ops for the dtypes the stock binary.wgsl cannot express.
@@ -8233,8 +8277,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 if coop_ok {
                     use_warptile = true;
                     // 128×64 dual-MMA + dbuf for large squares and tall/wide
-                    // (64×4096). 128×32 tall split and coop64-for-skinny both
-                    // regressed vs dual on RTX 3060. Keep 64×64 for mid squares.
+                    // (64×4096). Measured worse alternatives on RTX 3060:
+                    // coop64 skinny, BK=64 multi-MMA panel, N-coalesced BT loads.
                     if m.max(n) >= 512 && m.min(n) >= 64 {
                         matmul_label = "candle-wgpu-matmul-coop";
                         candle_wgpu_kernels::matmul_coop_shader().ok_or_else(|| {
@@ -11063,6 +11107,7 @@ impl BackendDevice for WgpuDevice {
                 active_batch: Mutex::new(None),
                 uniform_ring: Mutex::new((Vec::new(), 0)),
                 uniform_dyn: Mutex::new(None),
+                uniform_dyn_cursor: AtomicUsize::new(0),
                 uniform_dyn_slot,
                 hot_rings: Mutex::new(HashMap::new()),
                 elem_bg_cache: Mutex::new(HashMap::new()),
