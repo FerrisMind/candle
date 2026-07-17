@@ -8299,7 +8299,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
         // Large F32 GEMM binds contiguous (K,N) RHS as a virtual B^T via
         // stride_0k — measured faster than materializing on RTX 3060 (including
-        // coopmat path; a full B^T of 4096² is far costlier than strided loads).
+        // tall 64×4096: materialize regressed ~6× batch20). Keep virtual.
         let will_use_warptile = self.dtype == DType::F32 && m >= 64 && n >= 64 && k >= 64;
         let rhs_skip_transpose = will_use_warptile
             && rhs_l.is_contiguous()
@@ -11280,30 +11280,49 @@ impl BackendDevice for WgpuDevice {
         } else {
             wgpu::ExperimentalFeatures::disabled()
         };
-        // Request push-constant-style immediates when the adapter advertises a
-        // non-zero max (elementwise UnaryParams=48 B, BinaryParams=80 B).
+        // IMMEDIATES (push constants): BinaryContigParams=16 B, UnaryParams=48 B.
+        // Adapter may report max_immediate_size=0 until we request a non-zero
+        // limit with the feature bit — try 128, fall back without immediates.
         let mut required_features = required_features;
         let mut required_limits = adapter_limits.clone();
-        if required_features.contains(wgpu::Features::IMMEDIATES) {
-            if adapter_limits.max_immediate_size >= 80 {
-                required_limits.max_immediate_size =
-                    adapter_limits.max_immediate_size.min(256).max(80);
-            } else if adapter_limits.max_immediate_size >= 48 {
-                // Unary only; binary falls back to dyn uniform.
-                required_limits.max_immediate_size = adapter_limits.max_immediate_size;
+        let want_immediates = required_features.contains(wgpu::Features::IMMEDIATES);
+        if want_immediates {
+            let cap = if adapter_limits.max_immediate_size > 0 {
+                adapter_limits.max_immediate_size.min(256)
             } else {
-                // Feature bit without usable size — drop it.
-                required_features.remove(wgpu::Features::IMMEDIATES);
-            }
+                128
+            };
+            required_limits.max_immediate_size = cap.max(16);
         }
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("candle-wgpu"),
-            required_features,
-            required_limits: required_limits.clone(),
-            experimental_features,
-            ..Default::default()
-        }))
-        .map_err(Error::wrap)?;
+        let (device, queue) = match pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("candle-wgpu"),
+                required_features,
+                required_limits: required_limits.clone(),
+                experimental_features,
+                ..Default::default()
+            },
+        )) {
+            Ok(dq) => dq,
+            Err(e) if want_immediates => {
+                // Retry without IMMEDIATES (some drivers reject the limit).
+                required_features.remove(wgpu::Features::IMMEDIATES);
+                required_limits.max_immediate_size = 0;
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("candle-wgpu"),
+                    required_features,
+                    required_limits: required_limits.clone(),
+                    experimental_features,
+                    ..Default::default()
+                }))
+                .map_err(|e2| {
+                    Error::wrap(format!(
+                        "wgpu request_device failed (immediates retry also failed): {e}; {e2}"
+                    ))
+                })?
+            }
+            Err(e) => return Err(Error::wrap(e)),
+        };
         let adapter_limits = required_limits;
         // Cache env once — env::var on every matmul was measurable host cost.
         let coop_matmul_enabled = std::env::var("CANDLE_WGPU_COOP_MATMUL")
