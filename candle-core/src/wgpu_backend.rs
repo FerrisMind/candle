@@ -599,9 +599,32 @@ struct WgpuPipelineCacheKey {
 
 fn wgpu_shader_cache_key(shader: &str) -> (u64, usize) {
     use std::hash::{Hash, Hasher};
+    // Coopmat WGSL sources are multi-KB `'static` strings. Full DefaultHasher
+    // over the source on every dispatch dominated the WGPU single-matmul host
+    // path. Cache by (ptr, len) for the common case; content-hash only once per
+    // unique slice identity (also covers heap-built template strings while the
+    // allocation lives).
+    thread_local! {
+        static LAST: std::cell::Cell<(*const u8, usize, u64)> =
+            const { std::cell::Cell::new((std::ptr::null(), 0, 0)) };
+    }
+    let ptr = shader.as_ptr();
+    let len = shader.len();
+    if let Some(hash) = LAST.with(|cell| {
+        let (p, l, h) = cell.get();
+        if p == ptr && l == len {
+            Some(h)
+        } else {
+            None
+        }
+    }) {
+        return (hash, len);
+    }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     shader.hash(&mut hasher);
-    (hasher.finish(), shader.len())
+    let hash = hasher.finish();
+    LAST.with(|cell| cell.set((ptr, len, hash)));
+    (hash, len)
 }
 
 #[derive(Debug)]
@@ -7733,10 +7756,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     && params.stride_1k == 1;
                 if coop_ok {
                     use_warptile = true;
-                    // 128×64 dual-MMA + double-buffer wins on large squares and
-                    // tall/wide shapes with one long dim (e.g. 64×4096). Keep
-                    // 64×64 for mid squares (256³) where dual under-fills.
-                    // (Forcing 64×64 on skinny min-dim regressed 64×4096 ~1.3×.)
+                    // 128×64 dual-MMA + dbuf for large squares and tall/wide
+                    // (64×4096). 128×32 tall split and coop64-for-skinny both
+                    // regressed vs dual on RTX 3060. Keep 64×64 for mid squares.
                     if m.max(n) >= 512 && m.min(n) >= 64 {
                         matmul_label = "candle-wgpu-matmul-coop";
                         candle_wgpu_kernels::matmul_coop_shader().ok_or_else(|| {

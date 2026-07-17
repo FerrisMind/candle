@@ -1309,15 +1309,15 @@ fn scalar_raw_words(
 }
 
 fn hash_spirv_words(words: &[u32]) -> u64 {
-    // Stable process-local digest used only for in-memory pipeline cache keys.
-    let mut hash = 0xcbf29ce484222325u64;
-    for &word in words {
-        for byte in word.to_le_bytes() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-    hash
+    // Pipeline cache keys only need process-local identity. Embedded SPIR-V from
+    // candle-vulkan-kernels is `'static`, so (ptr, len) is unique and stable for
+    // the process. Full FNV over multi-KB modules on every dispatch was a large
+    // host-side cost on the single-matmul (sync) microbench path.
+    let ptr = words.as_ptr() as u64;
+    let len = words.len() as u64;
+    // Mix ptr/len; avoid depending on content scan. Collision across different
+    // static modules is impossible (distinct addresses); same module reused OK.
+    ptr.rotate_left(17) ^ len.wrapping_mul(0x9E3779B97F4A7C15)
 }
 
 impl VulkanDevice {

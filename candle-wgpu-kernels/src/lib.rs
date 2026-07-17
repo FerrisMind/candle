@@ -488,13 +488,13 @@ pub fn matmul_warptile_shader() -> Option<&'static str> {
 }
 
 /// Cooperative-matrix GEMM workgroup tile (f16 A/B → f32 C): 128×64 (m×n), K=16.
-/// Sixteen warps each own two 16×16 C tiles along M. Prefer when both candle
-/// dims are large (≥128); tall-skinny uses `*_64`.
+/// Sixteen warps each own two 16×16 C tiles along M. Prefer for large and
+/// tall/wide shapes; mid squares use `*_64`.
 pub fn matmul_coop_tile_shape() -> (u32, u32, u32) {
     (128, 64, 16)
 }
 
-/// Single-MMA-per-warp coop tile (64×64). Better for tall/wide residual shapes.
+/// Single-MMA-per-warp coop tile (64×64). Better for mid squares / residual.
 pub fn matmul_coop_64_tile_shape() -> (u32, u32, u32) {
     (64, 64, 16)
 }
