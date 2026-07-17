@@ -8,18 +8,23 @@ Related snapshots: [`../cuda-wgpu-vulkan-parity-matrix.md`](../cuda-wgpu-vulkan-
 
 ## Perf snapshot (RTX 3060, release, batch20 median_ms)
 
-Harness: `cargo run -p candle-core --example backend_parity_microbench --features cuda,vulkan,wgpu --release -- --suite`
+Harness: `cargo run -p candle-core --example backend_parity_microbench --features cuda,vulkan,wgpu --release -- --suite`  
+Evidence: `{SCRATCH}/bench-suite-hotring7.log` (session) / tip `a903f1a4`.
 
 | op | CUDA | Vulkan | WGPU | Vulkan×CUDA | WGPU×CUDA |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| matmul 256³ | 0.032 | 0.021 | 0.030 | 0.66 ✓ | 0.93 ✓ |
-| matmul 1024³ | 0.306 | 0.211 | 0.238 | 0.69 ✓ | 0.78 ✓ |
-| matmul 64×4096×4096 | 0.283 | 0.254 | 0.350 | 0.90 ✓ | **1.24** |
-| relu 1024² | 0.035 | 0.035 | 0.106 | 1.01 ✓ | **3.05** |
-| mul 1024² | 0.045 | 0.049 | 0.136 | 1.09 ✓ | **3.05** |
-| sum_last 1024² | 0.100 | 0.024 | 0.038 | 0.24 ✓ | 0.38 ✓ |
+| matmul 256³ | ~0.03 | ~0.021 | ~0.029 | **0.7 ✓** | **~1.0 ✓** |
+| matmul 1024³ | ~0.30 | ~0.21 | ~0.23 | **0.7 ✓** | **0.76 ✓** |
+| matmul 64×4096×4096 | ~0.28 | ~0.25 | ~0.34 | **0.90 ✓** | **~1.22** |
+| relu 1024² | ~0.034 | ~0.035 | ~0.103 | **1.03 ✓** | **~3.0** |
+| mul 1024² | ~0.043 | ~0.048 | ~0.131 | **1.12** | **~3.0** |
+| sum_last 1024² | ~0.10 | ~0.023 | ~0.038 | **0.23 ✓** | **0.38 ✓** |
 
-✓ = ≤1.10× CUDA. WGPU elementwise gap is host `create_bind_group` per unique dst (bind-group cache and storage arena prototypes measured; arena needs full `byte_offset` plumbing before re-enable).
+✓ = ≤1.10× CUDA.
+
+**WGPU elementwise (~3×):** dominated by host path (descriptor/dispatch). Tried and measured: (1) freelist arena — dual storage binds of one buffer fail wgpu RO/RW validation; (2) 4MiB hot-ring + bind-group cache (`a903f1a4`) — correct, modest gain only. Next: single-storage-binding elementwise shaders.
+
+**WGPU tall GEMM (~1.22×):** dual-MMA coop path; further tile/load work remaining.
 
 ## Scope
 
