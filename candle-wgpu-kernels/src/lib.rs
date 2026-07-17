@@ -484,9 +484,11 @@ pub fn matmul_fast_shader(dtype: DType, vectorized: bool) -> Option<String> {
             "#include \"mul_mat_decls.tmpl\"",
             get("mul_mat_decls.tmpl")?.source(),
         );
-    let inner_type = match dtype {
-        DType::F32 => "f32",
-        DType::F16 => "f16",
+    let (inner_type, need_f16_enable) = match dtype {
+        // Dense F32 uses f32 workgroup memory for full precision (FLOAT_ACC_SHMEM).
+        DType::F32 => ("f32", false),
+        // F16 path keeps the historical f16 shmem staging.
+        DType::F16 => ("f16", true),
     };
     let mut defines = vec![
         if vectorized {
@@ -502,6 +504,9 @@ pub fn matmul_fast_shader(dtype: DType, vectorized: bool) -> Option<String> {
         "WORKGROUP_SIZE_N".to_string(),
         "TILE_K".to_string(),
     ];
+    if matches!(dtype, DType::F32) {
+        defines.push("FLOAT_ACC_SHMEM".to_string());
+    }
     let replacements = vec![
         ("SRC0_INNER_TYPE".to_string(), inner_type.to_string()),
         ("SRC1_INNER_TYPE".to_string(), inner_type.to_string()),
@@ -522,7 +527,13 @@ pub fn matmul_fast_shader(dtype: DType, vectorized: bool) -> Option<String> {
     defines.push("WORKGROUP_SIZE_M".to_string());
     defines.push("WORKGROUP_SIZE_N".to_string());
     defines.push("TILE_K".to_string());
-    Some(preprocess(&source, &defines, &replacements, DType::F16))
+    // preprocess's dtype controls whether `enable f16;` is injected.
+    let pre_dtype = if need_f16_enable {
+        DType::F16
+    } else {
+        DType::F32
+    };
+    Some(preprocess(&source, &defines, &replacements, pre_dtype))
 }
 
 pub fn matvec_outputs_per_wg() -> u32 {

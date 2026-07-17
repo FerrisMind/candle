@@ -1,3 +1,32 @@
+#ifdef FLOAT_ACC_SHMEM
+// Full-precision f32 workgroup cache for dense F32 GEMM (no f16 demotion).
+#ifdef VEC
+#define VEC_SIZE 4
+#define SHMEM_TYPE vec4<f32>
+#define DST_TYPE vec4<f32>
+#define SRC0_TYPE vec4<SRC0_INNER_TYPE>
+#define SRC1_TYPE vec4<SRC1_INNER_TYPE>
+
+fn store_shmem(val: vec4<f32>, idx: u32) {
+    shmem[idx] = val.x;
+    shmem[idx + 1] = val.y;
+    shmem[idx + 2] = val.z;
+    shmem[idx + 3] = val.w;
+}
+#endif // VEC
+
+#ifdef SCALAR
+#define VEC_SIZE 1
+#define SHMEM_TYPE f32
+#define DST_TYPE f32
+#define SRC0_TYPE SRC0_INNER_TYPE
+#define SRC1_TYPE SRC1_INNER_TYPE
+
+fn store_shmem(val: f32, idx: u32) {
+    shmem[idx] = val;
+}
+#endif // SCALAR
+#else
 #ifdef VEC
 #define VEC_SIZE 4
 #define SHMEM_TYPE vec4<f16>
@@ -24,6 +53,7 @@ fn store_shmem(val: f16, idx: u32) {
     shmem[idx] = val;
 }
 #endif // SCALAR
+#endif // FLOAT_ACC_SHMEM
 
 #ifdef INIT_SRC0_SHMEM_FLOAT
 fn init_shmem_src0(thread_id: u32, batch_offset: u32, offset_m: u32, k_outer: u32) {

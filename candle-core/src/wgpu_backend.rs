@@ -7616,14 +7616,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let mut use_reg_tile = false;
         let shader: &str = match self.dtype {
             DType::F32 => {
-                // Note: mul_mat_reg_tile currently stages through f16 workgroup
-                // memory, which is not accurate enough for F32 vs CPU reference.
-                // Keep the naive F32 path until a true f32-shmem tile variant lands.
-                matmul_label = "candle-wgpu-matmul";
-                shader_storage = candle_wgpu_kernels::matmul_f32_shader().ok_or_else(|| {
-                    Error::Msg("wgpu shader mul_mat.wgsl not embedded".into()).bt()
-                })?;
-                &shader_storage
+                // Register-tiled F32 GEMM with f32 workgroup memory
+                // (FLOAT_ACC_SHMEM). Require tile-aligned dims for residual-edge
+                // correctness under tight smoke tolerances.
+                let tile_ok = m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(32);
+                if tile_ok && m.max(n) >= 64 {
+                    matmul_label = "candle-wgpu-matmul-fast";
+                    use_reg_tile = true;
+                    shader_storage = candle_wgpu_kernels::matmul_fast_shader(
+                        wgpu_kernel_dtype(DType::F32)?,
+                        false,
+                    )
+                    .ok_or_else(|| {
+                        Error::Msg("wgpu shader mul_mat_reg_tile.wgsl not embedded".into()).bt()
+                    })?;
+                    &shader_storage
+                } else {
+                    matmul_label = "candle-wgpu-matmul";
+                    shader_storage = candle_wgpu_kernels::matmul_f32_shader().ok_or_else(|| {
+                        Error::Msg("wgpu shader mul_mat.wgsl not embedded".into()).bt()
+                    })?;
+                    &shader_storage
+                }
             }
             DType::F16 => {
                 // f16 reg-tile is valid (shmem is f16). Restrict to tile-aligned

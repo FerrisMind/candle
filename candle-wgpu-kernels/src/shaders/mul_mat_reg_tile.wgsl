@@ -53,7 +53,12 @@ const TOTAL_WORKGROUP_SIZE = WORKGROUP_SIZE_M * WORKGROUP_SIZE_N;
 const TILE_SRC0_SHMEM = TILE_K * WORKGROUP_SIZE_M * TILE_M;
 const TILE_SRC1_SHMEM = TILE_K * WORKGROUP_SIZE_N * TILE_N;
 
+// SHMEM_ELEM is f32 for FLOAT_ACC_SHMEM (dense F32 accuracy) and f16 otherwise.
+#ifdef FLOAT_ACC_SHMEM
+var<workgroup> shmem: array<f32, TILE_SRC0_SHMEM + TILE_SRC1_SHMEM>;
+#else
 var<workgroup> shmem: array<f16, TILE_SRC0_SHMEM + TILE_SRC1_SHMEM>;
+#endif
 
 @compute @workgroup_size(TOTAL_WORKGROUP_SIZE)
 fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
@@ -113,7 +118,11 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
         let k_end = min(TILE_K, params.k - k_outer);
 
         for (var k_inner = 0u; k_inner < k_end; k_inner++) {
+#ifdef FLOAT_ACC_SHMEM
+            var src0_tile: array<f32, TILE_M>;
+#else
             var src0_tile: array<f16, TILE_M>;
+#endif
             for (var tm = 0u; tm < TILE_M; tm++) {
                 let src0_m = local_m * TILE_M + tm;
                 let src0_idx = k_inner + src0_m * TILE_K;
