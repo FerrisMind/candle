@@ -5,7 +5,7 @@
 //! - `batch`: N ops then one synchronize; per-op = total/N
 //!
 //! Default: dense F32 matmul shapes. Pass `--suite` for unary/binary/softmax too.
-use candle_core::{D, Device, DType, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor, D};
 use std::time::Instant;
 
 fn median_ms(mut v: Vec<f64>) -> f64 {
@@ -59,7 +59,12 @@ fn emit(name: &str, op: &str, mode: &str, ms: f64) {
     println!("{name},{op},{mode},{ms:.4}");
 }
 
-fn run_matmul(name: &str, dev: &Device, shapes: &[(usize, usize, usize)], iters: usize) -> Result<()> {
+fn run_matmul(
+    name: &str,
+    dev: &Device,
+    shapes: &[(usize, usize, usize)],
+    iters: usize,
+) -> Result<()> {
     let batch = 20usize;
     for &(m, n, k) in shapes {
         let a = Tensor::randn(0f32, 1.0, (m, k), dev)?;

@@ -1000,10 +1000,12 @@ fn vulkan_dmmv_workgroup(
     // block_size = subgroup_size * 4 > 1 subgroup, losing cross-subgroup partial
     // sums.  Fall back to Subgroup in that case.
     let large_ok = device.inner.subgroup_min_size <= 16;
-    if large_ok && matches!(
-        device.inner.vendor_id,
-        VULKAN_VENDOR_ID_NVIDIA | VULKAN_VENDOR_ID_INTEL
-    ) {
+    if large_ok
+        && matches!(
+            device.inner.vendor_id,
+            VULKAN_VENDOR_ID_NVIDIA | VULKAN_VENDOR_ID_INTEL
+        )
+    {
         if qdtype == GgmlDType::Q6K {
             if m < 4096 && k >= 1024 {
                 workgroup = VulkanDmmvWorkgroup::Large;
@@ -3864,11 +3866,9 @@ impl VulkanStorage {
             || !lhs_layout.is_contiguous()
             || !rhs_layout.is_contiguous()
         {
-            let mut lhs_mat =
-                unsafe { self.device.alloc_uninit(lhs_layout.shape(), self.dtype)? };
+            let mut lhs_mat = unsafe { self.device.alloc_uninit(lhs_layout.shape(), self.dtype)? };
             <Self as BackendStorage>::copy_strided_src(self, &mut lhs_mat, 0, lhs_layout)?;
-            let mut rhs_mat =
-                unsafe { self.device.alloc_uninit(rhs_layout.shape(), rhs.dtype)? };
+            let mut rhs_mat = unsafe { self.device.alloc_uninit(rhs_layout.shape(), rhs.dtype)? };
             <Self as BackendStorage>::copy_strided_src(rhs, &mut rhs_mat, 0, rhs_layout)?;
             let flat_l = Layout::contiguous(lhs_layout.shape());
             let flat_r = Layout::contiguous(rhs_layout.shape());
@@ -4211,7 +4211,10 @@ impl VulkanStorage {
                 current_layout = Layout::contiguous(Shape::from(current_shape.clone()));
                 current = Some(reduced);
             }
-            return match current { Some(v) => Ok(v), None => self.try_clone(layout) };
+            return match current {
+                Some(v) => Ok(v),
+                None => self.try_clone(layout),
+            };
         }
         let dim = reduce_dims[0];
         if dim != rank - 1 {
@@ -4357,7 +4360,10 @@ impl VulkanStorage {
     fn run_int_argextrema_last_dim(&self, layout: &Layout, mode: u32) -> Result<Self> {
         let rank = layout.dims().len();
         if rank == 0 {
-            return Ok(unsafe { self.device.alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)? });
+            return Ok(unsafe {
+                self.device
+                    .alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)?
+            });
         }
         let kx = *layout.dims().last().unwrap_or(&1);
         let mut dst_dims = layout.dims().to_vec();
@@ -4446,7 +4452,10 @@ impl VulkanStorage {
     fn run_argmax_last_dim(&self, layout: &Layout) -> Result<Self> {
         let rank = layout.dims().len();
         if rank == 0 {
-            return Ok(unsafe { self.device.alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)? });
+            return Ok(unsafe {
+                self.device
+                    .alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)?
+            });
         }
         let kx = *layout.dims().last().unwrap_or(&1);
         let mut dst_dims_candle = layout.dims().to_vec();
@@ -4563,7 +4572,10 @@ impl VulkanStorage {
             current_layout = Layout::contiguous(Shape::from(current_shape.clone()));
             current_storage = Some(reduced);
         }
-        match current_storage { Some(v) => Ok(v), None => self.try_clone(layout) }
+        match current_storage {
+            Some(v) => Ok(v),
+            None => self.try_clone(layout),
+        }
     }
 
     pub(crate) fn argsort_last_dim(
@@ -4643,7 +4655,10 @@ impl VulkanStorage {
         let workgroups_y = nrows_u32
             .min(self.device.inner.max_workgroup_count_y)
             .max(1);
-        let dst = unsafe { self.device.alloc_uninit(argsort_layout.shape(), DType::U32)? };
+        let dst = unsafe {
+            self.device
+                .alloc_uninit(argsort_layout.shape(), DType::U32)?
+        };
         let ncols_padded_log2 = ncols_padded.trailing_zeros();
         let pipeline_idx = ncols_padded_log2.min(VULKAN_ARGSORT_NUM_PIPELINES - 1);
         let use_small = ncols_padded_log2 <= self.device.inner.max_workgroup_size_log2;
@@ -5210,10 +5225,7 @@ impl VulkanStorage {
         beta_layout: &Layout,
         eps: f32,
     ) -> Result<Self> {
-        if self.dtype != DType::F32
-            || alpha.dtype != DType::F32
-            || beta.dtype != DType::F32
-        {
+        if self.dtype != DType::F32 || alpha.dtype != DType::F32 || beta.dtype != DType::F32 {
             let out_dtype = self.dtype;
             let src_f32 = self.to_dtype(layout, DType::F32)?;
             let alpha_f32 = alpha.to_dtype(alpha_layout, DType::F32)?;
@@ -5221,16 +5233,25 @@ impl VulkanStorage {
             let src_f32_layout = Layout::contiguous(layout.shape().clone());
             let alpha_f32_layout = Layout::contiguous(alpha_layout.shape().clone());
             let beta_f32_layout = Layout::contiguous(beta_layout.shape().clone());
-            let out_f32 =
-                src_f32.layer_norm(&src_f32_layout, &alpha_f32, &alpha_f32_layout, &beta_f32, &beta_f32_layout, eps)?;
+            let out_f32 = src_f32.layer_norm(
+                &src_f32_layout,
+                &alpha_f32,
+                &alpha_f32_layout,
+                &beta_f32,
+                &beta_f32_layout,
+                eps,
+            )?;
             if out_dtype == DType::F32 {
                 return Ok(out_f32);
             }
             return out_f32.to_dtype(&src_f32_layout, out_dtype);
         }
-        if !layout.is_contiguous() || layout.start_offset() != 0
-            || !alpha_layout.is_contiguous() || alpha_layout.start_offset() != 0
-            || !beta_layout.is_contiguous() || beta_layout.start_offset() != 0
+        if !layout.is_contiguous()
+            || layout.start_offset() != 0
+            || !alpha_layout.is_contiguous()
+            || alpha_layout.start_offset() != 0
+            || !beta_layout.is_contiguous()
+            || beta_layout.start_offset() != 0
         {
             let src_shape = layout.shape().clone();
             let alpha_shape = alpha_layout.shape().clone();
@@ -5244,7 +5265,14 @@ impl VulkanStorage {
             let src_layout = Layout::contiguous(src_shape);
             let alpha_layout = Layout::contiguous(alpha_shape);
             let beta_layout = Layout::contiguous(beta_shape);
-            return src.layer_norm(&src_layout, &alpha_tmp, &alpha_layout, &beta_tmp, &beta_layout, eps);
+            return src.layer_norm(
+                &src_layout,
+                &alpha_tmp,
+                &alpha_layout,
+                &beta_tmp,
+                &beta_layout,
+                eps,
+            );
         }
         let count = layout.shape().elem_count();
         let (dims, _strides) = dims4_ggml(layout)?;
@@ -5271,12 +5299,8 @@ impl VulkanStorage {
         let spirv = candle_vulkan_kernels::spirv("layernorm")
             .ok_or_else(|| Error::Msg("vulkan shader layernorm not generated".into()).bt())?;
         let rows = count / dims[0] as usize;
-        self.device.run_compute(
-            spirv,
-            &bindings,
-            Some(any_as_bytes(&pc)),
-            rows.try_into()?,
-        )?;
+        self.device
+            .run_compute(spirv, &bindings, Some(any_as_bytes(&pc)), rows.try_into()?)?;
         Ok(dst)
     }
     /// Fused flash attention: O = softmax(Q * K^T * scale + causal_mask) * V
@@ -5298,22 +5322,23 @@ impl VulkanStorage {
         let use_f16 = matches!(q.dtype, DType::BF16 | DType::F16);
         let compute_dtype = if use_f16 { DType::F16 } else { DType::F32 };
 
-        let ensure_contiguous = |src: &VulkanStorage, l: &Layout| -> Result<(VulkanStorage, Layout)> {
-            let storage = if src.dtype == compute_dtype {
-                if !l.is_contiguous() || l.start_offset() != 0 {
-                    let shape_ref = l.shape();
-                    let mut tmp = unsafe { src.device.alloc_uninit(shape_ref, compute_dtype)? };
-                    src.copy_strided_src(&mut tmp, 0, l)?;
-                    tmp
+        let ensure_contiguous =
+            |src: &VulkanStorage, l: &Layout| -> Result<(VulkanStorage, Layout)> {
+                let storage = if src.dtype == compute_dtype {
+                    if !l.is_contiguous() || l.start_offset() != 0 {
+                        let shape_ref = l.shape();
+                        let mut tmp = unsafe { src.device.alloc_uninit(shape_ref, compute_dtype)? };
+                        src.copy_strided_src(&mut tmp, 0, l)?;
+                        tmp
+                    } else {
+                        src.try_clone(l)?
+                    }
                 } else {
-                    src.try_clone(l)?
-                }
-            } else {
-                src.to_dtype(l, compute_dtype)?
+                    src.to_dtype(l, compute_dtype)?
+                };
+                let layout = Layout::contiguous(l.shape().clone());
+                Ok((storage, layout))
             };
-            let layout = Layout::contiguous(l.shape().clone());
-            Ok((storage, layout))
-        };
 
         let (q_buf, q_l) = ensure_contiguous(q, q_layout)?;
         let (k_buf, k_l) = ensure_contiguous(k, k_layout)?;
@@ -5365,7 +5390,11 @@ impl VulkanStorage {
             VulkanBinding::Storage(&dst.buffer),
         ];
 
-        let shader_name = if use_f16 { "flash_attn_f16" } else { "flash_attn" };
+        let shader_name = if use_f16 {
+            "flash_attn_f16"
+        } else {
+            "flash_attn"
+        };
         let spirv = candle_vulkan_kernels::spirv(shader_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {shader_name} not generated")).bt())?;
 
@@ -5457,7 +5486,7 @@ impl VulkanStorage {
             (Some(flat), Layout::contiguous(flat_shape))
         };
         let ids_len = ids_flat_l.dims()[0];
-        let _ = ids_flat_buf;  // keep alive
+        let _ = ids_flat_buf; // keep alive
         let left_size: usize = src_l.dims()[..dim].iter().product();
         let right_size: usize = src_l.dims()[dim + 1..].iter().product();
         let src_dim = src_l.dims()[dim];
@@ -5556,7 +5585,9 @@ impl VulkanStorage {
             (Some(flat), Layout::contiguous(flat_shape))
         };
         let ids_dim = ids_flat_l.dims()[ids_flat_l.dims().len() - 1];
-        let left_size: usize = ids_flat_l.dims()[..ids_flat_l.dims().len() - 1].iter().product();
+        let left_size: usize = ids_flat_l.dims()[..ids_flat_l.dims().len() - 1]
+            .iter()
+            .product();
         let _ = ids_flat_buf;
         let src_dim = src_l.dims()[rank - 1];
         let dst_shape = ids_l.shape().clone();
@@ -5729,9 +5760,8 @@ impl VulkanStorage {
             DType::U32 | DType::I32 => "set_rows_u32_i32",
             _ => "set_rows_f32_i32",
         };
-        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
-            Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
-        })?;
+        let spirv = candle_vulkan_kernels::spirv(spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         let rows: u32 = (left_size * ids_dim).try_into()?;
         self.device.run_compute(
             spirv,
@@ -5761,9 +5791,7 @@ impl VulkanStorage {
             return Ok(());
         }
         // Native F32 and F16 only (F16 uses packed-half CAS in set_rows_add_f16_i32).
-        if self.dtype != src.dtype
-            || !matches!(self.dtype, DType::F32 | DType::F16)
-        {
+        if self.dtype != src.dtype || !matches!(self.dtype, DType::F32 | DType::F16) {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_add").bt());
         }
         let rank = dst_l.dims().len();
@@ -5790,7 +5818,11 @@ impl VulkanStorage {
         } else if ids_l.dims() == [ids_dim] || ids_l.dims().len() == 1 {
             0
         } else {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_add ids shape mismatch").bt());
+            return Err(Error::UnsupportedDTypeForOp(
+                self.dtype,
+                "vulkan scatter_add ids shape mismatch",
+            )
+            .bt());
         };
         let dst_dim = dst_l.dims()[rank - 1];
         let params = GgmlBinaryParams {
@@ -5835,9 +5867,8 @@ impl VulkanStorage {
             DType::F16 => "set_rows_add_f16_i32",
             _ => "set_rows_add_f32_i32",
         };
-        let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
-            Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
-        })?;
+        let spirv = candle_vulkan_kernels::spirv(spirv_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         let rows: u32 = (left_size * ids_dim).try_into()?;
         self.device.run_compute(
             spirv,
@@ -6173,8 +6204,7 @@ impl VulkanStorage {
         // tile and K is a multiple of 32 — this matches ggml-vulkan's aligned
         // GEMM path and avoids residual edge handling overhead.
         // Virtual BT forces the unaligned virtual kernel (strided-K A loads).
-        let f32_aligned =
-            m.is_multiple_of(64) && n.is_multiple_of(64) && k.is_multiple_of(32);
+        let f32_aligned = m.is_multiple_of(64) && n.is_multiple_of(64) && k.is_multiple_of(32);
         let spirv_name = match self.dtype {
             // Tall-skinny virtual B^T: prefer coopmat when available.
             DType::F32
@@ -6236,15 +6266,7 @@ impl VulkanStorage {
         // aligned cm1 share 64×64 BLOCK=128 after vectorized tall loads.
         let (bm, bn, wm, wn, wmiter, tm, tn, tk, block_size) = if use_cm1 {
             (
-                64u32,
-                64u32,
-                32u32,
-                32u32,
-                2u32,
-                16u32,
-                16u32,
-                16u32,
-                128u32,
+                64u32, 64u32, 32u32, 32u32, 2u32, 16u32, 16u32, 16u32, 128u32,
             )
         } else if wide_n {
             // BM=128, BN=64, WM=32, WN=32, TM=4, TN=2 => 8 warps
@@ -6261,17 +6283,7 @@ impl VulkanStorage {
             )
         } else {
             // BM=BN=64 => 4 warps
-            (
-                64u32,
-                64u32,
-                32u32,
-                32u32,
-                2u32,
-                4u32,
-                2u32,
-                1u32,
-                warp * 4,
-            )
+            (64u32, 64u32, 32u32, 32u32, 2u32, 4u32, 2u32, 1u32, warp * 4)
         };
         // x covers params.M (candle N) with BM; y covers params.N (candle M) with BN.
         let dispatch_x = n.div_ceil(bm as usize);
@@ -6293,10 +6305,7 @@ impl VulkanStorage {
         }
         // Coopmat needs a full subgroup of the hardware size (32 on NVIDIA).
         let (require_full_sg, req_sg) = if use_cm1 {
-            (
-                self.device.inner.compute_full_subgroups,
-                Some(warp),
-            )
+            (self.device.inner.compute_full_subgroups, Some(warp))
         } else {
             (false, None)
         };
@@ -6928,9 +6937,7 @@ impl VulkanStorage {
         };
         let ids_len = match ids_l.dims() {
             [ids_len] => *ids_len,
-            _ => {
-                ids_l.shape().elem_count()
-            }
+            _ => ids_l.shape().elem_count(),
         };
         let dims = src_shape.dims();
         if dim >= dims.len() {
@@ -8065,7 +8072,9 @@ impl BackendStorage for VulkanStorage {
             return lhs.binary_impl::<B>(&rhs, &lhs_l, &rhs_l);
         }
         match match B::NAME {
-            "maximum" | "minimum" if matches!(self.dtype, DType::U8 | DType::U32 | DType::I32 | DType::I64) => {
+            "maximum" | "minimum"
+                if matches!(self.dtype, DType::U8 | DType::U32 | DType::I32 | DType::I64) =>
+            {
                 self.run_binary_named(rhs, lhs_layout, rhs_layout, B::NAME)
             }
             "maximum" | "minimum" => {
@@ -8424,8 +8433,7 @@ impl BackendStorage for VulkanStorage {
             if ids_l.is_contiguous() && ids_l.start_offset() == 0 {
                 (ids.try_clone(ids_l)?, Layout::contiguous(ids_l.shape()))
             } else {
-                let mut compact =
-                    unsafe { ids.device.alloc_uninit(ids_l.shape(), ids.dtype)? };
+                let mut compact = unsafe { ids.device.alloc_uninit(ids_l.shape(), ids.dtype)? };
                 ids.copy_strided_src(&mut compact, 0, ids_l)?;
                 (compact, Layout::contiguous(ids_l.shape()))
             }

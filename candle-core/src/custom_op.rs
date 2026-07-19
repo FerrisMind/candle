@@ -396,13 +396,7 @@ pub trait InplaceOp2 {
     }
 
     /// The forward pass, as run on a wgpu device.
-    fn wgpu_fwd(
-        &self,
-        _: &mut WgpuStorage,
-        _: &Layout,
-        _: &WgpuStorage,
-        _: &Layout,
-    ) -> Result<()> {
+    fn wgpu_fwd(&self, _: &mut WgpuStorage, _: &Layout, _: &WgpuStorage, _: &Layout) -> Result<()> {
         Err(crate::Error::Msg(format!(
             "no wgpu implementation for {}",
             self.name()
