@@ -1,0 +1,20 @@
+warning: candle-kernels@0.11.0: Compiling 11 of 11 PTX kernels
+warning: candle-kernels@0.11.0: Using 1 threads for compilation
+warning: candle-kernels@0.11.0: Compiling 15 of 15 kernels
+warning: candle-vulkan-kernels@0.11.0: glslc features: integer_dot=true coopmat=true coopmat2=false
+   Compiling candle-core v0.11.0 (C:\candle-build\candle\candle-core)
+warning: linker stdout: LINK : warning LNK4098: defaultlib 'LIBCMT' conflicts with use of other libs; use /NODEFAULTLIB:library
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `candle-core` (test "gpu_parity_matrix_tests") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.17s
+     Running tests\gpu_parity_matrix_tests.rs (C:\candle-build\target\debug\deps\gpu_parity_matrix_tests-34e0d1631570486b.exe)
+
+running 2 tests
+test gpu_parity_matrix_vulkan ... ok
+test gpu_parity_matrix_wgpu ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.15s
+
+parity_matrix_exit=0

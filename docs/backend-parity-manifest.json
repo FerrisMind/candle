@@ -30,8 +30,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "candle-core/src/wgpu_backend.rs (WGSL portable subset; no native-only features)",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Native",
       "cuda_baseline": "yes",
       "storage_dtypes": [
@@ -72,7 +72,17 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ]
     },
     {
       "op": "location",
@@ -81,8 +91,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "candle-core/src/wgpu_backend.rs (WGSL portable subset; no native-only features)",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Native",
       "cuda_baseline": "yes",
       "storage_dtypes": [
@@ -121,7 +131,17 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ]
     },
     {
       "op": "same_device",
@@ -130,8 +150,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "candle-core/src/wgpu_backend.rs (WGSL portable subset; no native-only features)",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Native",
       "cuda_baseline": "yes",
       "storage_dtypes": [
@@ -170,7 +190,17 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ]
     },
     {
       "op": "zeros_impl",
@@ -213,8 +243,7 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/backend_smoke_tests.rs::smoke_f32_upload_unary_binary_roundtrip"
       ],
       "portable_tests": [
         "candle-wasm-tests/tests/quantized_tests.rs"
@@ -222,7 +251,20 @@
       "bench": true,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/backend_smoke_tests.rs::smoke_f32_upload_unary_binary_roundtrip"
+      ]
     },
     {
       "op": "alloc_uninit",
@@ -265,13 +307,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs"
+        "candle-core/tests/backend_smoke_tests.rs::smoke_f32_matmul"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/backend_smoke_tests.rs::smoke_f32_matmul"
+      ]
     },
     {
       "op": "storage_from_slice",
@@ -280,8 +335,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "candle-core/src/wgpu_backend.rs (WGSL portable subset; no native-only features)",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Native",
       "cuda_baseline": "yes",
       "storage_dtypes": [
@@ -320,7 +375,17 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ]
     },
     {
       "op": "storage_from_cpu_storage",
@@ -363,8 +428,7 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/backend_smoke_tests.rs::smoke_non_f32_upload_download"
       ],
       "portable_tests": [
         "candle-wasm-tests/tests/quantized_tests.rs"
@@ -372,7 +436,20 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/backend_smoke_tests.rs::smoke_non_f32_upload_download"
+      ]
     },
     {
       "op": "storage_from_cpu_storage_owned",
@@ -415,13 +492,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs"
+        "candle-core/tests/backend_smoke_tests.rs::smoke_non_f32_upload_download"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/backend_smoke_tests.rs::smoke_non_f32_upload_download"
+      ]
     },
     {
       "op": "rand_uniform",
@@ -464,14 +554,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_rng_determinism"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_rng_determinism"
+      ]
     },
     {
       "op": "rand_normal",
@@ -514,14 +616,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_rng_determinism"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_rng_determinism"
+      ]
     },
     {
       "op": "set_seed",
@@ -564,13 +678,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_rng_determinism"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_rng_determinism"
+      ]
     },
     {
       "op": "get_current_seed",
@@ -613,13 +740,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_rng_determinism"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_rng_determinism"
+      ]
     },
     {
       "op": "synchronize",
@@ -662,9 +802,7 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs",
-        "candle-core/examples/fallback_runtime_audit.rs"
+        "candle-core/tests/backend_smoke_tests.rs::smoke_f32_matmul"
       ],
       "portable_tests": [
         "candle-wasm-tests/tests/quantized_tests.rs"
@@ -672,7 +810,20 @@
       "bench": true,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/backend_smoke_tests.rs::smoke_f32_matmul"
+      ]
     },
     {
       "op": "try_clone",
@@ -715,13 +866,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs"
+        "candle-core/tests/backend_smoke_tests.rs::smoke_strided_contiguous_copy"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/backend_smoke_tests.rs::smoke_strided_contiguous_copy"
+      ]
     },
     {
       "op": "dtype",
@@ -730,8 +894,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "candle-core/src/wgpu_backend.rs (WGSL portable subset; no native-only features)",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Native",
       "cuda_baseline": "yes",
       "storage_dtypes": [
@@ -754,7 +918,8 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": []
     },
     {
       "op": "device",
@@ -763,8 +928,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "candle-core/src/wgpu_backend.rs (WGSL portable subset; no native-only features)",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Native",
       "cuda_baseline": "yes",
       "storage_dtypes": [
@@ -787,7 +952,8 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": []
     },
     {
       "op": "to_cpu_storage",
@@ -830,8 +996,7 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/backend_smoke_tests.rs::smoke_non_f32_upload_download"
       ],
       "portable_tests": [
         "candle-wasm-tests/tests/quantized_tests.rs"
@@ -839,7 +1004,20 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/backend_smoke_tests.rs::smoke_non_f32_upload_download"
+      ]
     },
     {
       "op": "affine",
@@ -882,8 +1060,7 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/backend_smoke_tests.rs::smoke_f16_affine_minmax"
       ],
       "portable_tests": [],
       "bench": true,
@@ -891,7 +1068,20 @@
       "known_limitations": [
         "BF16 arithmetic uses GPU-resident F32 hub on Vulkan/WebGPU (GPUEmulated path for BF16)"
       ],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/backend_smoke_tests.rs::smoke_f16_affine_minmax"
+      ]
     },
     {
       "op": "powf",
@@ -934,14 +1124,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/backend_smoke_tests.rs::smoke_f32_upload_unary_binary_roundtrip"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/backend_smoke_tests.rs::smoke_f32_upload_unary_binary_roundtrip"
+      ]
     },
     {
       "op": "elu",
@@ -984,14 +1186,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/backend_smoke_tests.rs::smoke_unary_binary_family"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/backend_smoke_tests.rs::smoke_unary_binary_family"
+      ]
     },
     {
       "op": "unary_impl",
@@ -1034,8 +1248,7 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_unary_dtype_matrix"
       ],
       "portable_tests": [],
       "bench": true,
@@ -1043,7 +1256,20 @@
       "known_limitations": [
         "BF16 often GPUEmulated via F32 hub; F16 on portable may require f32 emulate without shader-f16"
       ],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_unary_dtype_matrix"
+      ]
     },
     {
       "op": "binary_impl",
@@ -1086,14 +1312,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_binary_dtype_matrix"
       ],
       "portable_tests": [],
       "bench": true,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_binary_dtype_matrix"
+      ]
     },
     {
       "op": "cmp",
@@ -1136,14 +1374,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_cmp_where_dtypes"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_cmp_where_dtypes"
+      ]
     },
     {
       "op": "where_cond",
@@ -1186,14 +1436,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_cmp_where_dtypes"
       ],
       "portable_tests": [],
       "bench": true,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_cmp_where_dtypes"
+      ]
     },
     {
       "op": "to_dtype",
@@ -1236,8 +1498,7 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_cast_matrix"
       ],
       "portable_tests": [],
       "bench": true,
@@ -1245,7 +1506,20 @@
       "known_limitations": [
         "F64 cast chains may route through F32 hub when direct kernel missing — GPUEmulated; not silent user dtype"
       ],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_cast_matrix"
+      ]
     },
     {
       "op": "const_set",
@@ -1288,13 +1562,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs"
+        "candle-core/tests/backend_smoke_tests.rs::smoke_strided_const_set"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/backend_smoke_tests.rs::smoke_strided_const_set"
+      ]
     },
     {
       "op": "reduce_op",
@@ -1337,14 +1624,28 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_reduce_multi_dim_sum",
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_rank0_reduce"
       ],
       "portable_tests": [],
       "bench": true,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_reduce_multi_dim_sum",
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_rank0_reduce"
+      ]
     },
     {
       "op": "cumsum_last_dim",
@@ -1353,8 +1654,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "candle-core/src/wgpu_backend.rs (WGSL portable subset; no native-only features)",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Native",
       "cuda_baseline": "unsupported (trait default on CUDA)",
       "storage_dtypes": [
@@ -1393,7 +1694,17 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ]
     },
     {
       "op": "clamp",
@@ -1442,7 +1753,17 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ]
     },
     {
       "op": "conv1d",
@@ -1485,14 +1806,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_conv_pool_bf16"
       ],
       "portable_tests": [],
       "bench": true,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_conv_pool_bf16"
+      ]
     },
     {
       "op": "conv_transpose1d",
@@ -1535,14 +1868,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/gpu_parity_matrix_tests.rs",
-        "candle-core/tests/backend_smoke_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_conv_transpose"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_conv_transpose"
+      ]
     },
     {
       "op": "conv2d",
@@ -1585,14 +1930,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_conv_pool_bf16"
       ],
       "portable_tests": [],
       "bench": true,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_conv_pool_bf16"
+      ]
     },
     {
       "op": "conv_transpose2d",
@@ -1601,8 +1958,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "candle-core/src/wgpu_backend.rs (WGSL portable subset; no native-only features)",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Native",
       "cuda_baseline": "yes",
       "storage_dtypes": [
@@ -1641,7 +1998,17 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ]
     },
     {
       "op": "avg_pool2d",
@@ -1684,14 +2051,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_conv_pool_bf16"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_conv_pool_bf16"
+      ]
     },
     {
       "op": "max_pool2d",
@@ -1734,14 +2113,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_max_pool_bf16"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_max_pool_bf16"
+      ]
     },
     {
       "op": "upsample_nearest1d",
@@ -1750,8 +2141,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "candle-core/src/wgpu_backend.rs (WGSL portable subset; no native-only features)",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Native",
       "cuda_baseline": "unsupported on CUDA (bail)",
       "storage_dtypes": [
@@ -1790,7 +2181,17 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ]
     },
     {
       "op": "upsample_nearest2d",
@@ -1799,8 +2200,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "candle-core/src/wgpu_backend.rs (WGSL portable subset; no native-only features)",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Native",
       "cuda_baseline": "yes",
       "storage_dtypes": [
@@ -1839,7 +2240,17 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ]
     },
     {
       "op": "upsample_bilinear2d",
@@ -1848,8 +2259,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "candle-core/src/wgpu_backend.rs (WGSL portable subset; no native-only features)",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Native",
       "cuda_baseline": "yes",
       "storage_dtypes": [
@@ -1888,7 +2299,17 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ]
     },
     {
       "op": "gather",
@@ -1931,14 +2352,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_indexing_matrix"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_indexing_matrix"
+      ]
     },
     {
       "op": "scatter_set",
@@ -1981,14 +2414,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_indexing_matrix"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_indexing_matrix"
+      ]
     },
     {
       "op": "scatter_add_set",
@@ -2031,14 +2476,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_indexing_matrix"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_indexing_matrix"
+      ]
     },
     {
       "op": "index_select",
@@ -2081,8 +2538,7 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_indexing_matrix"
       ],
       "portable_tests": [],
       "bench": false,
@@ -2090,7 +2546,20 @@
       "known_limitations": [
         "wgpu quantized index_select requires SHADER_F16 (native-only)"
       ],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_indexing_matrix"
+      ]
     },
     {
       "op": "index_add",
@@ -2133,14 +2602,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_indexing_matrix"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_indexing_matrix"
+      ]
     },
     {
       "op": "matmul",
@@ -2197,7 +2678,17 @@
       "known_limitations": [
         "Portable WebGPU uses generic WGSL GEMM only (no coop-matrix); tall GEMM residual vs Vulkan documented in git history"
       ],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ]
     },
     {
       "op": "copy_strided_src",
@@ -2240,13 +2731,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs"
+        "candle-core/tests/backend_smoke_tests.rs::smoke_strided_contiguous_copy"
       ],
       "portable_tests": [],
       "bench": true,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/backend_smoke_tests.rs::smoke_strided_contiguous_copy"
+      ]
     },
     {
       "op": "copy2d",
@@ -2289,13 +2793,26 @@
       "zero_sized": true,
       "ranks": "1-5 where backend allows (rank>4 may materialize)",
       "tests": [
-        "candle-core/tests/backend_smoke_tests.rs"
+        "candle-core/tests/backend_smoke_tests.rs::smoke_strided_contiguous_copy"
       ],
       "portable_tests": [],
       "bench": true,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64",
+        "U8",
+        "U32",
+        "I16",
+        "I32"
+      ],
+      "test_functions": [
+        "candle-core/tests/backend_smoke_tests.rs::smoke_strided_contiguous_copy"
+      ]
     },
     {
       "op": "cpu_fallback_policy",
@@ -2304,8 +2821,8 @@
       "vulkan_source": "candle-core/src/storage.rs",
       "native_webgpu_source": "candle-core/src/storage.rs",
       "portable_webgpu_source": "same policy",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Verified",
       "cuda_baseline": "n/a",
       "storage_dtypes": [],
@@ -2318,9 +2835,7 @@
       "zero_sized": true,
       "ranks": "n/a",
       "tests": [
-        "candle-core/examples/fallback_runtime_audit.rs",
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_parity_matrix_tests.rs"
+        "candle-core/examples/fallback_runtime_audit.rs"
       ],
       "portable_tests": [
         "candle-core/examples/fallback_runtime_audit.rs"
@@ -2328,7 +2843,11 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [],
+      "test_functions": [
+        "candle-core/examples/fallback_runtime_audit.rs"
+      ]
     },
     {
       "op": "quantized_dequantize",
@@ -2337,8 +2856,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "candle-core/src/wgpu_backend.rs (WGSL portable subset; no native-only features)",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "GPUEmulated",
       "cuda_baseline": "yes",
       "storage_dtypes": [
@@ -2380,7 +2899,17 @@
       "known_limitations": [
         "Some exotic quants may be UnsupportedByHardware per adapter"
       ],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "Q4_0",
+        "Q4_1",
+        "Q5_0",
+        "Q5_1",
+        "Q8_0",
+        "Q8_1",
+        "Q2K..Q6K",
+        "IQ* where implemented"
+      ]
     },
     {
       "op": "quantized_matmul",
@@ -2429,7 +2958,17 @@
       "known_limitations": [
         "Portable browser WebGPU: no guaranteed f16; classify UnsupportedBySpecification or GPUEmulated f32 path if present"
       ],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "Q4_0",
+        "Q4_1",
+        "Q5_0",
+        "Q5_1",
+        "Q8_0",
+        "Q8_1",
+        "Q2K",
+        "Q3K"
+      ]
     },
     {
       "op": "edge::scalar_tensors",
@@ -2464,16 +3003,23 @@
       "zero_sized": true,
       "ranks": "varies",
       "tests": [
-        "candle-core/tests/gpu_parity_matrix_tests.rs",
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_property_tests.rs",
-        "candle-core/tests/gpu_metamorphic_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_rank_layout_matrix"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "I32",
+        "U8"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_rank_layout_matrix"
+      ]
     },
     {
       "op": "edge::zero_sized",
@@ -2482,8 +3028,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "WGSL portable subset",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Native",
       "cuda_baseline": "yes",
       "storage_dtypes": [
@@ -2517,7 +3063,14 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "I32",
+        "U8"
+      ]
     },
     {
       "op": "edge::strided_views",
@@ -2552,16 +3105,23 @@
       "zero_sized": true,
       "ranks": "varies",
       "tests": [
-        "candle-core/tests/gpu_parity_matrix_tests.rs",
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_property_tests.rs",
-        "candle-core/tests/gpu_metamorphic_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_rank_layout_matrix"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "I32",
+        "U8"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_rank_layout_matrix"
+      ]
     },
     {
       "op": "edge::odd_prime_dims",
@@ -2596,16 +3156,23 @@
       "zero_sized": true,
       "ranks": "varies",
       "tests": [
-        "candle-core/tests/gpu_parity_matrix_tests.rs",
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_property_tests.rs",
-        "candle-core/tests/gpu_metamorphic_tests.rs"
+        "candle-core/tests/gpu_property_tests.rs"
       ],
       "portable_tests": [],
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "I32",
+        "U8"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_property_tests.rs"
+      ]
     },
     {
       "op": "edge::nan_inf_subnormal",
@@ -2646,7 +3213,17 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "I32",
+        "U8"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_special_floats"
+      ]
     },
     {
       "op": "edge::overflow_invalid_args",
@@ -2655,8 +3232,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "WGSL portable subset",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Native",
       "cuda_baseline": "yes",
       "storage_dtypes": [
@@ -2690,7 +3267,14 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "I32",
+        "U8"
+      ]
     },
     {
       "op": "edge::fixed_seed_rng",
@@ -2699,8 +3283,8 @@
       "vulkan_source": "candle-core/src/vulkan_backend.rs",
       "native_webgpu_source": "candle-core/src/wgpu_backend.rs",
       "portable_webgpu_source": "WGSL portable subset",
-      "vulkan_status": "Verified",
-      "native_webgpu_status": "Verified",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
       "portable_webgpu_status": "Native",
       "cuda_baseline": "yes",
       "storage_dtypes": [
@@ -2734,7 +3318,14 @@
       "bench": false,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "I32",
+        "U8"
+      ]
     },
     {
       "op": "nccl_distributed",
@@ -2763,7 +3354,13 @@
       "known_limitations": [
         "Distributed multi-GPU NCCL is CUDA-specific"
       ],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F32",
+        "F16",
+        "BF16",
+        "F64"
+      ]
     },
     {
       "op": "dtype::f64_arithmetic",
@@ -2790,8 +3387,8 @@
       "zero_sized": true,
       "ranks": "varies",
       "tests": [
-        "candle-core/tests/gpu_parity_matrix_tests.rs",
-        "candle-core/tests/backend_smoke_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_f64_surface",
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_f64_matmul_precision"
       ],
       "portable_tests": [],
       "bench": true,
@@ -2801,7 +3398,14 @@
       "known_limitations": [
         "Portable browsers: no f64 compute in base WebGPU"
       ],
-      "evidence": "https://www.w3.org/TR/WGSL/ ; wgpu Features::SHADER_F64"
+      "evidence": "https://www.w3.org/TR/WGSL/ ; wgpu Features::SHADER_F64",
+      "verified_dtypes": [
+        "F64"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_f64_surface",
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_f64_matmul_precision"
+      ]
     },
     {
       "op": "dtype::f16_native_arithmetic",
@@ -2829,8 +3433,7 @@
       "zero_sized": true,
       "ranks": "varies",
       "tests": [
-        "candle-core/tests/gpu_parity_matrix_tests.rs",
-        "candle-core/tests/backend_smoke_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_unary_dtype_matrix"
       ],
       "portable_tests": [],
       "bench": true,
@@ -2840,7 +3443,13 @@
       "known_limitations": [
         "Must not report storage-only f16 as full native arithmetic without feature"
       ],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "F16"
+      ],
+      "test_functions": [
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_unary_dtype_matrix"
+      ]
     },
     {
       "op": "dtype::bf16_arithmetic",
@@ -2875,7 +3484,11 @@
       "bench": true,
       "capability_requirements": [],
       "known_limitations": [],
-      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d"
+      "evidence": "baseline_commit=943192e140cde1d9a384556aeceed7331779333d",
+      "verified_dtypes": [
+        "BF16"
+      ]
     }
-  ]
+  ],
+  "verification_note": "Verified requires path::function evidence; generic file alone is rejected by strict audit. Commit under verification: 14c3fe5ab0fd08b0212561abd459d159bf45ae65"
 }

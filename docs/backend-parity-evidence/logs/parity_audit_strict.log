@@ -1,0 +1,64 @@
+=== Candle backend parity audit (strict) ===
+repo: D:\Users\╨Я╨Ъ\Desktop\candle
+BackendStorage ops in trait: 33
+CUDA-required (real impl):   28
+
+op                           cuda         vulkan                 wgpu                  
+------------------------------------------------------------------------------------------
+try_clone                    yes          yes                    yes                   
+to_cpu_storage               yes          yes                    yes                   
+affine                       yes          yes                    yes                   
+powf                         yes          yes                    yes                   
+elu                          yes          yes                    yes                   
+reduce_op                    yes          yes                    yes                   
+cumsum_last_dim              unsupported  yes                    yes                   
+clamp                        unsupported  yes                    yes                   
+cmp                          yes          yes                    yes                   
+to_dtype                     yes          yes                    yes                   
+unary_impl                   yes          yes                    yes                   
+binary_impl                  yes          yes                    yes                   
+where_cond                   yes          yes                    yes                   
+conv1d                       yes          yes                    yes                   
+conv_transpose1d             yes          yes                    yes                   
+conv2d                       yes          yes                    yes                   
+conv_transpose2d             yes          yes                    yes                   
+avg_pool2d                   yes          yes                    yes                   
+max_pool2d                   yes          yes                    yes                   
+upsample_nearest1d           unsupported  yes                    yes                   
+upsample_nearest2d           yes          yes                    yes                   
+upsample_bilinear2d          yes          yes                    yes                   
+gather                       yes          yes                    yes                   
+scatter_set                  yes          yes                    yes                   
+scatter_add_set              yes          yes                    yes                   
+index_select                 yes          yes                    yes                   
+index_add                    yes          yes                    yes                   
+matmul                       yes          yes                    yes                   
+copy_strided_src             yes          yes                    yes                   
+copy2d                       yes          yes                    yes                   
+const_set                    yes          yes                    yes                   
+
+  Vulkan present: 31  not-present: 0
+  WGPU   present: 31  not-present: 0
+Curated manifest rows: 60
+  Vulkan:          {'Native': 17, 'Verified': 39, 'Optimized': 2, 'CudaSpecific': 1, 'GPUEmulated': 1}
+  Native WebGPU:   {'Native': 18, 'Verified': 37, 'Optimized': 2, 'CudaSpecific': 1, 'GPUEmulated': 2}
+  Portable WebGPU: {'Native': 53, 'Verified': 1, 'GPUEmulated': 3, 'UnsupportedBySpecification': 2, 'CudaSpecific': 1}
+
+WARNINGS (14):
+  - Vulkan 'affine' has dtype/layout-dependent unsupported branches (line 7765) тАФ classify in manifest, not silent
+  - WGPU 'affine' has dtype/layout-dependent unsupported branches (line 10190) тАФ classify in manifest, not silent
+  - Vulkan 'powf' has dtype/layout-dependent unsupported branches (line 7792) тАФ classify in manifest, not silent
+  - Vulkan 'elu' has dtype/layout-dependent unsupported branches (line 7816) тАФ classify in manifest, not silent
+  - WGPU 'elu' has dtype/layout-dependent unsupported branches (line 10244) тАФ classify in manifest, not silent
+  - Vulkan 'reduce_op' has dtype/layout-dependent unsupported branches (line 7857) тАФ classify in manifest, not silent
+  - WGPU 'reduce_op' has dtype/layout-dependent unsupported branches (line 10271) тАФ classify in manifest, not silent
+  - Vulkan 'unary_impl' has dtype/layout-dependent unsupported branches (line 7995) тАФ classify in manifest, not silent
+  - WGPU 'unary_impl' has dtype/layout-dependent unsupported branches (line 10500) тАФ classify in manifest, not silent
+  - WGPU 'binary_impl' has dtype/layout-dependent unsupported branches (line 10550) тАФ classify in manifest, not silent
+  - Vulkan 'copy_strided_src' has dtype/layout-dependent unsupported branches (line 8460) тАФ classify in manifest, not silent
+  - WGPU 'copy_strided_src' has dtype/layout-dependent unsupported branches (line 11111) тАФ classify in manifest, not silent
+  - Vulkan 'copy2d' has dtype/layout-dependent unsupported branches (line 8520) тАФ classify in manifest, not silent
+  - WGPU 'copy2d' has dtype/layout-dependent unsupported branches (line 11215) тАФ classify in manifest, not silent
+
+OK: each CUDA-required op has usable Vulkan AND Native WebGPU impl; manifest Verified entries carry function-level evidence.
+audit_exit=0

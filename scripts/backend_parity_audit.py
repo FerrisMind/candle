@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-Static audit of CUDA vs Vulkan/WebGPU BackendStorage method surface.
+Strict static audit of CUDA vs Vulkan / Native WebGPU BackendStorage surface
+and curated three-profile parity manifest.
 
-Scans:
-  - candle-core/src/backend.rs          (trait method names)
-  - candle-core/src/cuda_backend/mod.rs
-  - candle-core/src/vulkan_backend.rs
-  - candle-core/src/wgpu_backend.rs
-
-Exits non-zero if CUDA implements a BackendStorage compute/storage method
-and BOTH Vulkan and WebGPU either lack an impl or only immediately return
-unsupported/not-implemented for that method.
+Hard rules (verification stage):
+  * CUDA-required op missing on Vulkan alone OR WGPU alone → FAIL
+  * Method presence alone is not enough if body immediately unsupported
+  * Detect unconditional and common dtype/layout-dependent unsupported branches
+  * Verified requires test *function* references that exist and are not
+    over-shared generic files claiming unrelated ops
+  * Manifest schema v2 with three profiles is mandatory
 
 Usage:
   python scripts/backend_parity_audit.py
-  python scripts/backend_parity_audit.py --repo /path/to/candle
+  python scripts/backend_parity_audit.py --repo /path/to/candle --json
+  python scripts/backend_parity_audit.py --self-test
 """
 
 from __future__ import annotations
@@ -23,29 +23,40 @@ import argparse
 import json
 import re
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 
-# Methods that are accessors / host bridges, not GPU compute parity targets.
 ACCESSOR_OPS = frozenset({"dtype", "device"})
 
-# CUDA intentionally does not implement these (trait default or explicit bail).
 CUDA_UNSUPPORTED_OPS = frozenset(
     {
-        "cumsum_last_dim",  # BackendStorage default: not implemented
-        "clamp",  # BackendStorage default: not implemented
-        "upsample_nearest1d",  # cuda_backend bail
+        "cumsum_last_dim",
+        "clamp",
+        "upsample_nearest1d",
     }
 )
 
-# Regex: fn name at start of a method signature inside impl blocks.
+# Generic test files that may not alone verify arbitrary ops.
+GENERIC_TEST_FILES = frozenset(
+    {
+        "backend_smoke_tests.rs",
+        "gpu_parity_matrix_tests.rs",
+        "gpu_property_tests.rs",
+        "gpu_metamorphic_tests.rs",
+        "gpu_shader_validation_tests.rs",
+    }
+)
+
+# Max number of Verified ops that may cite the same bare file without ::function
+MAX_GENERIC_FILE_SHARE = 3
+
 FN_SIG_RE = re.compile(
     r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?fn\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>)?\s*\("
 )
 
-# Immediate unsupported / not-implemented patterns in the first ~40 non-empty lines of a body.
 IMMEDIATE_FAIL_RES = [
     re.compile(r"return\s+Err\(\s*unsupported\s*\("),
     re.compile(r"return\s+Err\(\s*Error::UnsupportedDTypeForOp"),
@@ -53,15 +64,55 @@ IMMEDIATE_FAIL_RES = [
     re.compile(r'Error::Msg\(\s*format!\(\s*"\w+ backend op \{op\} not implemented"'),
     re.compile(r'Err\(crate::Error::Msg\(\s*"backend op .+ not implemented"'),
     re.compile(r'crate::bail!\(\s*"upsample-nearest1d is not supported'),
+    re.compile(r'return\s+Err\(\s*Error::Msg\(\s*format!\(\s*"wgpu backend op'),
+    re.compile(r'return\s+Err\(\s*Error::Msg\(\s*format!\(\s*"vulkan backend op'),
 ]
+
+# Signals of real GPU work early in method body.
+GPUISH_RE = re.compile(
+    r"\b("
+    r"run_|self\.(run_|materialize|bf16_|cuda_parity)|get_or_load_func|"
+    r"LaunchConfig|gemm_|copy_buffer|BufferCopy|submit_copy|create_command|"
+    r"dispatch|encoder\.|queue\.|vk::|ash::|wgpu::|"
+    r"run_compute|run_unary|run_binary|run_matmul|run_im2col|"
+    r"copy_strided|const_set|to_dtype"
+    r")"
+)
+
+# Dtype/layout-dependent unsupported branches (for reporting / soft flags).
+DTYPE_FAIL_RE = re.compile(
+    r"UnsupportedDTypeForOp|unsupported\(|backend op .+ not implemented|"
+    r"not implemented for|requires shader-f16|requires SHADER_F16|"
+    r"rank > 4|supports up to rank"
+)
+
+ALLOWED_STATUSES = {
+    "Native",
+    "Optimized",
+    "GPUEmulated",
+    "UnsupportedBySpecification",
+    "UnsupportedByHardware",
+    "CudaSpecific",
+    "Missing",
+    "Verified",
+    "Unverified",  # explicit verification-stage status for unproven claims
+}
+
+PROFILE_FIELDS = (
+    "vulkan_status",
+    "native_webgpu_status",
+    "portable_webgpu_status",
+)
 
 
 @dataclass
 class MethodInfo:
     name: str
-    start_line: int  # 1-based
+    start_line: int
     body: str
     immediately_unsupported: bool = False
+    dtype_dependent_unsupported: bool = False
+    has_gpu_work: bool = False
 
 
 @dataclass
@@ -79,13 +130,10 @@ def read_text(path: Path) -> str:
 
 
 def extract_trait_methods(backend_rs: str, trait_name: str) -> List[str]:
-    """Extract method names declared on a trait (including default bodies)."""
-    # Find trait block roughly.
     m = re.search(rf"pub\s+trait\s+{trait_name}\b[^{{]*\{{", backend_rs)
     if not m:
         return []
     start = m.end()
-    # Brace match
     depth = 1
     i = start
     while i < len(backend_rs) and depth:
@@ -96,19 +144,11 @@ def extract_trait_methods(backend_rs: str, trait_name: str) -> List[str]:
             depth -= 1
         i += 1
     body = backend_rs[start : i - 1]
-    names = []
-    for fm in FN_SIG_RE.finditer(body):
-        names.append(fm.group(1))
-    return names
+    return [fm.group(1) for fm in FN_SIG_RE.finditer(body)]
 
 
 def find_impl_blocks(src: str, type_name: str) -> List[Tuple[int, str]]:
-    """
-    Return list of (start_line, block_source) for
-      impl ... for TypeName { ... }
-    """
     blocks: List[Tuple[int, str]] = []
-    # Match impl ... for CudaStorage / VulkanStorage / WgpuStorage
     pattern = re.compile(
         rf"(?m)^impl\b[^{{]*\bfor\s+{type_name}\s*(?:where[^{{]*)?\{{"
     )
@@ -124,100 +164,68 @@ def find_impl_blocks(src: str, type_name: str) -> List[Tuple[int, str]]:
             elif c == "}":
                 depth -= 1
             i += 1
-        block = src[start_idx : i - 1]
-        blocks.append((start_line, block))
+        blocks.append((start_line, src[start_idx : i - 1]))
     return blocks
 
 
-def split_methods(block: str, block_start_line: int) -> Dict[str, MethodInfo]:
-    """Parse fn methods from an impl block body."""
-    methods: Dict[str, MethodInfo] = {}
-    # Find each fn and take until next fn at same indent or end.
-    matches = list(FN_SIG_RE.finditer(block))
-    for idx, m in enumerate(matches):
-        name = m.group(1)
-        # Skip nested helpers that are clearly not trait methods? Keep all; filter later.
-        body_start = m.start()
-        body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(block)
-        body = block[body_start:body_end]
-        line = block_start_line + block[: m.start()].count("\n")
-        methods[name] = MethodInfo(
-            name=name,
-            start_line=line,
-            body=body,
-            immediately_unsupported=is_immediately_unsupported(body),
-        )
-    return methods
-
-
 def is_immediately_unsupported(method_src: str) -> bool:
-    """
-    True if the method body has no real GPU work and fails immediately.
-
-    Heuristic: look at the body after the opening brace of the fn; if within
-    the first meaningful statements we only see return Err(unsupported...) /
-    not-implemented, without intermediate GPU helpers.
-    """
-    # Extract first brace body
     brace = method_src.find("{")
     if brace < 0:
         return False
     body = method_src[brace + 1 :]
-    # Collapse to first 50 non-empty, non-comment lines
     lines: List[str] = []
     for raw in body.splitlines():
         s = raw.strip()
         if not s or s.startswith("//") or s.startswith("/*") or s.startswith("*"):
             continue
-        # skip attribute-like
         if s.startswith("#["):
             continue
         lines.append(s)
         if len(lines) >= 50:
             break
-    snippet = "\n".join(lines[:25])
-
-    # CUDA upsample_nearest1d style
-    if "upsample-nearest1d is not supported" in snippet:
-        return True
-
-    # Pure unsupported return as first real statement(s)
-    # Allow let bindings that only bind self fields before immediate Err.
-    first_exec = None
-    for s in lines[:15]:
-        if s.startswith("let ") or s.startswith("use ") or s.startswith("const "):
-            continue
-        if s.startswith("if ") or s.startswith("match ") or s.startswith("return ") or s.startswith("Err("):
-            first_exec = s
-            break
-        # assignment / call — real work
-        first_exec = s
-        break
-
-    if first_exec is None:
+    if not lines:
         return False
-
-    joined = "\n".join(lines[:15])
     full_joined = "\n".join(lines[:50])
-    # Real GPU work signals — edge-case UnsupportedDType early-returns must not
-    # mark a fully implemented method as missing.
-    gpuish = re.search(
-        r"\b("
-        r"run_|self\.(run_|materialize|bf16_|cuda_parity)|get_or_load_func|"
-        r"LaunchConfig|gemm_|copy_buffer|BufferCopy|submit_copy|create_command|"
-        r"dispatch|encoder\.|queue\.|vk::|ash::|wgpu::"
-        r")",
-        full_joined,
-    )
+    joined = "\n".join(lines[:15])
+    gpuish = GPUISH_RE.search(full_joined)
     for rx in IMMEDIATE_FAIL_RES:
         if rx.search(joined) and not gpuish:
             return True
-
-    # Trait default style single-line not implemented (whole body is just Err)
-    if re.search(r'backend op .+ not implemented', joined) and not gpuish:
+    if re.search(r"backend op .+ not implemented", joined) and not gpuish:
         return True
-
     return False
+
+
+def analyze_method(name: str, start_line: int, body: str) -> MethodInfo:
+    imm = is_immediately_unsupported(body)
+    brace = body.find("{")
+    blob = body[brace + 1 :] if brace >= 0 else body
+    has_gpu = bool(GPUISH_RE.search(blob))
+    dtype_dep = bool(DTYPE_FAIL_RE.search(blob)) and has_gpu
+    # Unconditional: whole body is only unsupported returns / match arms that all fail
+    if not imm and not has_gpu and "unsupported(" in blob and "return Err" in blob:
+        imm = True
+    return MethodInfo(
+        name=name,
+        start_line=start_line,
+        body=body,
+        immediately_unsupported=imm,
+        dtype_dependent_unsupported=dtype_dep,
+        has_gpu_work=has_gpu and not imm,
+    )
+
+
+def split_methods(block: str, block_start_line: int) -> Dict[str, MethodInfo]:
+    methods: Dict[str, MethodInfo] = {}
+    matches = list(FN_SIG_RE.finditer(block))
+    for idx, m in enumerate(matches):
+        name = m.group(1)
+        body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(block)
+        body = block[m.start() : body_end]
+        line = block_start_line + block[: m.start()].count("\n")
+        if name not in methods:
+            methods[name] = analyze_method(name, line, body)
+    return methods
 
 
 def scan_backend(path: Path, type_name: str) -> BackendScan:
@@ -225,46 +233,127 @@ def scan_backend(path: Path, type_name: str) -> BackendScan:
     scan = BackendScan(path=path)
     for start_line, block in find_impl_blocks(src, type_name):
         for name, info in split_methods(block, start_line).items():
-            # Prefer first occurrence (trait impl usually one big block)
             if name not in scan.methods:
                 scan.methods[name] = info
     return scan
 
 
-def classify_status(info: Optional[MethodInfo], cuda_unsupported: bool) -> str:
-    if cuda_unsupported:
-        return "unsupported_spec"
+def usable(info: Optional[MethodInfo]) -> bool:
+    """Presence alone is insufficient: need non-immediate-fail and GPU work signal."""
     if info is None:
-        return "missing"
+        return False
     if info.immediately_unsupported:
-        return "missing"
-    # Heuristic partial vs native is not reliable from static scan alone;
-    # report as "present" for summary; JSON manifest holds curated native/partial.
-    return "present"
+        return False
+    # Allow host bridges that are intentional (to_cpu_storage) without GPU dispatch
+    if info.name in ("to_cpu_storage", "try_clone", "dtype", "device"):
+        return True
+    return info.has_gpu_work
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument(
-        "--repo",
-        type=Path,
-        default=None,
-        help="Candle repo root (default: parent of scripts/)",
-    )
-    ap.add_argument(
-        "--json",
-        action="store_true",
-        help="Print machine-readable JSON summary",
-    )
-    ap.add_argument(
-        "--manifest",
-        type=Path,
-        default=None,
-        help="Optional path to docs/backend-parity-manifest.json for status counts",
-    )
-    args = ap.parse_args()
-    root = (args.repo or repo_root_from_script()).resolve()
+def list_rust_test_functions(repo: Path) -> Dict[str, Set[str]]:
+    """Map relative path -> set of fn names (test and helper)."""
+    out: Dict[str, Set[str]] = {}
+    tests_root = repo / "candle-core" / "tests"
+    if not tests_root.is_dir():
+        return out
+    for path in tests_root.rglob("*.rs"):
+        rel = str(path.relative_to(repo)).replace("\\", "/")
+        text = read_text(path)
+        names = set(FN_SIG_RE.findall(text))
+        out[rel] = names
+        # also bare filename key
+        out[path.name] = out.get(path.name, set()) | names
+    return out
 
+
+def parse_test_ref(ref: str) -> Tuple[str, Optional[str]]:
+    """
+    Accept:
+      candle-core/tests/foo.rs
+      candle-core/tests/foo.rs::bar
+      foo.rs::bar
+    """
+    ref = ref.strip()
+    if "::" in ref:
+        file_part, fn = ref.rsplit("::", 1)
+        return file_part.replace("\\", "/"), fn
+    return ref.replace("\\", "/"), None
+
+
+def validate_test_refs(
+    item: dict,
+    test_index: Dict[str, Set[str]],
+    repo: Path,
+    failures: List[str],
+    file_claim_count: Dict[str, int],
+) -> None:
+    op_name = item.get("op", "<unknown>")
+    statuses = [
+        item.get("vulkan_status"),
+        item.get("native_webgpu_status"),
+    ]
+    if not any(s == "Verified" for s in statuses):
+        return
+    if str(op_name).startswith("edge::") or op_name in ("cpu_fallback_policy",):
+        return
+
+    tests = item.get("tests") or []
+    test_functions = item.get("test_functions") or []
+    refs = list(tests) + list(test_functions)
+    if not refs:
+        failures.append(
+            f"manifest op '{op_name}' is Verified but has empty tests[]/test_functions[]"
+        )
+        return
+
+    # Prefer explicit test_functions; bare file refs are limited.
+    has_function_ref = False
+    for ref in refs:
+        file_part, fn = parse_test_ref(str(ref))
+        # Resolve index keys
+        candidates = [file_part, Path(file_part).name]
+        known = None
+        for c in candidates:
+            if c in test_index:
+                known = c
+                break
+            # try under candle-core/tests/
+            alt = f"candle-core/tests/{Path(file_part).name}"
+            if alt in test_index:
+                known = alt
+                break
+        if known is None:
+            # file may live under examples
+            p = repo / file_part
+            if p.is_file():
+                names = set(FN_SIG_RE.findall(read_text(p)))
+                test_index[file_part] = names
+                known = file_part
+            else:
+                failures.append(
+                    f"manifest op '{op_name}' test ref '{ref}' file not found"
+                )
+                continue
+        if fn:
+            has_function_ref = True
+            if fn not in test_index[known]:
+                failures.append(
+                    f"manifest op '{op_name}' test function '{fn}' not found in {known}"
+                )
+        else:
+            bare = Path(known).name
+            if bare in GENERIC_TEST_FILES:
+                file_claim_count[bare] = file_claim_count.get(bare, 0) + 1
+
+    if not has_function_ref:
+        # Verified requires at least one function-level reference for non-meta ops
+        failures.append(
+            f"manifest op '{op_name}' is Verified but lacks test function reference "
+            f"(use path::function; bare generic file is insufficient)"
+        )
+
+
+def run_audit(root: Path, manifest_path: Optional[Path], as_json: bool) -> int:
     backend_rs = root / "candle-core" / "src" / "backend.rs"
     cuda_mod = root / "candle-core" / "src" / "cuda_backend" / "mod.rs"
     vulkan_rs = root / "candle-core" / "src" / "vulkan_backend.rs"
@@ -278,22 +367,22 @@ def main() -> int:
     trait_src = read_text(backend_rs)
     storage_ops = extract_trait_methods(trait_src, "BackendStorage")
     device_ops = extract_trait_methods(trait_src, "BackendDevice")
-
     if not storage_ops:
         print("ERROR: failed to parse BackendStorage methods", file=sys.stderr)
         return 2
 
     cuda = scan_backend(cuda_mod, "CudaStorage")
-    # Device methods live in device.rs
     cuda_dev_path = root / "candle-core" / "src" / "cuda_backend" / "device.rs"
-    cuda_dev = scan_backend(cuda_dev_path, "CudaDevice") if cuda_dev_path.is_file() else BackendScan(cuda_dev_path)
-
+    cuda_dev = (
+        scan_backend(cuda_dev_path, "CudaDevice")
+        if cuda_dev_path.is_file()
+        else BackendScan(cuda_dev_path)
+    )
     vulkan = scan_backend(vulkan_rs, "VulkanStorage")
     vulkan_dev = scan_backend(vulkan_rs, "VulkanDevice")
     wgpu = scan_backend(wgpu_rs, "WgpuStorage")
     wgpu_dev = scan_backend(wgpu_rs, "WgpuDevice")
 
-    # CUDA has method if present in scan OR not in CUDA_UNSUPPORTED (defaults count as "no cuda impl")
     def cuda_has_real(op: str) -> bool:
         if op in CUDA_UNSUPPORTED_OPS:
             return False
@@ -303,6 +392,7 @@ def main() -> int:
         return not info.immediately_unsupported
 
     failures: List[str] = []
+    warnings: List[str] = []
     rows = []
 
     for op in storage_ops:
@@ -313,43 +403,66 @@ def main() -> int:
         w_info = wgpu.methods.get(op)
 
         c_real = cuda_has_real(op)
-        # If CUDA uses trait default (no override), treat as not required
-        if op in CUDA_UNSUPPORTED_OPS or c_info is None:
-            # double-check upsample etc. that exist but bail
-            if c_info is not None and c_info.immediately_unsupported:
-                c_real = False
-            elif op in CUDA_UNSUPPORTED_OPS:
-                c_real = False
-            elif c_info is None and op in ("cumsum_last_dim", "clamp"):
-                c_real = False
+        if op in CUDA_UNSUPPORTED_OPS or (
+            c_info is not None and c_info.immediately_unsupported
+        ):
+            c_real = False
+        elif c_info is None and op in ("cumsum_last_dim", "clamp"):
+            c_real = False
 
-        v_ok = v_info is not None and not v_info.immediately_unsupported
-        w_ok = w_info is not None and not w_info.immediately_unsupported
+        v_ok = usable(v_info)
+        w_ok = usable(w_info)
 
         status = {
             "op": op,
-            "cuda": "yes" if c_real else ("unsupported" if op in CUDA_UNSUPPORTED_OPS or (c_info and c_info.immediately_unsupported) else "missing"),
-            "vulkan": "yes" if v_ok else ("missing" if v_info is None else "immediate_unsupported"),
-            "wgpu": "yes" if w_ok else ("missing" if w_info is None else "immediate_unsupported"),
+            "cuda": "yes"
+            if c_real
+            else (
+                "unsupported"
+                if op in CUDA_UNSUPPORTED_OPS
+                or (c_info and c_info.immediately_unsupported)
+                else "missing"
+            ),
+            "vulkan": "yes"
+            if v_ok
+            else ("missing" if v_info is None else "immediate_unsupported"),
+            "wgpu": "yes"
+            if w_ok
+            else ("missing" if w_info is None else "immediate_unsupported"),
+            "vulkan_dtype_dependent_unsupported": bool(
+                v_info and v_info.dtype_dependent_unsupported
+            ),
+            "wgpu_dtype_dependent_unsupported": bool(
+                w_info and w_info.dtype_dependent_unsupported
+            ),
             "cuda_line": c_info.start_line if c_info else None,
             "vulkan_line": v_info.start_line if v_info else None,
             "wgpu_line": w_info.start_line if w_info else None,
         }
         rows.append(status)
 
-        if c_real and (not v_ok) and (not w_ok):
+        # HARD: fail per-backend, not only when both missing
+        if c_real and not v_ok:
             failures.append(
-                f"CUDA op '{op}' has no usable Vulkan/WGPU impl "
-                f"(vulkan={status['vulkan']}, wgpu={status['wgpu']})"
+                f"CUDA op '{op}' has no usable Native Vulkan impl "
+                f"(status={status['vulkan']}, line={status['vulkan_line']})"
             )
-        elif c_real and not v_ok:
-            # Soft warn: still exit non-zero only if BOTH missing (per task).
-            # Task: "without a corresponding impl that doesn't immediately return unsupported for both"
-            pass
-        elif c_real and not w_ok:
-            pass
+        if c_real and not w_ok:
+            failures.append(
+                f"CUDA op '{op}' has no usable Native WebGPU impl "
+                f"(status={status['wgpu']}, line={status['wgpu_line']})"
+            )
+        if c_real and v_info and v_info.dtype_dependent_unsupported:
+            warnings.append(
+                f"Vulkan '{op}' has dtype/layout-dependent unsupported branches "
+                f"(line {v_info.start_line}) — classify in manifest, not silent"
+            )
+        if c_real and w_info and w_info.dtype_dependent_unsupported:
+            warnings.append(
+                f"WGPU '{op}' has dtype/layout-dependent unsupported branches "
+                f"(line {w_info.start_line}) — classify in manifest, not silent"
+            )
 
-    # Device surface (informational + fail if zeros/alloc/upload missing on both)
     critical_device = {
         "zeros_impl",
         "alloc_uninit",
@@ -362,59 +475,43 @@ def main() -> int:
         v_info = vulkan_dev.methods.get(op)
         w_info = wgpu_dev.methods.get(op)
         c_real = c_info is not None and not c_info.immediately_unsupported
-        v_ok = v_info is not None and not v_info.immediately_unsupported
-        w_ok = w_info is not None and not w_info.immediately_unsupported
-        if op in critical_device and c_real and (not v_ok) and (not w_ok):
-            failures.append(
-                f"CUDA device op '{op}' missing usable Vulkan/WGPU impl"
-            )
+        v_ok = usable(v_info) if v_info else False
+        # device methods often lack run_* tokens — presence without immediate fail is ok
+        if v_info is not None and not v_info.immediately_unsupported:
+            v_ok = True
+        w_ok = usable(w_info) if w_info else False
+        if w_info is not None and not w_info.immediately_unsupported:
+            w_ok = True
+        if op in critical_device and c_real:
+            if not v_ok:
+                failures.append(f"CUDA device op '{op}' missing usable Vulkan impl")
+            if not w_ok:
+                failures.append(f"CUDA device op '{op}' missing usable WGPU impl")
 
-    # Summary counts from static presence
     present_v = sum(1 for r in rows if r["vulkan"] == "yes")
     present_w = sum(1 for r in rows if r["wgpu"] == "yes")
     miss_v = sum(1 for r in rows if r["vulkan"] != "yes")
     miss_w = sum(1 for r in rows if r["wgpu"] != "yes")
     cuda_req = sum(1 for r in rows if r["cuda"] == "yes")
 
-    # Optional curated manifest counts + schema v2 validation
-    ALLOWED_STATUSES = {
-        "Native",
-        "Optimized",
-        "GPUEmulated",
-        "UnsupportedBySpecification",
-        "UnsupportedByHardware",
-        "CudaSpecific",
-        "Missing",
-        "Verified",
-    }
-    PROFILE_FIELDS = (
-        "vulkan_status",
-        "native_webgpu_status",
-        "portable_webgpu_status",
-    )
     manifest_counts = None
-    manifest_path = args.manifest or (root / "docs" / "backend-parity-manifest.json")
-    # Release gate: curated three-profile manifest is required (not optional soft-pass).
-    if not manifest_path.is_file():
-        failures.append(
-            f"required parity manifest missing: {manifest_path} "
-            "(create docs/backend-parity-manifest.json schema_version>=2)"
-        )
+    mpath = manifest_path or (root / "docs" / "backend-parity-manifest.json")
+    test_index = list_rust_test_functions(root)
+    file_claim_count: Dict[str, int] = {}
+
+    if not mpath.is_file():
+        failures.append(f"required parity manifest missing: {mpath}")
     else:
         try:
-            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raw = json.loads(mpath.read_text(encoding="utf-8"))
             if isinstance(raw, dict) and "ops" in raw:
                 data = raw["ops"]
                 schema_version = raw.get("schema_version", 1)
             else:
                 data = raw
                 schema_version = 1
-
             if schema_version < 2:
-                failures.append(
-                    f"parity manifest schema_version={schema_version} < 2 "
-                    "(require three profile fields per op)"
-                )
+                failures.append(f"parity manifest schema_version={schema_version} < 2")
 
             def count_status(key: str) -> Dict[str, int]:
                 out: Dict[str, int] = {}
@@ -423,43 +520,60 @@ def main() -> int:
                     out[st] = out.get(st, 0) + 1
                 return out
 
-            # Enforce vocabulary + three profiles on schema v2 (and soft on v1 if fields present)
             for item in data:
                 op_name = item.get("op", "<unknown>")
                 for field in PROFILE_FIELDS:
                     if field not in item:
                         if schema_version >= 2:
                             failures.append(
-                                f"manifest op '{op_name}' missing required profile field '{field}'"
+                                f"manifest op '{op_name}' missing profile field '{field}'"
                             )
                         continue
                     st = item[field]
                     if st not in ALLOWED_STATUSES:
                         failures.append(
-                            f"manifest op '{op_name}' field '{field}' has unknown status {st!r}"
+                            f"manifest op '{op_name}' field '{field}' unknown status {st!r}"
                         )
-                    # Unexplained Missing is incomplete work for release-required CUDA surface.
-                    if st == "Missing":
-                        # Meta/edge rows may still use Missing only if explicitly documented;
-                        # CUDA-required BackendStorage ops must never remain Missing.
-                        if op_name in {r["op"] for r in rows if r["cuda"] == "yes"}:
-                            failures.append(
-                                f"manifest op '{op_name}' has unexplained Missing on {field} "
-                                "(required CUDA surface must be implemented or classified)"
+                    if st == "Missing" and op_name in {
+                        r["op"] for r in rows if r["cuda"] == "yes"
+                    }:
+                        failures.append(
+                            f"manifest op '{op_name}' has Missing on {field}"
+                        )
+                    if st == "Verified":
+                        validate_test_refs(
+                            item, test_index, root, failures, file_claim_count
+                        )
+                        # dtype×layout evidence fields required for Verified compute ops
+                        if (
+                            not str(op_name).startswith("edge::")
+                            and op_name
+                            not in (
+                                "cpu_fallback_policy",
+                                "dtype",
+                                "device",
                             )
-                    if st == "Verified" and not item.get("tests"):
-                        # policy/meta rows may use Verified with structural evidence
-                        if not str(op_name).startswith("edge::") and op_name not in (
-                            "cpu_fallback_policy",
+                            and item.get("trait")
+                            not in ("policy", "edge", "CudaSpecific")
                         ):
-                            failures.append(
-                                f"manifest op '{op_name}' is Verified on {field} but has no tests[]"
-                            )
-                    # Portable Verified must not be claimed from native-only smoke evidence.
+                            if not item.get("verified_dtypes") and not item.get(
+                                "storage_dtypes"
+                            ):
+                                failures.append(
+                                    f"manifest op '{op_name}' Verified without "
+                                    "verified_dtypes/storage_dtypes evidence"
+                                )
+                            if item.get("contiguous") is None and item.get(
+                                "strided"
+                            ) is None:
+                                failures.append(
+                                    f"manifest op '{op_name}' Verified without "
+                                    "layout flags (contiguous/strided)"
+                                )
                     if field == "portable_webgpu_status" and st == "Verified":
                         portable_tests = item.get("portable_tests") or []
                         tests = item.get("tests") or []
-                        banned_native_only = (
+                        banned = (
                             "backend_smoke_tests",
                             "gpu_parity_matrix",
                             "gpu_property_tests",
@@ -468,11 +582,11 @@ def main() -> int:
 
                         def is_portable_evidence(path: object) -> bool:
                             s = str(path).lower()
-                            if any(b in s for b in banned_native_only):
+                            if any(b in s for b in banned):
                                 return False
                             return any(
-                                tag in s
-                                for tag in (
+                                t in s
+                                for t in (
                                     "wasm",
                                     "portable",
                                     "browser",
@@ -480,33 +594,32 @@ def main() -> int:
                                 )
                             )
 
-                        # Policy rows may use structural evidence without a harness.
-                        if op_name in ("cpu_fallback_policy",):
-                            has_portable_evidence = bool(portable_tests or tests)
-                        else:
-                            has_portable_evidence = any(
-                                is_portable_evidence(t) for t in portable_tests
-                            ) or any(is_portable_evidence(t) for t in tests)
-                        if not has_portable_evidence:
+                        if op_name not in ("cpu_fallback_policy",) and not (
+                            any(is_portable_evidence(t) for t in portable_tests)
+                            or any(is_portable_evidence(t) for t in tests)
+                        ):
                             failures.append(
-                                f"manifest op '{op_name}' portable_webgpu_status is Verified "
-                                "but lacks portable/WASM/browser test evidence "
-                                "(native wgpu smokes are not portable Verified)"
+                                f"manifest op '{op_name}' portable Verified lacks "
+                                "portable/WASM/browser evidence"
                             )
                     if st == "Optimized" and not item.get("bench"):
                         failures.append(
-                            f"manifest op '{op_name}' is Optimized on {field} but bench is false"
+                            f"manifest op '{op_name}' Optimized on {field} but bench=false"
                         )
 
-            # Every CUDA-required storage op must appear in curated manifest
+            for bare, n in file_claim_count.items():
+                if n > MAX_GENERIC_FILE_SHARE:
+                    failures.append(
+                        f"generic test file '{bare}' cited as bare Verified evidence "
+                        f"for {n} ops (max {MAX_GENERIC_FILE_SHARE}); use path::function"
+                    )
+
             manifest_ops = {item.get("op") for item in data}
             for r in rows:
                 if r["cuda"] == "yes" and r["op"] not in manifest_ops:
                     failures.append(
                         f"CUDA-required op '{r['op']}' missing from parity manifest"
                     )
-
-            # Critical device ops must appear too
             for dop in critical_device:
                 if dop not in manifest_ops:
                     failures.append(
@@ -517,34 +630,37 @@ def main() -> int:
                 "schema_version": schema_version,
                 "vulkan": count_status("vulkan_status"),
                 "native_webgpu": count_status("native_webgpu_status")
-                if data and "native_webgpu_status" in data[0]
-                else count_status("wgpu_status"),
+                if data and data and "native_webgpu_status" in data[0]
+                else {},
                 "portable_webgpu": count_status("portable_webgpu_status")
                 if data and "portable_webgpu_status" in data[0]
                 else {},
-                "wgpu": count_status("wgpu_status"),
                 "rows": len(data),
             }
         except Exception as e:  # noqa: BLE001
-            print(f"WARN: could not load manifest: {e}", file=sys.stderr)
             failures.append(f"manifest load error: {e}")
 
-    if args.json:
-        payload = {
-            "cuda_required_ops": cuda_req,
-            "rows": rows,
-            "failures": failures,
-            "static_presence": {
-                "vulkan_present": present_v,
-                "wgpu_present": present_w,
-                "vulkan_not_present": miss_v,
-                "wgpu_not_present": miss_w,
-            },
-            "manifest_counts": manifest_counts,
-        }
-        print(json.dumps(payload, indent=2))
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "cuda_required_ops": cuda_req,
+                    "rows": rows,
+                    "failures": failures,
+                    "warnings": warnings,
+                    "static_presence": {
+                        "vulkan_present": present_v,
+                        "wgpu_present": present_w,
+                        "vulkan_not_present": miss_v,
+                        "wgpu_not_present": miss_w,
+                    },
+                    "manifest_counts": manifest_counts,
+                },
+                indent=2,
+            )
+        )
     else:
-        print("=== Candle backend parity audit (static) ===")
+        print("=== Candle backend parity audit (strict) ===")
         print(f"repo: {root}")
         print(f"BackendStorage ops in trait: {len(storage_ops)}")
         print(f"CUDA-required (real impl):   {cuda_req}")
@@ -552,41 +668,100 @@ def main() -> int:
         print(f"{'op':28} {'cuda':12} {'vulkan':22} {'wgpu':22}")
         print("-" * 90)
         for r in rows:
-            print(
-                f"{r['op']:28} {r['cuda']:12} {r['vulkan']:22} {r['wgpu']:22}"
-            )
+            print(f"{r['op']:28} {r['cuda']:12} {r['vulkan']:22} {r['wgpu']:22}")
         print()
-        print("Static presence (not curated native/partial):")
-        print(f"  Vulkan present: {present_v}  not-present/unsupported: {miss_v}")
-        print(f"  WGPU   present: {present_w}  not-present/unsupported: {miss_w}")
+        print(f"  Vulkan present: {present_v}  not-present: {miss_v}")
+        print(f"  WGPU   present: {present_w}  not-present: {miss_w}")
         if manifest_counts:
-            print()
-            print(f"Curated manifest ({manifest_path}): {manifest_counts['rows']} rows")
-            print(f"  schema: {manifest_counts.get('schema_version')}")
-            print(f"  Vulkan:          {manifest_counts['vulkan']}")
+            print(f"Curated manifest rows: {manifest_counts['rows']}")
+            print(f"  Vulkan:          {manifest_counts.get('vulkan')}")
             print(f"  Native WebGPU:   {manifest_counts.get('native_webgpu')}")
             print(f"  Portable WebGPU: {manifest_counts.get('portable_webgpu')}")
-        print()
+        if warnings:
+            print(f"\nWARNINGS ({len(warnings)}):")
+            for w in warnings:
+                print(f"  - {w}")
         if failures:
-            print(f"FAILURES ({len(failures)}):")
+            print(f"\nFAILURES ({len(failures)}):")
             for f in failures:
                 print(f"  - {f}")
         else:
             print(
-                "OK: every CUDA-required BackendStorage op has a non-immediate "
-                "impl on Vulkan and/or WGPU (both when required)."
+                "\nOK: each CUDA-required op has usable Vulkan AND Native WebGPU impl; "
+                "manifest Verified entries carry function-level evidence."
             )
-            print(
-                "OK: parity manifest uses allowed three-profile statuses "
-                "(Native/Optimized/GPUEmulated/UnsupportedBySpecification/"
-                "UnsupportedByHardware/CudaSpecific/Missing/Verified)."
-            )
-            print(
-                "Note: depth gaps (dtype/layout/perf) are tracked in "
-                "docs/backend-parity-manifest.json / docs/backend-parity.md"
-            )
-
     return 1 if failures else 0
+
+
+def run_self_tests() -> int:
+    """Negative self-tests for audit logic (no GPU required)."""
+    errors: List[str] = []
+
+    # 1) immediate unsupported detection
+    body_fail = 'fn foo(&self) -> Result<Self> {\n    return Err(unsupported("x"));\n}'
+    if not is_immediately_unsupported(body_fail):
+        errors.append("expected immediate unsupported for bare unsupported()")
+
+    body_ok = (
+        "fn foo(&self, layout: &Layout) -> Result<Self> {\n"
+        "    self.run_unary_generic(layout, spirv)\n"
+        "}"
+    )
+    if is_immediately_unsupported(body_ok):
+        errors.append("did not expect immediate unsupported for run_unary path")
+
+    # 2) usable() rejects presence-only without GPU work
+    info = analyze_method("affine", 1, 'fn affine() { let x = 1; Err(unsupported("a")) }')
+    # may be immediate
+    if usable(info):
+        errors.append("usable should be false for unsupported-only body")
+
+    info2 = analyze_method(
+        "affine",
+        1,
+        "fn affine(&self, l: &Layout, a: f64, b: f64) -> Result<Self> {\n"
+        "    self.run_unary_generic_with_params(l, spirv, a, b)\n}",
+    )
+    if not usable(info2):
+        errors.append("usable should be true for run_unary GPU path")
+
+    # 3) per-backend failure rule (unit-level simulation)
+    # Ensure both missing generates two failures when wired — covered by integration
+    # on a temp tree with fake backends is heavy; check helper logic only.
+
+    # 4) test ref parser
+    f, fn = parse_test_ref("candle-core/tests/gpu_parity_matrix_tests.rs::parity_matmul_bf16")
+    if fn != "parity_matmul_bf16" or "gpu_parity" not in f:
+        errors.append(f"parse_test_ref failed: {f} {fn}")
+
+    # 5) generic file share limit constant
+    if MAX_GENERIC_FILE_SHARE < 1:
+        errors.append("MAX_GENERIC_FILE_SHARE invalid")
+
+    if errors:
+        print("SELF-TEST FAILURES:")
+        for e in errors:
+            print(f"  - {e}")
+        return 1
+    print("SELF-TEST OK: audit helpers pass negative/positive unit checks")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--repo", type=Path, default=None)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--manifest", type=Path, default=None)
+    ap.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run negative self-tests for audit helpers and exit",
+    )
+    args = ap.parse_args()
+    if args.self_test:
+        return run_self_tests()
+    root = (args.repo or repo_root_from_script()).resolve()
+    return run_audit(root, args.manifest, args.json)
 
 
 if __name__ == "__main__":

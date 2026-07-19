@@ -1,0 +1,299 @@
+{
+  "table": [
+    {
+      "op": "conv2d_64",
+      "mode": "sync",
+      "cuda_ms": 0.0826,
+      "vulkan_ms": 1.8072,
+      "vulkan_vs_cuda": 21.878934624697333,
+      "wgpu_ms": 0.2967,
+      "wgpu_vs_cuda": 3.5920096852300243
+    },
+    {
+      "op": "gather_32x128",
+      "mode": "sync",
+      "cuda_ms": 0.0194,
+      "vulkan_ms": 0.4199,
+      "vulkan_vs_cuda": 21.644329896907216,
+      "wgpu_ms": 0.4413,
+      "wgpu_vs_cuda": 22.74742268041237
+    },
+    {
+      "op": "matmul_1024x1024x1024",
+      "mode": "batch20",
+      "cuda_ms": 0.304,
+      "vulkan_ms": 0.2128,
+      "vulkan_vs_cuda": 0.7,
+      "wgpu_ms": 0.2655,
+      "wgpu_vs_cuda": 0.8733552631578948
+    },
+    {
+      "op": "matmul_1024x1024x1024",
+      "mode": "sync",
+      "cuda_ms": 0.3432,
+      "vulkan_ms": 0.3097,
+      "vulkan_vs_cuda": 0.9023892773892773,
+      "wgpu_ms": 0.413,
+      "wgpu_vs_cuda": 1.2033799533799534
+    },
+    {
+      "op": "matmul_256_bf16",
+      "mode": "sync",
+      "cuda_ms": 0.0381,
+      "vulkan_ms": 0.1597,
+      "vulkan_vs_cuda": 4.191601049868766,
+      "wgpu_ms": 0.2606,
+      "wgpu_vs_cuda": 6.83989501312336
+    },
+    {
+      "op": "matmul_256_f16",
+      "mode": "sync",
+      "cuda_ms": 0.0267,
+      "vulkan_ms": 0.1569,
+      "vulkan_vs_cuda": 5.876404494382022,
+      "wgpu_ms": 0.3558,
+      "wgpu_vs_cuda": 13.325842696629213
+    },
+    {
+      "op": "matmul_256x256x256",
+      "mode": "batch20",
+      "cuda_ms": 0.0323,
+      "vulkan_ms": 0.0231,
+      "vulkan_vs_cuda": 0.7151702786377708,
+      "wgpu_ms": 0.0432,
+      "wgpu_vs_cuda": 1.3374613003095974
+    },
+    {
+      "op": "matmul_256x256x256",
+      "mode": "sync",
+      "cuda_ms": 0.0489,
+      "vulkan_ms": 0.1119,
+      "vulkan_vs_cuda": 2.2883435582822087,
+      "wgpu_ms": 0.1512,
+      "wgpu_vs_cuda": 3.0920245398773005
+    },
+    {
+      "op": "matmul_64x4096x4096",
+      "mode": "batch20",
+      "cuda_ms": 0.2835,
+      "vulkan_ms": 0.2576,
+      "vulkan_vs_cuda": 0.908641975308642,
+      "wgpu_ms": 0.3641,
+      "wgpu_vs_cuda": 1.2843033509700177
+    },
+    {
+      "op": "matmul_64x4096x4096",
+      "mode": "sync",
+      "cuda_ms": 0.301,
+      "vulkan_ms": 0.3441,
+      "vulkan_vs_cuda": 1.1431893687707642,
+      "wgpu_ms": 0.4999,
+      "wgpu_vs_cuda": 1.6607973421926912
+    },
+    {
+      "op": "mul_1024",
+      "mode": "batch20",
+      "cuda_ms": 0.0436,
+      "vulkan_ms": 0.0506,
+      "vulkan_vs_cuda": 1.1605504587155964,
+      "wgpu_ms": 0.0728,
+      "wgpu_vs_cuda": 1.6697247706422018
+    },
+    {
+      "op": "mul_1024",
+      "mode": "sync",
+      "cuda_ms": 0.0581,
+      "vulkan_ms": 0.1312,
+      "vulkan_vs_cuda": 2.258175559380379,
+      "wgpu_ms": 0.1751,
+      "wgpu_vs_cuda": 3.0137693631669538
+    },
+    {
+      "op": "relu_1024",
+      "mode": "batch20",
+      "cuda_ms": 0.0345,
+      "vulkan_ms": 0.0378,
+      "vulkan_vs_cuda": 1.0956521739130434,
+      "wgpu_ms": 0.059,
+      "wgpu_vs_cuda": 1.7101449275362317
+    },
+    {
+      "op": "relu_1024",
+      "mode": "sync",
+      "cuda_ms": 0.049,
+      "vulkan_ms": 0.1231,
+      "vulkan_vs_cuda": 2.512244897959184,
+      "wgpu_ms": 0.1613,
+      "wgpu_vs_cuda": 3.2918367346938773
+    },
+    {
+      "op": "scatter_add_32x128",
+      "mode": "sync",
+      "cuda_ms": 0.0285,
+      "vulkan_ms": 0.5205,
+      "vulkan_vs_cuda": 18.26315789473684,
+      "wgpu_ms": 0.5138,
+      "wgpu_vs_cuda": 18.028070175438597
+    },
+    {
+      "op": "softmax_like_64x2048",
+      "mode": "sync",
+      "cuda_ms": 0.0644,
+      "vulkan_ms": 0.1243,
+      "vulkan_vs_cuda": 1.9301242236024845,
+      "wgpu_ms": 0.2491,
+      "wgpu_vs_cuda": 3.8680124223602483
+    },
+    {
+      "op": "sum_last_1024",
+      "mode": "batch20",
+      "cuda_ms": 0.1016,
+      "vulkan_ms": 0.0247,
+      "vulkan_vs_cuda": 0.24311023622047245,
+      "wgpu_ms": 0.0613,
+      "wgpu_vs_cuda": 0.6033464566929134
+    },
+    {
+      "op": "sum_last_1024",
+      "mode": "sync",
+      "cuda_ms": 0.1555,
+      "vulkan_ms": 0.1099,
+      "vulkan_vs_cuda": 0.7067524115755627,
+      "wgpu_ms": 0.1909,
+      "wgpu_vs_cuda": 1.227652733118971
+    }
+  ],
+  "violations": [
+    {
+      "backend": "vulkan",
+      "op": "conv2d_64",
+      "mode": "sync",
+      "ratio": 21.878934624697333,
+      "limit": 1.5
+    },
+    {
+      "backend": "wgpu",
+      "op": "conv2d_64",
+      "mode": "sync",
+      "ratio": 3.5920096852300243,
+      "limit": 2.0
+    },
+    {
+      "backend": "vulkan",
+      "op": "gather_32x128",
+      "mode": "sync",
+      "ratio": 21.644329896907216,
+      "limit": 1.5
+    },
+    {
+      "backend": "wgpu",
+      "op": "gather_32x128",
+      "mode": "sync",
+      "ratio": 22.74742268041237,
+      "limit": 2.0
+    },
+    {
+      "backend": "vulkan",
+      "op": "matmul_256_bf16",
+      "mode": "sync",
+      "ratio": 4.191601049868766,
+      "limit": 1.5
+    },
+    {
+      "backend": "wgpu",
+      "op": "matmul_256_bf16",
+      "mode": "sync",
+      "ratio": 6.83989501312336,
+      "limit": 2.0
+    },
+    {
+      "backend": "vulkan",
+      "op": "matmul_256_f16",
+      "mode": "sync",
+      "ratio": 5.876404494382022,
+      "limit": 1.5
+    },
+    {
+      "backend": "wgpu",
+      "op": "matmul_256_f16",
+      "mode": "sync",
+      "ratio": 13.325842696629213,
+      "limit": 2.0
+    },
+    {
+      "backend": "vulkan",
+      "op": "matmul_256x256x256",
+      "mode": "sync",
+      "ratio": 2.2883435582822087,
+      "limit": 1.5
+    },
+    {
+      "backend": "wgpu",
+      "op": "matmul_256x256x256",
+      "mode": "sync",
+      "ratio": 3.0920245398773005,
+      "limit": 2.0
+    },
+    {
+      "backend": "vulkan",
+      "op": "mul_1024",
+      "mode": "sync",
+      "ratio": 2.258175559380379,
+      "limit": 1.5
+    },
+    {
+      "backend": "wgpu",
+      "op": "mul_1024",
+      "mode": "sync",
+      "ratio": 3.0137693631669538,
+      "limit": 2.0
+    },
+    {
+      "backend": "vulkan",
+      "op": "relu_1024",
+      "mode": "sync",
+      "ratio": 2.512244897959184,
+      "limit": 1.5
+    },
+    {
+      "backend": "wgpu",
+      "op": "relu_1024",
+      "mode": "sync",
+      "ratio": 3.2918367346938773,
+      "limit": 2.0
+    },
+    {
+      "backend": "vulkan",
+      "op": "scatter_add_32x128",
+      "mode": "sync",
+      "ratio": 18.26315789473684,
+      "limit": 1.5
+    },
+    {
+      "backend": "wgpu",
+      "op": "scatter_add_32x128",
+      "mode": "sync",
+      "ratio": 18.028070175438597,
+      "limit": 2.0
+    },
+    {
+      "backend": "vulkan",
+      "op": "softmax_like_64x2048",
+      "mode": "sync",
+      "ratio": 1.9301242236024845,
+      "limit": 1.5
+    },
+    {
+      "backend": "wgpu",
+      "op": "softmax_like_64x2048",
+      "mode": "sync",
+      "ratio": 3.8680124223602483,
+      "limit": 2.0
+    }
+  ],
+  "vulkan_matmul_batch_geomean_vs_cuda": 0.769071582582569,
+  "wgpu_matmul_batch_geomean_vs_cuda": 1.1447568756354998,
+  "vulkan_slo_critical_kernel": 1.5,
+  "wgpu_slo_critical_kernel": 2.0,
+  "e2e_note": "Transformer/LLM e2e not executed in this pack \u2014 see STATUS.md"
+}

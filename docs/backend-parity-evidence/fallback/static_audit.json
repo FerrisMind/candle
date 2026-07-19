@@ -1,0 +1,127 @@
+{
+  "suspect_count": 20,
+  "intentional_or_bridge_count": 2,
+  "suspects": [
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 1747,
+      "kind": "to_cpu_storage call",
+      "text": "let cpu = storage.to_cpu_storage()?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 7735,
+      "kind": "read_buffer call",
+      "text": "let bytes = self.device.read_buffer(&self.buffer)?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 7761,
+      "kind": "read_buffer call",
+      "text": "let mut bytes = self.device.read_buffer(&self.buffer)?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 9115,
+      "kind": "to_cpu_storage call",
+      "text": "let col_cpu = col.to_cpu_storage()?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 9128,
+      "kind": "to_cpu_storage call",
+      "text": "let col_pad_cpu = col_pad.to_cpu_storage()?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 9175,
+      "kind": "to_cpu_storage call",
+      "text": "let res_cpu = res.to_cpu_storage()?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 9185,
+      "kind": "to_cpu_storage call",
+      "text": "let out_cpu = out.to_cpu_storage()?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 9204,
+      "kind": "to_cpu_storage call",
+      "text": "let res_pad_cpu = res_pad.to_cpu_storage()?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 9215,
+      "kind": "to_cpu_storage call",
+      "text": "let out_pad_cpu = out_pad.to_cpu_storage()?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 9309,
+      "kind": "to_cpu_storage call",
+      "text": "let col_cpu = match col.to_cpu_storage()? {"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 9328,
+      "kind": "to_cpu_storage call",
+      "text": "let res_cpu = match res.to_cpu_storage()? {"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 9347,
+      "kind": "to_cpu_storage call",
+      "text": "let out_cpu = match out.to_cpu_storage()? {"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 9398,
+      "kind": "to_cpu_storage call",
+      "text": "let out_cpu = out.to_cpu_storage()?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 9432,
+      "kind": "to_cpu_storage call",
+      "text": "let col_cpu = col.to_cpu_storage()?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 9489,
+      "kind": "to_cpu_storage call",
+      "text": "let res_cpu = res.to_cpu_storage()?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 9501,
+      "kind": "to_cpu_storage call",
+      "text": "let out_cpu = out.to_cpu_storage()?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/vulkan_backend.rs",
+      "line": 9610,
+      "kind": "read_buffer call",
+      "text": "let gpu = device.read_buffer(&packed)?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/wgpu_backend.rs",
+      "line": 1021,
+      "kind": "to_cpu_storage call",
+      "text": "let cpu = storage.to_cpu_storage()?;"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/wgpu_backend.rs",
+      "line": 1605,
+      "kind": "map_async",
+      "text": "slice.map_async(wgpu::MapMode::Read, move |result| {"
+    },
+    {
+      "file": "D:/Users/\u041f\u041a/Desktop/candle/candle-core/src/wgpu_backend.rs",
+      "line": 10187,
+      "kind": "read_buffer call",
+      "text": "let bytes = self.device.read_buffer(&self.buffer, size)?;"
+    }
+  ],
+  "note": "Suspects require manual classification. Runtime STRICT mode uses CANDLE_STRICT_NO_CPU_FALLBACK=1 with record_* hooks."
+}

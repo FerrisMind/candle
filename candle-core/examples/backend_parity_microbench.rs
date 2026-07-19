@@ -56,6 +56,7 @@ where
 }
 
 fn emit(name: &str, op: &str, mode: &str, ms: f64) {
+    // Compatible columns: backend,op,mode,median_ms[,p95_ms,var]
     println!("{name},{op},{mode},{ms:.4}");
 }
 
@@ -96,6 +97,39 @@ fn run_suite_ops(name: &str, dev: &Device, iters: usize) -> Result<()> {
     let batch_ms = bench_op_batch(dev, iters, batch, || x.sum_keepdim(D::Minus1))?;
     emit(name, "sum_last_1024", "sync", sync_ms);
     emit(name, "sum_last_1024", &format!("batch{batch}"), batch_ms);
+
+    // Softmax-like: exp + sum_last + div (reduction-sensitive chain)
+    let row = Tensor::randn(0f32, 1.0, (64, 2048), dev)?;
+    let sync_ms = bench_op_sync(dev, iters, || {
+        let e = row.exp()?;
+        let s = e.sum_keepdim(D::Minus1)?;
+        e.broadcast_div(&s)
+    })?;
+    emit(name, "softmax_like_64x2048", "sync", sync_ms);
+
+    // Gather / scatter_add last dim
+    let base = Tensor::zeros((32, 128), DType::F32, dev)?;
+    let ids = Tensor::arange(0u32, 64, dev)?.reshape((32, 2))?;
+    let src = Tensor::randn(0f32, 1.0, (32, 2), dev)?;
+    let sync_ms = bench_op_sync(dev, iters, || base.scatter_add(&ids, &src, 1))?;
+    emit(name, "scatter_add_32x128", "sync", sync_ms);
+    let gsrc = Tensor::randn(0f32, 1.0, (32, 128), dev)?;
+    let sync_ms = bench_op_sync(dev, iters, || gsrc.gather(&ids, 1))?;
+    emit(name, "gather_32x128", "sync", sync_ms);
+
+    // Conv2d small
+    let img = Tensor::randn(0f32, 1.0, (1, 3, 64, 64), dev)?;
+    let ker = Tensor::randn(0f32, 1.0, (8, 3, 3, 3), dev)?;
+    let sync_ms = bench_op_sync(dev, iters.min(10), || img.conv2d(&ker, 0, 1, 1, 1))?;
+    emit(name, "conv2d_64", "sync", sync_ms);
+
+    // F16 / BF16 matmul
+    for (dtype, tag) in [(DType::F16, "f16"), (DType::BF16, "bf16")] {
+        let a = Tensor::randn(0f32, 1.0, (256, 256), dev)?.to_dtype(dtype)?;
+        let b = Tensor::randn(0f32, 1.0, (256, 256), dev)?.to_dtype(dtype)?;
+        let sync_ms = bench_op_sync(dev, iters, || a.matmul(&b))?;
+        emit(name, &format!("matmul_256_{tag}"), "sync", sync_ms);
+    }
     Ok(())
 }
 

@@ -1,0 +1,27 @@
+{
+  "note": "CPU reference is Candle CPU; half compared in f32",
+  "cases": [
+    {"op":"abs","dtype":"F32","shape":"scalar","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":1},
+    {"op":"neg","dtype":"F32","shape":"scalar","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":1},
+    {"op":"mul","dtype":"F32","shape":"scalar","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":1},
+    {"op":"abs","dtype":"F32","shape":"odd1d","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":7},
+    {"op":"neg","dtype":"F32","shape":"odd1d","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":7},
+    {"op":"mul","dtype":"F32","shape":"odd1d","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":7},
+    {"op":"abs","dtype":"F32","shape":"prime2d","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":15},
+    {"op":"neg","dtype":"F32","shape":"prime2d","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":15},
+    {"op":"mul","dtype":"F32","shape":"prime2d","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":15},
+    {"op":"relu","dtype":"F32","shape":"prime2d","layout":"strided_transpose","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":15},
+    {"op":"abs","dtype":"F32","shape":"pow2","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":64},
+    {"op":"neg","dtype":"F32","shape":"pow2","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":64},
+    {"op":"mul","dtype":"F32","shape":"pow2","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":64},
+    {"op":"relu","dtype":"F32","shape":"pow2","layout":"strided_transpose","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":64},
+    {"op":"abs","dtype":"F32","shape":"odd3d","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":13},
+    {"op":"neg","dtype":"F32","shape":"odd3d","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":13},
+    {"op":"mul","dtype":"F32","shape":"odd3d","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":13},
+    {"op":"relu","dtype":"F32","shape":"odd3d","layout":"strided_transpose","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":13},
+    {"op":"matmul","dtype":"F32","shape":"7x5x11","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":1.907349e-6,"max_rel_vs_cpu":8.159042e-7,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":11,"n":77},
+    {"op":"matmul","dtype":"F16","shape":"7x5x11","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":77},
+    {"op":"add_u8","dtype":"U8","shape":"3x5","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":0.000000e0,"max_rel_vs_cpu":0.000000e0,"max_abs_vs_cuda":0.000000e0,"max_ulp_vs_cpu":0,"n":15},
+    {"op":"abs_special","dtype":"F32","shape":"3x3","layout":"contiguous","backend":"vulkan","max_abs_vs_cpu":2.938736e-39,"max_rel_vs_cpu":2.938736e-9,"max_abs_vs_cuda":2.938736e-39,"max_ulp_vs_cpu":2097152,"n":9}
+  ]
+}

@@ -11,23 +11,70 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static WGPU_CPU_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VULKAN_CPU_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Retained for diagnostic hooks / future sparse recovery paths.
-/// Production quantized GPU paths no longer call these (GPU dequant+dense instead).
+/// Record a forbidden compute CPU-fallback. When `CANDLE_STRICT_NO_CPU_FALLBACK=1`,
+/// panics so parity matrix / e2e tests fail closed.
 #[allow(dead_code)]
 pub(crate) fn record_wgpu_cpu_fallback(err: &Error) {
     let count = WGPU_CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
         eprintln!("[candle][wgpu][cpu-fallback#{count}] {err:?}");
     }
+    if std::env::var_os("CANDLE_STRICT_NO_CPU_FALLBACK").is_some() {
+        panic!("[candle][wgpu] STRICT: CPU compute fallback invoked: {err:?}");
+    }
 }
 
-/// Retained for diagnostic hooks / future sparse recovery paths.
+/// Record a forbidden compute CPU-fallback. When `CANDLE_STRICT_NO_CPU_FALLBACK=1`,
+/// panics so parity matrix / e2e tests fail closed.
 #[allow(dead_code)]
 pub(crate) fn record_vulkan_cpu_fallback(err: &Error) {
     let count = VULKAN_CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
         eprintln!("[candle][vulkan][cpu-fallback#{count}] {err:?}");
     }
+    if std::env::var_os("CANDLE_STRICT_NO_CPU_FALLBACK").is_some() {
+        panic!("[candle][vulkan] STRICT: CPU compute fallback invoked: {err:?}");
+    }
+}
+
+/// Host-side compute/readback counters for verification (not transfer APIs).
+static WGPU_HOST_COMPUTE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static VULKAN_HOST_COMPUTE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Mark an unexpected host compute/readback used as compute (not intentional D2H).
+#[allow(dead_code)]
+pub(crate) fn record_wgpu_host_compute(reason: &str) {
+    let count = WGPU_HOST_COMPUTE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
+        eprintln!("[candle][wgpu][host-compute#{count}] {reason}");
+    }
+    if std::env::var_os("CANDLE_STRICT_NO_CPU_FALLBACK").is_some() {
+        panic!("[candle][wgpu] STRICT: host compute/readback: {reason}");
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn record_vulkan_host_compute(reason: &str) {
+    let count = VULKAN_HOST_COMPUTE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if std::env::var_os("CANDLE_DEBUG_GPU_FALLBACK").is_some() {
+        eprintln!("[candle][vulkan][host-compute#{count}] {reason}");
+    }
+    if std::env::var_os("CANDLE_STRICT_NO_CPU_FALLBACK").is_some() {
+        panic!("[candle][vulkan] STRICT: host compute/readback: {reason}");
+    }
+}
+
+pub fn wgpu_host_compute_count() -> usize {
+    WGPU_HOST_COMPUTE_COUNT.load(Ordering::Relaxed)
+}
+pub fn vulkan_host_compute_count() -> usize {
+    VULKAN_HOST_COMPUTE_COUNT.load(Ordering::Relaxed)
+}
+pub fn reset_wgpu_host_compute_count() {
+    WGPU_HOST_COMPUTE_COUNT.store(0, Ordering::Relaxed);
+}
+pub fn reset_vulkan_host_compute_count() {
+    VULKAN_HOST_COMPUTE_COUNT.store(0, Ordering::Relaxed);
 }
 
 pub fn wgpu_cpu_fallback_count() -> usize {

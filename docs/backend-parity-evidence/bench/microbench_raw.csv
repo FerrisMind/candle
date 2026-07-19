@@ -1,0 +1,82 @@
+warning: candle-vulkan-kernels@0.11.0: glslc features: integer_dot=true coopmat=true coopmat2=false
+warning: candle-kernels@0.11.0: Compiling 11 of 11 PTX kernels
+warning: candle-kernels@0.11.0: Using 8 threads for compilation
+warning: candle-kernels@0.11.0: Compiling 15 of 15 kernels
+   Compiling candle-core v0.11.0 (C:\candle-build\candle\candle-core)
+warning: function `p95_ms` is never used
+  --> candle-core\examples\backend_parity_microbench.rs:16:4
+   |
+16 | fn p95_ms(mut v: Vec<f64>) -> f64 {
+   |    ^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `variance` is never used
+  --> candle-core\examples\backend_parity_microbench.rs:22:4
+   |
+22 | fn variance(v: &[f64], mean: f64) -> f64 {
+   |    ^^^^^^^^
+
+warning: linker stdout: LINK : warning LNK4098: defaultlib 'LIBCMT' conflicts with use of other libs; use /NODEFAULTLIB:library
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `candle-core` (example "backend_parity_microbench") generated 3 warnings
+    Finished `release` profile [optimized] target(s) in 2.55s
+     Running `C:\candle-build\target\release\examples\backend_parity_microbench.exe --suite`
+backend,op,mode,median_ms
+cuda,matmul_256x256x256,sync,0.0489
+cuda,matmul_256x256x256,batch20,0.0323
+cuda,matmul_1024x1024x1024,sync,0.3432
+cuda,matmul_1024x1024x1024,batch20,0.3040
+cuda,matmul_64x4096x4096,sync,0.3010
+cuda,matmul_64x4096x4096,batch20,0.2835
+cuda,relu_1024,sync,0.0490
+cuda,relu_1024,batch20,0.0345
+cuda,mul_1024,sync,0.0581
+cuda,mul_1024,batch20,0.0436
+cuda,sum_last_1024,sync,0.1555
+cuda,sum_last_1024,batch20,0.1016
+cuda,softmax_like_64x2048,sync,0.0644
+cuda,scatter_add_32x128,sync,0.0285
+cuda,gather_32x128,sync,0.0194
+cuda,conv2d_64,sync,0.0826
+cuda,matmul_256_f16,sync,0.0267
+cuda,matmul_256_bf16,sync,0.0381
+vulkan,matmul_256x256x256,sync,0.1119
+vulkan,matmul_256x256x256,batch20,0.0231
+vulkan,matmul_1024x1024x1024,sync,0.3097
+vulkan,matmul_1024x1024x1024,batch20,0.2128
+vulkan,matmul_64x4096x4096,sync,0.3441
+vulkan,matmul_64x4096x4096,batch20,0.2576
+vulkan,relu_1024,sync,0.1231
+vulkan,relu_1024,batch20,0.0378
+vulkan,mul_1024,sync,0.1312
+vulkan,mul_1024,batch20,0.0506
+vulkan,sum_last_1024,sync,0.1099
+vulkan,sum_last_1024,batch20,0.0247
+vulkan,softmax_like_64x2048,sync,0.1243
+vulkan,scatter_add_32x128,sync,0.5205
+vulkan,gather_32x128,sync,0.4199
+vulkan,conv2d_64,sync,1.8072
+vulkan,matmul_256_f16,sync,0.1569
+vulkan,matmul_256_bf16,sync,0.1597
+wgpu,matmul_256x256x256,sync,0.1512
+wgpu,matmul_256x256x256,batch20,0.0432
+wgpu,matmul_1024x1024x1024,sync,0.4130
+wgpu,matmul_1024x1024x1024,batch20,0.2655
+wgpu,matmul_64x4096x4096,sync,0.4999
+wgpu,matmul_64x4096x4096,batch20,0.3641
+wgpu,relu_1024,sync,0.1613
+wgpu,relu_1024,batch20,0.0590
+wgpu,mul_1024,sync,0.1751
+wgpu,mul_1024,batch20,0.0728
+wgpu,sum_last_1024,sync,0.1909
+wgpu,sum_last_1024,batch20,0.0613
+wgpu,softmax_like_64x2048,sync,0.2491
+wgpu,scatter_add_32x128,sync,0.5138
+wgpu,gather_32x128,sync,0.4413
+wgpu,conv2d_64,sync,0.2967
+wgpu,matmul_256_f16,sync,0.3558
+wgpu,matmul_256_bf16,sync,0.2606
+bench_exit=0
