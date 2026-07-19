@@ -1,19 +1,21 @@
 {
   "verification_stage": "verification-only",
   "target_commit": "14c3fe5ab0fd08b0212561abd459d159bf45ae65",
-  "actual_commit": "14c3fe5ab0fd08b0212561abd459d159bf45ae65",
+  "evidence_commit": "9e087a2f",
   "branch": "wgpu/vulkan",
-  "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
-  "cargo": "cargo 1.97.0 (c980f4866 2026-06-30)",
-  "gpu_nvidia_smi": "NVIDIA GeForce RTX 3060, 610.74, 12288 MiB",
-  "CUDA_PATH": "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6",
-  "VULKAN_SDK": "C:\VulkanSDK\1.4.350.0",
-  "wgpu_dep": "111:wgpu = { version = "29", default-features = false, features = ["vulkan", "dx12", "metal", "gles", "wgsl"] }",
+  "rustc": "rustc 1.97.0",
+  "cargo": "cargo 1.97.0",
+  "gpu": "NVIDIA GeForce RTX 3060",
+  "driver": "610.74",
+  "CUDA_PATH": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6",
+  "VULKAN_SDK": "C:\\VulkanSDK\\1.4.350.0",
+  "wgpu": "29",
   "required_env": {
     "CANDLE_REQUIRE_CUDA_TEST_DEVICE": "1",
     "CANDLE_REQUIRE_VULKAN_TEST_DEVICE": "1",
     "CANDLE_REQUIRE_WGPU_TEST_DEVICE": "1",
-    "CANDLE_EXPECTED_GPU_NAME": "RTX 3060"
+    "CANDLE_EXPECTED_GPU_NAME": "RTX 3060",
+    "CANDLE_STRICT_NO_CPU_FALLBACK": "1"
   },
-  "ascii_cuda_path_note": "Use C:\\candle-build\\candle + CARGO_TARGET_DIR when nvcc fails on Cyrillic paths"
+  "ascii_cuda_path_note": "C:\\candle-build\\candle junction + CARGO_TARGET_DIR when nvcc fails on Cyrillic paths"
 }
