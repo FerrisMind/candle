@@ -134,20 +134,14 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
         Device::Wgpu(_) => {
             // Build via byte path so alignment/unaligned GGML loads stay correct.
             let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    data.as_ptr() as *const u8,
-                    std::mem::size_of_val(data),
-                )
+                std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
             };
             QStorage::from_data(std::borrow::Cow::Borrowed(bytes), device, T::DTYPE)?
         }
         #[cfg(feature = "vulkan")]
         Device::Vulkan(_) => {
             let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    data.as_ptr() as *const u8,
-                    std::mem::size_of_val(data),
-                )
+                std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
             };
             QStorage::from_data(std::borrow::Cow::Borrowed(bytes), device, T::DTYPE)?
         }

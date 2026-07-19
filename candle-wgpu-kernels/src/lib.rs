@@ -531,11 +531,6 @@ pub fn matmul_coop_64_shader() -> Option<&'static str> {
     get("mul_mat_coop_64.wgsl").map(|m| m.source())
 }
 
-
-
-
-
-
 pub fn matmul_fast_shader(dtype: DType, vectorized: bool) -> Option<String> {
     let source = get("mul_mat_reg_tile.wgsl")?
         .source()
@@ -1110,7 +1105,13 @@ fn preprocess(
         if !is_active(&stack) {
             continue;
         }
-        if trimmed == "enable f16;" && matches!(dtype, DType::F32) {
+        // Strip f16 enable for pure-F32 variants (portable + adapters without
+        // shader-f16). Match loosely so BOM/whitespace cannot leave the line in.
+        if matches!(dtype, DType::F32)
+            && trimmed
+                .trim_start_matches('\u{feff}')
+                .starts_with("enable f16")
+        {
             continue;
         }
         let mut expanded = line.to_string();
@@ -1208,5 +1209,40 @@ mod tests {
         assert!(!source.contains("#ifdef"));
         assert!(!source.contains("#define"));
         assert!(!source.contains("DataType"));
+    }
+
+    #[test]
+    fn set_rows_add_f32_strips_f16_tokens() {
+        let source = super::set_rows_add_f32_shader(256).expect("set_rows add f32");
+        // Critical: no f16 *types/functions* without enable (naga panic).
+        // enable line is stripped for F32; if a future path keeps it, still require no f16 tokens.
+        assert!(
+            !source.contains("atomic_add_f16"),
+            "F32 scatter-add must not keep atomic_add_f16; head:\n{}",
+            source.lines().take(30).collect::<Vec<_>>().join("\n")
+        );
+        // Avoid matching substring f16 inside identifiers like "atomic_add_f16" already checked.
+        let has_f16_type = source.lines().any(|l| {
+            let t = l.trim();
+            t == "enable f16;"
+                || t.contains(": f16")
+                || t.contains("<f16>")
+                || t.contains(" f16(")
+                || t.contains("f16)")
+        });
+        assert!(
+            !has_f16_type,
+            "F32 scatter-add must not leave f16 types; head:\n{}",
+            source.lines().take(40).collect::<Vec<_>>().join("\n")
+        );
+        assert!(source.contains("atomic_add_f32"));
+    }
+
+    #[test]
+    fn set_rows_add_f16_keeps_f16_extension() {
+        let source = super::set_rows_add_f16_shader(256).expect("set_rows add f16");
+        assert!(source.contains("enable f16;"));
+        assert!(source.contains("atomic_add_f16"));
+        assert!(!source.contains("atomic_add_f32"));
     }
 }

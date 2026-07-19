@@ -866,22 +866,6 @@ impl QStorage {
             }
         }
     }
-
-    #[cfg(feature = "cuda")]
-    pub fn device_ptr_with_guard<'a>(
-        &'a self,
-        stream: &'a crate::cuda_backend::cudarc::driver::CudaStream,
-    ) -> Result<(
-        *const u8,
-        crate::cuda_backend::cudarc::driver::SyncOnDrop<'a>,
-    )> {
-        match self {
-            QStorage::Cuda(storage) => storage.device_ptr_with_guard(stream),
-            QStorage::Metal(_) | QStorage::Cpu(_) => {
-                crate::bail!("not implemented");
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1383,10 +1367,7 @@ impl QTensor {
             )
         }
         // WGPU/Vulkan: native quantized gather (no host dequant round-trip).
-        if matches!(
-            &self.storage,
-            QStorage::Wgpu(_) | QStorage::Vulkan(_)
-        ) {
+        if matches!(&self.storage, QStorage::Wgpu(_) | QStorage::Vulkan(_)) {
             let flat_ids = ids.flatten_all()?;
             let gathered = self.index_select_rows0_f32(&flat_ids)?;
             let mut out_dims = ids.dims().to_vec();

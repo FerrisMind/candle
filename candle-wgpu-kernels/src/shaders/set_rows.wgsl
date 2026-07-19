@@ -71,6 +71,10 @@ struct Params {
 var<uniform> params: Params;
 
 #ifdef ADD
+// Keep f32 and f16 CAS helpers behind separate defines so F32 preprocess can
+// strip `enable f16;` without leaving f16 tokens in the module (naga rejects
+// f16 types unless the extension is enabled).
+#ifndef ADD_F16
 fn atomic_add_f32(dst_idx: u32, value: f32) {
     loop {
         let old_bits = atomicLoad(&dst[dst_idx]);
@@ -82,7 +86,7 @@ fn atomic_add_f32(dst_idx: u32, value: f32) {
         }
     }
 }
-
+#else
 // Native f16 scatter-add: CAS on the u32 word packing two halves.
 // `f16_elem_idx` is in f16 elements (same indexing as non-atomic f16 set_rows).
 fn atomic_add_f16(f16_elem_idx: u32, value: f16) {
@@ -102,6 +106,7 @@ fn atomic_add_f16(f16_elem_idx: u32, value: f16) {
         }
     }
 }
+#endif
 #endif
 
 @compute @workgroup_size(WG_SIZE)

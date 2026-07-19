@@ -394,7 +394,13 @@ def main() -> int:
     )
     manifest_counts = None
     manifest_path = args.manifest or (root / "docs" / "backend-parity-manifest.json")
-    if manifest_path.is_file():
+    # Release gate: curated three-profile manifest is required (not optional soft-pass).
+    if not manifest_path.is_file():
+        failures.append(
+            f"required parity manifest missing: {manifest_path} "
+            "(create docs/backend-parity-manifest.json schema_version>=2)"
+        )
+    else:
         try:
             raw = json.loads(manifest_path.read_text(encoding="utf-8"))
             if isinstance(raw, dict) and "ops" in raw:
@@ -403,6 +409,12 @@ def main() -> int:
             else:
                 data = raw
                 schema_version = 1
+
+            if schema_version < 2:
+                failures.append(
+                    f"parity manifest schema_version={schema_version} < 2 "
+                    "(require three profile fields per op)"
+                )
 
             def count_status(key: str) -> Dict[str, int]:
                 out: Dict[str, int] = {}
@@ -426,6 +438,15 @@ def main() -> int:
                         failures.append(
                             f"manifest op '{op_name}' field '{field}' has unknown status {st!r}"
                         )
+                    # Unexplained Missing is incomplete work for release-required CUDA surface.
+                    if st == "Missing":
+                        # Meta/edge rows may still use Missing only if explicitly documented;
+                        # CUDA-required BackendStorage ops must never remain Missing.
+                        if op_name in {r["op"] for r in rows if r["cuda"] == "yes"}:
+                            failures.append(
+                                f"manifest op '{op_name}' has unexplained Missing on {field} "
+                                "(required CUDA surface must be implemented or classified)"
+                            )
                     if st == "Verified" and not item.get("tests"):
                         # policy/meta rows may use Verified with structural evidence
                         if not str(op_name).startswith("edge::") and op_name not in (
@@ -438,9 +459,19 @@ def main() -> int:
                     if field == "portable_webgpu_status" and st == "Verified":
                         portable_tests = item.get("portable_tests") or []
                         tests = item.get("tests") or []
-                        has_portable_evidence = bool(portable_tests) or any(
-                            any(
-                                tag in str(t).lower()
+                        banned_native_only = (
+                            "backend_smoke_tests",
+                            "gpu_parity_matrix",
+                            "gpu_property_tests",
+                            "gpu_metamorphic_tests",
+                        )
+
+                        def is_portable_evidence(path: object) -> bool:
+                            s = str(path).lower()
+                            if any(b in s for b in banned_native_only):
+                                return False
+                            return any(
+                                tag in s
                                 for tag in (
                                     "wasm",
                                     "portable",
@@ -448,8 +479,14 @@ def main() -> int:
                                     "candle-wasm",
                                 )
                             )
-                            for t in tests
-                        )
+
+                        # Policy rows may use structural evidence without a harness.
+                        if op_name in ("cpu_fallback_policy",):
+                            has_portable_evidence = bool(portable_tests or tests)
+                        else:
+                            has_portable_evidence = any(
+                                is_portable_evidence(t) for t in portable_tests
+                            ) or any(is_portable_evidence(t) for t in tests)
                         if not has_portable_evidence:
                             failures.append(
                                 f"manifest op '{op_name}' portable_webgpu_status is Verified "
@@ -467,6 +504,13 @@ def main() -> int:
                 if r["cuda"] == "yes" and r["op"] not in manifest_ops:
                     failures.append(
                         f"CUDA-required op '{r['op']}' missing from parity manifest"
+                    )
+
+            # Critical device ops must appear too
+            for dop in critical_device:
+                if dop not in manifest_ops:
+                    failures.append(
+                        f"critical device op '{dop}' missing from parity manifest"
                     )
 
             manifest_counts = {

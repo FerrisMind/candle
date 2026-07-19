@@ -155,6 +155,19 @@ impl CudaDevice {
         self.stream.clone_htod(src).w()
     }
 
+    fn check_capture_copy(&self, op: &str) -> Result<()> {
+        if cuda_graph_htod_cache_enabled() {
+            let is_capturing = self.cuda_graph_capture_active();
+            if is_capturing {
+                crate::bail!(
+                    "{op} during CUDA graph capture: host/device copies are not \
+                     permitted while capturing (use param cache for kernel parameters)"
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn memcpy_htod_capture_cached<
         T: cudarc::driver::DeviceRepr + 'static,
         Src: cudarc::driver::HostSlice<T> + ?Sized,
@@ -232,7 +245,7 @@ impl CudaDevice {
     }
 }
 
-fn cuda_graph_htod_cache_enabled() -> bool {
+pub(crate) fn cuda_graph_htod_cache_enabled() -> bool {
     CUDA_GRAPH_HTOD_CACHE_DEPTH.with(|depth| depth.get() > 0)
 }
 
