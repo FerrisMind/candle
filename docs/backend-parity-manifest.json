@@ -2632,7 +2632,7 @@
         "I32",
         "U8"
       ],
-      "accumulator_notes": "float special values; discrete ops exact",
+      "accumulator_notes": "CUDA differential NaN/Inf/signed-zero/subnormal via parity_special_floats",
       "contiguous": true,
       "strided": true,
       "broadcasting": true,
@@ -2640,10 +2640,7 @@
       "zero_sized": true,
       "ranks": "varies",
       "tests": [
-        "candle-core/tests/gpu_parity_matrix_tests.rs",
-        "candle-core/tests/backend_smoke_tests.rs",
-        "candle-core/tests/gpu_property_tests.rs",
-        "candle-core/tests/gpu_metamorphic_tests.rs"
+        "candle-core/tests/gpu_parity_matrix_tests.rs::parity_special_floats"
       ],
       "portable_tests": [],
       "bench": false,

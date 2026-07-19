@@ -645,7 +645,9 @@ fn wgpu_buffer_key(buffer: &wgpu::Buffer) -> usize {
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 enum WgpuBindingKindKey {
-    Storage { read_only: bool },
+    Storage {
+        read_only: bool,
+    },
     Uniform,
     /// Uniform with `has_dynamic_offset` (offset applied at set_bind_group).
     UniformDynamic,
@@ -1721,60 +1723,58 @@ impl WgpuDevice {
             entries: entry_keys,
             immediate_size,
         };
-        let cached = {
-            let mut cache = self
-                .inner
-                .pipeline_cache
-                .lock()
-                .map_err(|e| Error::wrap(e.to_string()))?;
-            if let Some(cached) = cache.get(&cache_key) {
-                cached.clone()
-            } else {
-                let module = self
+        let cached =
+            {
+                let mut cache = self
                     .inner
-                    .device
-                    .create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some(label),
-                        source: wgpu::ShaderSource::Wgsl(shader.into()),
-                    });
-                let bind_group_layout =
-                    self.inner
-                        .device
-                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    .pipeline_cache
+                    .lock()
+                    .map_err(|e| Error::wrap(e.to_string()))?;
+                if let Some(cached) = cache.get(&cache_key) {
+                    cached.clone()
+                } else {
+                    let module =
+                        self.inner
+                            .device
+                            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                                label: Some(label),
+                                source: wgpu::ShaderSource::Wgsl(shader.into()),
+                            });
+                    let bind_group_layout = self.inner.device.create_bind_group_layout(
+                        &wgpu::BindGroupLayoutDescriptor {
                             label: Some(label),
                             entries,
-                        });
-                let pipeline_layout =
-                    self.inner
-                        .device
-                        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                            label: Some(label),
-                            bind_group_layouts: &[Some(&bind_group_layout)],
-                            immediate_size,
-                        });
-                let pipeline =
-                    self.inner
-                        .device
-                        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        },
+                    );
+                    let pipeline_layout =
+                        self.inner
+                            .device
+                            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                                label: Some(label),
+                                bind_group_layouts: &[Some(&bind_group_layout)],
+                                immediate_size,
+                            });
+                    let pipeline = self.inner.device.create_compute_pipeline(
+                        &wgpu::ComputePipelineDescriptor {
                             label: Some(label),
                             layout: Some(&pipeline_layout),
                             module: &module,
                             entry_point: Some("main"),
                             compilation_options: Default::default(),
                             cache: None,
-                        });
-                let cached = Arc::new(WgpuCachedPipeline {
-                    bind_group_layout,
-                    pipeline,
-                });
-                cache.insert(cache_key, cached.clone());
-                cached
-            }
-        };
+                        },
+                    );
+                    let cached = Arc::new(WgpuCachedPipeline {
+                        bind_group_layout,
+                        pipeline,
+                    });
+                    cache.insert(cache_key, cached.clone());
+                    cached
+                }
+            };
         // Elementwise path: cache bind groups by (shader, storage ptrs).
         // Dyn-uniform: storage + trailing uniform. Immediates: storage only.
-        let cacheable = use_immediates
-            || (!dynamic_offsets.is_empty() && bindings.len() >= 3);
+        let cacheable = use_immediates || (!dynamic_offsets.is_empty() && bindings.len() >= 3);
         let bind_group = if cacheable {
             let ptrs: Vec<usize> = bindings
                 .iter()
@@ -2111,7 +2111,12 @@ fn dtype_cache_tag(dtype: DType) -> u8 {
 
 /// Cache preprocessed WGSL so elementwise batch20 does not rebuild/preprocess
 /// the shader string on every dispatch (was a dominant host-path cost).
-fn cached_shader_source(kind: u8, op: &str, dtype: DType, build: impl FnOnce() -> Result<String>) -> Result<Arc<str>> {
+fn cached_shader_source(
+    kind: u8,
+    op: &str,
+    dtype: DType,
+    build: impl FnOnce() -> Result<String>,
+) -> Result<Arc<str>> {
     use std::hash::{Hash, Hasher};
     type ShaderCacheKey = (u8, u64, u8);
     type ShaderCache = Mutex<HashMap<ShaderCacheKey, Arc<str>>>;
@@ -2140,8 +2145,7 @@ fn rewrite_params_to_immediate(source: &str) -> String {
     // or single-line variants. Be careful not to leave a stray `@group(0)`.
     for binding in 0..8u32 {
         for sep in ["\n", "\r\n", " "] {
-            let pattern =
-                format!("@group(0) @binding({binding}){sep}var<uniform> params: Params;");
+            let pattern = format!("@group(0) @binding({binding}){sep}var<uniform> params: Params;");
             if out.contains(&pattern) {
                 return out.replace(&pattern, "var<immediate> params: Params;");
             }
@@ -2244,7 +2248,6 @@ fn binary_shader_ex(op: &str, dtype: DType, contig: bool) -> Result<Arc<str>> {
         ))
     })
 }
-
 
 // Integer binary ops for the dtypes the stock binary.wgsl cannot express.
 // U32 is native; U8 packs four bytes per u32 word (one thread per output
@@ -4494,9 +4497,8 @@ fn uniform_binding_dyn<'a>(
     buffer: &'a wgpu::Buffer,
     slot_size: u64,
 ) -> Result<wgpu::BindGroupEntry<'a>> {
-    let size = NonZeroU64::new(slot_size).ok_or_else(|| {
-        Error::Msg("wgpu dynamic uniform slot size must be non-zero".into()).bt()
-    })?;
+    let size = NonZeroU64::new(slot_size)
+        .ok_or_else(|| Error::Msg("wgpu dynamic uniform slot size must be non-zero".into()).bt())?;
     Ok(wgpu::BindGroupEntry {
         binding,
         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -4513,9 +4515,8 @@ fn buffer_binding_range<'a>(
     offset_bytes: u64,
     size_bytes: u64,
 ) -> Result<wgpu::BindGroupEntry<'a>> {
-    let size = NonZeroU64::new(size_bytes).ok_or_else(|| {
-        Error::Msg("wgpu binding range size must be non-zero".into()).bt()
-    })?;
+    let size = NonZeroU64::new(size_bytes)
+        .ok_or_else(|| Error::Msg("wgpu binding range size must be non-zero".into()).bt())?;
     Ok(wgpu::BindGroupEntry {
         binding,
         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -4627,8 +4628,7 @@ impl WgpuStorage {
             .inner
             .features
             .contains(wgpu::Features::IMMEDIATES)
-            && (param_bytes.len() as u32)
-                <= self.device.inner.limits.max_immediate_size
+            && (param_bytes.len() as u32) <= self.device.inner.limits.max_immediate_size
             && !label.contains("clamp")
             && !label.contains("fill");
         if use_imm {
@@ -4731,7 +4731,8 @@ impl WgpuStorage {
         }
         let dst = if self.dtype == DType::BF16 {
             if !layout.is_contiguous() {
-                let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+                let mut materialized =
+                    unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
                 <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
                 let mat_layout = Layout::contiguous(layout.shape());
                 return materialized.run_scale(&mat_layout, scale, bias);
@@ -6524,7 +6525,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     fn run_argmax_last_dim(&self, layout: &Layout) -> Result<Self> {
         let rank = layout.dims().len();
         if rank == 0 {
-            return Ok(unsafe { self.device.alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)? });
+            return Ok(unsafe {
+                self.device
+                    .alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)?
+            });
         }
         let ne0 = *layout.dims().last().unwrap_or(&1);
         let mut dst_dims = layout.dims().to_vec();
@@ -6614,7 +6618,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             }
             ReduceOp::Sum => {
                 let rank = layout.dims().len();
-                let perm = (0..rank).filter(|&i| i != rank - 1).chain(std::iter::once(rank - 1));
+                let perm = (0..rank)
+                    .filter(|&i| i != rank - 1)
+                    .chain(std::iter::once(rank - 1));
                 let perm = perm.collect::<Vec<_>>();
                 let perm_shape = perm.iter().map(|&i| layout.dims()[i]).collect::<Vec<_>>();
                 let perm_stride = perm.iter().map(|&i| layout.stride()[i]).collect::<Vec<_>>();
@@ -6630,7 +6636,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 <Self as BackendStorage>::copy_strided_src(self, &mut permuted, 0, &perm_layout)?;
                 let permuted_layout = Layout::contiguous(Shape::from(perm_shape));
                 <Self as BackendStorage>::reduce_op(&permuted, op, &permuted_layout, &[rank - 1])
-            },
+            }
         }
     }
 
@@ -6738,7 +6744,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let (dims, strides) = dims4(argsort_layout)?;
         let count = argsort_layout.shape().elem_count();
         let nrows = count / last_dim;
-        let dst = unsafe { self.device.alloc_uninit(argsort_layout.shape(), DType::U32)? };
+        let dst = unsafe {
+            self.device
+                .alloc_uninit(argsort_layout.shape(), DType::U32)?
+        };
         let dst_strides = contiguous_strides(dims);
         let npr = last_dim.div_ceil(workgroup_size as usize);
         let top_k = if npr == 1 {
@@ -6934,7 +6943,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             .last()
             .ok_or_else(|| Error::Msg("cumsum scalar".into()))?;
         let rows = cumsum_layout.shape().elem_count() / ne0;
-        let dst = unsafe { self.device.alloc_uninit(cumsum_layout.shape(), self.dtype)? };
+        let dst = unsafe {
+            self.device
+                .alloc_uninit(cumsum_layout.shape(), self.dtype)?
+        };
         let params = CumsumParams {
             offset_src: cumsum_layout.start_offset().try_into()?,
             offset_dst: 0,
@@ -7256,13 +7268,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             causal: if causal { 1 } else { 0 },
         };
 
-        let param_buffer = q.device.inner.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("candle-wgpu-flash-attn-params"),
-            size: std::mem::size_of::<FlashAttnParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        q.device.inner.queue.write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = q
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-flash-attn-params"),
+                size: std::mem::size_of::<FlashAttnParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        q.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
 
         let entries = [
             storage_entry(0, true),
@@ -7417,10 +7436,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     ) -> Result<Self> {
         // CUDA parity: mixed dtypes and F16 use a GPU-resident F32 hub.
         // rms_norm WGSL only supports f32/bf16 — always upconvert F16.
-        if self.dtype != alpha.dtype
-            || self.dtype == DType::F16
-            || alpha.dtype == DType::F16
-        {
+        if self.dtype != alpha.dtype || self.dtype == DType::F16 || alpha.dtype == DType::F16 {
             let out_dtype = self.dtype;
             let src_f32 = self.to_dtype(layout, DType::F32)?;
             let alpha_f32 = alpha.to_dtype(alpha_layout, DType::F32)?;
@@ -7435,8 +7451,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if self.dtype == DType::BF16 && alpha.dtype != DType::BF16 {
             return Err(Error::UnsupportedDTypeForOp(alpha.dtype, "wgpu rms_norm").bt());
         }
-        if !layout.is_contiguous() || layout.start_offset() != 0
-            || !alpha_layout.is_contiguous() || alpha_layout.start_offset() != 0
+        if !layout.is_contiguous()
+            || layout.start_offset() != 0
+            || !alpha_layout.is_contiguous()
+            || alpha_layout.start_offset() != 0
         {
             let src_shape = layout.shape().clone();
             let alpha_shape = alpha_layout.shape().clone();
@@ -7564,10 +7582,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         beta_layout: &Layout,
         eps: f32,
     ) -> Result<Self> {
-        if self.dtype != DType::F32
-            || alpha.dtype != DType::F32
-            || beta.dtype != DType::F32
-        {
+        if self.dtype != DType::F32 || alpha.dtype != DType::F32 || beta.dtype != DType::F32 {
             let out_dtype = self.dtype;
             let src_f32 = self.to_dtype(layout, DType::F32)?;
             let alpha_f32 = alpha.to_dtype(alpha_layout, DType::F32)?;
@@ -7575,16 +7590,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let src_f32_layout = Layout::contiguous(layout.shape().clone());
             let alpha_f32_layout = Layout::contiguous(alpha_layout.shape().clone());
             let beta_f32_layout = Layout::contiguous(beta_layout.shape().clone());
-            let out_f32 =
-                src_f32.layer_norm(&src_f32_layout, &alpha_f32, &alpha_f32_layout, &beta_f32, &beta_f32_layout, eps)?;
+            let out_f32 = src_f32.layer_norm(
+                &src_f32_layout,
+                &alpha_f32,
+                &alpha_f32_layout,
+                &beta_f32,
+                &beta_f32_layout,
+                eps,
+            )?;
             if out_dtype == DType::F32 {
                 return Ok(out_f32);
             }
             return out_f32.to_dtype(&src_f32_layout, out_dtype);
         }
-        if !layout.is_contiguous() || layout.start_offset() != 0
-            || !alpha_layout.is_contiguous() || alpha_layout.start_offset() != 0
-            || !beta_layout.is_contiguous() || beta_layout.start_offset() != 0
+        if !layout.is_contiguous()
+            || layout.start_offset() != 0
+            || !alpha_layout.is_contiguous()
+            || alpha_layout.start_offset() != 0
+            || !beta_layout.is_contiguous()
+            || beta_layout.start_offset() != 0
         {
             let src_shape = layout.shape().clone();
             let alpha_shape = alpha_layout.shape().clone();
@@ -7598,7 +7622,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let src_layout = Layout::contiguous(src_shape);
             let alpha_layout = Layout::contiguous(alpha_shape);
             let beta_layout = Layout::contiguous(beta_shape);
-            return src.layer_norm(&src_layout, &alpha_tmp, &alpha_layout, &beta_tmp, &beta_layout, eps);
+            return src.layer_norm(
+                &src_layout,
+                &alpha_tmp,
+                &alpha_layout,
+                &beta_tmp,
+                &beta_layout,
+                eps,
+            );
         }
         let (dims, strides) = dims4(layout)?;
         let (alpha_dims, alpha_strides) = dims4(alpha_layout)?;
@@ -8137,9 +8168,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             return Ok(());
         }
         // Native F32 and F16 only (F16 uses packed-half CAS, no F32 hub).
-        if self.dtype != src.dtype
-            || !matches!(self.dtype, DType::F32 | DType::F16)
-        {
+        if self.dtype != src.dtype || !matches!(self.dtype, DType::F32 | DType::F16) {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu scatter_add").bt());
         }
         let rank = dst_l.dims().len();
@@ -8164,7 +8193,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         } else if ids_l.dims() == [ids_dim] || ids_l.dims().len() == 1 {
             0
         } else {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu scatter_add ids shape mismatch").bt());
+            return Err(Error::UnsupportedDTypeForOp(
+                self.dtype,
+                "wgpu scatter_add ids shape mismatch",
+            )
+            .bt());
         };
         let dst_dim = dst_l.dims()[rank - 1];
         let params = GetRowsParams {
@@ -10025,7 +10058,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let rank = layout.dims().len();
         if rank == 0 {
             if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
-                return Ok(unsafe { self.device.alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)? });
+                return Ok(unsafe {
+                    self.device
+                        .alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)?
+                });
             }
             return self.try_clone(layout);
         }
@@ -10557,7 +10593,13 @@ impl BackendStorage for WgpuStorage {
         }
         if !matches!(
             self.dtype,
-            DType::F32 | DType::F16 | DType::BF16 | DType::U8 | DType::U32 | DType::I32 | DType::I64
+            DType::F32
+                | DType::F16
+                | DType::BF16
+                | DType::U8
+                | DType::U32
+                | DType::I32
+                | DType::I64
         ) {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "op").bt());
         }
@@ -10644,11 +10686,55 @@ impl BackendStorage for WgpuStorage {
             && lhs_layout.is_contiguous()
             && rhs_layout.is_contiguous()
             && lhs_layout.dims() == rhs_layout.dims();
-        let shader = binary_shader_ex(B::NAME, self.dtype, contig)?;
-        // Eager write into the permanent dyn-uniform ring (not deferred-to-encode
-        // and not a stack-local Buffer that dies before submit).
-        let (param_buffer, param_off) = self.device.write_uniform_slot(param_bytes)?;
+        let base_shader = binary_shader_ex(B::NAME, self.dtype, contig)?;
+        let label = if contig {
+            "candle-wgpu-binary-contig"
+        } else {
+            "candle-wgpu-binary"
+        };
+        // Prefer IMMEDIATES for binary params when available. Dyn-uniform ring
+        // reuse previously required a host readback fence after every binary
+        // (18× CUDA on mul_1024 batch). Immediates carry params per-dispatch
+        // and avoid that ring race without GPU→CPU compute readback.
+        let use_imm = self
+            .device
+            .inner
+            .features
+            .contains(wgpu::Features::IMMEDIATES)
+            && (param_bytes.len() as u32) <= self.device.inner.limits.max_immediate_size;
+        if use_imm {
+            let imm_shader = if base_shader.contains("var<uniform> params") {
+                rewrite_params_to_immediate(&base_shader)
+            } else {
+                base_shader.to_string()
+            };
+            let imm_size = (param_bytes.len() as u32).next_multiple_of(4).max(16);
+            let entries = [
+                storage_entry(0, false),
+                storage_entry(1, false),
+                storage_entry(2, false),
+            ];
+            let bindings = [
+                buffer_binding(0, &self.buffer),
+                buffer_binding(1, &rhs.buffer),
+                buffer_binding(2, &dst.buffer),
+            ];
+            self.device.run_compute_linear_immediates(
+                &imm_shader,
+                &entries,
+                &bindings,
+                work_items as u32,
+                param_bytes,
+                imm_size,
+                label,
+            )?;
+            return Ok(dst);
+        }
+        // Fallback: dyn-uniform ring. Must not overwrite the slot before the GPU
+        // finishes — use deferred write path (same as unary) instead of eager
+        // write + host readback fence.
         let slot = self.device.inner.uniform_dyn_slot;
+        let param_buffer = self.device.uniform_dyn_buffer()?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -10661,33 +10747,15 @@ impl BackendStorage for WgpuStorage {
             buffer_binding(2, &dst.buffer),
             uniform_binding_dyn(3, &param_buffer, slot)?,
         ];
-        let (wg_x, wg_y) = linear_dispatch_workgroups(&self.device, work_items as u32);
-        match self.device.run_compute_xyz(
-            &shader,
+        self.device.run_compute_linear_deferred_uniform(
+            &base_shader,
             &entries,
             &bindings,
-            (wg_x, wg_y, 1),
-            &[param_off],
-            None,
-            if contig {
-                "candle-wgpu-binary-contig"
-            } else {
-                "candle-wgpu-binary"
-            },
-        ) {
-            Ok(()) => {
-                // GPU fence after every binary. Required on Windows/wgpu for correct
-                // multi-step chains: silu (`x/(exp(-x)+1)`) then mul, BatchNorm
-                // broadcast, residual streams. Skipping the fence for contig ops
-                // produced silent wrong logits on llama2_c / Qwen3 (dst appeared
-                // correct only after an intervening host readback). Map 4 bytes of
-                // dst as a lightweight completion fence, not data validation.
-                let _ = self.device.read_buffer(&dst.buffer, 4)?;
-                let _ = contig; // retained for label selection above
-                Ok(dst)
-            }
-            Err(err) => Err(err),
-        }
+            work_items as u32,
+            param_bytes,
+            label,
+        )?;
+        Ok(dst)
     }
     fn where_cond(
         &self,
@@ -11011,7 +11079,18 @@ impl BackendStorage for WgpuStorage {
         let dst_perm_l = dst_l.permute(&perm)?;
         let mut dst_p = unsafe { self.device.alloc_uninit(dst_perm_l.shape(), self.dtype)? };
         self.copy_strided_src(&mut dst_p, 0, &dst_perm_l)?;
-        let (ids_p, ids_pl) = permute_contiguous(ids, ids_l)?;
+        // 1-D index tensors index the moved dim; do not apply rank-N permute to ids.
+        let (ids_p, ids_pl) = if ids_l.dims().len() == 1 {
+            if ids_l.is_contiguous() && ids_l.start_offset() == 0 {
+                (ids.try_clone(ids_l)?, Layout::contiguous(ids_l.shape()))
+            } else {
+                let mut compact = unsafe { ids.device.alloc_uninit(ids_l.shape(), ids.dtype)? };
+                ids.copy_strided_src(&mut compact, 0, ids_l)?;
+                (compact, Layout::contiguous(ids_l.shape()))
+            }
+        } else {
+            permute_contiguous(ids, ids_l)?
+        };
         let (src_p, src_pl) = permute_contiguous(src, src_l)?;
         let dst_pl = Layout::contiguous(dst_perm_l.shape());
         dst_p.run_scatter_add_last_dim_f32(&dst_pl, &ids_p, &ids_pl, &src_p, &src_pl)?;
@@ -11303,18 +11382,16 @@ impl BackendDevice for WgpuDevice {
             | wgpu::Features::SUBGROUP_BARRIER
             | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
             | wgpu::Features::IMMEDIATES;
-        let required_features =
-            wgpu::Features::SHADER_F64 | (adapter_features & optional);
+        let required_features = wgpu::Features::SHADER_F64 | (adapter_features & optional);
         // SAFETY: cooperative matrix is experimental; we only enable it when
         // the adapter advertises EXPERIMENTAL_COOPERATIVE_MATRIX and fall back
         // to software warptile otherwise. Report bugs to gfx-rs/wgpu if hit.
-        let experimental_features = if required_features
-            .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
-        {
-            unsafe { wgpu::ExperimentalFeatures::enabled() }
-        } else {
-            wgpu::ExperimentalFeatures::disabled()
-        };
+        let experimental_features =
+            if required_features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+                unsafe { wgpu::ExperimentalFeatures::enabled() }
+            } else {
+                wgpu::ExperimentalFeatures::disabled()
+            };
         // IMMEDIATES (push constants): BinaryContigParams=16 B, UnaryParams=48 B.
         // Adapter may report max_immediate_size=0 until we request a non-zero
         // limit with the feature bit — try 128, fall back without immediates.
@@ -11329,35 +11406,34 @@ impl BackendDevice for WgpuDevice {
             };
             required_limits.max_immediate_size = cap.max(16);
         }
-        let (device, queue) = match pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
+        let (device, queue) =
+            match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("candle-wgpu"),
                 required_features,
                 required_limits: required_limits.clone(),
                 experimental_features,
                 ..Default::default()
-            },
-        )) {
-            Ok(dq) => dq,
-            Err(e) if want_immediates => {
-                // Retry without IMMEDIATES (some drivers reject the limit).
-                required_features.remove(wgpu::Features::IMMEDIATES);
-                required_limits.max_immediate_size = 0;
-                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                    label: Some("candle-wgpu"),
-                    required_features,
-                    required_limits: required_limits.clone(),
-                    experimental_features,
-                    ..Default::default()
-                }))
-                .map_err(|e2| {
-                    Error::wrap(format!(
-                        "wgpu request_device failed (immediates retry also failed): {e}; {e2}"
-                    ))
-                })?
-            }
-            Err(e) => return Err(Error::wrap(e)),
-        };
+            })) {
+                Ok(dq) => dq,
+                Err(e) if want_immediates => {
+                    // Retry without IMMEDIATES (some drivers reject the limit).
+                    required_features.remove(wgpu::Features::IMMEDIATES);
+                    required_limits.max_immediate_size = 0;
+                    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                        label: Some("candle-wgpu"),
+                        required_features,
+                        required_limits: required_limits.clone(),
+                        experimental_features,
+                        ..Default::default()
+                    }))
+                    .map_err(|e2| {
+                        Error::wrap(format!(
+                            "wgpu request_device failed (immediates retry also failed): {e}; {e2}"
+                        ))
+                    })?
+                }
+                Err(e) => return Err(Error::wrap(e)),
+            };
         let adapter_limits = required_limits;
         // Cache env once — env::var on every matmul was measurable host cost.
         let coop_matmul_enabled = std::env::var("CANDLE_WGPU_COOP_MATMUL")
@@ -11413,8 +11489,8 @@ impl BackendDevice for WgpuDevice {
         let size = byte_len(dtype, count, "wgpu zeros")?;
         // wgpu can't allocate 0-byte buffers; use a 1-byte dummy for empty shapes.
         let alloc_size = size.max(1);
-        let buffer =
-            self.register_buffer(self.create_zeroed_storage_buffer(alloc_size, "candle-wgpu-zeros"));
+        let buffer = self
+            .register_buffer(self.create_zeroed_storage_buffer(alloc_size, "candle-wgpu-zeros"));
         Ok(WgpuStorage {
             buffer,
             device: self.clone(),
@@ -11457,9 +11533,8 @@ impl BackendDevice for WgpuDevice {
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
         let (dtype, count, bytes) = cpu_storage_to_bytes(storage)?;
-        let buffer = self.register_buffer_arc(
-            self.create_storage_buffer_arc(bytes.len(), "candle-wgpu-upload"),
-        );
+        let buffer = self
+            .register_buffer_arc(self.create_storage_buffer_arc(bytes.len(), "candle-wgpu-upload"));
         self.inner
             .queue
             .write_buffer(&buffer, 0, &wgpu_padded_write_bytes(&bytes));

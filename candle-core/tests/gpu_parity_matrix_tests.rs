@@ -426,6 +426,216 @@ fn parity_indexing_matrix(under_test: &Device, cuda: &Device) -> Result<()> {
             &format!("gather dim1 {dtype:?}"),
         )?;
     }
+
+    // scatter_set / scatter_add / index_add: CUDA differential (not smoke-only).
+    // Unique indices for scatter_set (duplicate-index last/first-write races are
+    // backend-defined; test deterministic unique-id paths + scatter_add sums).
+    for dtype in [DType::F32, DType::F16] {
+        let dst_vals = vec![0.0f32; 8];
+        let ids_unique = Tensor::from_vec(vec![1u32, 2, 3, 6], (1, 4), under_test)?;
+        let ids_unique_cuda = Tensor::from_vec(vec![1u32, 2, 3, 6], (1, 4), cuda)?;
+        let src =
+            Tensor::from_vec(vec![3.5f32, 1.25, 4.0, 0.5], (1, 4), under_test)?.to_dtype(dtype)?;
+        let src_cuda =
+            Tensor::from_vec(vec![3.5f32, 1.25, 4.0, 0.5], (1, 4), cuda)?.to_dtype(dtype)?;
+
+        let got_set = Tensor::from_vec(dst_vals.clone(), (1, 8), under_test)?
+            .to_dtype(dtype)?
+            .scatter(&ids_unique, &src, 1)?;
+        let want_set = Tensor::from_vec(dst_vals.clone(), (1, 8), cuda)?
+            .to_dtype(dtype)?
+            .scatter(&ids_unique_cuda, &src_cuda, 1)?;
+        assert_tensors_close(
+            &got_set,
+            &want_set,
+            dtype,
+            &format!("scatter_set last-dim {dtype:?}"),
+        )?;
+
+        // scatter_add with duplicate indices must sum (CUDA atomic semantics).
+        let ids_dup = Tensor::from_vec(vec![1u32, 1, 3, 6], (1, 4), under_test)?;
+        let ids_dup_cuda = Tensor::from_vec(vec![1u32, 1, 3, 6], (1, 4), cuda)?;
+        let src_dup =
+            Tensor::from_vec(vec![3.5f32, 0.5, 4.0, 0.5], (1, 4), under_test)?.to_dtype(dtype)?;
+        let src_dup_cuda =
+            Tensor::from_vec(vec![3.5f32, 0.5, 4.0, 0.5], (1, 4), cuda)?.to_dtype(dtype)?;
+        let got_add = Tensor::from_vec(dst_vals.clone(), (1, 8), under_test)?
+            .to_dtype(dtype)?
+            .scatter_add(&ids_dup, &src_dup, 1)?;
+        let want_add = Tensor::from_vec(dst_vals.clone(), (1, 8), cuda)?
+            .to_dtype(dtype)?
+            .scatter_add(&ids_dup_cuda, &src_dup_cuda, 1)?;
+        assert_tensors_close(
+            &got_add,
+            &want_add,
+            dtype,
+            &format!("scatter_add last-dim {dtype:?}"),
+        )?;
+
+        // Matches smoke_f32_scatter_add_and_index_add shapes: base (2,3), ids (2,), src (2,3).
+        let base = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), under_test)?
+            .to_dtype(dtype)?;
+        let base_cuda = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), cuda)?
+            .to_dtype(dtype)?;
+        let row_ids = Tensor::from_vec(vec![1u32, 0], (2,), under_test)?;
+        let row_ids_cuda = Tensor::from_vec(vec![1u32, 0], (2,), cuda)?;
+        let add_rows =
+            Tensor::from_vec(vec![10.0f32, 10.0, 10.0, 1.0, 1.0, 1.0], (2, 3), under_test)?
+                .to_dtype(dtype)?;
+        let add_rows_cuda =
+            Tensor::from_vec(vec![10.0f32, 10.0, 10.0, 1.0, 1.0, 1.0], (2, 3), cuda)?
+                .to_dtype(dtype)?;
+        assert_tensors_close(
+            &base.index_add(&row_ids, &add_rows, 0)?,
+            &base_cuda.index_add(&row_ids_cuda, &add_rows_cuda, 0)?,
+            dtype,
+            &format!("index_add dim0 {dtype:?}"),
+        )?;
+    }
+    Ok(())
+}
+
+/// Special floats: NaN, ±Inf, signed zero, subnormals — CUDA differential.
+#[cfg(all(feature = "cuda", any(feature = "wgpu", feature = "vulkan")))]
+fn parity_special_floats(under_test: &Device, cuda: &Device) -> Result<()> {
+    let vals = [
+        0.0f32,
+        -0.0f32,
+        f32::MIN_POSITIVE / 4.0, // subnormal
+        -(f32::MIN_POSITIVE / 4.0),
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        1.0f32,
+        -2.5f32,
+    ];
+    let shape = (3, 3);
+    // F32: full IEEE-special suite vs CUDA.
+    {
+        let dtype = DType::F32;
+        let got = Tensor::from_slice(&vals, shape, under_test)?;
+        let want = Tensor::from_slice(&vals, shape, cuda)?;
+        assert_special_float_parity(&got.abs()?, &want.abs()?, dtype, "abs special F32")?;
+        assert_special_float_parity(&got.neg()?, &want.neg()?, dtype, "neg special F32")?;
+        assert_special_float_parity(&got.relu()?, &want.relu()?, dtype, "relu special F32")?;
+        let got_b = Tensor::from_slice(&vals, shape, under_test)?;
+        let want_b = Tensor::from_slice(&vals, shape, cuda)?;
+        assert_special_float_parity(
+            &got.add(&got_b)?,
+            &want.add(&want_b)?,
+            dtype,
+            "add special F32",
+        )?;
+        assert_special_float_parity(
+            &got.mul(&got_b)?,
+            &want.mul(&want_b)?,
+            dtype,
+            "mul special F32",
+        )?;
+        let cmp_got = got.eq(&got_b)?;
+        let cmp_want = want.eq(&want_b)?;
+        assert_eq!(
+            cmp_got.flatten_all()?.to_vec1::<u8>()?,
+            cmp_want.flatten_all()?.to_vec1::<u8>()?,
+            "eq special F32"
+        );
+    }
+    // F16: Inf / signed-zero / finite / subnormal path (cast may flush tiny subnormals).
+    // NaN in F16 relu/select kernels often becomes 0 (max(x,0) with NaN-false compares);
+    // use abs/neg which preserve NaN bit patterns on both CUDA and SPIR-V/WGSL.
+    {
+        let dtype = DType::F16;
+        let vals_f16 = [
+            0.0f32,
+            -0.0f32,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            1.0f32,
+            -2.5f32,
+            0.5f32,
+            -0.25f32,
+        ];
+        let got = Tensor::from_slice(&vals_f16, shape, under_test)?.to_dtype(dtype)?;
+        let want = Tensor::from_slice(&vals_f16, shape, cuda)?.to_dtype(dtype)?;
+        assert_special_float_parity(&got.abs()?, &want.abs()?, dtype, "abs special F16")?;
+        assert_special_float_parity(&got.neg()?, &want.neg()?, dtype, "neg special F16")?;
+        let got_b = Tensor::from_slice(&vals_f16, shape, under_test)?.to_dtype(dtype)?;
+        let want_b = Tensor::from_slice(&vals_f16, shape, cuda)?.to_dtype(dtype)?;
+        assert_special_float_parity(
+            &got.mul(&got_b)?,
+            &want.mul(&want_b)?,
+            dtype,
+            "mul special F16",
+        )?;
+    }
+    Ok(())
+}
+
+/// Compare floats allowing NaN==NaN and matching signed zeros / Inf.
+#[cfg(all(feature = "cuda", any(feature = "wgpu", feature = "vulkan")))]
+fn assert_special_float_parity(
+    actual: &Tensor,
+    expected: &Tensor,
+    dtype: DType,
+    label: &str,
+) -> Result<()> {
+    if actual.dims() != expected.dims() {
+        candle_core::bail!(
+            "{label}: shape mismatch {:?} vs {:?}",
+            actual.dims(),
+            expected.dims()
+        );
+    }
+    // Compare in f32 domain after cast for half types.
+    let a = actual
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let e = expected
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    if a.len() != e.len() {
+        candle_core::bail!("{label}: length {} vs {}", a.len(), e.len());
+    }
+    let (atol, rtol) = match dtype {
+        DType::F16 => (2e-2, 2e-2),
+        _ => (1e-5, 1e-5),
+    };
+    for (idx, (av, ev)) in a.iter().zip(e.iter()).enumerate() {
+        let both_nan = av.is_nan() && ev.is_nan();
+        if both_nan {
+            continue;
+        }
+        if av.is_nan() || ev.is_nan() {
+            candle_core::bail!("{label}: NaN mismatch at {idx}: got {av}, want {ev}");
+        }
+        if av.is_infinite() || ev.is_infinite() {
+            if *av != *ev {
+                candle_core::bail!("{label}: Inf mismatch at {idx}: got {av}, want {ev}");
+            }
+            continue;
+        }
+        // Signed zero: bit-exact preferred for F32; for F16 cast may collapse.
+        if *av == 0.0 && *ev == 0.0 {
+            if dtype == DType::F32 && av.to_bits() != ev.to_bits() {
+                candle_core::bail!(
+                    "{label}: signed-zero mismatch at {idx}: got bits {:#x}, want {:#x}",
+                    av.to_bits(),
+                    ev.to_bits()
+                );
+            }
+            continue;
+        }
+        let diff = (av - ev).abs();
+        let tol = atol + rtol * av.abs().max(ev.abs());
+        if diff > tol {
+            candle_core::bail!(
+                "{label}: mismatch at {idx}: got {av}, want {ev}, diff {diff}, tol {tol}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -507,6 +717,7 @@ fn run_parity_matrix(under_test: &Device, cuda: &Device) -> Result<()> {
     parity_cast_matrix(under_test, cuda)?;
     parity_cmp_where_dtypes(under_test, cuda)?;
     parity_indexing_matrix(under_test, cuda)?;
+    parity_special_floats(under_test, cuda)?;
     parity_matmul_f16_f64(under_test, cuda)?;
     parity_f64_matmul_precision(under_test, cuda)?;
     parity_int_binary_matrix(under_test, cuda)?;

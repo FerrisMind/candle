@@ -8418,7 +8418,20 @@ impl BackendStorage for VulkanStorage {
         let dst_perm_l = dst_l.permute(&perm)?;
         let mut dst_p = unsafe { self.device.alloc_uninit(dst_perm_l.shape(), self.dtype)? };
         self.copy_strided_src(&mut dst_p, 0, &dst_perm_l)?;
-        let (ids_p, ids_pl) = permute_contiguous(ids, ids_l)?;
+        // Index ids are 1-D (length = source size on `dim`); they index the
+        // target dim after it is moved to last — do not apply tensor rank permute.
+        let (ids_p, ids_pl) = if ids_l.dims().len() == 1 {
+            if ids_l.is_contiguous() && ids_l.start_offset() == 0 {
+                (ids.try_clone(ids_l)?, Layout::contiguous(ids_l.shape()))
+            } else {
+                let mut compact =
+                    unsafe { ids.device.alloc_uninit(ids_l.shape(), ids.dtype)? };
+                ids.copy_strided_src(&mut compact, 0, ids_l)?;
+                (compact, Layout::contiguous(ids_l.shape()))
+            }
+        } else {
+            permute_contiguous(ids, ids_l)?
+        };
         let (src_p, src_pl) = permute_contiguous(src, src_l)?;
         let dst_pl = Layout::contiguous(dst_perm_l.shape());
         dst_p.run_scatter_add_last_dim_f32(&dst_pl, &ids_p, &ids_pl, &src_p, &src_pl)?;
