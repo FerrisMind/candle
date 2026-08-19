@@ -23,8 +23,14 @@ fn flash_attn(
 
 #[cfg(not(feature = "flash-attn"))]
 #[allow(dead_code)]
-fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Tensor> {
-    candle::bail!("flash-attn feature not enabled, compile with '--features flash-attn'")
+fn flash_attn(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
+    candle_nn::ops::flash_attn(q, k, v, softmax_scale, causal)
 }
 
 // ==================== Constants ====================
