@@ -1,0 +1,39 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#if defined(USE_F16)
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+#include "types.glsl"
+#include "fp8_helpers.glsl"
+#include "generic_unary_head.glsl"
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+// F8E4M3 conversion kernel. F8E4M3 is stored as uint8_t.
+// Decode: f8e4m3 → f32 (or f16 via f32 intermediate)
+// Encode:  f32 → f8e4m3 (or f16 → f32 → f8e4m3)
+
+D_TYPE convert_value(A_TYPE v) {
+#if defined(DATA_A_F8E4M3)
+    // Decode f8e4m3 → target
+    float f32_val = f8e4m3_to_f32(uint8_t(v));
+    return D_TYPE(f32_val);
+#elif defined(DATA_D_F8E4M3)
+    // Encode source → f8e4m3
+    float f32_val = float(v);
+    return D_TYPE(f32_to_f8e4m3(f32_val));
+#else
+    // Should not reach here
+    return D_TYPE(0);
+#endif
+}
+
+void main() {
+    const uint idx = get_idx();
+    if (idx >= p.ne) {
+        return;
+    }
+    data_d[get_doffset() + dst_idx(idx)] = convert_value(data_a[get_aoffset() + src0_idx(idx)]);
+}

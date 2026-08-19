@@ -742,6 +742,23 @@ fn generate_candle_spirv_modules(
             candle_shaders_dir.join("flash_attn.comp"),
             &["INPUT_F16"],
         ),
+        // F8E4M3 conversion shaders
+        ("convert_f8e4m3_f32", candle_shaders_dir.join("convert_fp8.comp"), &["A_TYPE=uint8_t", "D_TYPE=float", "DATA_A_F8E4M3"]),
+        ("convert_f32_f8e4m3", candle_shaders_dir.join("convert_fp8.comp"), &["A_TYPE=float", "D_TYPE=uint8_t", "DATA_D_F8E4M3"]),
+        ("convert_f8e4m3_f16", candle_shaders_dir.join("convert_fp8.comp"), &["A_TYPE=uint8_t", "D_TYPE=float16_t", "DATA_A_F8E4M3", "USE_F16"]),
+        ("convert_f16_f8e4m3", candle_shaders_dir.join("convert_fp8.comp"), &["A_TYPE=float16_t", "D_TYPE=uint8_t", "DATA_D_F8E4M3", "USE_F16"]),
+        // F64 native shaders
+        ("unary_f64", candle_shaders_dir.join("unary_f64.comp"), &[]),
+        ("binary_f64", candle_shaders_dir.join("binary_f64.comp"), &[]),
+        ("cmp_f64", candle_shaders_dir.join("cmp_f64.comp"), &[]),
+        ("sum_rows_f64", candle_shaders_dir.join("sum_rows_f64.comp"), &[]),
+        ("reduce_extrema_f64", candle_shaders_dir.join("reduce_extrema_f64.comp"), &[]),
+        ("argextrema_f64", candle_shaders_dir.join("argextrema_f64.comp"), &[]),
+        // Scatter-add extended dtypes
+        ("set_rows_add_u8_i32", candle_shaders_dir.join("set_rows_add_ext.comp"), &["A_TYPE=uint8_t", "B_TYPE=uint", "D_TYPE=uint", "FLOAT_TYPE=float", "D_READ_WRITE", "SRC_U8"]),
+        ("set_rows_add_u32_i32", candle_shaders_dir.join("set_rows_add_ext.comp"), &["A_TYPE=uint", "B_TYPE=uint", "D_TYPE=uint", "FLOAT_TYPE=float", "D_READ_WRITE", "SRC_U32"]),
+        ("set_rows_add_i64_i32", candle_shaders_dir.join("set_rows_add_ext.comp"), &["A_TYPE=int64_t", "B_TYPE=uint", "D_TYPE=uint", "FLOAT_TYPE=float", "D_READ_WRITE", "SRC_I64"]),
+        ("set_rows_add_f64_i32", candle_shaders_dir.join("set_rows_add_ext.comp"), &["A_TYPE=float64_t", "B_TYPE=uint", "D_TYPE=uint", "FLOAT_TYPE=float", "D_READ_WRITE", "SRC_F64"]),
     ];
     for (name, source, defines) in modules {
         let output = spv_dir.join(format!("{name}.spv"));
