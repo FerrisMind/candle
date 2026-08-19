@@ -5,6 +5,8 @@
 #extension GL_EXT_control_flow_attributes : require
 
 // F64 native unary kernel. Uses the same push-constant layout as GgmlUnaryParams.
+// All transcendental functions are manually implemented in double precision
+// because GLSL/Vulkan has no double overloads for exp/log/sin/cos.
 
 layout (push_constant) uniform parameter {
     uint ne;
@@ -58,104 +60,212 @@ uint dst_idx(uint idx) {
     return i13 * p.nb13 + i12 * p.nb12 + i11 * p.nb11 + i10 * p.nb10;
 }
 
-// ---------------------------------------------------------------------------
-// Manual double-precision transcendentals
-// GLSL's built-in exp/log/sin/cos only support float; double variants require
-// GL_EXT_shader_explicit_arithmetic_types_float64 but are not universally
-// available. We implement them here via polynomial/minimax approximations.
-// ---------------------------------------------------------------------------
+// ---- Manual double-precision transcendentals ----
 
-// Constants
-const double LN2_HI = 0.693147180559945309417232121458176568LF;  // 0x1.62e42fee00000p-1
-const double LN2_LO = 1.908214929270939946e-10LF;               // 0x1.a39ef35793c76p-43
-const double INV_LN2 = 1.442695040888963387004650940070860088LF; // 1/ln(2)
-const double PI = 3.14159265358979311599796346854418516LF;
-const double TWO_PI = 6.28318530717958623199592693708837033LF;
-const double PI_OVER_2 = 1.57079632679489655799898173427209258LF;
-const double PI_OVER_4 = 0.78539816339744827899949086713604629LF;
-const double INV_PI = 0.318309886183790671537767526745028724LF;
+// Construct 2^k as a double for integer k in [-1074, 1023].
+// Returns +Inf for overflow, 0.0 for underflow.
+double pow2_double(int k) {
+    if (k > 1023) {
+        // Overflow: return +Inf
+        return 1.0LF / 0.0LF;
+    }
+    if (k < -1074) {
+        // Underflow: return 0.0
+        return 0.0LF;
+    }
+    if (k >= -1022) {
+        // Normal range: exponent = 1023 + k, mantissa = 0
+        uint hi = uint(1023 + k) << 20u;
+        return packDouble2x32(uvec2(0u, hi));
+    }
+    // Subnormal range: 2^k = 2^(k+1074) * 2^-1074
+    // mantissa bits = 1 << (k + 1074)
+    uint mantissa = 1u << uint(k + 1074);
+    return packDouble2x32(uvec2(mantissa, 0u));
+}
 
-// exp(x): k = round(x / ln2), r = x - k*ln2, then exp(r)*2^k via Taylor
+// ln(2) split into high and low parts for accurate range reduction:
+// ln(2) = 0.693147180559945309417232121458176568...
+// ln2_hi = 0.693147180559945286226763982995180413... (53 bits)
+// ln2_lo = 0.693147180559945309417232121458176568... - ln2_hi
+const double LN2_HI = 0.6931471805599453LF;  // 0x1.62e42fefa39efp-1
+const double LN2_LO = 2.3190468138462996e-17LF; // remainder
+
+// 1/ln(2) = 1.442695040888963407359924681001892137...
+const double INV_LN2 = 1.4426950408889634LF; // 0x1.71547652b82fep+0
+
+// exp(x) for double, |x| < infinity.
+// Method: k = round(x / ln2), r = x - k*ln2, exp(x) = 2^k * exp(r).
+// exp(r) via Taylor series: sum_{n=0}^{13} r^n / n!
 double exp_double(double x) {
     // Handle special cases
-    if (x < -745.0LF) return 0.0LF;
-    if (x > 709.0LF)  return 1.0LF / 0.0LF; // +inf
+    if (isnan(x)) return x;
+    if (x > 709.782712893384LF) return 1.0LF / 0.0LF; // overflow
+    if (x < -745.1332191019411LF) return 0.0LF; // underflow
 
-    // Range reduction: k = round(x / ln2)
-    double kf = floor(x * INV_LN2 + 0.5LF);
-    int k = int(kf);
-    double r = x - kf * LN2_HI - kf * LN2_LO;
+    double kd = round(x * INV_LN2);
+    int k = int(kd);
+    // r = x - k*ln2 computed with high precision split
+    double r = (x - kd * LN2_HI) - kd * LN2_LO;
 
-    // Taylor series for exp(r) when |r| <= ln2/2 ~ 0.3466
+    // Taylor series for exp(r), |r| <= ln2/2 ≈ 0.3466
+    // Horner: exp(r) ≈ 1 + r*(1 + r/2*(1 + r/3*(1 + ...)))
     double r2 = r * r;
-    double r3 = r2 * r;
-    double r4 = r3 * r;
-    double exp_r = 1.0LF + r + r2 * 0.5LF + r3 * 0.1666666666666666666666666666666667LF + r4 * 0.04166666666666666666666666666666667LF;
+    double r4 = r2 * r2;
+    double r6 = r4 * r2;
+    double r8 = r4 * r4;
+    double r10 = r8 * r2;
+    double r12 = r6 * r6;
 
-// Build 2^k via packDouble2x32
-    uvec2 bits = uvec2(0, uint(k + 1023) << 20u);
-    double pow2 = packDouble2x32(bits);
+    double num = 1.0LF
+        + r * (1.0LF
+        + r / 2.0LF * (1.0LF
+        + r / 3.0LF * (1.0LF
+        + r / 4.0LF * (1.0LF
+        + r / 5.0LF * (1.0LF
+        + r / 6.0LF * (1.0LF
+        + r / 7.0LF * (1.0LF
+        + r / 8.0LF * (1.0LF
+        + r / 9.0LF * (1.0LF
+        + r / 10.0LF * (1.0LF
+        + r / 11.0LF * (1.0LF
+        + r / 12.0LF * (1.0LF
+        + r / 13.0LF))))))))))));
 
-    return exp_r * pow2;
+    return num * pow2_double(k);
 }
 
-// log(x) via atanh series: log(x) = 2 * atanh((x-1)/(x+1))
+// log(x) for double, x > 0.
+// Method: x = m * 2^e with m in [sqrt(0.5), sqrt(2)).
+// log(x) = e*ln(2) + log(m).
+// log(m) = 2*atanh(z), z = (m-1)/(m+1), |z| <= 0.17157
+// atanh(z) = z + z^3/3 + z^5/5 + ... + z^19/19
 double log_double(double x) {
-    if (x <= 0.0LF) return 0.0LF / 0.0LF; // NaN
-    double y = (x - 1.0LF) / (x + 1.0LF);
-    double y2 = y * y;
-    double y4 = y2 * y2;
-    double y6 = y4 * y2;
-    double y8 = y4 * y4;
-    double y10 = y8 * y2;
-    double y12 = y6 * y6;
-    double y14 = y12 * y2;
-    // atanh(y) = y + y^3/3 + y^5/5 + y^7/7 + y^9/9 + y^11/11 + y^13/13 + y^15/15
-    double atanh_y = y * (1.0LF
-        + y2 * (0.3333333333333333333333333333333333LF
-        + y2 * (0.2LF
-        + y2 * (0.1428571428571428571428571428571429LF
-        + y2 * (0.1111111111111111111111111111111111LF
-        + y2 * (0.09090909090909090909090909090909091LF
-        + y2 * (0.07692307692307692307692307692307692LF
-        + y2 *  0.06666666666666666666666666666666667LF)))))));
-    return 2.0LF * atanh_y;
+    if (x <= 0.0LF) {
+        // NaN for x < 0, -Inf for x == 0
+        return (x == 0.0LF) ? (-1.0LF / 0.0LF) : (0.0LF / 0.0LF);
+    }
+    if (isinf(x)) return x;
+
+    // Extract exponent and mantissa via bit operations
+    uvec2 bits = unpackDouble2x32(x);
+    uint hi = bits.y;
+    uint lo = bits.x;
+
+    // Extract exponent (bits 52-62) and mantissa (bits 0-51)
+    int e = int((hi >> 20u) & 0x7FFu) - 1023;
+    // Set exponent to 1023 (bias for 1.0) to get m in [1, 2)
+    uint mantissa_hi = (hi & 0xFFFFFu) | (1023u << 20u);
+    double m = packDouble2x32(uvec2(lo, mantissa_hi));
+
+    // Adjust so m is in [sqrt(0.5), sqrt(2)) ≈ [0.7071, 1.4142)
+    if (m < 0.7071067811865476LF) {
+        m *= 2.0LF;
+        e -= 1;
+    }
+
+    // z = (m-1)/(m+1)
+    double z = (m - 1.0LF) / (m + 1.0LF);
+    double z2 = z * z;
+
+    // atanh(z) = z + z^3/3 + z^5/5 + ... + z^19/19
+    double z4 = z2 * z2;
+    double z8 = z4 * z4;
+    double z16 = z8 * z8;
+
+    double atanh = z
+        + z2 * z / 3.0LF
+        + z4 * z / 5.0LF
+        + z4 * z2 * z / 7.0LF
+        + z8 * z / 9.0LF
+        + z8 * z2 * z / 11.0LF
+        + z8 * z4 * z / 13.0LF
+        + z8 * z4 * z2 * z / 15.0LF
+        + z16 * z / 17.0LF
+        + z16 * z2 * z / 19.0LF;
+
+    // log(m) = 2 * atanh(z)
+    double log_m = 2.0LF * atanh;
+
+    return double(e) * LN2_HI + double(e) * LN2_LO + log_m;
 }
 
-// sin(x) via quadrant reduction
+// pi/2 split into high and low parts for range reduction
+const double PI_HI = 1.5707963267948966LF;   // pi/2 high
+const double PI_LO = 6.123233995736766e-17LF; // pi/2 low
+const double TWO_OVER_PI = 0.6366197723675814LF; // 2/pi
+
+// sin(x) for double, |x| limited to ~1e6 for accuracy.
+// Method: range reduction to [-pi/4, pi/4], then Taylor series.
 double sin_double(double x) {
-    // Reduce to [-pi/2, pi/2]
-    double kf = floor(x * INV_PI + 0.5LF);
-    int k = int(kf);
-    x = x - kf * PI;
+    if (isnan(x)) return x;
+    if (isinf(x)) return 0.0LF / 0.0LF; // NaN
 
-    // Taylor series for sin(x) when |x| <= pi/2
-    double x2 = x * x;
-    double x3 = x2 * x;
-    double x4 = x3 * x;
-    double x5 = x3 * x2;
-    double x6 = x4 * x2;
-    double x7 = x4 * x3;
-    double x9 = x7 * x2;
-    double x11 = x9 * x2;
-    double x13 = x11 * x2;
-    double result = x
-        - x3 * 0.1666666666666666666666666666666667LF
-        + x5 * 0.008333333333333333333333333333333333LF
-        - x7 * 0.0001984126984126984126984126984126984LF
-        + x9 * 2.755731922398589065255731922398589e-6LF
-        - x11 * 2.505210838544171877505210838544172e-8LF
-        + x13 * 1.605904383682161459939237717015494e-10LF;
+    // Handle negative: sin(-x) = -sin(x)
+    double sign = 1.0LF;
+    if (x < 0.0LF) {
+        x = -x;
+        sign = -1.0LF;
+    }
 
-    return (k & 1) == 0 ? result : -result;
+    // Range reduction: k = round(x * (2/pi)), r = x - k*(pi/2)
+    double kd = round(x * TWO_OVER_PI);
+    int k = int(kd);
+    double r = (x - kd * PI_HI) - kd * PI_LO;
+    int quadrant = k & 3;
+
+    // Taylor series for sin(r) or cos(r) depending on quadrant, |r| <= pi/4
+    double r2 = r * r;
+    double r4 = r2 * r2;
+    double r6 = r4 * r2;
+    double r8 = r4 * r4;
+    double r10 = r8 * r2;
+    double r12 = r6 * r6;
+    double r14 = r8 * r6;
+    double r16 = r8 * r8;
+
+    // sin(r) ≈ r - r^3/6 + r^5/120 - r^7/5040 + ... + r^17/17!
+    double sin_r = r
+        - r2 * r / 6.0LF
+        + r4 * r / 120.0LF
+        - r6 * r / 5040.0LF
+        + r8 * r / 362880.0LF
+        - r10 * r / 39916800.0LF
+        + r12 * r / 6227020800.0LF
+        - r14 * r / 1307674368000.0LF
+        + r16 * r / 355687428096000.0LF;
+
+    // cos(r) ≈ 1 - r^2/2 + r^4/24 - r^6/720 + ... - r^16/16!
+    double cos_r = 1.0LF
+        - r2 / 2.0LF
+        + r4 / 24.0LF
+        - r6 / 720.0LF
+        + r8 / 40320.0LF
+        - r10 / 3628800.0LF
+        + r12 / 479001600.0LF
+        - r14 / 87178291200.0LF
+        + r16 / 20922789888000.0LF;
+
+    double result;
+    if (quadrant == 0) {
+        result = sin_r;
+    } else if (quadrant == 1) {
+        result = cos_r;
+    } else if (quadrant == 2) {
+        result = -sin_r;
+    } else {
+        result = -cos_r;
+    }
+    return sign * result;
 }
 
-// cos(x) = sin(x + pi/2)
+// cos(x) = sin(pi/2 - x)
 double cos_double(double x) {
-    return sin_double(x + PI_OVER_2);
+    return sin_double(PI_HI + PI_LO - x);
 }
 
 // Manual double-precision erf via Horner's method (approximation).
+// Uses exp_double for the exp(-x^2) factor.
 double erf_double(double x) {
     double t = 1.0LF / (1.0LF + 0.3275911LF * abs(x));
     double y = 1.0LF - (((((1.061405429LF * t - 1.453152027LF) * t) + 1.421413741LF) * t - 0.284496736LF) * t + 0.254829592LF) * t * exp_double(-x * x);
@@ -180,16 +290,21 @@ double apply_unary_f64(int op, double x) {
         case 7: return x * x;
         case 8: return sqrt(x);
         case 9: {
+            // gelu: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
             double x3 = x * x * x;
             double inner = 0.7978845608028654LF * (x + 0.044715LF * x3);
             return x * 0.5LF * (1.0LF + tanh_double(inner));
         }
         case 10: {
+            // gelu_erf: x * 0.5 * (1 + erf(x / sqrt(2)))
             return x * 0.5LF * (1.0LF + erf_double(x * 0.7071067811865475LF));
         }
         case 11: return erf_double(x);
         case 12: return max(x, 0.0LF);
-        case 13: return x / (1.0LF + exp_double(-x));
+        case 13: {
+            // silu: x * sigmoid(x) = x / (1 + exp(-x))
+            return x / (1.0LF + exp_double(-x));
+        }
         case 14: return tanh_double(x);
         case 15: return floor(x);
         case 16: return ceil(x);

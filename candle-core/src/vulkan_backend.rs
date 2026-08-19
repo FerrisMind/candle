@@ -10987,6 +10987,9 @@ mod tests {
             other => crate::bail!("unexpected dtype: {other:?}"),
         };
         assert_eq!(got, expected);
+        Ok(())
+    }
+
     /// Test that the deferred buffer cap prevents unbounded growth.
     /// Allocates many small tensors without synchronizing, then verifies
     /// the device is still healthy after the cleanup path drains.
