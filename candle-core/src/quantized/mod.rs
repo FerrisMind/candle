@@ -404,6 +404,18 @@ impl QWgpuStorage {
             Err(err) => Err(err),
         }
     }
+
+    fn indexed_moe_forward_f32(
+        &self,
+        self_shape: &Shape,
+        input: &crate::WgpuStorage,
+        input_l: &crate::Layout,
+        ids: &crate::WgpuStorage,
+        ids_l: &crate::Layout,
+    ) -> Result<(crate::WgpuStorage, Shape)> {
+        self.storage
+            .quantized_indexed_moe_f32(self.dtype, self_shape, input, input_l, ids, ids_l)
+    }
 }
 
 pub struct QVulkanStorage {
@@ -1529,6 +1541,37 @@ impl QTensor {
                     return out.to_device(&output_device);
                 }
                 Err(err) if should_quantized_backend_fallback(&err, "vulkan") => {}
+                Err(err) => return Err(err),
+            }
+        }
+        if let (
+            QStorage::Wgpu(storage),
+            Storage::Wgpu(x_storage),
+            Storage::Wgpu(ids_storage),
+        ) = (&self.storage, &*x3_f32.storage(), &*ids.storage())
+        {
+            match storage.indexed_moe_forward_f32(
+                &self.shape,
+                x_storage,
+                x3_f32.layout(),
+                ids_storage,
+                ids.layout(),
+            ) {
+                Ok((storage, out_shape)) => {
+                    let out = crate::tensor::from_storage(
+                        Storage::Wgpu(storage),
+                        out_shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    );
+                    let out = if out.dtype() == output_dtype {
+                        out
+                    } else {
+                        out.to_dtype(output_dtype)?
+                    };
+                    return out.to_device(&output_device);
+                }
+                Err(err) if should_quantized_backend_fallback(&err, "wgpu") => {}
                 Err(err) => return Err(err),
             }
         }

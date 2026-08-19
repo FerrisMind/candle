@@ -72,6 +72,10 @@ fn load_f16_as_f32_at_src0(byte_offset: u32) -> f32 {
     let d_bits = (word >> shift) & 0xFFFFu;
     return unpack2x16float(d_bits)[0];
 }
+
+fn load_f32_at_src0(byte_offset: u32) -> f32 {
+    return bitcast<f32>(load_u32_at_src0(byte_offset));
+}
 #endif
 #endif
 

@@ -952,15 +952,20 @@ pub fn quantized_mul_mat_id_shader(dtype: QuantizedDType, rhs_dtype: DType) -> O
             "#include \"mul_mat_decls.tmpl\"",
             get("mul_mat_decls.tmpl")?.source(),
         );
-    let defines = vec![
-        "MUL_MAT_ID".to_string(),
-        "SCALAR".to_string(),
-        "BYTE_HELPERS".to_string(),
-        "DECLARE_BYTE_LOADERS_SRC0".to_string(),
-        "INIT_SRC1_SHMEM_FLOAT".to_string(),
-        "U32_DEQUANT_HELPERS".to_string(),
-        quantized_mul_mat_id_init_define(dtype).to_string(),
-    ];
+    let (mut defines, _, _) = quantized_shader_config(dtype);
+    defines.push("MUL_MAT_ID".to_string());
+    defines.push("SCALAR".to_string());
+    defines.push("BYTE_HELPERS".to_string());
+    defines.push("DECLARE_BYTE_LOADERS_SRC0".to_string());
+    defines.push("INIT_SRC1_SHMEM_FLOAT".to_string());
+    defines.push("U32_DEQUANT_HELPERS".to_string());
+    defines.push(quantized_mul_mat_id_init_define(dtype).to_string());
+    defines.push("TILE_M".to_string());
+    defines.push("TILE_N".to_string());
+    defines.push("WORKGROUP_SIZE_M".to_string());
+    defines.push("WORKGROUP_SIZE_N".to_string());
+    defines.push("TILE_K".to_string());
+
     let src1_type = match rhs_dtype {
         DType::F32 => "f32",
         DType::F16 => "f16",
@@ -968,6 +973,9 @@ pub fn quantized_mul_mat_id_shader(dtype: QuantizedDType, rhs_dtype: DType) -> O
     let replacements = vec![
         ("SRC0_TYPE".to_string(), "u32".to_string()),
         ("SRC1_TYPE".to_string(), src1_type.to_string()),
+        ("SRC0_INNER_TYPE".to_string(), "u32".to_string()),
+        ("SRC1_INNER_TYPE".to_string(), src1_type.to_string()),
+        ("DST_TYPE".to_string(), "f32".to_string()),
         ("TILE_M".to_string(), "4u".to_string()),
         ("TILE_N".to_string(), "4u".to_string()),
         ("TILE_K".to_string(), "32u".to_string()),
@@ -1019,6 +1027,18 @@ pub fn fill_inplace_shader(dtype: DType, workgroup_size: u32) -> String {
         }
     }
     preprocess(UNARY_WGSL.source(), &defines, &replacements, dtype)
+}
+
+pub fn quantize_q8_1_shader() -> Option<String> {
+    Some(get("quantize_q8_1.wgsl")?.source().to_string())
+}
+
+pub fn dequant_nvfp4_shader() -> Option<String> {
+    Some(get("dequant_nvfp4.wgsl")?.source().to_string())
+}
+
+pub fn dequant_mxfp4_shader() -> Option<String> {
+    Some(get("dequant_mxfp4.wgsl")?.source().to_string())
 }
 
 #[derive(Clone, Copy)]
@@ -1244,5 +1264,14 @@ mod tests {
         assert!(source.contains("enable f16;"));
         assert!(source.contains("atomic_add_f16"));
         assert!(!source.contains("atomic_add_f32"));
+    }
+
+    #[test]
+    fn test_quantized_mul_mat_id_shader() {
+        use super::QuantizedDType::*;
+        for dt in [Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K] {
+            let s = super::quantized_mul_mat_id_shader(dt, DType::F32).expect("moe shader");
+            assert!(s.contains("fn init_shmem_src0"), "Shader for {dt:?} missing init_shmem_src0");
+        }
     }
 }

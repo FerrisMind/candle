@@ -7213,6 +7213,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         scale: f32,
         causal: bool,
     ) -> Result<WgpuStorage> {
+        Self::flash_attn_ext(
+            q, q_layout, k, k_layout, v, v_layout, None, None, None, None, scale, causal,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_ext(
+        q: &WgpuStorage,
+        q_layout: &Layout,
+        k: &WgpuStorage,
+        k_layout: &Layout,
+        v: &WgpuStorage,
+        v_layout: &Layout,
+        alibi_slopes: Option<&WgpuStorage>,
+        window_size_left: Option<usize>,
+        window_size_right: Option<usize>,
+        softcap: Option<f32>,
+        scale: f32,
+        causal: bool,
+    ) -> Result<WgpuStorage> {
         use crate::DType;
 
         let ensure_contiguous = |src: &WgpuStorage, l: &Layout| -> Result<(WgpuStorage, Layout)> {
@@ -7242,6 +7262,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let out_shape = Shape::from_dims(&[b, h, seq_q, head_dim_v]);
         let dst = unsafe { q.device.alloc_uninit(&out_shape, DType::F32)? };
 
+        let alibi_storage = if let Some(alibi) = alibi_slopes {
+            if alibi.dtype != DType::F32 {
+                Some(alibi.to_dtype(&Layout::contiguous(alibi.count), DType::F32)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let alibi_ref = alibi_storage.as_ref().or(alibi_slopes).unwrap_or(&q_buf);
+        let has_alibi = alibi_slopes.is_some();
+
         #[repr(C)]
         #[derive(Clone, Copy)]
         struct FlashAttnParams {
@@ -7254,6 +7286,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             batch_size: u32,
             scale: f32,
             causal: u32,
+            window_size_left: u32,
+            window_size_right: u32,
+            softcap: f32,
+            has_alibi: u32,
         }
 
         let params = FlashAttnParams {
@@ -7266,6 +7302,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             batch_size: b as u32,
             scale,
             causal: if causal { 1 } else { 0 },
+            window_size_left: window_size_left.unwrap_or(0) as u32,
+            window_size_right: window_size_right.unwrap_or(0) as u32,
+            softcap: softcap.unwrap_or(0.0),
+            has_alibi: if has_alibi { 1 } else { 0 },
         };
 
         let param_buffer = q
@@ -7289,6 +7329,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             storage_entry(2, true),
             storage_entry(3, false),
             uniform_entry(4),
+            storage_entry(5, true),
         ];
         let bindings = [
             buffer_binding(0, &q_buf.buffer),
@@ -7296,6 +7337,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             buffer_binding(2, &v_buf.buffer),
             buffer_binding(3, &dst.buffer),
             buffer_binding(4, &param_buffer),
+            buffer_binding(5, &alibi_ref.buffer),
         ];
 
         let shader_source = candle_wgpu_kernels::get("flash_attn_simple.wgsl")
@@ -9652,6 +9694,185 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
+    pub fn quantize_f32_to_q8_1(&self, elem_count: usize) -> Result<WgpuStorage> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu quantize_q8_1").bt());
+        }
+        let num_blocks = elem_count.div_ceil(32);
+        let dst_len_bytes = num_blocks * 36;
+        let dst = unsafe { self.device.alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)? };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct QuantizeParams {
+            ne: u32,
+            num_blocks: u32,
+        }
+
+        let params = QuantizeParams {
+            ne: elem_count as u32,
+            num_blocks: num_blocks as u32,
+        };
+
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-quantize-q8-1-params"),
+                size: std::mem::size_of::<QuantizeParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+
+        let shader_source = candle_wgpu_kernels::quantize_q8_1_shader()
+            .ok_or_else(|| Error::Msg("wgpu quantize_q8_1 shader not found".into()).bt())?;
+
+        let num_wgs = (num_blocks as u32).div_ceil(8);
+        self.device.run_compute_xyz(
+            &shader_source,
+            &entries,
+            &bindings,
+            (num_wgs, 1, 1),
+            &[],
+            None,
+            "candle-wgpu-quantize-q8-1",
+        )?;
+
+        Ok(dst)
+    }
+
+    pub fn dequantize_nvfp4(&self, elem_count: usize) -> Result<WgpuStorage> {
+        let dst_shape = Shape::from(elem_count);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct DequantParams {
+            nel: u32,
+        }
+
+        let params = DequantParams {
+            nel: elem_count as u32,
+        };
+
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-dequant-nvfp4-params"),
+                size: std::mem::size_of::<DequantParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+
+        let shader_source = candle_wgpu_kernels::dequant_nvfp4_shader()
+            .ok_or_else(|| Error::Msg("wgpu dequant_nvfp4 shader not found".into()).bt())?;
+
+        let total_subs = (elem_count as u32).div_ceil(16);
+        let num_wgs = total_subs.div_ceil(64);
+        self.device.run_compute_xyz(
+            &shader_source,
+            &entries,
+            &bindings,
+            (num_wgs, 1, 1),
+            &[],
+            None,
+            "candle-wgpu-dequant-nvfp4",
+        )?;
+
+        Ok(dst)
+    }
+
+    pub fn dequantize_mxfp4(&self, elem_count: usize) -> Result<WgpuStorage> {
+        let dst_shape = Shape::from(elem_count);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct DequantParams {
+            nel: u32,
+        }
+
+        let params = DequantParams {
+            nel: elem_count as u32,
+        };
+
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-dequant-mxfp4-params"),
+                size: std::mem::size_of::<DequantParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+
+        let shader_source = candle_wgpu_kernels::dequant_mxfp4_shader()
+            .ok_or_else(|| Error::Msg("wgpu dequant_mxfp4 shader not found".into()).bt())?;
+
+        let total_blocks = (elem_count as u32).div_ceil(32);
+        let num_wgs = total_blocks.div_ceil(64);
+        self.device.run_compute_xyz(
+            &shader_source,
+            &entries,
+            &bindings,
+            (num_wgs, 1, 1),
+            &[],
+            None,
+            "candle-wgpu-dequant-mxfp4",
+        )?;
+
+        Ok(dst)
+    }
+
     pub(crate) fn quantized_matmul(
         &self,
         qdtype: GgmlDType,
@@ -9981,6 +10202,226 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         )?;
         drop(src_contiguous);
         Ok((dst, dst_shape))
+    }
+
+    pub(crate) fn quantized_indexed_moe_f32(
+        &self,
+        qdtype: GgmlDType,
+        qshape: &Shape,
+        storage: &Self,
+        layout: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+    ) -> Result<(Self, Shape)> {
+        if storage.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(
+                storage.dtype,
+                "wgpu quantized indexed_moe",
+            )
+            .bt());
+        }
+        if ids.dtype != DType::U32 && ids.dtype != DType::I32 {
+            return Err(Error::UnsupportedDTypeForOp(
+                ids.dtype,
+                "wgpu quantized indexed_moe ids",
+            )
+            .bt());
+        }
+        let (num_experts, n, k) = qshape.dims3()?;
+        let rank = layout.dims().len();
+        if rank != 3 {
+            return Err(Error::Msg("wgpu quantized indexed_moe expects rank 3 input".into()).bt());
+        }
+        let (batch, input_dim1, input_k) = layout.shape().dims3()?;
+        let (ids_batch, topk) = ids_l.shape().dims2()?;
+        if batch != ids_batch {
+            crate::bail!("indexed_moe_forward batch mismatch: input={batch}, ids={ids_batch}");
+        }
+        if input_k != k {
+            crate::bail!("indexed_moe_forward last dim mismatch: input={input_k}, weight={k}");
+        }
+        if input_dim1 != 1 && input_dim1 != topk {
+            crate::bail!(
+                "indexed_moe_forward expects input dim-1 to be 1 or topk ({topk}), got {input_dim1}"
+            );
+        }
+
+        let ensure_contiguous = |src: &WgpuStorage, l: &Layout| -> Result<(WgpuStorage, Layout)> {
+            if !l.is_contiguous() || l.start_offset() != 0 {
+                let shape_ref = l.shape();
+                let mut tmp = unsafe { src.device.alloc_uninit(shape_ref, src.dtype)? };
+                src.copy_strided_src(&mut tmp, 0, l)?;
+                Ok((tmp, Layout::contiguous(shape_ref.clone())))
+            } else {
+                Ok((src.try_clone(l)?, l.clone()))
+            }
+        };
+
+        let (src, _) = ensure_contiguous(storage, layout)?;
+        let (ids_src, ids_layout) = ensure_contiguous(ids, ids_l)?;
+
+        let dst_shape = Shape::from((batch, topk, n));
+        let dst = unsafe { storage.device.alloc_uninit(&dst_shape, DType::F32)? };
+
+        let wgpu_qdtype = wgpu_quantized_dtype(qdtype)?;
+        let kernel_rhs_dtype = wgpu_kernel_dtype(src.dtype)?;
+
+        let id_shader = candle_wgpu_kernels::quantized_mul_mat_id_shader(wgpu_qdtype, kernel_rhs_dtype);
+        let gather_shader = candle_wgpu_kernels::quantized_mul_mat_id_gather_shader(64);
+
+        if let (Some(id_shader), Some(gather_shader)) = (id_shader, gather_shader) {
+            let gather_count = (num_experts * batch).max(1) as u64;
+            let global_gathered_expert_used = storage.device.inner.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-moe-gather-expert-used"),
+                size: (gather_count * 4).max(16),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let global_gathered_tokens = storage.device.inner.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-moe-gather-tokens"),
+                size: (gather_count * 4).max(16),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let gathered_count_ids = storage.device.inner.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-moe-gather-count-ids"),
+                size: ((num_experts as u64) * 4).max(16),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct MulMatIdGatherParams {
+                offset_ids: u32,
+                n_expert: u32,
+                n_expert_used: u32,
+                n_tokens: u32,
+                stride_ids_1: u32,
+            }
+
+            let gather_params = MulMatIdGatherParams {
+                offset_ids: 0,
+                n_expert: num_experts as u32,
+                n_expert_used: topk as u32,
+                n_tokens: batch as u32,
+                stride_ids_1: ids_layout.dims()[1] as u32,
+            };
+
+            let gather_param_buf = storage.device.inner.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-moe-gather-params"),
+                size: std::mem::size_of::<MulMatIdGatherParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            storage.device.inner.queue.write_buffer(&gather_param_buf, 0, any_as_bytes(&gather_params));
+
+            let gather_entries = [
+                storage_entry(0, false),
+                storage_entry(1, false),
+                storage_entry(2, false),
+                storage_entry(3, false),
+                uniform_entry(4),
+            ];
+            let gather_bindings = [
+                buffer_binding(0, &ids_src.buffer),
+                buffer_binding(1, &global_gathered_expert_used),
+                buffer_binding(2, &global_gathered_tokens),
+                buffer_binding(3, &gathered_count_ids),
+                buffer_binding(4, &gather_param_buf),
+            ];
+
+            storage.device.run_compute_xyz(
+                &gather_shader,
+                &gather_entries,
+                &gather_bindings,
+                (num_experts as u32, 1, 1),
+                &[],
+                None,
+                "candle-wgpu-moe-gather",
+            )?;
+
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct MulMatIdParams {
+                offset_src0: u32,
+                offset_src1: u32,
+                offset_dst: u32,
+                k: u32,
+                m: u32,
+                n_expert: u32,
+                n_expert_used: u32,
+                n_tokens: u32,
+                b_ne1: u32,
+                stride_01: u32,
+                stride_11: u32,
+                stride_02: u32,
+                stride_12: u32,
+            }
+
+            let block_size = qdtype.block_size();
+            let moe_params = MulMatIdParams {
+                offset_src0: 0,
+                offset_src1: 0,
+                offset_dst: 0,
+                k: k as u32,
+                m: n as u32,
+                n_expert: num_experts as u32,
+                n_expert_used: topk as u32,
+                n_tokens: batch as u32,
+                b_ne1: input_dim1 as u32,
+                stride_01: (k / block_size) as u32,
+                stride_11: k as u32,
+                stride_02: ((n * k) / block_size) as u32,
+                stride_12: (input_dim1 * k) as u32,
+            };
+
+            let moe_param_buf = storage.device.inner.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-moe-params"),
+                size: std::mem::size_of::<MulMatIdParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            storage.device.inner.queue.write_buffer(&moe_param_buf, 0, any_as_bytes(&moe_params));
+
+            let moe_entries = [
+                storage_entry(0, false),
+                storage_entry(1, false),
+                storage_entry(2, false),
+                storage_entry(3, false),
+                storage_entry(4, false),
+                storage_entry(5, false),
+                uniform_entry(6),
+            ];
+            let moe_bindings = [
+                buffer_binding(0, &self.buffer),
+                buffer_binding(1, &src.buffer),
+                buffer_binding(2, &dst.buffer),
+                buffer_binding(3, &global_gathered_expert_used),
+                buffer_binding(4, &global_gathered_tokens),
+                buffer_binding(5, &gathered_count_ids),
+                buffer_binding(6, &moe_param_buf),
+            ];
+
+            let wg_m_count = (n as u32).div_ceil(32);
+            let wg_n_count = ((batch * topk) as u32).div_ceil(32);
+            let total_moe_wg = wg_m_count * wg_n_count * (num_experts as u32);
+            let (wg_x, wg_y) = compute_2d_workgroups(total_moe_wg.max(1), wgpu_dispatch_wg_cap(&storage.device));
+
+            storage.device.run_compute_xyz(
+                &id_shader,
+                &moe_entries,
+                &moe_bindings,
+                (wg_x, wg_y, 1),
+                &[],
+                None,
+                "candle-wgpu-moe-matmul",
+            )?;
+
+            Ok((dst, dst_shape))
+        } else {
+            Err(Error::Msg("wgpu quantized mul_mat_id shader not available".into()).bt())
+        }
     }
 
     // Integer reductions (u8/u32/i64), fully GPU-resident. Mirrors the float
