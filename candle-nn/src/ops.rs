@@ -1595,3 +1595,80 @@ pub fn sdpa(
     }
     sdpa_unfused(q, k, v, mask, do_causal, scale, softcapping)
 }
+
+/// Flash Attention with unified cross-backend dispatch.
+///
+/// **Inputs shapes:**
+/// - `q`: `(bs, seq_len, num_heads, head_dim)`
+/// - `k`: `(bs, kv_seq_len, num_kv_heads, head_dim)`
+/// - `v`: `(bs, kv_seq_len, num_kv_heads, head_dim_v)`
+/// - `softmax_scale`: scale factor applied before softmax (typically `1.0 / sqrt(head_dim)`)
+/// - `causal`: whether to apply causal masking
+///
+/// **Output shape:** `(bs, seq_len, num_heads, head_dim_v)`
+pub fn flash_attn(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
+    #[cfg(feature = "flash-attn")]
+    if q.device().is_cuda() {
+        return candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal);
+    }
+
+    if q.device().is_metal() || q.device().is_vulkan() || q.device().is_wgpu() {
+        let q_t = q.transpose(1, 2)?;
+        let k_t = k.transpose(1, 2)?;
+        let v_t = v.transpose(1, 2)?;
+        let out = q_t.apply_op3_no_bwd(
+            &k_t,
+            &v_t,
+            &Sdpa {
+                scale: softmax_scale,
+                softcapping: 1.0,
+                mask: None,
+                do_causal: causal,
+            },
+        )?;
+        return out.transpose(1, 2);
+    }
+
+    if q.device().is_cpu() {
+        let mask = if causal {
+            crate::attention::AttnMask::causal()
+        } else {
+            crate::attention::AttnMask::None
+        };
+        let res = match q.dtype() {
+            DType::F32 => {
+                crate::attention::cpu_flash::flash_attn::<f32>(
+                    q, k, v, softmax_scale, mask, None, None,
+                )
+            }
+            DType::F16 => {
+                crate::attention::cpu_flash::flash_attn::<half::f16>(
+                    q, k, v, softmax_scale, mask, None, None,
+                )
+            }
+            DType::BF16 => {
+                crate::attention::cpu_flash::flash_attn::<half::bf16>(
+                    q, k, v, softmax_scale, mask, None, None,
+                )
+            }
+            _ => Err(candle::Error::Msg(
+                "unsupported dtype for cpu flash attention".to_string(),
+            )),
+        };
+        if let Ok(out) = res {
+            return out.transpose(1, 2);
+        }
+    }
+
+    let q_t = q.transpose(1, 2)?;
+    let k_t = k.transpose(1, 2)?;
+    let v_t = v.transpose(1, 2)?;
+    let out = sdpa_unfused(&q_t, &k_t, &v_t, None, causal, softmax_scale, 1.0)?;
+    out.transpose(1, 2)
+}
