@@ -2384,7 +2384,113 @@ fn int_reduce_wgsl(op: ReduceOp, dtype: DType) -> Result<String> {
                 }
             }
         }
+        DType::I32 => {
+            if is_arg {
+                let cmp = if want_max { ">" } else { "<" };
+                format!(
+                    r#"
+    var best = bitcast<i32>(src[r * params.kx]);
+    var bidx: u32 = 0u;
+    for (var c: u32 = 1u; c < params.kx; c = c + 1u) {{
+        let v = bitcast<i32>(src[r * params.kx + c]);
+        if (v {cmp} best) {{ best = v; bidx = c; }}
+    }}
+    dst[r] = bidx;
+"#
+                )
+            } else {
+                match op {
+                    ReduceOp::Sum => r#"
+    var acc: i32 = 0;
+    for (var c: u32 = 0u; c < params.kx; c = c + 1u) {
+        acc = acc + bitcast<i32>(src[r * params.kx + c]);
+    }
+    dst[r] = bitcast<u32>(acc);
+"#
+                    .to_string(),
+                    _ => {
+                        let cmp = if want_max { ">" } else { "<" };
+                        format!(
+                            r#"
+    var acc = bitcast<i32>(src[r * params.kx]);
+    for (var c: u32 = 1u; c < params.kx; c = c + 1u) {{
+        let v = bitcast<i32>(src[r * params.kx + c]);
+        if (v {cmp} acc) {{ acc = v; }}
+    }}
+    dst[r] = bitcast<u32>(acc);
+"#
+                        )
+                    }
+                }
+            }
+        }
         other => return Err(Error::UnsupportedDTypeForOp(other, "wgpu int reduce").bt()),
+    };
+
+    Ok(format!(
+        r#"
+struct Params {{ rows: u32, kx: u32, }};
+{src_decl}
+{dst_decl}
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let r = gid.x;
+    if (r >= params.rows) {{ return; }}
+{body}
+}}
+"#
+    ))
+}
+
+fn f64_reduce_wgsl(op: ReduceOp) -> Result<String> {
+    let is_arg = matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin);
+    let want_max = matches!(op, ReduceOp::Max | ReduceOp::ArgMax);
+
+    let src_decl = "@group(0) @binding(0) var<storage, read> src: array<f64>;";
+
+    let (dst_decl, body) = if is_arg {
+        let cmp = if want_max { ">" } else { "<" };
+        let dst_decl = "@group(0) @binding(1) var<storage, read_write> dst: array<u32>;";
+        let body = format!(
+            r#"
+    var best = src[r * params.kx];
+    var bidx: u32 = 0u;
+    for (var c: u32 = 1u; c < params.kx; c = c + 1u) {{
+        let v = src[r * params.kx + c];
+        if (v {cmp} best) {{ best = v; bidx = c; }}
+    }}
+    dst[r] = bidx;
+"#
+        );
+        (dst_decl, body)
+    } else {
+        let dst_decl = "@group(0) @binding(1) var<storage, read_write> dst: array<f64>;";
+        let body = match op {
+            ReduceOp::Sum => r#"
+    var acc: f64 = 0.0;
+    for (var c: u32 = 0u; c < params.kx; c = c + 1u) {
+        acc = acc + src[r * params.kx + c];
+    }
+    dst[r] = acc;
+"#
+            .to_string(),
+            _ => {
+                let cmp = if want_max { ">" } else { "<" };
+                format!(
+                    r#"
+    var acc = src[r * params.kx];
+    for (var c: u32 = 1u; c < params.kx; c = c + 1u) {{
+        let v = src[r * params.kx + c];
+        if (v {cmp} acc) {{ acc = v; }}
+    }}
+    dst[r] = acc;
+"#
+                )
+            }
+        };
+        (dst_decl, body)
     };
 
     Ok(format!(
@@ -6486,7 +6592,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{{body}}}
     }
 
     fn run_f64_f32_cast(&self, layout: &Layout, dst_dtype: DType) -> Result<Self> {
-        eprintln!("RUN_F64_F32_CAST {:?} -> {:?}", self.dtype, dst_dtype);
         if !matches!(
             (self.dtype, dst_dtype),
             (DType::F32, DType::F64) | (DType::F64, DType::F32) | (DType::F64, DType::F64)
@@ -10926,6 +11031,140 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
+    fn run_f64_reduce(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
+        let rank = layout.dims().len();
+        if rank == 0 {
+            return self.try_clone(layout);
+        }
+        if reduce_dims.is_empty() {
+            return self.try_clone(layout);
+        }
+        for &dim in reduce_dims {
+            if dim >= rank {
+                crate::bail!("wgpu backend f64 reduce got out-of-range dim {dim} for rank {rank}")
+            }
+        }
+        if reduce_dims.len() > 1 {
+            let mut current_layout = layout.clone();
+            let mut current_shape = layout.dims().to_vec();
+            let mut current: Option<Self> = None;
+            for &dim in reduce_dims {
+                let src = current.as_ref().map_or(self, |s| s);
+                let reduced = src.run_f64_reduce(op, &current_layout, &[dim])?;
+                current_shape[dim] = 1;
+                current_layout = Layout::contiguous(Shape::from(current_shape.clone()));
+                current = Some(reduced);
+            }
+            return match current {
+                Some(v) => Ok(v),
+                None => self.try_clone(layout),
+            };
+        }
+        let dim = reduce_dims[0];
+        if dim != rank - 1 {
+            let perm = (0..rank)
+                .filter(|&i| i != dim)
+                .chain(std::iter::once(dim))
+                .collect::<Vec<_>>();
+            let perm_shape = perm.iter().map(|&i| layout.dims()[i]).collect::<Vec<_>>();
+            let perm_stride = perm.iter().map(|&i| layout.stride()[i]).collect::<Vec<_>>();
+            let perm_layout = Layout::new(
+                Shape::from(perm_shape.clone()),
+                perm_stride,
+                layout.start_offset(),
+            );
+            let mut permuted = unsafe {
+                self.device
+                    .alloc_uninit(&Shape::from(perm_shape.clone()), self.dtype)?
+            };
+            self.copy_strided_src(&mut permuted, 0, &perm_layout)?;
+            let permuted_layout = Layout::contiguous(Shape::from(perm_shape));
+            return permuted.run_f64_reduce(op, &permuted_layout, &[rank - 1]);
+        }
+        // Last-dim reduction: materialize contiguous, then dispatch.
+        let mut materialized;
+        let src;
+        let src_layout;
+        let contiguous_layout;
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            src = self;
+            src_layout = layout;
+        } else {
+            materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            self.copy_strided_src(&mut materialized, 0, layout)?;
+            contiguous_layout = Layout::contiguous(layout.shape());
+            src = &materialized;
+            src_layout = &contiguous_layout;
+        }
+        src.run_f64_reduce_last_dim(op, src_layout)
+    }
+
+    fn run_f64_reduce_last_dim(&self, op: ReduceOp, layout: &Layout) -> Result<Self> {
+        let rank = layout.dims().len();
+        if rank == 0 {
+            if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
+                return Ok(unsafe {
+                    self.device
+                        .alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)?
+                });
+            }
+            return self.try_clone(layout);
+        }
+        let kx = *layout.dims().last().unwrap_or(&1);
+        let mut dst_dims = layout.dims().to_vec();
+        dst_dims[rank - 1] = 1;
+        let dst_shape = Shape::from(dst_dims);
+        let rows = dst_shape.elem_count();
+        let is_arg = matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin);
+        let dst_dtype = if is_arg { DType::U32 } else { self.dtype };
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, dst_dtype)? };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct F64ReduceParams {
+            rows: u32,
+            kx: u32,
+        }
+        let params = F64ReduceParams {
+            rows: rows.try_into()?,
+            kx: kx.try_into()?,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-f64-reduce-params"),
+                size: std::mem::size_of::<F64ReduceParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+        let shader = f64_reduce_wgsl(op)?;
+        let workgroups = (rows as u32).div_ceil(WG_SIZE);
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-f64-reduce",
+        )?;
+        Ok(dst)
+    }
+
     fn encode_f32_to_f8e4m3(&self, layout: &Layout) -> Result<Self> {
         if !layout.is_contiguous() || layout.start_offset() != 0 {
             let mut materialized =
@@ -11033,7 +11272,6 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn to_cpu_storage(&self) -> Result<CpuStorage> {
-        eprintln!("TO_CPU {:?}", self.dtype);
         let size = byte_len(self.dtype, self.count, "wgpu download")?;
         let bytes = self.device.read_buffer(&self.buffer, size)?;
         bytes_to_cpu_storage(self.dtype, self.count, &bytes)
@@ -11120,7 +11358,7 @@ impl BackendStorage for WgpuStorage {
         self.run_unary_like(layout, &shader, "candle-wgpu-elu")
     }
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
-        if matches!(self.dtype, DType::U8 | DType::U32 | DType::I64) {
+        if matches!(self.dtype, DType::U8 | DType::U32 | DType::I64 | DType::I32) {
             return self.run_int_reduce(op, layout, reduce_dims);
         }
         if self.dtype == DType::BF16 {
@@ -11152,6 +11390,9 @@ impl BackendStorage for WgpuStorage {
             }
             let out_layout = Layout::contiguous(Shape::from(out_dims));
             return reduced.to_dtype(&out_layout, DType::F16);
+        }
+        if self.dtype == DType::F64 {
+            return self.run_f64_reduce(op, layout, reduce_dims);
         }
         if self.dtype != DType::F32 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu reduce").bt());
@@ -11299,7 +11540,6 @@ impl BackendStorage for WgpuStorage {
         self.run_cmp_u8(rhs, lhs_l, rhs_l, op)
     }
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
-        eprintln!("TO_DTYPE {:?} -> {:?}", self.dtype, dtype);
         if layout.dims().len() > 4 {
             let (materialized, compact_layout) = self.materialize_rank_gt4_compact(layout)?;
             return materialized.to_dtype(&compact_layout, dtype);
@@ -12510,62 +12750,7 @@ mod wgpu_f8e4m3_tests {
     use crate::{CpuStorage, DType, Error, Layout, Result, Shape};
     use float8::F8E4M3 as f8e4m3;
 
-    #[test]
-    fn probe_fp8_steps_to_f64() {
-        let dev = match wgpu_device() {
-            Some(d) => d,
-            None => return,
-        };
-        let bits: Vec<u8> = vec![0x38, 0x48, 0x00, 0x80, 0x7F, 0x01, 0x7D];
-        let shape = Shape::from(bits.len());
-        let src = upload_f8e4m3(&dev, &bits).unwrap();
-        let layout = Layout::contiguous(shape);
-        let f64_storage = src.to_dtype(&layout, DType::F64).unwrap();
-        let got = download_f64(&f64_storage).unwrap();
-        let mut acc: u64 = 0;
-        for i in 0..bits.len() {
-            acc = acc.wrapping_add(got[i].to_bits());
-        }
-        eprintln!("PROBE STAGE A OK {acc}");
-        let mut acc2: u64 = 0;
-        for i in 0..bits.len() {
-            let cpu = f8e4m3::from_bits(bits[i]).to_f64();
-            acc2 = acc2.wrapping_add(cpu.to_bits());
-        }
-        eprintln!("PROBE STAGE B OK {acc2}");
-        for i in 0..bits.len() {
-            let cpu = f8e4m3::from_bits(bits[i]).to_f64();
-            assert_eq!(
-                got[i].to_bits(),
-                cpu.to_bits(),
-                "f8->f64 mismatch at {i}: bits=0x{:02X}",
-                bits[i]
-            );
-        }
-        eprintln!("PROBE OK");
-    }
 
-    #[test]
-    fn probe_plain_f32_to_f64() {
-        let dev = match wgpu_device() {
-            Some(d) => d,
-            None => return,
-        };
-        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
-        let storage = dev.storage_from_slice(&data).unwrap();
-        let out = storage
-            .to_dtype(
-                &Layout::contiguous(Shape::from(data.len())),
-                DType::F64,
-            )
-            .unwrap();
-        let cpu = out.to_cpu_storage().unwrap();
-        let v = match cpu {
-            CpuStorage::F64(v) => v,
-            other => panic!("expected F64, got {other:?}"),
-        };
-        assert_eq!(v, vec![1.0, 2.0, 3.0, 4.0]);
-    }
 
     fn wgpu_device() -> Option<WgpuDevice> {
         match crate::Device::new_wgpu(0) {
@@ -12650,13 +12835,11 @@ mod wgpu_f8e4m3_tests {
         for i in 0..n {
             let cpu_f8 = f8e4m3::from_f32(data[i]);
             let cpu_round = cpu_f8.to_f32();
-            assert_eq!(
-                round_data[i].to_bits(),
-                cpu_round.to_bits(),
-                "roundtrip mismatch at {i}: gpu={} cpu={}",
-                round_data[i],
-                cpu_round
-            );
+            if cpu_round.is_nan() {
+                assert!(round_data[i].is_nan(), "expected NaN at {i}");
+            } else {
+                assert_eq!(round_data[i].to_bits(), cpu_round.to_bits(), "roundtrip at {i}");
+            }
         }
     }
 
@@ -12678,14 +12861,11 @@ mod wgpu_f8e4m3_tests {
         assert_eq!(f32_data.len(), bits.len());
         for i in 0..bits.len() {
             let cpu = f8e4m3::from_bits(bits[i]).to_f32();
-            assert_eq!(
-                f32_data[i].to_bits(),
-                cpu.to_bits(),
-                "decode mismatch at {i}: bits=0x{:02X} gpu={} cpu={}",
-                bits[i],
-                f32_data[i],
-                cpu
-            );
+            if cpu.is_nan() {
+                assert!(f32_data[i].is_nan(), "expected NaN at {i}");
+            } else {
+                assert_eq!(f32_data[i].to_bits(), cpu.to_bits(), "decode at {i}");
+            }
         }
     }
 
@@ -12704,13 +12884,12 @@ mod wgpu_f8e4m3_tests {
         let f32_via_f16 = f16_storage.to_dtype(&layout, DType::F32).unwrap();
         let got = download_f32(&f32_via_f16).unwrap();
         for i in 0..bits.len() {
-            let cpu = f8e4m3::from_bits(bits[i]).to_f16().to_f32_const();
-            assert_eq!(
-                got[i].to_bits(),
-                cpu.to_bits(),
-                "f8->f16 mismatch at {i}: bits=0x{:02X}",
-                bits[i]
-            );
+            let cpu: f32 = f8e4m3::from_bits(bits[i]).to_f16().to_f32_const();
+            if cpu.is_nan() {
+                assert!(got[i].is_nan(), "expected NaN at {i}");
+            } else {
+                assert_eq!(got[i].to_bits(), cpu.to_bits(), "f8->f16 at {i}");
+            }
         }
     }
 
@@ -12808,14 +12987,18 @@ mod wgpu_f8e4m3_tests {
         let layout = Layout::contiguous(shape);
         let f64_storage = src.to_dtype(&layout, DType::F64).unwrap();
         let got = download_f64(&f64_storage).unwrap();
+        // NaN policy: GPU decode yields canonical f32 NaN (like CUDA);
+        // CPU reference preserves f16 payload bits — compare via is_nan.
+        // Reference via to_f32().into(): float8::to_f64() (half const path)
+        // overflows the stack in this test binary on Windows debug builds;
+        // for all non-NaN fp8 values both paths are bit-identical.
         for i in 0..bits.len() {
-            let cpu = f8e4m3::from_bits(bits[i]).to_f64();
-            assert_eq!(
-                got[i].to_bits(),
-                cpu.to_bits(),
-                "f8->f64 mismatch at {i}: bits=0x{:02X}",
-                bits[i]
-            );
+            let cpu: f64 = f8e4m3::from_bits(bits[i]).to_f32().into();
+            if cpu.is_nan() {
+                assert!(got[i].is_nan(), "expected NaN at {i}");
+            } else {
+                assert_eq!(got[i].to_bits(), cpu.to_bits(), "mismatch at {i}");
+            }
         }
     }
 
@@ -13038,5 +13221,277 @@ mod wgpu_int_tests {
         assert_eq!(ga.le(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.le(&cb).unwrap().to_vec1::<u8>().unwrap());
         assert_eq!(ga.gt(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.gt(&cb).unwrap().to_vec1::<u8>().unwrap());
         assert_eq!(ga.ge(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.ge(&cb).unwrap().to_vec1::<u8>().unwrap());
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "wgpu")]
+mod wgpu_reduce_tests {
+    use super::*;
+
+    fn wgpu_device() -> crate::Device {
+        crate::Device::Wgpu(WgpuDevice::new(0).expect("wgpu device ordinal 0"))
+    }
+
+    fn cpu_argmax_i32(vals: &[i32], shape: &[usize], dim: usize) -> (Vec<u32>, Vec<usize>) {
+        let dev = &crate::Device::Cpu;
+        let t = crate::Tensor::from_vec(vals.to_vec(), shape, dev).unwrap();
+        let r = t.argmax(dim).unwrap();
+        let out_dims = r.dims().to_vec();
+        let data = r.to_vec1::<u32>().unwrap();
+        (data, out_dims)
+    }
+
+    fn cpu_argmin_i32(vals: &[i32], shape: &[usize], dim: usize) -> (Vec<u32>, Vec<usize>) {
+        let dev = &crate::Device::Cpu;
+        let t = crate::Tensor::from_vec(vals.to_vec(), shape, dev).unwrap();
+        let r = t.argmin(dim).unwrap();
+        let out_dims = r.dims().to_vec();
+        let data = r.to_vec1::<u32>().unwrap();
+        (data, out_dims)
+    }
+
+
+
+    #[test]
+    fn wgpu_reduce_i32_sum() {
+        let dev = wgpu_device();
+        let vals: Vec<i32> = vec![1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12];
+        let shape = vec![3, 4];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.sum_keepdim(1).unwrap();
+        let got: Vec<i32> = result.flatten_all().unwrap().to_vec1().unwrap();
+        // Row 0: 1-2+3-4 = -2, Row 1: 5-6+7-8 = -2, Row 2: 9-10+11-12 = -2
+        assert_eq!(got, vec![-2, -2, -2], "i32 sum over dim 1 mismatch");
+        assert_eq!(result.dims().to_vec(), vec![3, 1], "keepdim shape");
+    }
+
+    #[test]
+    fn wgpu_reduce_i32_sum_all() {
+        let dev = wgpu_device();
+        let vals: Vec<i32> = vec![10, -20, 30, -40, 50, -60];
+        let shape = vec![2, 3];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.sum_all().unwrap();
+        let got: i32 = result.to_scalar().unwrap();
+        let want: i32 = vals.iter().sum();
+        assert_eq!(got, want, "i32 sum_all mismatch");
+    }
+
+    #[test]
+    fn wgpu_reduce_i32_max() {
+        let dev = wgpu_device();
+        let vals: Vec<i32> = vec![1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12];
+        let shape = vec![3, 4];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+
+        // max over dim 1
+        let result = t.max(1).unwrap();
+        let got: Vec<i32> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![3, 7, 11], "i32 max over dim 1");
+
+        // max over dim 0
+        let result = t.max(0).unwrap();
+        let got: Vec<i32> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![9, -2, 11, -4], "i32 max over dim 0");
+    }
+
+    #[test]
+    fn wgpu_reduce_i32_min() {
+        let dev = wgpu_device();
+        let vals: Vec<i32> = vec![1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12];
+        let shape = vec![3, 4];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+
+        // min over dim 1
+        let result = t.min(1).unwrap();
+        let got: Vec<i32> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![-4, -8, -12], "i32 min over dim 1");
+
+        // min over dim 0
+        let result = t.min(0).unwrap();
+        let got: Vec<i32> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![1, -10, 3, -12], "i32 min over dim 0");
+    }
+
+    #[test]
+    fn wgpu_reduce_i32_argmax_tie() {
+        let dev = wgpu_device();
+        let vals: Vec<i32> = vec![5, 3, 5, 1, 5, 2];
+        let shape = vec![1, 6];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.argmax(1).unwrap();
+        let got: Vec<u32> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![0], "i32 argmax tie: first-index-wins, expected 0");
+
+        let (cpu_got, _) = cpu_argmax_i32(&vals, &shape, 1);
+        assert_eq!(got, cpu_got, "i32 argmax must match CPU exactly");
+    }
+
+    #[test]
+    fn wgpu_reduce_i32_argmax_negative() {
+        let dev = wgpu_device();
+        let vals: Vec<i32> = vec![-10, -5, -20, -3, -15, -1];
+        let shape = vec![2, 3];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.argmax(1).unwrap();
+        let got: Vec<u32> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![1, 2], "i32 argmax with negatives");
+
+        let (cpu_got, _) = cpu_argmax_i32(&vals, &shape, 1);
+        assert_eq!(got, cpu_got, "i32 argmax with negatives must match CPU");
+    }
+
+    #[test]
+    fn wgpu_reduce_i32_argmin() {
+        let dev = wgpu_device();
+        let vals: Vec<i32> = vec![3, 1, 4, 1, 5, 9];
+        let shape = vec![1, 6];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.argmin(1).unwrap();
+        let got: Vec<u32> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![1], "i32 argmin tie: first-index-wins");
+
+        let (cpu_got, _) = cpu_argmin_i32(&vals, &shape, 1);
+        assert_eq!(got, cpu_got, "i32 argmin must match CPU exactly");
+    }
+
+    #[test]
+    fn wgpu_reduce_i32_2d_dim0() {
+        let dev = wgpu_device();
+        let vals: Vec<i32> = vec![1, 2, 3, 4, 5, 6];
+        let shape = vec![2, 3];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.sum_keepdim(0).unwrap();
+        let got: Vec<i32> = result.flatten_all().unwrap().to_vec1().unwrap();
+        // Row 0: [1,2,3], Row 1: [4,5,6]; sum over dim 0: [1+4, 2+5, 3+6] = [5, 7, 9]
+        assert_eq!(got, vec![5, 7, 9], "i32 sum over dim 0");
+        assert_eq!(result.dims().to_vec(), vec![1, 3], "keepdim shape");
+    }
+
+    #[test]
+    fn wgpu_reduce_i32_2d_dim1() {
+        let dev = wgpu_device();
+        let vals: Vec<i32> = vec![1, 2, 3, 4, 5, 6];
+        let shape = vec![2, 3];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.sum_keepdim(1).unwrap();
+        let got: Vec<i32> = result.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(got, vec![6, 15], "i32 sum over dim 1");
+        assert_eq!(result.dims().to_vec(), vec![2, 1], "keepdim shape");
+    }
+
+    #[test]
+    fn wgpu_reduce_f64_sum() {
+        let dev = wgpu_device();
+        let vals: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let shape = vec![2, 3];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.sum_keepdim(1).unwrap();
+        let got: Vec<f64> = result.flatten_all().unwrap().to_vec1().unwrap();
+
+        // Row 0: 1+2+3=6, Row 1: 4+5+6=15
+        let want: Vec<f64> = vec![6.0, 15.0];
+        for (g, w) in got.iter().zip(want.iter()) {
+            let rel = (g - w).abs() / w.abs().max(1e-15);
+            assert!(rel < 1e-12, "f64 sum rel err {rel:.3e} exceeds 1e-12");
+        }
+        assert_eq!(result.dims().to_vec(), vec![2, 1], "keepdim shape");
+    }
+
+    #[test]
+    fn wgpu_reduce_f64_sum_all() {
+        let dev = wgpu_device();
+        let vals: Vec<f64> = vec![0.1, 0.2, 1e-10, -0.3, 1e10, -1e10];
+        let shape = vec![2, 3];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.sum_all().unwrap();
+        let got: f64 = result.to_scalar().unwrap();
+        let want: f64 = vals.iter().sum();
+        let rel = (got - want).abs() / want.abs().max(1e-15);
+        assert!(rel < 1e-12, "f64 sum_all rel err {rel:.3e} exceeds 1e-12");
+    }
+
+    #[test]
+    fn wgpu_reduce_f64_max() {
+        let dev = wgpu_device();
+        let vals: Vec<f64> = vec![1.5, -2.5, 3.0, -4.0, 0.0, 100.0, -50.0, 7.0];
+        let shape = vec![2, 4];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.max(1).unwrap();
+        let got: Vec<f64> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![3.0, 100.0], "f64 max over dim 1");
+    }
+
+    #[test]
+    fn wgpu_reduce_f64_min() {
+        let dev = wgpu_device();
+        let vals: Vec<f64> = vec![1.5, -2.5, 3.0, -4.0, 0.0, 100.0, -50.0, 7.0];
+        let shape = vec![2, 4];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.min(1).unwrap();
+        let got: Vec<f64> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![-4.0, -50.0], "f64 min over dim 1");
+    }
+
+    #[test]
+    fn wgpu_reduce_f64_argmax() {
+        let dev = wgpu_device();
+        let vals: Vec<f64> = vec![1.0, 5.0, 3.0, 5.0, 2.0];
+        let shape = vec![1, 5];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.argmax(1).unwrap();
+        let got: Vec<u32> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![1], "f64 argmax tie: first-index-wins");
+
+        let cpu_dev = &crate::Device::Cpu;
+        let cpu_t = crate::Tensor::from_vec(vals, shape, cpu_dev).unwrap();
+        let cpu_r = cpu_t.argmax(1).unwrap();
+        let cpu_got: Vec<u32> = cpu_r.to_vec1().unwrap();
+        assert_eq!(got, cpu_got, "f64 argmax must match CPU exactly");
+    }
+
+    #[test]
+    fn wgpu_reduce_f64_argmin() {
+        let dev = wgpu_device();
+        let vals: Vec<f64> = vec![3.0, 1.0, 4.0, 1.0, 5.0];
+        let shape = vec![1, 5];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.argmin(1).unwrap();
+        let got: Vec<u32> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![1], "f64 argmin tie: first-index-wins");
+
+        let cpu_dev = &crate::Device::Cpu;
+        let cpu_t = crate::Tensor::from_vec(vals, shape, cpu_dev).unwrap();
+        let cpu_r = cpu_t.argmin(1).unwrap();
+        let cpu_got: Vec<u32> = cpu_r.to_vec1().unwrap();
+        assert_eq!(got, cpu_got, "f64 argmin must match CPU exactly");
+    }
+
+    #[test]
+    fn wgpu_reduce_f64_2d_dim0() {
+        let dev = wgpu_device();
+        let vals: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let shape = vec![2, 3];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.sum_keepdim(0).unwrap();
+        let got: Vec<f64> = result.flatten_all().unwrap().to_vec1().unwrap();
+        assert!((got[0] - 5.0).abs() < 1e-12);
+        assert!((got[1] - 7.0).abs() < 1e-12);
+        assert!((got[2] - 9.0).abs() < 1e-12);
+        assert_eq!(result.dims().to_vec(), vec![1, 3], "keepdim shape");
+    }
+
+    #[test]
+    fn wgpu_reduce_f64_2d_dim1() {
+        let dev = wgpu_device();
+        let vals: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let shape = vec![2, 3];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.sum_keepdim(1).unwrap();
+        let got: Vec<f64> = result.flatten_all().unwrap().to_vec1().unwrap();
+        assert!((got[0] - 6.0).abs() < 1e-12);
+        assert!((got[1] - 15.0).abs() < 1e-12);
+        assert_eq!(result.dims().to_vec(), vec![2, 1], "keepdim shape");
     }
 }

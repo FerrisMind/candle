@@ -29,6 +29,27 @@ fn fp8e4m3_to_f16(bits: u32) -> u32 {
     return sign | exponent | mantissa;
 }
 
+fn f16_bits_to_f32_bits(h: u32) -> u32 {
+    // Deterministic f16 -> f32 bit expansion (no float conversion, NaN-safe).
+    // fp8e4m3_to_f16 already normalizes subnormals, so exp==0 implies zero.
+    let sign = (h & 0x8000u) << 16u;
+    let exp = (h >> 10u) & 0x1Fu;
+    let man = h & 0x03FFu;
+    // fp8e4m3_to_f16 normalizes fp8 subnormals, so f16 exp==0 implies zero.
+    if exp == 0u {
+        return sign;
+    }
+    if exp == 0x1Fu {
+        if man == 0u {
+            return sign | 0x7F800000u; // Inf
+        }
+        // Canonical f32 NaN (matches CUDA fp8->float conversion semantics).
+        return 0x7FC00000u;
+    }
+    // Re-bias exponent: f16 bias 15 -> f32 bias 127 (+112).
+    return sign | ((exp + 112u) << 23u) | (man << 13u);
+}
+
 fn f32_to_fp8e4m3(v: f32) -> u32 {
     let bits = bitcast<u32>(v);
     let sign_bit = (bits >> 31u) & 1u;
@@ -79,7 +100,9 @@ fn f32_to_fp8e4m3(v: f32) -> u32 {
         return result | (sign_bit << 7u);
     }
 
-    if target_exp >= 15i {
+    // e4m3 exponent field max is 15 (biased): values up to 448 are legal.
+    // Only target_exp > 15 (i.e. >= 16) overflows and saturates to 0x7E.
+    if target_exp >= 16i {
         return 0x7Eu | (sign_bit << 7u);
     }
 
@@ -122,24 +145,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if base >= params.ne { return; }
     let word = src[wi];
     if base < params.ne {
-        let b0 = fp8e4m3_to_f16(word & 0xFFu);
-        let packed0 = b0 | (b0 << 16u);
-        dst[base] = bitcast<u32>(unpack2x16float(packed0)[0]);
+        dst[base] = f16_bits_to_f32_bits(fp8e4m3_to_f16(word & 0xFFu));
     }
     if base + 1u < params.ne {
-        let b1 = fp8e4m3_to_f16((word >> 8u) & 0xFFu);
-        let packed1 = b1 | (b1 << 16u);
-        dst[base + 1u] = bitcast<u32>(unpack2x16float(packed1)[0]);
+        dst[base + 1u] = f16_bits_to_f32_bits(fp8e4m3_to_f16((word >> 8u) & 0xFFu));
     }
     if base + 2u < params.ne {
-        let b2 = fp8e4m3_to_f16((word >> 16u) & 0xFFu);
-        let packed2 = b2 | (b2 << 16u);
-        dst[base + 2u] = bitcast<u32>(unpack2x16float(packed2)[0]);
+        dst[base + 2u] = f16_bits_to_f32_bits(fp8e4m3_to_f16((word >> 16u) & 0xFFu));
     }
     if base + 3u < params.ne {
-        let b3 = fp8e4m3_to_f16((word >> 24u) & 0xFFu);
-        let packed3 = b3 | (b3 << 16u);
-        dst[base + 3u] = bitcast<u32>(unpack2x16float(packed3)[0]);
+        dst[base + 3u] = f16_bits_to_f32_bits(fp8e4m3_to_f16((word >> 24u) & 0xFFu));
     }
 }
 #endif
