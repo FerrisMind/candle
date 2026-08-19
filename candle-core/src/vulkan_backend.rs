@@ -8,7 +8,7 @@ use gpu_allocator::vulkan::{
 };
 use gpu_allocator::MemoryLocation;
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::trace_span;
@@ -525,6 +525,13 @@ struct VulkanInner {
     reusable_compute_submissions: Mutex<Vec<VulkanSubmissionResources>>,
     reusable_transfer_submissions: Mutex<Vec<VulkanSubmissionResources>>,
     deferred_buffer_frees: Mutex<Vec<VulkanDeferredBuffer>>,
+    /// Pool of reusable upload staging buffers, keyed by size class (power-of-two).
+    upload_staging_pool: Mutex<HashMap<usize, Vec<Arc<VulkanBuffer>>>>,
+    /// Pool of reusable readback staging buffers, keyed by size class (power-of-two).
+    readback_staging_pool: Mutex<HashMap<usize, Vec<Arc<VulkanBuffer>>>>,
+    /// Staging buffers whose GPU references have been released and are pending
+    /// return to the pool (drained during cleanup).
+    staging_pending_return: Mutex<Vec<Arc<VulkanBuffer>>>,
 }
 
 impl VulkanDevice {
@@ -814,12 +821,21 @@ impl std::fmt::Debug for VulkanInner {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingKind {
+    None,
+    Upload,
+    Readback,
+}
+
 #[derive(Debug)]
 struct VulkanBuffer {
     device: VulkanDevice,
     buffer: vk::Buffer,
     allocation: Mutex<Option<Allocation>>,
     size: usize,
+    is_staging: bool,
+    staging_kind: StagingKind,
 }
 
 #[derive(Debug, Clone)]
@@ -1351,6 +1367,10 @@ impl VulkanDevice {
         Self::MAX_ALLOCATED_DESCRIPTOR_SETS_PER_BATCH * Self::SUBMISSION_DESCRIPTOR_CAPACITY;
     const MAX_BATCH_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
     const MAX_BATCH_COMPUTE_BYTES: usize = 512 * 1024 * 1024;
+    /// Maximum number of deferred buffer frees before forcing a drain.
+    const MAX_DEFERRED_BUFFER_FREES: usize = 256;
+    /// Maximum number of staging buffers per size class in the pool.
+    const MAX_STAGING_PER_SIZE_CLASS: usize = 32;
 
     fn copy_queue_and_family(
         &self,
@@ -1545,7 +1565,7 @@ impl VulkanDevice {
             transfer_bytes: 0,
             compute_bytes: 0,
             retained_buffers: Vec::new(),
-            cached_descriptor_sets: HashMap::new(),
+            cached_descriptor_sets: HashMap::default(),
         })
     }
 
@@ -1765,6 +1785,8 @@ impl VulkanDevice {
         name: &'static str,
         usage: vk::BufferUsageFlags,
         location: MemoryLocation,
+        is_staging: bool,
+        staging_kind: StagingKind,
     ) -> Result<Arc<VulkanBuffer>> {
         self.cleanup_pending_submissions(false)?;
         let mut info = vk::BufferCreateInfo::default()
@@ -1836,6 +1858,8 @@ impl VulkanDevice {
             buffer,
             allocation: Mutex::new(Some(allocation)),
             size,
+            is_staging,
+            staging_kind,
         }))
     }
 
@@ -1848,24 +1872,126 @@ impl VulkanDevice {
                 | vk::BufferUsageFlags::TRANSFER_SRC
                 | vk::BufferUsageFlags::TRANSFER_DST,
             MemoryLocation::GpuOnly,
+            false,
+            StagingKind::None,
         )
     }
 
+    /// Power-of-two size class for staging buffer pooling.
+    fn staging_size_class(size: usize) -> usize {
+        if size == 0 {
+            return 0;
+        }
+        size.next_power_of_two()
+    }
+
+    /// Try to get a staging buffer from the pool, or create a new one.
+    fn acquire_staging_buffer(
+        &self,
+        size: usize,
+        name: &'static str,
+        usage: vk::BufferUsageFlags,
+        location: MemoryLocation,
+        staging_kind: StagingKind,
+    ) -> Result<Arc<VulkanBuffer>> {
+        let size_class = Self::staging_size_class(size);
+        let pool = match staging_kind {
+            StagingKind::Upload => &self.inner.upload_staging_pool,
+            StagingKind::Readback => &self.inner.readback_staging_pool,
+            StagingKind::None => {
+                return self.create_buffer_with_location(
+                    size, name, usage, location, false, StagingKind::None,
+                );
+            }
+        };
+        // Try to pop from pool
+        {
+            let mut pool = pool.lock().map_err(|e| Error::wrap(e.to_string()))?;
+            if let Some(entry) = pool.get_mut(&size_class) {
+                if let Some(buf) = entry.pop() {
+                    return Ok(buf);
+                }
+            }
+        }
+        // Pool miss: create a new buffer with the requested size (not size_class)
+        // to avoid allocating more than needed.
+        self.create_buffer_with_location(size, name, usage, location, true, staging_kind)
+    }
+
+    /// Drain the staging pending return list into the free pools.
+    fn drain_staging_pending(&self) -> Result<()> {
+        let pending = {
+            let mut pending = self
+                .inner
+                .staging_pending_return
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            std::mem::take(&mut *pending)
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        for buf in pending {
+            let size_class = Self::staging_size_class(buf.size);
+            let pool = match buf.staging_kind {
+                StagingKind::Upload => &self.inner.upload_staging_pool,
+                StagingKind::Readback => &self.inner.readback_staging_pool,
+                StagingKind::None => {
+                    // Not a staging buffer, defer free
+                    if let Ok(mut alloc) = buf.allocation.lock() {
+                        if let Some(allocation) = alloc.take() {
+                            if let Ok(mut deferred) =
+                                self.inner.deferred_buffer_frees.lock()
+                            {
+                                deferred.push(VulkanDeferredBuffer {
+                                    buffer: buf.buffer,
+                                    allocation,
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+            let mut pool = pool.lock().map_err(|e| Error::wrap(e.to_string()))?;
+            let entry = pool.entry(size_class).or_default();
+            if entry.len() < Self::MAX_STAGING_PER_SIZE_CLASS {
+                entry.push(buf);
+            } else {
+                // Pool full: defer free instead
+                drop(pool);
+                if let Ok(mut alloc) = buf.allocation.lock() {
+                    if let Some(allocation) = alloc.take() {
+                        if let Ok(mut deferred) = self.inner.deferred_buffer_frees.lock() {
+                            deferred.push(VulkanDeferredBuffer {
+                                buffer: buf.buffer,
+                                allocation,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn create_upload_staging_buffer(&self, size: usize) -> Result<Arc<VulkanBuffer>> {
-        self.create_buffer_with_location(
+        self.acquire_staging_buffer(
             size,
             "candle-vulkan-upload-staging",
             vk::BufferUsageFlags::TRANSFER_SRC,
             MemoryLocation::CpuToGpu,
+            StagingKind::Upload,
         )
     }
 
     fn create_readback_staging_buffer(&self, size: usize) -> Result<Arc<VulkanBuffer>> {
-        self.create_buffer_with_location(
+        self.acquire_staging_buffer(
             size,
             "candle-vulkan-readback-staging",
             vk::BufferUsageFlags::TRANSFER_DST,
             MemoryLocation::GpuToCpu,
+            StagingKind::Readback,
         )
     }
 
@@ -1991,7 +2117,66 @@ impl VulkanDevice {
                 .map_err(|e| Error::wrap(e.to_string()))?
                 .is_none();
         if pending_empty && active_batches_empty {
+            self.drain_staging_pending()?;
             self.destroy_deferred_buffers()?;
+        } else {
+            // Always drain staging pending when we can
+            self.drain_staging_pending()?;
+            // Cap check: if deferred list is too large, force drain
+            let deferred_exceeded = {
+                self.inner
+                    .deferred_buffer_frees
+                    .lock()
+                    .map_err(|e| Error::wrap(e.to_string()))?
+                    .len()
+                    > Self::MAX_DEFERRED_BUFFER_FREES
+            };
+            if deferred_exceeded {
+                // Force-wait: drain all remaining pending submissions
+                if !wait {
+                    let mut pending = self
+                        .inner
+                        .pending_submissions
+                        .lock()
+                        .map_err(|e| Error::wrap(e.to_string()))?;
+                    let remaining: Vec<_> = pending.drain(..).collect();
+                    drop(pending);
+                    for submission in remaining {
+                        unsafe {
+                            self.inner
+                                .device
+                                .wait_for_fences(
+                                    std::slice::from_ref(&submission.resources.fence),
+                                    true,
+                                    u64::MAX,
+                                )
+                                .map_err(Error::wrap)?;
+                        }
+                        drop(submission.retained_buffers);
+                        self.recycle_submission_resources(
+                            submission.queue_kind,
+                            submission.resources,
+                        )?;
+                    }
+                }
+                // Now drain staging pending and destroy deferred
+                self.drain_staging_pending()?;
+                self.destroy_deferred_buffers()?;
+                // Verify cap is now satisfied
+                let still_exceeded = self
+                    .inner
+                    .deferred_buffer_frees
+                    .lock()
+                    .map_err(|e| Error::wrap(e.to_string()))?
+                    .len()
+                    > Self::MAX_DEFERRED_BUFFER_FREES;
+                if still_exceeded {
+                    return Err(Error::Msg(
+                        "vulkan: deferred buffer cap still exceeded after force drain".to_string(),
+                    )
+                    .bt());
+                }
+            }
         }
         Ok(())
     }
@@ -8063,6 +8248,23 @@ impl Drop for VulkanBuffer {
     fn drop(&mut self) {
         if let Ok(mut allocation) = self.allocation.lock() {
             if let Some(allocation) = allocation.take() {
+                if self.is_staging {
+                    // Return to staging pending list instead of deferred free
+                    if let Ok(mut pending) =
+                        self.device.inner.staging_pending_return.lock()
+                    {
+                        let buf = Arc::new(VulkanBuffer {
+                            device: self.device.clone(),
+                            buffer: self.buffer,
+                            allocation: Mutex::new(Some(allocation)),
+                            size: self.size,
+                            is_staging: true,
+                            staging_kind: self.staging_kind,
+                        });
+                        pending.push(buf);
+                        return;
+                    }
+                }
                 if let Ok(mut deferred) = self.device.inner.deferred_buffer_frees.lock() {
                     deferred.push(VulkanDeferredBuffer {
                         buffer: self.buffer,
@@ -8166,6 +8368,35 @@ impl Drop for VulkanInner {
                         for deferred in deferred.drain(..) {
                             self.device.destroy_buffer(deferred.buffer, None);
                             let _ = allocator.free(deferred.allocation);
+                        }
+                    }
+                }
+            }
+            // Drain staging pools: destroy all pooled staging buffers
+            if let Ok(mut allocator) = self.allocator.lock() {
+                if let Some(allocator) = allocator.as_mut() {
+                    if let Ok(mut pending) = self.staging_pending_return.lock() {
+                        for buf in pending.drain(..) {
+                            if let Ok(mut alloc) = buf.allocation.lock() {
+                                if let Some(allocation) = alloc.take() {
+                                    self.device.destroy_buffer(buf.buffer, None);
+                                    let _ = allocator.free(allocation);
+                                }
+                            }
+                        }
+                    }
+                    for pool in [&self.upload_staging_pool, &self.readback_staging_pool] {
+                        if let Ok(mut pool) = pool.lock() {
+                            for (_, bufs) in pool.drain() {
+                                for buf in bufs {
+                                    if let Ok(mut alloc) = buf.allocation.lock() {
+                                        if let Some(allocation) = alloc.take() {
+                                            self.device.destroy_buffer(buf.buffer, None);
+                                            let _ = allocator.free(allocation);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -9414,13 +9645,16 @@ impl BackendDevice for VulkanDevice {
                 transfer_queue,
                 allocator: Mutex::new(Some(allocator)),
                 seed_value: RwLock::new(299_792_458),
-                pipeline_cache: Mutex::new(HashMap::new()),
+                pipeline_cache: Mutex::new(HashMap::default()),
                 pending_submissions: Mutex::new(Vec::new()),
                 active_compute_batch: Mutex::new(None),
                 active_transfer_batch: Mutex::new(None),
                 reusable_compute_submissions: Mutex::new(Vec::new()),
                 reusable_transfer_submissions: Mutex::new(Vec::new()),
                 deferred_buffer_frees: Mutex::new(Vec::new()),
+                upload_staging_pool: Mutex::new(HashMap::default()),
+                readback_staging_pool: Mutex::new(HashMap::default()),
+                staging_pending_return: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -10753,6 +10987,69 @@ mod tests {
             other => crate::bail!("unexpected dtype: {other:?}"),
         };
         assert_eq!(got, expected);
+    /// Test that the deferred buffer cap prevents unbounded growth.
+    /// Allocates many small tensors without synchronizing, then verifies
+    /// the device is still healthy after the cleanup path drains.
+    #[test]
+    #[ignore]
+    fn vulkan_perf_deferred_cap() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        // Allocate and drop many small tensors without explicit synchronize.
+        // This exercises the deferred buffer free path and the cap logic.
+        let n = 1200usize;
+        for i in 0..n {
+            let vals = vec![i as f32; 64];
+            let storage = device.storage_from_cpu_storage(&CpuStorage::F32(vals))?;
+            // Drop storage immediately — buffer goes to deferred list
+            drop(storage);
+            // Periodically allow cleanup to drain some deferred buffers
+            if i % 200 == 0 {
+                device.synchronize_pending()?;
+            }
+        }
+        // Final synchronize: all deferred buffers should be drained
+        device.synchronize_pending()?;
+        // Verify device is still healthy: allocate and read back
+        let vals = vec![42.0f32; 64];
+        let storage = device.storage_from_cpu_storage(&CpuStorage::F32(vals))?;
+        let cpu = storage.to_cpu_storage()?;
+        match cpu {
+            CpuStorage::F32(v) => {
+                assert_eq!(v.len(), 64);
+                for &x in &v {
+                    assert!((x - 42.0f32).abs() < 1e-6);
+                }
+            }
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Test that the staging buffer pool correctly reuses buffers without
+    /// data corruption across many write/read cycles.
+    #[test]
+    #[ignore]
+    fn vulkan_perf_staging_pool() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        // Perform many write_buffer/read_buffer cycles with the same buffer.
+        let n_cycles = 200usize;
+        let buf_size = 4096usize;
+        let buffer = device.create_buffer(buf_size, "candle-vulkan-pool-test")?;
+        for i in 0..n_cycles {
+            let pattern = ((i as u8)..(i as u8).wrapping_add(buf_size as u8))
+                .collect::<Vec<u8>>();
+            device.write_buffer(&buffer, &pattern)?;
+            let readback = device.read_buffer(&buffer)?;
+            assert_eq!(readback.len(), buf_size);
+            for (j, &byte) in readback.iter().enumerate() {
+                let expected = (i as u8).wrapping_add(j as u8);
+                assert_eq!(
+                    byte, expected,
+                    "staging pool corruption at cycle {}, byte {}: got {}, expected {}",
+                    i, j, byte, expected
+                );
+            }
+        }
         Ok(())
     }
 }
