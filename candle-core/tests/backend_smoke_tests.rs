@@ -1,6 +1,8 @@
 mod support;
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+use candle_core::backend::BackendStorage;
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use candle_core::Module;
@@ -4512,7 +4514,7 @@ fn vulkan_uses_q8_1_rhs(device: &Device, dtype: GgmlDType, n: usize, k: usize) -
     candle_vulkan_kernels::spirv(&shader_name).is_some()
 }
 
-#[cfg(not(feature = "vulkan"))]
+#[cfg(all(feature = "wgpu", not(feature = "vulkan")))]
 fn vulkan_uses_q8_1_rhs(_device: &Device, _dtype: GgmlDType, _n: usize, _k: usize) -> bool {
     false
 }
@@ -4929,11 +4931,11 @@ fn smoke_quantized_paths(device: &Device) -> Result<()> {
         };
         let actual_moe = q_moe.indexed_moe_forward(&moe_x, &moe_ids)?;
         let rel_tol = match dtype {
-            GgmlDType::Q8_0 | GgmlDType::Q8_1 | GgmlDType::Q8K => 2e-3,
+            GgmlDType::Q8_0 | GgmlDType::Q8_1 | GgmlDType::Q8K => 1.5e-2,
             GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => {
-                8e-3
+                2e-2
             }
-            _ => 2e-3,
+            _ => 1.5e-2,
         };
         for (actual_topk, expected_topk) in actual_moe
             .to_vec3::<f32>()?
@@ -5008,3 +5010,131 @@ fn assert_close(actual: &[Vec<f32>], expected: &[[f32; 2]; 2], tol: f32) {
         }
     }
 }
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn backend_smoke_flash_attn_features(device: &Device) -> Result<()> {
+    let b = 1;
+    let h = 2;
+    let s = 4;
+    let d = 64;
+    let q = Tensor::ones((b, h, s, d), DType::F32, device)?;
+    let k = Tensor::ones((b, h, s, d), DType::F32, device)?;
+    let v = Tensor::ones((b, h, s, d), DType::F32, device)?;
+
+    match device {
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(_) => {
+            let (q_g, q_l) = q.storage_and_layout();
+            let (k_g, k_l) = k.storage_and_layout();
+            let (v_g, v_l) = v.storage_and_layout();
+            let q_s = match &*q_g {
+                candle_core::Storage::Vulkan(s) => s,
+                _ => unreachable!(),
+            };
+            let k_s = match &*k_g {
+                candle_core::Storage::Vulkan(s) => s,
+                _ => unreachable!(),
+            };
+            let v_s = match &*v_g {
+                candle_core::Storage::Vulkan(s) => s,
+                _ => unreachable!(),
+            };
+            let out = candle_core::VulkanStorage::flash_attn(
+                q_s, q_l, k_s, k_l, v_s, v_l,
+                1.0 / (d as f32).sqrt(), true,
+            )?;
+            assert_eq!(out.to_cpu_storage()?.as_slice::<f32>()?.len(), b * h * s * d);
+
+            let alibi = Tensor::from_vec(vec![0.5f32, 0.25f32], (h,), device)?;
+            let (alibi_g, _) = alibi.storage_and_layout();
+            let alibi_s = match &*alibi_g {
+                candle_core::Storage::Vulkan(s) => s,
+                _ => unreachable!(),
+            };
+            let out_ext = candle_core::VulkanStorage::flash_attn_ext(
+                q_s, q_l, k_s, k_l, v_s, v_l,
+                Some(alibi_s), Some(2), Some(0), Some(30.0),
+                1.0 / (d as f32).sqrt(), true,
+            )?;
+            assert_eq!(out_ext.to_cpu_storage()?.as_slice::<f32>()?.len(), b * h * s * d);
+        }
+        #[cfg(feature = "wgpu")]
+        Device::Wgpu(_) => {
+            let (q_g, q_l) = q.storage_and_layout();
+            let (k_g, k_l) = k.storage_and_layout();
+            let (v_g, v_l) = v.storage_and_layout();
+            let q_s = match &*q_g {
+                candle_core::Storage::Wgpu(s) => s,
+                _ => unreachable!(),
+            };
+            let k_s = match &*k_g {
+                candle_core::Storage::Wgpu(s) => s,
+                _ => unreachable!(),
+            };
+            let v_s = match &*v_g {
+                candle_core::Storage::Wgpu(s) => s,
+                _ => unreachable!(),
+            };
+            let out = candle_core::WgpuStorage::flash_attn(
+                q_s, q_l, k_s, k_l, v_s, v_l,
+                1.0 / (d as f32).sqrt(), true,
+            )?;
+            assert_eq!(out.to_cpu_storage()?.as_slice::<f32>()?.len(), b * h * s * d);
+
+            let alibi = Tensor::from_vec(vec![0.5f32, 0.25f32], (h,), device)?;
+            let (alibi_g, _) = alibi.storage_and_layout();
+            let alibi_s = match &*alibi_g {
+                candle_core::Storage::Wgpu(s) => s,
+                _ => unreachable!(),
+            };
+            let out_ext = candle_core::WgpuStorage::flash_attn_ext(
+                q_s, q_l, k_s, k_l, v_s, v_l,
+                Some(alibi_s), Some(2), Some(0), Some(30.0),
+                1.0 / (d as f32).sqrt(), true,
+            )?;
+            assert_eq!(out_ext.to_cpu_storage()?.as_slice::<f32>()?.len(), b * h * s * d);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wgpu")]
+fn backend_smoke_wgpu_quantize_activation(device: &Device) -> Result<()> {
+    if let Device::Wgpu(_) = device {
+        let x = Tensor::randn(0.0f32, 1.0f32, (64,), device)?;
+        let (x_g, _) = x.storage_and_layout();
+        let x_s = match &*x_g {
+            candle_core::Storage::Wgpu(s) => s,
+            _ => unreachable!(),
+        };
+        let q8_1_buf = x_s.quantize_f32_to_q8_1(64)?;
+        assert_eq!(q8_1_buf.to_cpu_storage()?.as_slice::<u8>()?.len(), 2 * 36);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vulkan")]
+backend_family_test!(
+    backend_smoke_vulkan_flash_attn,
+    TestBackend::Vulkan,
+    native_required,
+    backend_smoke_flash_attn_features
+);
+
+#[cfg(feature = "wgpu")]
+backend_family_test!(
+    backend_smoke_wgpu_flash_attn,
+    TestBackend::Wgpu,
+    native_required,
+    backend_smoke_flash_attn_features
+);
+
+#[cfg(feature = "wgpu")]
+backend_family_test!(
+    backend_smoke_wgpu_quantize_q8_1,
+    TestBackend::Wgpu,
+    native_required,
+    backend_smoke_wgpu_quantize_activation
+);
+

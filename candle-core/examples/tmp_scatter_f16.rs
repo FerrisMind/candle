@@ -1,11 +1,11 @@
 // quick f16 scatter_add parity
-use candle::{DType, Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 
 fn main() -> Result<()> {
     let dev = Device::new_vulkan(0)?;
     // dim=0 scatter like deepstack: (rows, cols)
-    let dst = Tensor::zeros((4, 4), DType::F16, &dev)?;
-    let ids = Tensor::from_slice(
+    let _dst = Tensor::zeros((4, 4), DType::F16, &dev)?;
+    let _ids = Tensor::from_slice(
         &[1u32, 1u32, 3u32, 0u32, 2u32, 2u32, 1u32, 3u32],
         (2, 4),
         &dev,
