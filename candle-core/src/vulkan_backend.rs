@@ -493,6 +493,8 @@ struct VulkanInner {
     physical_device: vk::PhysicalDevice,
     vendor_id: u32,
     integer_dot_product: bool,
+    /// shaderFloat64 feature enabled; required for native F64 compute.
+    shader_float64: bool,
     /// VK_KHR_cooperative_matrix enabled (tensor-core style GEMM shaders).
     cooperative_matrix: bool,
     subgroup_arithmetic: bool,
@@ -536,6 +538,11 @@ impl VulkanDevice {
 
     pub fn integer_dot_product_supported(&self) -> bool {
         self.inner.integer_dot_product
+    }
+
+    /// Returns true when the physical device exposes `shaderFloat64`.
+    pub fn shader_float64_supported(&self) -> bool {
+        self.inner.shader_float64
     }
 
     pub fn subgroup_arithmetic_supported(&self) -> bool {
@@ -2851,6 +2858,32 @@ fn binary_int_opcode(op: &str) -> Result<i32> {
     }
 }
 
+/// Map a `UnaryOpT::NAME` to the opcode used by `unary_f64.comp`.
+fn f64_unary_opcode(op: &str) -> Result<f32> {
+    match op {
+        "exp" => Ok(0.0),
+        "log" => Ok(1.0),
+        "sin" => Ok(2.0),
+        "cos" => Ok(3.0),
+        "abs" => Ok(4.0),
+        "neg" => Ok(5.0),
+        "recip" => Ok(6.0),
+        "sqr" => Ok(7.0),
+        "sqrt" => Ok(8.0),
+        "gelu" => Ok(9.0),
+        "gelu_erf" => Ok(10.0),
+        "erf" => Ok(11.0),
+        "relu" => Ok(12.0),
+        "silu" => Ok(13.0),
+        "tanh" => Ok(14.0),
+        "floor" => Ok(15.0),
+        "ceil" => Ok(16.0),
+        "round" => Ok(17.0),
+        "sign" => Ok(18.0),
+        _ => Err(unsupported("f64 unary")),
+    }
+}
+
 fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
     let name = match (src, dst) {
         (DType::F32, DType::F32) => "cpy_f32_f32",
@@ -3724,6 +3757,113 @@ impl VulkanStorage {
         Ok(dst)
     }
 
+    /// F64 comparison dispatch using `cmp_f64.comp`.
+    fn run_cmp_f64(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        op: CmpOp,
+    ) -> Result<Self> {
+        if rhs.dtype != DType::F64 {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan f64 cmp").bt());
+        }
+        self.device
+            .same_device(&rhs.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: rhs.device.location(),
+                    op: "cmp",
+                }
+                .bt()
+            })?;
+        if lhs_layout.dims().len() > 4 || rhs_layout.dims().len() > 4 {
+            let (lhs, lhs_layout) = if lhs_layout.dims().len() > 4 {
+                self.materialize_rank_gt4_compact(lhs_layout)?
+            } else if lhs_layout.start_offset() == 0 {
+                (self.try_clone(lhs_layout)?, lhs_layout.clone())
+            } else {
+                let mut tmp = unsafe { self.device.alloc_uninit(lhs_layout.shape(), DType::F64)? };
+                <Self as BackendStorage>::copy_strided_src(self, &mut tmp, 0, lhs_layout)?;
+                (tmp, Layout::contiguous(lhs_layout.shape().clone()))
+            };
+            let (rhs, rhs_layout) = if rhs_layout.dims().len() > 4 {
+                rhs.materialize_rank_gt4_compact(rhs_layout)?
+            } else if rhs_layout.start_offset() == 0 {
+                (rhs.try_clone(rhs_layout)?, rhs_layout.clone())
+            } else {
+                let mut tmp = unsafe { rhs.device.alloc_uninit(rhs_layout.shape(), DType::F64)? };
+                <Self as BackendStorage>::copy_strided_src(rhs, &mut tmp, 0, rhs_layout)?;
+                (tmp, Layout::contiguous(rhs_layout.shape().clone()))
+            };
+            return lhs.run_cmp_f64(&rhs, &lhs_layout, &rhs_layout, op);
+        }
+        let (lhs_tmp, lhs_layout) = if lhs_layout.start_offset() == 0 {
+            (None, lhs_layout.clone())
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(lhs_layout.shape(), DType::F64)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut tmp, 0, lhs_layout)?;
+            (Some(tmp), Layout::contiguous(lhs_layout.shape().clone()))
+        };
+        let lhs = lhs_tmp.as_ref().unwrap_or(self);
+        let (rhs_tmp, rhs_layout) = if rhs_layout.start_offset() == 0 {
+            (None, rhs_layout.clone())
+        } else {
+            let mut tmp = unsafe { rhs.device.alloc_uninit(rhs_layout.shape(), DType::F64)? };
+            <Self as BackendStorage>::copy_strided_src(rhs, &mut tmp, 0, rhs_layout)?;
+            (Some(tmp), Layout::contiguous(rhs_layout.shape().clone()))
+        };
+        let rhs = rhs_tmp.as_ref().unwrap_or(rhs);
+        let (lhs_dims, lhs_strides) = dims4_ggml(&lhs_layout)?;
+        let (rhs_dims, rhs_strides) = dims4_ggml(&rhs_layout)?;
+        let count = lhs_layout.shape().elem_count();
+        let dst = unsafe { self.device.alloc_uninit(lhs_layout.shape(), DType::U8)? };
+        let params = GgmlBinaryParams {
+            ne: count.try_into()?,
+            ne00: lhs_dims[0],
+            ne01: lhs_dims[1],
+            ne02: lhs_dims[2],
+            ne03: lhs_dims[3],
+            nb00: lhs_strides[0],
+            nb01: lhs_strides[1],
+            nb02: lhs_strides[2],
+            nb03: lhs_strides[3],
+            ne10: rhs_dims[0],
+            ne11: rhs_dims[1],
+            ne12: rhs_dims[2],
+            ne13: rhs_dims[3],
+            nb10: rhs_strides[0],
+            nb11: rhs_strides[1],
+            nb12: rhs_strides[2],
+            nb13: rhs_strides[3],
+            ne20: lhs_dims[0],
+            ne21: lhs_dims[1],
+            ne22: lhs_dims[2],
+            ne23: lhs_dims[3],
+            nb20: 1,
+            nb21: lhs_dims[0],
+            nb22: lhs_dims[0] * lhs_dims[1],
+            nb23: lhs_dims[0] * lhs_dims[1] * lhs_dims[2],
+            misalign_offsets: 0,
+            param1: 0.0,
+            param2: 0.0,
+            param3: cmp_opcode(op),
+        };
+        let bindings = [
+            VulkanBinding::Storage(&lhs.buffer),
+            VulkanBinding::Storage(&rhs.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("cmp_f64")
+            .ok_or_else(|| Error::Msg("vulkan shader cmp_f64 not generated".into()).bt())?;
+        let workgroups = ggml_linear_workgroups(count)?;
+        self.device
+            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+        Ok(dst)
+    }
+
     fn run_where_u8_cond(
         &self,
         layout: &Layout,
@@ -3915,6 +4055,89 @@ impl VulkanStorage {
             VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv = binary_spirv(op, self.dtype)?;
+        let workgroups = ggml_linear_workgroups(count)?;
+        self.device
+            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+        Ok(dst)
+    }
+
+    /// F64 binary dispatch using `binary_f64.comp` (opcode-switched).
+    fn run_binary_f64(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        op: &'static str,
+    ) -> Result<Self> {
+        if rhs.dtype != DType::F64 {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan f64 binary").bt());
+        }
+        self.device
+            .same_device(&rhs.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: rhs.device.location(),
+                    op,
+                }
+                .bt()
+            })?;
+        if lhs_layout.start_offset() != 0
+            || rhs_layout.start_offset() != 0
+            || !lhs_layout.is_contiguous()
+            || !rhs_layout.is_contiguous()
+        {
+            let mut lhs_mat = unsafe { self.device.alloc_uninit(lhs_layout.shape(), DType::F64)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut lhs_mat, 0, lhs_layout)?;
+            let mut rhs_mat = unsafe { rhs.device.alloc_uninit(rhs_layout.shape(), DType::F64)? };
+            <Self as BackendStorage>::copy_strided_src(rhs, &mut rhs_mat, 0, rhs_layout)?;
+            let flat_l = Layout::contiguous(lhs_layout.shape());
+            let flat_r = Layout::contiguous(rhs_layout.shape());
+            return lhs_mat.run_binary_f64(&rhs_mat, &flat_l, &flat_r, op);
+        }
+        let (lhs_dims, lhs_strides) = dims4_ggml(lhs_layout)?;
+        let (rhs_dims, rhs_strides) = dims4_ggml(rhs_layout)?;
+        let count = lhs_layout.shape().elem_count();
+        let dst = unsafe { self.device.alloc_uninit(lhs_layout.shape(), DType::F64)? };
+        let params = GgmlBinaryParams {
+            ne: count.try_into()?,
+            ne00: lhs_dims[0],
+            ne01: lhs_dims[1],
+            ne02: lhs_dims[2],
+            ne03: lhs_dims[3],
+            nb00: lhs_strides[0],
+            nb01: lhs_strides[1],
+            nb02: lhs_strides[2],
+            nb03: lhs_strides[3],
+            ne10: rhs_dims[0],
+            ne11: rhs_dims[1],
+            ne12: rhs_dims[2],
+            ne13: rhs_dims[3],
+            nb10: rhs_strides[0],
+            nb11: rhs_strides[1],
+            nb12: rhs_strides[2],
+            nb13: rhs_strides[3],
+            ne20: lhs_dims[0],
+            ne21: lhs_dims[1],
+            ne22: lhs_dims[2],
+            ne23: lhs_dims[3],
+            nb20: 1,
+            nb21: lhs_dims[0],
+            nb22: lhs_dims[0] * lhs_dims[1],
+            nb23: lhs_dims[0] * lhs_dims[1] * lhs_dims[2],
+            misalign_offsets: 0,
+            param1: 0.0,
+            param2: 0.0,
+            param3: binary_int_opcode(op)?,
+        };
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&rhs.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("binary_f64")
+            .ok_or_else(|| Error::Msg("vulkan shader binary_f64 not generated".into()).bt())?;
         let workgroups = ggml_linear_workgroups(count)?;
         self.device
             .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
@@ -4389,6 +4612,201 @@ impl VulkanStorage {
         };
         let spirv = candle_vulkan_kernels::spirv(name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated")).bt())?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (rows.try_into()?, 1, 1),
+            Some(&[(0, self.device.inner.subgroup_size)]),
+        )?;
+        Ok(dst)
+    }
+
+    /// F64 last-dim reduction dispatch.
+    fn run_f64_reduce(
+        &self,
+        op: ReduceOp,
+        layout: &Layout,
+        reduce_dims: &[usize],
+    ) -> Result<Self> {
+        let rank = layout.dims().len();
+        if rank == 0 {
+            return self.try_clone(layout);
+        }
+        if reduce_dims.len() > 1 {
+            let mut current_layout = layout.clone();
+            let mut current_shape = layout.dims().to_vec();
+            let mut current: Option<Self> = None;
+            for &dim in reduce_dims {
+                let src = current.as_ref().unwrap_or(self);
+                let reduced = src.run_f64_reduce(op, &current_layout, &[dim])?;
+                current_shape[dim] = 1;
+                current_layout = Layout::contiguous(Shape::from(current_shape.clone()));
+                current = Some(reduced);
+            }
+            return match current {
+                Some(v) => Ok(v),
+                None => self.try_clone(layout),
+            };
+        }
+        let dim = reduce_dims[0];
+        if dim != rank - 1 {
+            // Permute the reduced dim to the last position, materialize
+            // contiguously on the GPU, then reduce the last dim.
+            let perm = (0..rank)
+                .filter(|&i| i != dim)
+                .chain(std::iter::once(dim))
+                .collect::<Vec<_>>();
+            let perm_shape = perm.iter().map(|&i| layout.dims()[i]).collect::<Vec<_>>();
+            let perm_stride = perm.iter().map(|&i| layout.stride()[i]).collect::<Vec<_>>();
+            let perm_layout = Layout::new(
+                Shape::from(perm_shape.clone()),
+                perm_stride,
+                layout.start_offset(),
+            );
+            let mut permuted = unsafe {
+                self.device
+                    .alloc_uninit(&Shape::from(perm_shape.clone()), DType::F64)?
+            };
+            <Self as BackendStorage>::copy_strided_src(self, &mut permuted, 0, &perm_layout)?;
+            let permuted_layout = Layout::contiguous(Shape::from(perm_shape));
+            return permuted.run_f64_reduce(op, &permuted_layout, &[rank - 1]);
+        }
+        // Last-dim reduction. Materialize contiguously if needed.
+        let mut materialized_storage;
+        let src;
+        let src_layout;
+        let contiguous_layout;
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            src = self;
+            src_layout = layout;
+        } else {
+            materialized_storage = unsafe { self.device.alloc_uninit(layout.shape(), DType::F64)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized_storage, 0, layout)?;
+            contiguous_layout = Layout::contiguous(layout.shape());
+            src = &materialized_storage;
+            src_layout = &contiguous_layout;
+        }
+        match op {
+            ReduceOp::Sum => src.run_f64_sum_rows(src_layout),
+            ReduceOp::Max => src.run_f64_extrema_last_dim(src_layout, 0),
+            ReduceOp::Min => src.run_f64_extrema_last_dim(src_layout, 1),
+            ReduceOp::ArgMax => src.run_f64_argextrema_last_dim(src_layout, 0),
+            ReduceOp::ArgMin => src.run_f64_argextrema_last_dim(src_layout, 1),
+        }
+    }
+
+    /// F64 last-dim sum reduction using `sum_rows_f64.comp`.
+    fn run_f64_sum_rows(&self, layout: &Layout) -> Result<Self> {
+        if layout.start_offset() > u16::MAX as usize {
+            return self.run_f64_sum_rows(&Layout::contiguous(layout.shape()));
+        }
+        let rank = layout.dims().len();
+        let (src_dims, src_strides) = dims4_ggml(layout)?;
+        let mut dst_dims_candle = layout.dims().to_vec();
+        dst_dims_candle[rank - 1] = 1;
+        let dst_shape = Shape::from(dst_dims_candle);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F64)? };
+
+        let mut dst_dims = src_dims;
+        dst_dims[0] = 1;
+        let dst_strides = contiguous_strides_ggml(dst_dims);
+        let rows = src_dims[1] * src_dims[2] * src_dims[3];
+        let (ne0_12mp, ne0_12l) = fastdiv_values(src_dims[1] * src_dims[2]);
+        let (ne0_1mp, ne0_1l) = fastdiv_values(src_dims[1]);
+        let params = IntSumRowsParams {
+            n_cols: src_dims[0],
+            ne01: src_dims[1],
+            ne02: src_dims[2],
+            nb01: src_strides[1],
+            nb02: src_strides[2],
+            nb03: src_strides[3],
+            nb11: dst_strides[1],
+            nb12: dst_strides[2],
+            nb13: dst_strides[3],
+            misalign_offsets: (layout.start_offset() as u32) << 16,
+            ne0_12mp,
+            ne0_12l,
+            ne0_1mp,
+            ne0_1l,
+        };
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("sum_rows_f64")
+            .ok_or_else(|| Error::Msg("vulkan shader sum_rows_f64 not generated".into()).bt())?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (rows, 1, 1),
+            Some(&[(0, self.device.inner.subgroup_size)]),
+        )?;
+        Ok(dst)
+    }
+
+    /// F64 last-dim extrema reduction using `reduce_extrema_f64.comp`.
+    fn run_f64_extrema_last_dim(&self, layout: &Layout, mode: u32) -> Result<Self> {
+        let rank = layout.dims().len();
+        if rank == 0 {
+            return self.try_clone(layout);
+        }
+        let kx = *layout.dims().last().unwrap_or(&1);
+        let mut dst_dims = layout.dims().to_vec();
+        dst_dims[rank - 1] = 1;
+        let dst_shape = Shape::from(dst_dims);
+        let rows = dst_shape.elem_count();
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F64)? };
+        let params = IntExtremaParams {
+            kx: kx.try_into()?,
+            ky: rows.try_into()?,
+            mode,
+            pad: 0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("reduce_extrema_f64")
+            .ok_or_else(|| Error::Msg("vulkan shader reduce_extrema_f64 not generated".into()).bt())?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (rows.try_into()?, 1, 1),
+            Some(&[(0, self.device.inner.subgroup_size)]),
+        )?;
+        Ok(dst)
+    }
+
+    /// F64 last-dim arg-extrema reduction using `argextrema_f64.comp`.
+    fn run_f64_argextrema_last_dim(&self, layout: &Layout, mode: u32) -> Result<Self> {
+        let rank = layout.dims().len();
+        if rank == 0 {
+            return Ok(unsafe {
+                self.device
+                    .alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)?
+            });
+        }
+        let kx = *layout.dims().last().unwrap_or(&1);
+        let mut dst_dims = layout.dims().to_vec();
+        dst_dims[rank - 1] = 1;
+        let dst_shape = Shape::from(dst_dims);
+        let rows = dst_shape.elem_count();
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::U32)? };
+        let params = IntExtremaParams {
+            kx: kx.try_into()?,
+            ky: rows.try_into()?,
+            mode,
+            pad: 0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("argextrema_f64")
+            .ok_or_else(|| Error::Msg("vulkan shader argextrema_f64 not generated".into()).bt())?;
         self.device.run_compute_specialized(
             spirv,
             &bindings,
@@ -7901,6 +8319,7 @@ impl BackendStorage for VulkanStorage {
             && self.dtype != DType::F16
             && self.dtype != DType::BF16
             && !int_dtype
+            && self.dtype != DType::F64
         {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan reduce").bt());
         }
@@ -7915,6 +8334,15 @@ impl BackendStorage for VulkanStorage {
             if dim >= rank {
                 crate::bail!("vulkan backend op reduce got out-of-range dim {dim} for rank {rank}")
             }
+        }
+        if self.dtype == DType::F64 {
+            if !self.device.shader_float64_supported() {
+                return Err(Error::Msg(
+                    "vulkan F64 reduce requires shaderFloat64 device feature".into(),
+                )
+                .bt());
+            }
+            return self.run_f64_reduce(op, layout, reduce_dims);
         }
         if int_dtype {
             return self.run_int_reduce(op, layout, reduce_dims);
@@ -8005,6 +8433,15 @@ impl BackendStorage for VulkanStorage {
         if self.dtype == DType::BF16 {
             return self.bf16_cmp_via_f32(rhs, lhs_l, rhs_l, op);
         }
+        if self.dtype == DType::F64 {
+            if !self.device.shader_float64_supported() {
+                return Err(Error::Msg(
+                    "vulkan F64 cmp requires shaderFloat64 device feature".into(),
+                )
+                .bt());
+            }
+            return self.run_cmp_f64(rhs, lhs_l, rhs_l, op);
+        }
         self.run_cmp_u8(rhs, lhs_l, rhs_l, op)
     }
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
@@ -8038,10 +8475,16 @@ impl BackendStorage for VulkanStorage {
             return self.bf16_unary_via_f32(layout, |src, src_l| src.unary_impl::<B>(src_l));
         }
         if self.dtype == DType::F64 {
-            let src_l = Layout::contiguous(layout.shape());
-            let src_f32 = self.to_dtype(layout, DType::F32)?;
-            let out_f32 = src_f32.unary_impl::<B>(&src_l)?;
-            return out_f32.to_dtype(&src_l, DType::F64);
+            if !self.device.shader_float64_supported() {
+                return Err(Error::Msg(
+                    "vulkan F64 unary requires shaderFloat64 device feature".into(),
+                )
+                .bt());
+            }
+            let opcode = f64_unary_opcode(B::NAME)?;
+            let spirv = candle_vulkan_kernels::spirv("unary_f64")
+                .ok_or_else(|| Error::Msg("vulkan shader unary_f64 not generated".into()).bt())?;
+            return self.run_unary_generic_with_params(layout, spirv, opcode, 0.0);
         }
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan unary").bt());
@@ -8086,12 +8529,13 @@ impl BackendStorage for VulkanStorage {
             );
         }
         if self.dtype == DType::F64 {
-            let lhs_l = Layout::contiguous(lhs_layout.shape());
-            let rhs_l = Layout::contiguous(rhs_layout.shape());
-            let lhs_f32 = self.to_dtype(lhs_layout, DType::F32)?;
-            let rhs_f32 = rhs.to_dtype(rhs_layout, DType::F32)?;
-            let out_f32 = lhs_f32.binary_impl::<B>(&rhs_f32, &lhs_l, &rhs_l)?;
-            return out_f32.to_dtype(&lhs_l, DType::F64);
+            if !self.device.shader_float64_supported() {
+                return Err(Error::Msg(
+                    "vulkan F64 binary requires shaderFloat64 device feature".into(),
+                )
+                .bt());
+            }
+            return self.run_binary_f64(rhs, lhs_layout, rhs_layout, B::NAME);
         }
         if lhs_layout.dims().len() > 4 || rhs_layout.dims().len() > 4 {
             let (lhs, lhs_l) = if lhs_layout.dims().len() > 4 {
@@ -8947,6 +9391,7 @@ impl BackendDevice for VulkanDevice {
                 physical_device,
                 vendor_id,
                 integer_dot_product,
+                shader_float64,
                 cooperative_matrix,
                 subgroup_arithmetic,
                 subgroup_size,
@@ -9887,6 +10332,427 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    // ---- F64 native dispatch tests (requires shaderFloat64) ----
+
+    /// Helper: compare two f64 slices with relative tolerance 1e-12.
+    fn assert_f64_close(got: &[f64], expected: &[f64], tol: f64) {
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "length mismatch: got {}, expected {}",
+            got.len(),
+            expected.len()
+        );
+        for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            let abs_diff = (g - e).abs();
+            let rel = if e.abs() > 1e-300 {
+                abs_diff / e.abs().max(1e-300)
+            } else {
+                abs_diff
+            };
+            assert!(
+                rel <= tol,
+                "f64 mismatch at [{i}]: got {g:e}, expected {e:e}, rel_err {rel:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn vulkan_f64_unary_exp() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![0.0, 1.0, -1.0, 2.0, -2.0, 0.5, -0.5, 10.0, -10.0];
+        let expected: Vec<f64> = x.iter().map(|v| v.exp()).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((9,));
+        let out = src.unary_impl::<crate::op::Exp>(&layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_unary_log() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![0.5, 1.0, 2.0, 10.0, 0.1, 3.0, 7.0];
+        let expected: Vec<f64> = x.iter().map(|v| v.ln()).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((7,));
+        let out = src.unary_impl::<crate::op::Log>(&layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_unary_sqrt() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![0.0, 1.0, 2.0, 4.0, 16.0, 0.25, 100.0];
+        let expected: Vec<f64> = x.iter().map(|v| v.sqrt()).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((7,));
+        let out = src.unary_impl::<crate::op::Sqrt>(&layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_unary_sqr() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![0.0, 1.0, -2.0, 3.0, -4.0, 0.5, 10.0];
+        let expected: Vec<f64> = x.iter().map(|v| v * v).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((7,));
+        let out = src.unary_impl::<crate::op::Sqr>(&layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_unary_neg() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![0.0, 1.0, -2.0, 3.5, -0.0_f64];
+        let expected: Vec<f64> = x.iter().map(|v| -v).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((5,));
+        let out = src.unary_impl::<crate::op::Neg>(&layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_unary_abs() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![0.0, 1.0, -2.0, 3.5, -0.5, -100.0];
+        let expected: Vec<f64> = x.iter().map(|v| v.abs()).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((6,));
+        let out = src.unary_impl::<crate::op::Abs>(&layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_binary_add() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0];
+        let b: Vec<f64> = vec![5.0, 6.0, 7.0, 8.0];
+        let expected: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.binary_impl::<crate::op::Add>(&rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_binary_mul() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0];
+        let b: Vec<f64> = vec![5.0, 6.0, 7.0, 8.0];
+        let expected: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x * y).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.binary_impl::<crate::op::Mul>(&rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_binary_div() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![10.0, 20.0, 30.0, 0.0];
+        let b: Vec<f64> = vec![2.0, 4.0, 5.0, 1.0];
+        let expected: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x / y).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.binary_impl::<crate::op::Div>(&rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_binary_max() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![1.0, 5.0, 3.0, 4.0];
+        let b: Vec<f64> = vec![2.0, 3.0, 7.0, 1.0];
+        let expected: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x.max(*y)).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.binary_impl::<crate::op::Maximum>(&rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_binary_min() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![1.0, 5.0, 3.0, 4.0];
+        let b: Vec<f64> = vec![2.0, 3.0, 7.0, 1.0];
+        let expected: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x.min(*y)).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.binary_impl::<crate::op::Minimum>(&rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_cmp_eq() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 3.0];
+        let b: Vec<f64> = vec![1.0, 0.0, 3.0, 4.0];
+        let expected: Vec<u8> = vec![1, 0, 1, 0];
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.cmp(CmpOp::Eq, &rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::U8(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_eq!(got, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_cmp_lt() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 5.0];
+        let b: Vec<f64> = vec![2.0, 2.0, 1.0, 10.0];
+        let expected: Vec<u8> = vec![1, 0, 0, 1];
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.cmp(CmpOp::Lt, &rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::U8(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_eq!(got, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_cmp_ge() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 5.0];
+        let b: Vec<f64> = vec![2.0, 2.0, 1.0, 10.0];
+        let expected: Vec<u8> = vec![0, 1, 1, 0];
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.cmp(CmpOp::Ge, &rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::U8(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_eq!(got, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_reduce_sum() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let expected: Vec<f64> = vec![21.0];
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((6,));
+        let out = src.reduce_op(ReduceOp::Sum, &layout, &[0])?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_reduce_sum_2d() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let expected: Vec<f64> = vec![5.0, 7.0, 9.0]; // sum over rows: [1+4, 2+5, 3+6]
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((2, 3));
+        let out = src.reduce_op(ReduceOp::Sum, &layout, &[0])?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_reduce_max() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0];
+        let expected: Vec<f64> = vec![6.0];
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((6,));
+        let out = src.reduce_op(ReduceOp::Max, &layout, &[0])?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_reduce_min() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![3.0, 1.0, 5.0, 2.0, 4.0, 0.5];
+        let expected: Vec<f64> = vec![0.5];
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((6,));
+        let out = src.reduce_op(ReduceOp::Min, &layout, &[0])?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_reduce_argmax() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0];
+        let expected: Vec<u32> = vec![5];
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((6,));
+        let out = src.reduce_op(ReduceOp::ArgMax, &layout, &[0])?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::U32(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_eq!(got, expected);
         Ok(())
     }
 }

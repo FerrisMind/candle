@@ -1,5 +1,6 @@
 #version 450
 
+#extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_control_flow_attributes : require
