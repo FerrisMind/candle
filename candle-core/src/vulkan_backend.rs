@@ -5315,6 +5315,26 @@ impl VulkanStorage {
         scale: f32,
         causal: bool,
     ) -> Result<VulkanStorage> {
+        Self::flash_attn_ext(
+            q, q_layout, k, k_layout, v, v_layout, None, None, None, None, scale, causal,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_ext(
+        q: &VulkanStorage,
+        q_layout: &Layout,
+        k: &VulkanStorage,
+        k_layout: &Layout,
+        v: &VulkanStorage,
+        v_layout: &Layout,
+        alibi_slopes: Option<&VulkanStorage>,
+        window_size_left: Option<usize>,
+        window_size_right: Option<usize>,
+        softcap: Option<f32>,
+        scale: f32,
+        causal: bool,
+    ) -> Result<VulkanStorage> {
         use crate::DType;
 
         // Decide compute dtype: F16 when inputs are BF16/F16 (halves VRAM,
@@ -5357,6 +5377,18 @@ impl VulkanStorage {
         let out_shape = Shape::from_dims(&[b, h, seq_q, head_dim_v]);
         let dst = unsafe { q_buf.device.alloc_uninit(&out_shape, DType::F32)? };
 
+        let alibi_storage = if let Some(alibi) = alibi_slopes {
+            if alibi.dtype != DType::F32 {
+                Some(alibi.to_dtype(&Layout::contiguous(alibi.count), DType::F32)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let alibi_ref = alibi_storage.as_ref().or(alibi_slopes).unwrap_or(&dst);
+        let has_alibi = alibi_slopes.is_some();
+
         #[repr(C)]
         #[derive(Clone, Copy)]
         struct FlashAttnParams {
@@ -5369,6 +5401,10 @@ impl VulkanStorage {
             batch_size: u32,
             scale: f32,
             causal: u32,
+            window_size_left: u32,
+            window_size_right: u32,
+            softcap: f32,
+            has_alibi: u32,
         }
 
         let params = FlashAttnParams {
@@ -5381,6 +5417,10 @@ impl VulkanStorage {
             batch_size: b as u32,
             scale,
             causal: if causal { 1 } else { 0 },
+            window_size_left: window_size_left.unwrap_or(0) as u32,
+            window_size_right: window_size_right.unwrap_or(0) as u32,
+            softcap: softcap.unwrap_or(0.0),
+            has_alibi: if has_alibi { 1 } else { 0 },
         };
 
         let bindings = [
@@ -5388,6 +5428,7 @@ impl VulkanStorage {
             VulkanBinding::Storage(&k_buf.buffer),
             VulkanBinding::Storage(&v_buf.buffer),
             VulkanBinding::Storage(&dst.buffer),
+            VulkanBinding::Storage(&alibi_ref.buffer),
         ];
 
         let shader_name = if use_f16 {

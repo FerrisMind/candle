@@ -15,6 +15,7 @@ layout(binding = 0) readonly buffer QBuf  { float16_t data_q[]; };
 layout(binding = 1) readonly buffer KBuf  { float16_t data_k[]; };
 layout(binding = 2) readonly buffer VBuf  { float16_t data_v[]; };
 layout(binding = 3) writeonly buffer OBuf { float data_o[]; };
+layout(binding = 4) readonly buffer AlibiBuf { float data_alibi[]; };
 
 layout(push_constant) uniform params {
     uint seq_q;
@@ -25,6 +26,10 @@ layout(push_constant) uniform params {
     uint batch_size;
     float scale;
     uint causal;
+    uint window_size_left;
+    uint window_size_right;
+    float softcap;
+    uint has_alibi;
 };
 
 void main() {
@@ -49,19 +54,33 @@ void main() {
     float m = -1e30;
     float l = 0.0;
 
-    float o_acc[128];
+    float o_acc[512];
     for (uint d = 0; d < D; d++) {
         o_acc[d] = 0.0;
     }
 
+    const int q_pos = int(s + (seq_kv - seq_q));
+
     for (uint kv = 0u; kv < seq_kv; kv++) {
-        if (causal != 0u && kv > s) continue;
+        const int k_pos = int(kv);
+        if (causal != 0u && k_pos > q_pos) continue;
+        if (window_size_left != 0u && k_pos < q_pos - int(window_size_left)) continue;
+        if (window_size_right != 0u && k_pos > q_pos + int(window_size_right)) continue;
 
         float score = 0.0;
         for (uint d = 0u; d < D; d++) {
             score += float(data_q[q_base + s * D + d]) * float(data_k[k_base + kv * D + d]);
         }
         score *= scale;
+
+        if (has_alibi != 0u) {
+            float slope = data_alibi[h_q];
+            score += slope * float(k_pos - q_pos);
+        }
+
+        if (softcap > 0.0) {
+            score = softcap * tanh(score / softcap);
+        }
 
         float m_new = max(m, score);
         float exp_diff = (m_new - m < 80.0) ? exp(m - m_new) : 0.0;
