@@ -575,8 +575,12 @@ struct WgpuInner {
     /// Buffers are never destroyed; cursor resets on synchronize when safe so
     /// bind-group cache hits across microbench samples.
     hot_rings: Mutex<HashMap<u64, WgpuHotRing>>,
+    /// Reusable dedup set for retain_from_bindings (hot dispatch path).
+    retain_seen: Mutex<HashSet<usize>>,
     /// Bind groups for elementwise dyn-uniform path (src+dst+params permanent).
-    elem_bg_cache: Mutex<HashMap<WgpuElemBgKey, wgpu::BindGroup>>,
+    elem_bg_cache: Mutex<HashMap<WgpuElemBgKey, (wgpu::BindGroup, u64)>>,
+    /// Monotonic clock for LRU ticks in elem_bg_cache.
+    elem_bg_tick: std::sync::atomic::AtomicU64,
     elem_bg_hits: std::sync::atomic::AtomicU64,
     elem_bg_misses: std::sync::atomic::AtomicU64,
 }
@@ -585,10 +589,19 @@ struct WgpuInner {
 #[derive(Debug)]
 struct WgpuHotRing {
     buffers: Vec<Arc<wgpu::Buffer>>,
+    /// O(1) membership of `buffers` (identity keys) — checked on every
+    /// WgpuStorage::drop, so avoid the O(n) scan (perf-book coll-set-membership).
+    buffer_keys: std::collections::HashSet<usize>,
     /// Ready to hand out (GPU-idle, may still be pinned by bind-group cache).
     free: Vec<Arc<wgpu::Buffer>>,
     /// Dropped since last synchronize; moved to `free` after GPU drain.
     pending_free: Vec<Arc<wgpu::Buffer>>,
+}
+
+impl WgpuHotRing {
+    fn contains(&self, key: usize) -> bool {
+        self.buffer_keys.contains(&key)
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -1077,6 +1090,7 @@ impl WgpuDevice {
             if let Ok(mut rings) = self.inner.hot_rings.lock() {
                 let ring = rings.entry(key).or_insert_with(|| WgpuHotRing {
                     buffers: Vec::new(),
+                    buffer_keys: std::collections::HashSet::new(),
                     free: Vec::new(),
                     pending_free: Vec::new(),
                 });
@@ -1094,6 +1108,7 @@ impl WgpuDevice {
                     });
                     let arc = Arc::new(buffer);
                     ring.buffers.push(Arc::clone(&arc));
+                    ring.buffer_keys.insert(wgpu_buffer_key(arc.as_ref()));
                     return arc;
                 }
             }
@@ -1144,9 +1159,10 @@ impl WgpuDevice {
     }
 
     fn release_hot_ring_buffer(&self, buffer: &Arc<wgpu::Buffer>) {
+        let key = wgpu_buffer_key(buffer.as_ref());
         if let Ok(mut rings) = self.inner.hot_rings.lock() {
             for ring in rings.values_mut() {
-                if ring.buffers.iter().any(|b| Arc::ptr_eq(b, buffer)) {
+                if ring.contains(key) {
                     ring.pending_free.push(Arc::clone(buffer));
                     return;
                 }
@@ -1162,9 +1178,10 @@ impl WgpuDevice {
     /// dispatches and corrupts multi-layer graphs (e.g. ConvMixer batch-norm).
     fn recycle_storage_buffer(&self, buffer: &Arc<wgpu::Buffer>) {
         // Hot-ring buffers are permanent; never put them in the free pool.
+        let key = wgpu_buffer_key(buffer.as_ref());
         if let Ok(rings) = self.inner.hot_rings.lock() {
             for ring in rings.values() {
-                if ring.buffers.iter().any(|b| Arc::ptr_eq(b, buffer)) {
+                if ring.contains(key) {
                     return;
                 }
             }
@@ -1367,8 +1384,14 @@ impl WgpuDevice {
         &self,
         bindings: &[wgpu::BindGroupEntry<'_>],
     ) -> Vec<Arc<wgpu::Buffer>> {
+        // perf-book mem-reuse-collections: the dedup set is hot-path state,
+        // kept on the device inner to avoid a fresh HashSet per dispatch.
+        let mut seen = match self.inner.retain_seen.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => HashSet::new(),
+        };
+        seen.clear();
         let mut retained = Vec::new();
-        let mut seen = HashSet::new();
         for entry in bindings {
             let wgpu::BindingResource::Buffer(buf) = &entry.resource else {
                 continue;
@@ -1379,6 +1402,9 @@ impl WgpuDevice {
                     retained.push(arc);
                 }
             }
+        }
+        if let Ok(mut g) = self.inner.retain_seen.lock() {
+            *g = seen;
         }
         retained
     }
@@ -1813,7 +1839,12 @@ impl WgpuDevice {
                     .elem_bg_cache
                     .lock()
                     .map_err(|e| Error::wrap(e.to_string()))?;
-                if let Some(bg) = cache.get(&key) {
+                let tick = self
+                    .inner
+                    .elem_bg_tick
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some((bg, t)) = cache.get_mut(&key) {
+                    *t = tick;
                     self.inner
                         .elem_bg_hits
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1831,13 +1862,18 @@ impl WgpuDevice {
                             entries: bindings,
                         });
                     if cache.len() >= 256 {
+                        // LRU eviction: drop the oldest quarter by tick.
                         let drop_n = cache.len() / 4;
-                        let keys: Vec<_> = cache.keys().take(drop_n).cloned().collect();
-                        for k in keys {
+                        let mut ticks: Vec<(u64, WgpuElemBgKey)> = cache
+                            .iter()
+                            .map(|(k, (_, t))| (*t, k.clone()))
+                            .collect();
+                        ticks.sort_unstable_by_key(|(t, _)| *t);
+                        for (_, k) in ticks.into_iter().take(drop_n) {
                             cache.remove(&k);
                         }
                     }
-                    cache.insert(key, bg.clone());
+                    cache.insert(key, (bg.clone(), tick));
                     bg
                 }
             } else {
@@ -12688,7 +12724,9 @@ impl BackendDevice for WgpuDevice {
                 uniform_dyn_cursor: AtomicUsize::new(0),
                 uniform_dyn_slot,
                 hot_rings: Mutex::new(HashMap::new()),
+                retain_seen: Mutex::new(HashSet::new()),
                 elem_bg_cache: Mutex::new(HashMap::new()),
+                elem_bg_tick: std::sync::atomic::AtomicU64::new(0),
                 elem_bg_hits: std::sync::atomic::AtomicU64::new(0),
                 elem_bg_misses: std::sync::atomic::AtomicU64::new(0),
             }),
