@@ -293,6 +293,66 @@ pub fn argsort_u32_shader(workgroup_size: u32, asc: bool) -> Option<String> {
     argsort_shader_for_type(workgroup_size, asc, "u32")
 }
 
+/// Extended-dtype argsort: values are read as their storage type and mapped to
+/// orderable u32 keys inside the shader (CUDA sort.cu key trick).
+pub fn argsort_keyed_shader(
+    workgroup_size: u32,
+    asc: bool,
+    src_type: &str,
+    sort_key: &str,
+) -> Option<String> {
+    let source = get("argsort.wgsl")?.source();
+    let mut defines = vec![
+        "WG_SIZE".to_string(),
+        "KEY_ORDERABLE".to_string(),
+        "KEY_FN".to_string(),
+    ];
+    if asc {
+        defines.push("ORDER == 0".to_string());
+    }
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        (
+            "ORDER".to_string(),
+            if asc { "0".to_string() } else { "1".to_string() },
+        ),
+        ("SRC_TYPE".to_string(), src_type.to_string()),
+        ("KEY_BODY".to_string(), sort_key.to_string()),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
+pub fn argsort_i32_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    argsort_keyed_shader(workgroup_size, asc, "i32", "orderable_from_i32(src[i])")
+}
+
+pub fn argsort_i16_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    // i16 stored as u32 words (2 per word) is not the layout here: the host
+    // uploads a materialized i16 buffer reinterpreted as i32 lanes.
+    argsort_keyed_shader(workgroup_size, asc, "i32", "orderable_from_i16(src[i])")
+}
+
+pub fn argsort_u8_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    argsort_keyed_shader(workgroup_size, asc, "u32", "orderable_from_u8(src[i])")
+}
+
+pub fn argsort_f16_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    argsort_keyed_shader(workgroup_size, asc, "f32", "orderable_from_f32(src[i])")
+}
+
+pub fn argsort_bf16_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    argsort_keyed_shader(workgroup_size, asc, "f32", "orderable_from_f32(src[i])")
+}
+
+pub fn argsort_f8e4m3_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    argsort_keyed_shader(
+        workgroup_size,
+        asc,
+        "u32",
+        "orderable_from_f8e4m3_bits(src[i])",
+    )
+}
+
 fn argsort_merge_shader_for_type(workgroup_size: u32, asc: bool, src_type: &str) -> Option<String> {
     let source = get("argsort_merge.wgsl")?.source();
     let mut defines = vec!["WG_SIZE".to_string()];
@@ -321,6 +381,30 @@ pub fn argsort_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
 
 pub fn argsort_u32_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
     argsort_merge_shader_for_type(workgroup_size, asc, "u32")
+}
+
+/// Orderable-key merge pass for widened integer keys (i32 words with sign
+/// flip) — mirrors argsort_keyed_shader's key construction.
+pub fn argsort_i32_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    let source = get("argsort_merge.wgsl")?.source();
+    let mut defines = vec![
+        "WG_SIZE".to_string(),
+        "KEY_ORDERABLE".to_string(),
+        "KEY_FN".to_string(),
+    ];
+    if asc {
+        defines.push("ORDER == 0".to_string());
+    }
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        (
+            "ORDER".to_string(),
+            if asc { "0".to_string() } else { "1".to_string() },
+        ),
+        ("SRC_TYPE".to_string(), "i32".to_string()),
+            ("KEY_BODY".to_string(), "(bitcast<u32>(src[i]) ^ 0x80000000u)".to_string()),
+];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
 }
 
 pub fn cumsum_shader(workgroup_size: u32) -> Option<String> {

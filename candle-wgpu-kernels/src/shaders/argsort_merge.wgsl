@@ -38,12 +38,28 @@ struct Params {
 @group(0) @binding(3)
 var<uniform> params: Params;
 
+#ifdef KEY_FN
+fn sort_key(i: u32) -> u32 {
+    return KEY_BODY;
+}
+#else
+fn sort_key(i: u32) -> u32 {
+    return bitcast<u32>(src[i]);
+}
+#endif
+
 fn take_left(a_idx: u32, b_idx: u32, row_base: u32) -> bool {
-    let a_val = src[row_base + a_idx];
-    let b_val = src[row_base + b_idx];
+    let a_val = sort_key(row_base + a_idx);
+    let b_val = sort_key(row_base + b_idx);
 #if ORDER == 0
+    if (a_val == b_val) {
+        return a_idx <= b_idx;
+    }
     return a_val <= b_val;
 #else
+    if (a_val == b_val) {
+        return a_idx >= b_idx;
+    }
     return a_val >= b_val;
 #endif
 }

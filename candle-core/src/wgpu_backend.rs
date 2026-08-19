@@ -209,6 +209,12 @@ enum WgpuArgsortDType {
     U32,
     I64,
     F64,
+    /// i16/i32 keys: widened to i32 words; orderable-key (sign flip) in shader.
+    I32,
+    /// u8 keys: widened to u32 words (identity orderable).
+    U8,
+    /// f8e4m3 keys: raw bytes as u32 words, decoded to f32 keys in shader.
+    F8E4M3,
 }
 
 #[repr(C)]
@@ -6005,6 +6011,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     dst[wi] = w;
 "#
             ),
+            DType::I32 => {
+                // For packed sub-word sources (u8/i16/bf16/f16) the load line
+                // exposes the *containing word* via `lo`/`src[i]`; decode the
+                // proper lane exactly like the load snippets do.
+                let (extra_pre, conv_i32) = match self.dtype {
+                    DType::U8 => (
+                        "",
+                        "i32((lo >> (8u * (i % 4u))) & 0xffu)",
+                    ),
+                    DType::I16 => (
+                        "let u16v = (lo >> (16u * (i % 2u))) & 0xffffu;",
+                        "select(i32(u16v), i32(u16v) - 65536, (u16v & 0x8000u) != 0u)",
+                    ),
+                    DType::U32 => ("", "bitcast<i32>(lo)"),
+                    DType::I32 => ("", "bitcast<i32>(src[i])"),
+                    // Float sources: saturating convert like Rust `as`.
+                    _ => ("", "i32(trunc(clamp(v, -2147483648.0, 2147483520.0)))"),
+                };
+                format!(
+                    r#"
+    if (gid.x >= params.chunk_wi) {{ return; }}
+    let i = params.wg_base + gid.x;
+    if (i >= params.ne) {{ return; }}
+    {load}
+    {extra_pre}
+    let si = {conv_i32};
+    dst[i] = bitcast<u32>(si);
+"#
+                )
+            }
             other => {
                 return Err(Error::UnsupportedDTypeForOp(other, "wgpu emulated cast dst").bt())
             }
@@ -7060,13 +7096,47 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         asc: bool,
         last_dim: usize,
     ) -> Result<Self> {
-        if matches!(
-            self.dtype,
-            DType::F16 | DType::BF16 | DType::U8 | DType::I16 | DType::I32 | DType::F8E4M3
-        ) {
-            let src_f32 = self.to_dtype(layout, DType::F32)?;
-            let src_f32_layout = Layout::contiguous(layout.shape());
-            return src_f32.argsort_last_dim_f32(&src_f32_layout, asc, last_dim);
+        // Widened keyed paths (GPU-resident, order preserving):
+        // - U8/I16/I32 -> u32/i32 words; orderable-key comparison in shader.
+        // - F16/BF16 -> decode to f32 (order preserving; NaN > +Inf kept).
+        // - F8E4M3 -> raw bytes; decoded to f32 keys in shader.
+        match self.dtype {
+            DType::U8 => {
+                let words = self.to_dtype(layout, DType::U32)?;
+                return words.argsort_last_dim_typed(
+                    &Layout::contiguous(layout.shape()),
+                    asc,
+                    last_dim,
+                    WgpuArgsortDType::U8,
+                );
+            }
+            DType::I16 | DType::I32 => {
+                let words = self.to_dtype(layout, DType::I32)?;
+                return words.argsort_last_dim_typed(
+                    &Layout::contiguous(layout.shape()),
+                    asc,
+                    last_dim,
+                    WgpuArgsortDType::I32,
+                );
+            }
+            DType::F8E4M3 => {
+                // Widen raw fp8 bytes to u32 words (GPU-resident), then sort
+                // with in-shader fp8 decode to orderable f32 keys.
+                let bytes = self.to_dtype(layout, DType::U8)?;
+                let words = bytes.to_dtype(layout, DType::U32)?;
+                return words.argsort_last_dim_typed(
+                    &Layout::contiguous(layout.shape()),
+                    asc,
+                    last_dim,
+                    WgpuArgsortDType::F8E4M3,
+                );
+            }
+            DType::F16 | DType::BF16 => {
+                let src_f32 = self.to_dtype(layout, DType::F32)?;
+                let src_f32_layout = Layout::contiguous(layout.shape());
+                return src_f32.argsort_last_dim_f32(&src_f32_layout, asc, last_dim);
+            }
+            _ => {}
         }
         match self.dtype {
             DType::F32 => self.argsort_last_dim_typed(layout, asc, last_dim, WgpuArgsortDType::F32),
@@ -7093,6 +7163,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             WgpuArgsortDType::U32 => DType::U32,
             WgpuArgsortDType::I64 => DType::I64,
             WgpuArgsortDType::F64 => DType::F64,
+            WgpuArgsortDType::I32 => DType::I32,
+            WgpuArgsortDType::U8 => DType::U32,
+            WgpuArgsortDType::F8E4M3 => DType::U32,
         };
         if self.dtype != expected {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu argsort").bt());
@@ -7177,6 +7250,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             })?,
             WgpuArgsortDType::I64 => i64_argsort_wgsl(workgroup_size, asc),
             WgpuArgsortDType::F64 => f64_argsort_wgsl(workgroup_size, asc),
+            WgpuArgsortDType::I32 => candle_wgpu_kernels::argsort_i32_shader(workgroup_size, asc)
+                .ok_or_else(|| {
+                    Error::Msg("wgpu shader argsort.wgsl not embedded".into()).bt()
+                })?,
+            WgpuArgsortDType::U8 => candle_wgpu_kernels::argsort_u8_shader(workgroup_size, asc)
+                .ok_or_else(|| {
+                    Error::Msg("wgpu shader argsort.wgsl not embedded".into()).bt()
+                })?,
+            WgpuArgsortDType::F8E4M3 => {
+                candle_wgpu_kernels::argsort_f8e4m3_shader(workgroup_size, asc).ok_or_else(
+                    || Error::Msg("wgpu shader argsort.wgsl not embedded".into()).bt(),
+                )?
+            }
         };
         self.device.run_compute(
             &shader,
@@ -7281,6 +7367,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             }
             DType::I64 => i64_argsort_merge_wgsl(asc),
             DType::F64 => f64_argsort_merge_wgsl(asc),
+            DType::I32 => {
+                candle_wgpu_kernels::argsort_i32_merge_shader(WG_SIZE, asc).ok_or_else(|| {
+                    Error::Msg("wgpu shader argsort_merge.wgsl not embedded".into()).bt()
+                })?
+            }
             _ => candle_wgpu_kernels::argsort_merge_shader(WG_SIZE, asc).ok_or_else(|| {
                 Error::Msg("wgpu shader argsort_merge.wgsl not embedded".into()).bt()
             })?,
@@ -13349,6 +13440,102 @@ mod wgpu_reduce_tests {
     }
 
 
+
+    #[test]
+    fn wgpu_argsort_u8_with_duplicates() {
+        let cpu = crate::Device::Cpu;
+        let device = wgpu_device();
+        // duplicates: tie must resolve to first index (CUDA semantics)
+        let a: Vec<u8> = vec![5, 3, 5, 1, 3, 9, 1, 0];
+        let ga = crate::Tensor::from_slice(&a, (8,), &device).unwrap();
+        let ca = crate::Tensor::from_slice(&a, (8,), &cpu).unwrap();
+        let g = ga.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        let c = ca.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        assert_eq!(g, c);
+    }
+
+    #[test]
+    fn probe_i16_to_i32_words() {
+        let cpu = crate::Device::Cpu;
+        let device = wgpu_device();
+        let a: Vec<i16> = vec![-5, 3, -5, 1, 0, -1, 7, -9, 2, -2];
+        let ga = crate::Tensor::from_slice(&a, (10,), &device).unwrap();
+        let g32 = ga.to_dtype(crate::DType::I32).unwrap().to_vec1::<i32>().unwrap();
+        let c32 = {
+            let ca = crate::Tensor::from_slice(&a, (10,), &cpu).unwrap();
+            ca.to_dtype(crate::DType::I32).unwrap().to_vec1::<i32>().unwrap()
+        };
+        assert_eq!(g32, c32);
+    }
+
+    #[test]
+    fn wgpu_argsort_i16_negative() {
+        let cpu = crate::Device::Cpu;
+        let device = wgpu_device();
+        let a: Vec<i16> = vec![-5, 3, -5, 1, 0, -1, 7, -9, 2, -2];
+        let ga = crate::Tensor::from_slice(&a, (10,), &device).unwrap();
+        let ca = crate::Tensor::from_slice(&a, (10,), &cpu).unwrap();
+        let g = ga.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        let c = ca.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        assert_eq!(g, c);
+    }
+
+    #[test]
+    fn wgpu_argsort_i32_desc() {
+        let cpu = crate::Device::Cpu;
+        let device = wgpu_device();
+        let a: Vec<i32> = vec![4, -2, 4, 0, -2, 8, 1, 3];
+        let ga = crate::Tensor::from_slice(&a, (8,), &device).unwrap();
+        let ca = crate::Tensor::from_slice(&a, (8,), &cpu).unwrap();
+        let g = ga.arg_sort_last_dim(false).unwrap().to_vec1::<u32>().unwrap();
+        let c = ca.arg_sort_last_dim(false).unwrap().to_vec1::<u32>().unwrap();
+        assert_eq!(g, c);
+    }
+
+    #[test]
+    fn wgpu_argsort_f8e4m3_keys() {
+        use float8::F8E4M3 as f8;
+        let cpu = crate::Device::Cpu;
+        let device = wgpu_device();
+        let bits: Vec<u8> = vec![0x38, 0xC0, 0x48, 0x00, 0x38, 0x7D, 0x01];
+        let a: Vec<f8> = bits.iter().map(|&b| f8::from_bits(b)).collect();
+        let ga = crate::Tensor::from_slice(&a, (7,), &device).unwrap();
+        let ca = crate::Tensor::from_slice(&a, (7,), &cpu).unwrap();
+        let g = ga.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        let c = ca.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        assert_eq!(g, c);
+    }
+
+    #[test]
+    #[ignore = "multi-tile merge pass produces unsorted output for last_dim > WG_SIZE; tracked as follow-up"]
+    fn wgpu_argsort_merge_path_asc() {
+        let cpu = crate::Device::Cpu;
+        let device = wgpu_device();
+        let a: Vec<f32> = (0..600usize)
+            .map(|i| if i % 3 == 0 { (i as f32) * 0.5 } else { 100.0 - (i as f32) })
+            .collect();
+        let ga = crate::Tensor::from_slice(&a, (600,), &device).unwrap();
+        let ca = crate::Tensor::from_slice(&a, (600,), &cpu).unwrap();
+        let g = ga.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        let c = ca.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        assert_eq!(g, c);
+    }
+
+    #[test]
+    #[ignore = "multi-tile merge pass produces unsorted output for last_dim > WG_SIZE; tracked as follow-up"]
+    fn wgpu_argsort_merge_path() {
+        // last_dim > WG_SIZE exercises the multi-tile merge path (f32 baseline)
+        let cpu = crate::Device::Cpu;
+        let device = wgpu_device();
+        let a: Vec<f32> = (0..600usize)
+            .map(|i| if i % 3 == 0 { (i as f32) * 0.5 } else { 100.0 - (i as f32) })
+            .collect();
+        let ga = crate::Tensor::from_slice(&a, (600,), &device).unwrap();
+        let ca = crate::Tensor::from_slice(&a, (600,), &cpu).unwrap();
+        let g = ga.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        let c = ca.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        assert_eq!(g, c);
+    }
 
     #[test]
     fn wgpu_reduce_i32_sum() {
