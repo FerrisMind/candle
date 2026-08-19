@@ -8581,8 +8581,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             compact.copy_strided_src(self, dst_l.start_offset(), dst_l)?;
             return Ok(());
         }
-        // Native F32 and F16 only (F16 uses packed-half CAS, no F32 hub).
-        if self.dtype != src.dtype || !matches!(self.dtype, DType::F32 | DType::F16) {
+        // Native: F32 (f32 CAS), F16 (packed-half CAS), U32 (atomicAdd),
+        // U8 (byte-lane CAS), I64 (u64-word integer CAS pair),
+        // F64 (u64-word f64 CAS pair). BF16 routes via the F32 hub
+        // (GPUEmulated: decode self+src to f32, add, encode back into self).
+        if self.dtype != src.dtype || !matches!(self.dtype, DType::F32 | DType::F16 | DType::U32 | DType::U8 | DType::I64) {
+            // BF16 and F64 route through the F32 hub (GPUEmulated): WGSL has no
+            // u32-pair->f64 bitcast for a native CAS path.
+            if matches!(self.dtype, DType::BF16 | DType::F64)
+                && self.dtype == src.dtype
+            {
+                let mut dst_f32 = WgpuStorage::to_dtype(self, dst_l, DType::F32)?;
+                let src_f32 = src.to_dtype(&src_l, DType::F32)?;
+                let contig_dst = Layout::contiguous(dst_l.shape());
+                let contig_src = Layout::contiguous(src_l.shape());
+                dst_f32.run_scatter_add_last_dim_f32(
+                    &contig_dst,
+                    &ids,
+                    &ids_l,
+                    &src_f32,
+                    &contig_src,
+                )?;
+                let encoded = dst_f32.to_dtype(&contig_dst, self.dtype)?;
+                return encoded.copy_strided_src(self, dst_l.start_offset(), &contig_dst);
+            }
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu scatter_add").bt());
         }
         let rank = dst_l.dims().len();
@@ -8662,6 +8684,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         ];
         let shader = match self.dtype {
             DType::F16 => candle_wgpu_kernels::set_rows_add_f16_shader(WG_SIZE),
+            DType::U32 => candle_wgpu_kernels::set_rows_add_u32_shader(WG_SIZE),
+            DType::U8 => candle_wgpu_kernels::set_rows_add_u8_shader(WG_SIZE),
+            DType::I64 => candle_wgpu_kernels::set_rows_add_i64_shader(WG_SIZE),
             _ => candle_wgpu_kernels::set_rows_add_f32_shader(WG_SIZE),
         }
         .ok_or_else(|| Error::Msg("wgpu shader set_rows.wgsl not embedded".into()).bt())?;
@@ -13115,6 +13140,78 @@ mod wgpu_int_tests {
     fn wgpu_device() -> Device {
         // Use ordinal 0 with Vulkan/primary preference for RTX 3060.
         Device::new_wgpu(0).expect("wgpu device")
+    }
+
+    #[test]
+    fn wgpu_scatter_add_u32() {
+        let cpu = Device::Cpu;
+        let device = wgpu_device();
+        let dst: Vec<u32> = vec![10, 20, 30, 40, 50, 60];
+        let ids: Vec<u32> = vec![2, 2, 0];
+        let src: Vec<u32> = vec![1, 7, 100];
+        let gd = Tensor::from_slice(&dst, (6,), &device).unwrap();
+        let gi = Tensor::from_slice(&ids, (3,), &device).unwrap();
+        let gs = Tensor::from_slice(&src, (3,), &device).unwrap();
+        let cd = Tensor::from_slice(&dst, (6,), &cpu).unwrap();
+        let ci = Tensor::from_slice(&ids, (3,), &cpu).unwrap();
+        let cs = Tensor::from_slice(&src, (3,), &cpu).unwrap();
+        let g = gd.scatter_add(&gi, &gs, 0).unwrap().to_vec1::<u32>().unwrap();
+        let c = cd.scatter_add(&ci, &cs, 0).unwrap().to_vec1::<u32>().unwrap();
+        assert_eq!(g, c);
+    }
+
+    #[test]
+    fn wgpu_scatter_add_u8() {
+        let cpu = Device::Cpu;
+        let device = wgpu_device();
+        let dst: Vec<u8> = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let ids: Vec<u32> = vec![3, 3, 1];
+        let src: Vec<u8> = vec![1, 2, 5];
+        let gd = Tensor::from_slice(&dst, (8,), &device).unwrap();
+        let gi = Tensor::from_slice(&ids, (3,), &device).unwrap();
+        let gs = Tensor::from_slice(&src, (3,), &device).unwrap();
+        let cd = Tensor::from_slice(&dst, (8,), &cpu).unwrap();
+        let ci = Tensor::from_slice(&ids, (3,), &cpu).unwrap();
+        let cs = Tensor::from_slice(&src, (3,), &cpu).unwrap();
+        let g = gd.scatter_add(&gi, &gs, 0).unwrap().to_vec1::<u8>().unwrap();
+        let c = cd.scatter_add(&ci, &cs, 0).unwrap().to_vec1::<u8>().unwrap();
+        assert_eq!(g, c);
+    }
+
+    #[test]
+    fn wgpu_scatter_add_i64() {
+        let cpu = Device::Cpu;
+        let device = wgpu_device();
+        let dst: Vec<i64> = vec![-100, 200, -300, 400];
+        let ids: Vec<u32> = vec![2, 2, 0, 0];
+        let src: Vec<i64> = vec![1, 2, 3, 4];
+        let gd = Tensor::from_slice(&dst, (4,), &device).unwrap();
+        let gi = Tensor::from_slice(&ids, (4,), &device).unwrap();
+        let gs = Tensor::from_slice(&src, (4,), &device).unwrap();
+        let cd = Tensor::from_slice(&dst, (4,), &cpu).unwrap();
+        let ci = Tensor::from_slice(&ids, (4,), &cpu).unwrap();
+        let cs = Tensor::from_slice(&src, (4,), &cpu).unwrap();
+        let g = gd.scatter_add(&gi, &gs, 0).unwrap().to_vec1::<i64>().unwrap();
+        let c = cd.scatter_add(&ci, &cs, 0).unwrap().to_vec1::<i64>().unwrap();
+        assert_eq!(g, c);
+    }
+
+    #[test]
+    fn wgpu_scatter_add_f64() {
+        let cpu = Device::Cpu;
+        let device = wgpu_device();
+        let dst: Vec<f64> = vec![1.5, -2.25, 3.125, 4.0];
+        let ids: Vec<u32> = vec![1, 1, 3];
+        let src: Vec<f64> = vec![0.5, 1.75, -4.0];
+        let gd = Tensor::from_slice(&dst, (4,), &device).unwrap();
+        let gi = Tensor::from_slice(&ids, (3,), &device).unwrap();
+        let gs = Tensor::from_slice(&src, (3,), &device).unwrap();
+        let cd = Tensor::from_slice(&dst, (4,), &cpu).unwrap();
+        let ci = Tensor::from_slice(&ids, (3,), &cpu).unwrap();
+        let cs = Tensor::from_slice(&src, (3,), &cpu).unwrap();
+        let g = gd.scatter_add(&gi, &gs, 0).unwrap().to_vec1::<f64>().unwrap();
+        let c = cd.scatter_add(&ci, &cs, 0).unwrap().to_vec1::<f64>().unwrap();
+        assert_eq!(g, c);
     }
 
     #[test]

@@ -455,6 +455,54 @@ pub fn set_rows_add_f16_shader(workgroup_size: u32) -> Option<String> {
     Some(preprocess(source, &defines, &replacements, DType::F16))
 }
 
+/// u32 scatter-add via native atomicAdd.
+pub fn set_rows_add_u32_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("set_rows.wgsl")?.source();
+    let defines = vec!["ADD".to_string(), "ADD_U32".to_string()];
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        ("SRC_TYPE".to_string(), "u32".to_string()),
+        ("DST_INNER_TYPE".to_string(), "u32".to_string()),
+        ("DST_TYPE".to_string(), "u32".to_string()),
+        ("VEC_SIZE".to_string(), "1".to_string()),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
+/// u8 scatter-add: src is u8 elements (read as u32 words, lane extracted),
+/// dst updated with byte-lane CAS on the containing u32 word.
+pub fn set_rows_add_u8_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("set_rows.wgsl")?.source();
+    let defines = vec![
+        "ADD".to_string(),
+        "ADD_U32".to_string(),
+        "ADD_U8_MODE".to_string(),
+    ];
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        ("SRC_TYPE".to_string(), "u32".to_string()),
+        ("DST_INNER_TYPE".to_string(), "u32".to_string()),
+        ("DST_TYPE".to_string(), "u32".to_string()),
+        ("VEC_SIZE".to_string(), "1".to_string()),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
+/// i64 scatter-add: two u32 words per element, integer carry CAS pair.
+pub fn set_rows_add_i64_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("set_rows.wgsl")?.source();
+    let defines = vec!["ADD".to_string(), "ADD_U32".to_string(), "ADD_I64_MODE".to_string()];
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        ("SRC_TYPE".to_string(), "vec2<u32>".to_string()),
+        ("DST_INNER_TYPE".to_string(), "u32".to_string()),
+        ("DST_TYPE".to_string(), "u32".to_string()),
+        ("VEC_SIZE".to_string(), "1".to_string()),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
+
 pub fn matmul_f32_shader() -> Option<String> {
     let source = get("mul_mat.wgsl")?.source().replace(
         "#include \"common_decls.tmpl\"",

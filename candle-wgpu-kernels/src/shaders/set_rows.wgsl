@@ -74,6 +74,74 @@ var<uniform> params: Params;
 // Keep f32 and f16 CAS helpers behind separate defines so F32 preprocess can
 // strip `enable f16;` without leaving f16 tokens in the module (naga rejects
 // f16 types unless the extension is enabled).
+#ifdef ADD_U32
+fn atomic_add_u32(dst_idx: u32, value: u32) {
+    atomicAdd(&dst[dst_idx], value);
+}
+
+// u8: 4 bytes per u32 word — CAS read-modify-write of one byte lane.
+fn atomic_add_u8(dst_u8_idx: u32, value: u32) {
+    let word_idx = dst_u8_idx / 4u;
+    let shift = (dst_u8_idx % 4u) * 8u;
+    let mask = 0xFFu << shift;
+    loop {
+        let old_bits = atomicLoad(&dst[word_idx]);
+        let old_b = (old_bits >> shift) & 0xFFu;
+        let new_b = (old_b + value) & 0xFFu;
+        let new_bits = (old_bits & ~mask) | (new_b << shift);
+        let result = atomicCompareExchangeWeak(&dst[word_idx], old_bits, new_bits);
+        if result.exchanged {
+            return;
+        }
+    }
+}
+
+// i64: two u32 words per element — integer 64-bit add via CAS pair with
+// rollback on race. (f64 scatter-add is routed through the F32 hub on the
+// host side; WGSL cannot bitcast u32 pairs to f64 without f64 storage.)
+fn atomic_add_i64(dst_elem_idx: u32, add_lo: u32, add_hi: u32) {
+    let w0 = dst_elem_idx * 2u;
+    let w1 = w0 + 1u;
+    loop {
+        let old_lo = atomicLoad(&dst[w0]);
+        let old_hi = atomicLoad(&dst[w1]);
+        let new_lo = add_u32_sum(old_lo, add_lo);
+        let c = add_u32_carry(old_lo, add_lo);
+        let new_hi = old_hi + add_hi + c;
+        let r_hi = atomicCompareExchangeWeak(&dst[w1], old_hi, new_hi);
+        if !r_hi.exchanged {
+            continue;
+        }
+        let r_lo = atomicCompareExchangeWeak(&dst[w0], old_lo, new_lo);
+        if !r_lo.exchanged {
+            // Roll hi back to old value; give up silently if raced again.
+            loop {
+                let cur_hi = atomicLoad(&dst[w1]);
+                if cur_hi != new_hi {
+                    break;
+                }
+                let r2 = atomicCompareExchangeWeak(&dst[w1], cur_hi, old_hi);
+                if r2.exchanged {
+                    break;
+                }
+            }
+            continue;
+        }
+        return;
+    }
+}
+
+fn add_u32_sum(a: u32, b: u32) -> u32 {
+    return a + b;
+}
+
+fn add_u32_carry(a: u32, b: u32) -> u32 {
+    // returns carry-out (0 or 1) of a + b
+    return select(0u, 1u, (a + b) < a);
+}
+#endif
+
+#ifndef ADD_U32
 #ifndef ADD_F16
 fn atomic_add_f32(dst_idx: u32, value: f32) {
     loop {
@@ -106,6 +174,7 @@ fn atomic_add_f16(f16_elem_idx: u32, value: f16) {
         }
     }
 }
+#endif
 #endif
 #endif
 
@@ -153,7 +222,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 #ifdef ADD_F16
     atomic_add_f16(i_dst_row/VEC_SIZE + col_idx, f16(src[i_src_row/VEC_SIZE + col_idx]));
 #else
+#ifdef ADD_U32
+    #ifdef ADD_U8_MODE
+    // u8 elements: 4 per u32 word. Indices are in bytes (elements).
+    let src_b = i_src_row + col_idx;
+    let src_lane = (src_b % 4u) * 8u;
+    let src_byte = (src[src_b / 4u] >> src_lane) & 0xFFu;
+    atomic_add_u8(i_dst_row + col_idx, src_byte);
+    #else
+    #ifdef ADD_I64_MODE
+    let s = src[i_src_row + col_idx];
+    atomic_add_i64(i_dst_row + col_idx, s.x, s.y);
+    #else
+    atomic_add_u32(i_dst_row + col_idx, src[i_src_row + col_idx]);
+    #endif
+    #endif
+#else
     atomic_add_f32(i_dst_row/VEC_SIZE + col_idx, f32(src[i_src_row/VEC_SIZE + col_idx]));
+#endif
 #endif
 #else
     dst[i_dst_row/VEC_SIZE + col_idx] = DST_TYPE(src[i_src_row/VEC_SIZE + col_idx]);
