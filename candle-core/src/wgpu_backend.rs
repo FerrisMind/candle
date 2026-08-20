@@ -160,6 +160,28 @@ struct ArgMaxParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct PoolParams {
+    offset_src: u32, // in elements
+    offset_dst: u32, // in elements
+    // Strides (in elements): [0]=batch, [1]=channel, [2]=h, [3]=w.
+    stride0: u32,
+    stride1: u32,
+    stride2: u32,
+    stride3: u32,
+    ne: u32, // total output elements (b*c*out_h*out_w)
+    bc: u32,
+    c: u32,
+    out_h: u32,
+    out_w: u32,
+    kh: u32,
+    kw: u32,
+    sh: u32,
+    sw: u32,
+    _pad0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct ArgsortParams {
     offset_src: u32,
     offset_dst: u32,
@@ -359,6 +381,29 @@ struct ScaleParams {
     bias: f32,
 }
 
+// Native-dtype upsample gather: one partition per axis (nearest index tables /
+// bilinear (idx0, idx1, weight) tables are precomputed on the host in f64 so
+// selection is bit-exact against the CPU reference).
+#[derive(Clone, Copy)]
+enum UpsampleMode {
+    Nearest1D,
+    Nearest2D,
+    Bilinear2D,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UpsampleParams {
+    ne: u32, // total output elements
+    bc: u32, // rows (b*c); unused by NEAREST1D's flat row indexing
+    src_h: u32,
+    src_w: u32,
+    out_h: u32,
+    out_w: u32,
+    offset_src: u32, // in elements (always 0 after materialization)
+    offset_dst: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RandParams {
@@ -517,28 +562,6 @@ struct Im2ColParams {
     p1: u32,
     d0: u32,
     d1: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PoolParams {
-    offset_src: u32, // in elements
-    offset_dst: u32, // in elements
-    // Strides (in elements): [0]=batch, [1]=channel, [2]=h, [3]=w.
-    stride0: u32,
-    stride1: u32,
-    stride2: u32,
-    stride3: u32,
-    ne: u32, // total output elements (b*c*out_h*out_w)
-    bc: u32,
-    c: u32,
-    out_h: u32,
-    out_w: u32,
-    kh: u32,
-    kw: u32,
-    sh: u32,
-    sw: u32,
-    _pad0: u32,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -2092,6 +2115,55 @@ fn nearest_interp_weights(in_size: usize, out_size: usize) -> Vec<f32> {
         weights[src_idx * out_size + out_idx] = 1.0;
     }
     weights
+}
+
+/// CPU-parity nearest source-index table: identical f64 math to
+/// `cpu_backend::UpsampleNearest1D`/`UpsampleNearest2D`, so index selection is
+/// bit-exact against the CPU reference (integer division in WGSL can diverge
+/// from `(idx * scale) as usize` at exact rational boundaries, e.g. 3/2).
+fn nearest_src_indices(in_size: usize, out_size: usize) -> Vec<f32> {
+    let scale = in_size as f64 / out_size as f64;
+    (0..out_size)
+        .map(|i| usize::min(in_size - 1, (i as f64 * scale) as usize) as f32)
+        .collect()
+}
+
+/// CPU-parity bilinear (idx0, idx1, weight) axis table. f64 math mirrors
+/// `cpu_backend::UpsampleBilinear2D`; the weight is clamped in f64 then rounded
+/// to f32 exactly as in the existing F32 hub path (`bilinear_interp_weights`).
+fn bilinear_axis_table(
+    in_size: usize,
+    out_size: usize,
+    align_corners: bool,
+    scale_factor: Option<f64>,
+) -> Vec<f32> {
+    let scale = if align_corners {
+        if out_size > 1 {
+            (in_size - 1) as f64 / (out_size - 1) as f64
+        } else {
+            0.0
+        }
+    } else if let Some(scale_factor) = scale_factor {
+        1.0 / scale_factor
+    } else {
+        in_size as f64 / out_size as f64
+    };
+    let mut out = Vec::with_capacity(out_size * 3);
+    for o in 0..out_size {
+        let src = if align_corners {
+            scale * o as f64
+        } else {
+            scale * (o as f64 + 0.5) - 0.5
+        };
+        let src = src.max(0.0);
+        let idx0 = src.floor() as usize;
+        let idx1 = (idx0 + 1).min(in_size - 1);
+        let weight = (src - idx0 as f64).clamp(0.0, 1.0) as f32;
+        out.push(idx0 as f32);
+        out.push(idx1 as f32);
+        out.push(weight);
+    }
+    out
 }
 
 fn bilinear_interp_weights(
@@ -7876,24 +7948,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
-    /// Variable-length flash attention (CUDA `flash_attn_varlen` analogue).
-    ///
-    /// Computes `softmax(Q @ K^T * softmax_scale) @ V` per sequence with
-    /// online softmax. `q`/`k`/`v` are contiguous `(total, num_heads, head_dim)`
-    /// tensors; `cu_seqlens_q`/`cu_seqlens_k` are contiguous I32 tensors of
-    /// `batch + 1` cumulative lengths (`[0, l1, l1 + l2, ...]`). A q row with
-    /// global index `i` and its owning sequence `b` attends to the KV span
-    /// `[cu_seqlens_k[b], cu_seqlens_k[b + 1])`; with `causal = true` only KV
-    /// positions whose in-sequence index is `<=` the query's are kept
-    /// (`window_size_left = None`, `window_size_right = Some(0)` upstream).
-    ///
-    /// GQA: `num_heads_q / num_heads_kv` must be a positive integer; q head `n`
-    /// uses kv head `n * num_heads_kv / num_heads_q`.
-    ///
-    /// Dtypes: F32, F16, BF16. The kernel computes in F32 (accumulator parity
-    /// with CUDA flash-attn); non-F32 inputs are converted to F32 on the GPU
-    /// and the result is converted back to the input dtype (`rms_norm`/`rope`
-    /// F32-hub convention). Output shape is `(total_q, num_heads_q, head_dim_v)`.
     #[allow(clippy::too_many_arguments)]
     pub fn flash_attn_varlen(
         &self,
@@ -10065,6 +10119,102 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
     }
 
+    fn run_pool2d_native(
+        &self,
+        layout: &Layout,
+        out_shape: &Shape,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        max_pool: bool,
+        op_name: &'static str,
+    ) -> Result<Self> {
+        match self.dtype {
+            DType::F32 | DType::F16 | DType::BF16 => {}
+            other => return Err(Error::UnsupportedDTypeForOp(other, op_name).bt()),
+        }
+        if self.dtype == DType::F16
+            && !self
+                .device
+                .inner
+                .features
+                .contains(wgpu::Features::SHADER_F16)
+        {
+            return Err(Error::Msg(format!("{op_name} f16 requires shader-f16")).bt());
+        }
+        let (_, src_strides) = dims4(layout)?;
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let out_h = (h - kernel_size.0) / stride.0 + 1;
+        let out_w = (w - kernel_size.1) / stride.1 + 1;
+        let shader = match (self.dtype, max_pool) {
+            (DType::F32, true) => candle_wgpu_kernels::pool_max_f32_shader(WG_SIZE),
+            (DType::F32, false) => candle_wgpu_kernels::pool_avg_f32_shader(WG_SIZE),
+            (DType::F16, true) => candle_wgpu_kernels::pool_max_f16_shader(WG_SIZE),
+            (DType::F16, false) => candle_wgpu_kernels::pool_avg_f16_shader(WG_SIZE),
+            (DType::BF16, true) => candle_wgpu_kernels::pool_max_bf16_shader(WG_SIZE),
+            (DType::BF16, false) => candle_wgpu_kernels::pool_avg_bf16_shader(WG_SIZE),
+            _ => unreachable!(),
+        }
+        .ok_or_else(|| Error::Msg("wgpu shader pool.wgsl not embedded".into()).bt())?;
+
+        let dst = unsafe { self.device.alloc_uninit(out_shape, self.dtype)? };
+        let params = PoolParams {
+            offset_src: layout.start_offset().try_into()?,
+            offset_dst: 0,
+            // src_strides from dims4 are reversed: [0]=w, [1]=h, [2]=c, [3]=b.
+            stride0: src_strides[3],
+            stride1: src_strides[2],
+            stride2: src_strides[1],
+            stride3: src_strides[0],
+            ne: out_shape.elem_count().try_into()?,
+            bc: (b * c).try_into()?,
+            c: c.try_into()?,
+            out_h: out_h.try_into()?,
+            out_w: out_w.try_into()?,
+            kh: kernel_size.0.try_into()?,
+            kw: kernel_size.1.try_into()?,
+            sh: stride.0.try_into()?,
+            sw: stride.1.try_into()?,
+            _pad0: 0,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-pool2d-native-params"),
+                size: std::mem::size_of::<PoolParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+        let workgroups = (out_shape.elem_count() as u32).div_ceil(WG_SIZE);
+        let label = match (max_pool, self.dtype) {
+            (true, DType::F32) => "candle-wgpu-maxpool2d-f32",
+            (true, DType::F16) => "candle-wgpu-maxpool2d-f16",
+            (true, DType::BF16) => "candle-wgpu-maxpool2d-bf16",
+            (false, DType::F32) => "candle-wgpu-avgpool2d-f32",
+            (false, DType::F16) => "candle-wgpu-avgpool2d-f16",
+            (false, DType::BF16) => "candle-wgpu-avgpool2d-bf16",
+            _ => unreachable!(),
+        };
+        self.device
+            .run_compute(&shader, &entries, &bindings, workgroups, label)?;
+        Ok(dst)
+    }
+
     fn run_upsample_nearest1d_f32(&self, layout: &Layout, out_l: usize) -> Result<Self> {
         if self.dtype != DType::F32 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu upsample_nearest1d").bt());
@@ -10136,6 +10286,196 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         height.copy_strided_src(&mut out, 0, &height_l)?;
         drop(src_contiguous);
         Ok(out)
+    }
+
+    /// Native-dtype gather upsample (nearest1d / nearest2d / bilinear2d).
+    ///
+    /// The source buffer is read in its stored dtype — F32 and F16 natively,
+    /// BF16 as packed u32 half-words — with no F32-hub round trip. Bilinear
+    /// interpolation accumulates in f32 and is rounded to the source dtype
+    /// exactly once on store. Axis coordinate tables (`tab_a`/`tab_b`) are
+    /// precomputed on the host in f64 so index/weight selection is bit-exact
+    /// with the CPU reference. Callers route F16 here only when the device
+    /// advertises u32-module `SHADER_F16` (see `wgpu_f16_emulates_f32`).
+    #[allow(clippy::too_many_arguments)]
+    fn run_upsample_gather_native(
+        &self,
+        layout: &Layout,
+        mode: UpsampleMode,
+        bc_rows: usize,
+        src_h: usize,
+        src_w: usize,
+        out_h: usize,
+        out_w: usize,
+        out_shape: &Shape,
+        tab_a: &[f32],
+        tab_b: &[f32],
+    ) -> Result<Self> {
+        let dtype = self.dtype;
+        let src_type = match dtype {
+            DType::F32 => "f32",
+            DType::F16 => "f16",
+            DType::BF16 => "u32", // two bf16 half-words per u32 word
+            other => {
+                return Err(Error::UnsupportedDTypeForOp(other, "wgpu upsample gather").bt());
+            }
+        };
+        let shader = match mode {
+            UpsampleMode::Nearest1D => {
+                candle_wgpu_kernels::upsample_nearest1d_shader(WG_SIZE, src_type)
+            }
+            UpsampleMode::Nearest2D => {
+                candle_wgpu_kernels::upsample_nearest2d_shader(WG_SIZE, src_type)
+            }
+            UpsampleMode::Bilinear2D => {
+                candle_wgpu_kernels::upsample_bilinear2d_shader(WG_SIZE, src_type)
+            }
+        }
+        .ok_or_else(|| Error::Msg("wgpu shader upsample.wgsl not embedded".into()).bt())?;
+
+        let ne = out_shape.elem_count();
+        let dst = unsafe { self.device.alloc_uninit(out_shape, dtype)? };
+
+        // Materialize strided/offset inputs to a contiguous buffer so the shader
+        // can index [bc, src_h, src_w] row-major (same policy as the F32 path).
+        // `src_buf` keeps an Arc<Buffer> clone alive for the whole dispatch, so
+        // the (optional) materialization temp can be dropped safely — Drop only
+        // recycles when refcount would reach zero.
+        let src_buf = if layout.is_contiguous() && layout.start_offset() == 0 {
+            self.buffer.clone()
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(layout.shape(), dtype)? };
+            self.copy_strided_src(&mut tmp, 0, layout)?;
+            tmp.buffer.clone()
+        };
+
+        if ne == 0 {
+            return Ok(dst);
+        }
+
+        let ne_u32: u32 = ne.try_into()?;
+        let params = UpsampleParams {
+            ne: ne_u32,
+            bc: bc_rows.try_into()?,
+            src_h: src_h.try_into()?,
+            src_w: src_w.try_into()?,
+            out_h: out_h.try_into()?,
+            out_w: out_w.try_into()?,
+            offset_src: 0,
+            offset_dst: 0,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-upsample-params"),
+                size: std::mem::size_of::<UpsampleParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+
+        let tab_a_storage = self.device.storage_from_slice(tab_a)?;
+        let tab_b_storage = self.device.storage_from_slice(tab_b)?;
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            storage_entry(3, false),
+            uniform_entry(4),
+        ];
+        let bindings = [
+            buffer_binding(0, &src_buf),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &tab_a_storage.buffer),
+            buffer_binding(3, &tab_b_storage.buffer),
+            buffer_binding(4, &param_buffer),
+        ];
+        let workgroups = ne_u32.div_ceil(WG_SIZE);
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-upsample",
+        )?;
+        Ok(dst)
+    }
+
+    fn run_upsample_nearest1d_native(&self, layout: &Layout, out_l: usize) -> Result<Self> {
+        let (b, c, l) = layout.shape().dims3()?;
+        let rows = b * c;
+        let out_shape = Shape::from(vec![b, c, out_l]);
+        let tab_a = nearest_src_indices(l, out_l);
+        self.run_upsample_gather_native(
+            layout,
+            UpsampleMode::Nearest1D,
+            rows,
+            1,
+            l,
+            1,
+            out_l,
+            &out_shape,
+            &tab_a,
+            &[0.0],
+        )
+    }
+
+    fn run_upsample_nearest2d_native(
+        &self,
+        layout: &Layout,
+        out_h: usize,
+        out_w: usize,
+    ) -> Result<Self> {
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let bc = b * c;
+        let out_shape = Shape::from(vec![b, c, out_h, out_w]);
+        let tab_a = nearest_src_indices(h, out_h);
+        let tab_b = nearest_src_indices(w, out_w);
+        self.run_upsample_gather_native(
+            layout,
+            UpsampleMode::Nearest2D,
+            bc,
+            h,
+            w,
+            out_h,
+            out_w,
+            &out_shape,
+            &tab_a,
+            &tab_b,
+        )
+    }
+
+    fn run_upsample_bilinear2d_native(
+        &self,
+        layout: &Layout,
+        out_h: usize,
+        out_w: usize,
+        align_corners: bool,
+        scale_h: Option<f64>,
+        scale_w: Option<f64>,
+    ) -> Result<Self> {
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let bc = b * c;
+        let out_shape = Shape::from(vec![b, c, out_h, out_w]);
+        let tab_a = bilinear_axis_table(h, out_h, align_corners, scale_h);
+        let tab_b = bilinear_axis_table(w, out_w, align_corners, scale_w);
+        self.run_upsample_gather_native(
+            layout,
+            UpsampleMode::Bilinear2D,
+            bc,
+            h,
+            w,
+            out_h,
+            out_w,
+            &out_shape,
+            &tab_a,
+            &tab_b,
+        )
     }
 
     fn run_pool2d_im2col_f32(
@@ -10265,111 +10605,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             });
         }
         acc.ok_or_else(|| Error::Msg("pool2d empty kernel".into()).bt())
-    }
-
-    /// Native F32/F16/BF16 pool2d (max or avg) through pool.wgsl, one thread
-    /// per output element. No dtype conversion and no im2col staging: non-
-    /// contiguous inputs are handled directly through the stride fields.
-    ///
-    /// Semantics mirror the CUDA/CPU path: avg accumulates in f32 and rounds
-    /// back to the source dtype; max reduces on the source dtype (for BF16 the
-    /// f32 decode is order-preserving, so comparing the f32 values is
-    /// equivalent). F16 requires SHADER_F16.
-    #[allow(clippy::too_many_arguments)]
-    fn run_pool2d_native(
-        &self,
-        layout: &Layout,
-        out_shape: &Shape,
-        kernel_size: (usize, usize),
-        stride: (usize, usize),
-        max_pool: bool,
-        op_name: &'static str,
-    ) -> Result<Self> {
-        match self.dtype {
-            DType::F32 | DType::F16 | DType::BF16 => {}
-            other => return Err(Error::UnsupportedDTypeForOp(other, op_name).bt()),
-        }
-        if self.dtype == DType::F16
-            && !self
-                .device
-                .inner
-                .features
-                .contains(wgpu::Features::SHADER_F16)
-        {
-            return Err(Error::Msg(format!("{op_name} f16 requires shader-f16")).bt());
-        }
-        let (_, src_strides) = dims4(layout)?;
-        let (b, c, h, w) = layout.shape().dims4()?;
-        let out_h = (h - kernel_size.0) / stride.0 + 1;
-        let out_w = (w - kernel_size.1) / stride.1 + 1;
-        let shader = match (self.dtype, max_pool) {
-            (DType::F32, true) => candle_wgpu_kernels::pool_max_f32_shader(WG_SIZE),
-            (DType::F32, false) => candle_wgpu_kernels::pool_avg_f32_shader(WG_SIZE),
-            (DType::F16, true) => candle_wgpu_kernels::pool_max_f16_shader(WG_SIZE),
-            (DType::F16, false) => candle_wgpu_kernels::pool_avg_f16_shader(WG_SIZE),
-            (DType::BF16, true) => candle_wgpu_kernels::pool_max_bf16_shader(WG_SIZE),
-            (DType::BF16, false) => candle_wgpu_kernels::pool_avg_bf16_shader(WG_SIZE),
-            _ => unreachable!(),
-        }
-        .ok_or_else(|| Error::Msg("wgpu shader pool.wgsl not embedded".into()).bt())?;
-
-        let dst = unsafe { self.device.alloc_uninit(out_shape, self.dtype)? };
-        let params = PoolParams {
-            offset_src: layout.start_offset().try_into()?,
-            offset_dst: 0,
-            // src_strides from dims4 are reversed: [0]=w, [1]=h, [2]=c, [3]=b.
-            stride0: src_strides[3],
-            stride1: src_strides[2],
-            stride2: src_strides[1],
-            stride3: src_strides[0],
-            ne: out_shape.elem_count().try_into()?,
-            bc: (b * c).try_into()?,
-            c: c.try_into()?,
-            out_h: out_h.try_into()?,
-            out_w: out_w.try_into()?,
-            kh: kernel_size.0.try_into()?,
-            kw: kernel_size.1.try_into()?,
-            sh: stride.0.try_into()?,
-            sw: stride.1.try_into()?,
-            _pad0: 0,
-        };
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-pool2d-native-params"),
-                size: std::mem::size_of::<PoolParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
-        let entries = [
-            storage_entry(0, false),
-            storage_entry(1, false),
-            uniform_entry(2),
-        ];
-        let bindings = [
-            buffer_binding(0, &self.buffer),
-            buffer_binding(1, &dst.buffer),
-            buffer_binding(2, &param_buffer),
-        ];
-        let workgroups = (out_shape.elem_count() as u32).div_ceil(WG_SIZE);
-        let label = match (max_pool, self.dtype) {
-            (true, DType::F32) => "candle-wgpu-maxpool2d-f32",
-            (true, DType::F16) => "candle-wgpu-maxpool2d-f16",
-            (true, DType::BF16) => "candle-wgpu-maxpool2d-bf16",
-            (false, DType::F32) => "candle-wgpu-avgpool2d-f32",
-            (false, DType::F16) => "candle-wgpu-avgpool2d-f16",
-            (false, DType::BF16) => "candle-wgpu-avgpool2d-bf16",
-            _ => unreachable!(),
-        };
-        self.device
-            .run_compute(&shader, &entries, &bindings, workgroups, label)?;
-        Ok(dst)
     }
 
     pub(crate) fn quantized_index_select_f32(
@@ -12557,25 +12792,54 @@ impl BackendStorage for WgpuStorage {
         })
     }
     fn upsample_nearest1d(&self, layout: &Layout, out_l: usize) -> Result<Self> {
-        self.run_upsample_nearest1d_f32(layout, out_l)
+        match self.dtype {
+            // F32 keeps the exact matmul path.
+            DType::F32 => self.run_upsample_nearest1d_f32(layout, out_l),
+            // Native F16/BF16 gather; F16 on devices without shader-f16 falls
+            // back to the F32 hub so parity is preserved everywhere.
+            DType::F16 if !wgpu_shader_f16_enabled(&self.device) => {
+                let (b, c, _l) = layout.shape().dims3()?;
+                let out_shape = Shape::from(vec![b, c, out_l]);
+                self.gpu_resident_via_f32(
+                    layout,
+                    &out_shape,
+                    "wgpu upsample_nearest1d",
+                    |src, src_l| src.run_upsample_nearest1d_f32(src_l, out_l),
+                )
+            }
+            DType::F16 | DType::BF16 => self.run_upsample_nearest1d_native(layout, out_l),
+            other => Err(Error::UnsupportedDTypeForOp(other, "wgpu upsample_nearest1d").bt()),
+        }
     }
     fn upsample_nearest2d(&self, layout: &Layout, out_h: usize, out_w: usize) -> Result<Self> {
         let (b, c, h, w) = layout.shape().dims4()?;
         let out_shape = Shape::from(vec![b, c, out_h, out_w]);
-        self.gpu_resident_via_f32(
-            layout,
-            &out_shape,
-            "wgpu upsample_nearest2d",
-            |src, src_l| {
-                src.run_upsample2d_f32(
-                    src_l,
-                    out_h,
-                    out_w,
-                    nearest_interp_weights(h, out_h),
-                    nearest_interp_weights(w, out_w),
-                )
-            },
-        )
+        match self.dtype {
+            // F32 always keeps the exact matmul path; F16 without shader-f16 also
+            // routes through the F32 hub so parity is preserved everywhere.
+            DType::F32 | DType::F16 => {
+                if self.dtype == DType::F16 && wgpu_shader_f16_enabled(&self.device) {
+                    self.run_upsample_nearest2d_native(layout, out_h, out_w)
+                } else {
+                    self.gpu_resident_via_f32(
+                        layout,
+                        &out_shape,
+                        "wgpu upsample_nearest2d",
+                        |src, src_l| {
+                            src.run_upsample2d_f32(
+                                src_l,
+                                out_h,
+                                out_w,
+                                nearest_interp_weights(h, out_h),
+                                nearest_interp_weights(w, out_w),
+                            )
+                        },
+                    )
+                }
+            }
+            DType::BF16 => self.run_upsample_nearest2d_native(layout, out_h, out_w),
+            other => Err(Error::UnsupportedDTypeForOp(other, "wgpu upsample_nearest2d").bt()),
+        }
     }
     fn upsample_bilinear2d(
         &self,
@@ -12588,20 +12852,46 @@ impl BackendStorage for WgpuStorage {
     ) -> Result<Self> {
         let (b, c, h, w) = layout.shape().dims4()?;
         let out_shape = Shape::from(vec![b, c, out_h, out_w]);
-        self.gpu_resident_via_f32(
-            layout,
-            &out_shape,
-            "wgpu upsample_bilinear2d",
-            |src, src_l| {
-                src.run_upsample2d_f32(
-                    src_l,
-                    out_h,
-                    out_w,
-                    bilinear_interp_weights(h, out_h, align_corners, scale_h),
-                    bilinear_interp_weights(w, out_w, align_corners, scale_w),
-                )
-            },
-        )
+        match self.dtype {
+            // F32 always keeps the exact matmul path; F16 without shader-f16 also
+            // routes through the F32 hub so parity is preserved everywhere.
+            DType::F32 | DType::F16 => {
+                if self.dtype == DType::F16 && wgpu_shader_f16_enabled(&self.device) {
+                    self.run_upsample_bilinear2d_native(
+                        layout,
+                        out_h,
+                        out_w,
+                        align_corners,
+                        scale_h,
+                        scale_w,
+                    )
+                } else {
+                    self.gpu_resident_via_f32(
+                        layout,
+                        &out_shape,
+                        "wgpu upsample_bilinear2d",
+                        |src, src_l| {
+                            src.run_upsample2d_f32(
+                                src_l,
+                                out_h,
+                                out_w,
+                                bilinear_interp_weights(h, out_h, align_corners, scale_h),
+                                bilinear_interp_weights(w, out_w, align_corners, scale_w),
+                            )
+                        },
+                    )
+                }
+            }
+            DType::BF16 => self.run_upsample_bilinear2d_native(
+                layout,
+                out_h,
+                out_w,
+                align_corners,
+                scale_h,
+                scale_w,
+            ),
+            other => Err(Error::UnsupportedDTypeForOp(other, "wgpu upsample_bilinear2d").bt()),
+        }
     }
     fn gather(&self, src_l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
         let rank = src_l.dims().len();
@@ -14247,6 +14537,318 @@ mod wgpu_reduce_tests {
     }
 }
 
+#[cfg(test)]
+mod wgpu_upsample_tests {
+    use crate::test_utils::compare_f32_slices;
+    use crate::{DType, Device, Tensor};
+
+    fn wgpu_device() -> Option<Device> {
+        match Device::new_wgpu(0) {
+            Ok(dev) => Some(dev),
+            Err(e) => {
+                eprintln!("skipping wgpu upsample tests: {e}");
+                None
+            }
+        }
+    }
+
+    fn as_f32(t: &Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    fn gen(shape: &[usize], scale: f32) -> Vec<f32> {
+        let n: usize = shape.iter().product();
+        (0..n).map(|i| (i as f32) * scale - 2.0).collect()
+    }
+
+    /// Differential nearest1d on the same dtype: nearest selects a source value
+    /// and copies it, so the f32-rounded results must match exactly.
+    #[test]
+    fn wgpu_upsample_nearest1d_f16_bf16() {
+        let gpu = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        for dtype in [DType::F16, DType::BF16] {
+            for (shape, out_l, label) in [
+                ((1, 2, 4), 8, "upx2"),
+                ((2, 1, 3), 9, "upx3"),
+                ((2, 2, 6), 3, "down"),
+                ((1, 1, 5), 11, "odd"),
+                ((3, 2, 7), 14, "reg"),
+            ] {
+                let src = gen(&[shape.0, shape.1, shape.2], 0.7);
+                let cpu = Tensor::from_vec(src.clone(), shape, &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+                    .upsample_nearest1d(out_l)
+                    .unwrap();
+                let g = Tensor::from_vec(src, shape, &gpu)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+                    .upsample_nearest1d(out_l)
+                    .unwrap();
+                assert_eq!(g.dims(), &[shape.0, shape.1, out_l], "{dtype:?} {label} shape");
+                let got = as_f32(&g);
+                let expected = as_f32(&cpu);
+                let (max_abs, max_rel, _ulp, bad) = compare_f32_slices(&got, &expected);
+                assert!(
+                    max_abs <= 1e-9 && max_rel <= 1e-9,
+                    "{dtype:?} {label}: max_abs={max_abs:e} max_rel={max_rel:e} first_bad={bad:?}"
+                );
+            }
+        }
+    }
+
+    /// Differential nearest2d on F16/BF16: nearest copies source values, so the
+    /// f32-rounded results must match the CPU reference exactly.
+    #[test]
+    fn wgpu_upsample_nearest2d_f16_bf16() {
+        let gpu = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        for dtype in [DType::F16, DType::BF16] {
+            for ((in_h, in_w, out_h, out_w), label) in [
+                ((2, 3, 4, 6), "upx2"),
+                ((2, 2, 6, 6), "upx3"),
+                ((4, 4, 2, 2), "down"),
+                ((3, 5, 7, 9), "odd"),
+                ((1, 1, 3, 5), "channel"),
+            ] {
+                let src = gen(&[1, 2, in_h, in_w], 0.7);
+                let cpu = Tensor::from_vec(src.clone(), (1, 2, in_h, in_w), &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+                    .upsample_nearest2d(out_h, out_w)
+                    .unwrap();
+                let g = Tensor::from_vec(src, (1, 2, in_h, in_w), &gpu)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+                    .upsample_nearest2d(out_h, out_w)
+                    .unwrap();
+                assert_eq!(
+                    g.dims(),
+                    &[1, 2, out_h, out_w],
+                    "{dtype:?} {label} shape"
+                );
+                let got = as_f32(&g);
+                let expected = as_f32(&cpu);
+                let (max_abs, max_rel, _ulp, bad) = compare_f32_slices(&got, &expected);
+                assert!(
+                    max_abs <= 1e-9 && max_rel <= 1e-9,
+                    "{dtype:?} {label}: max_abs={max_abs:e} max_rel={max_rel:e} first_bad={bad:?}"
+                );
+            }
+        }
+    }
+
+    /// Differential bilinear2d on F16/BF16. Interpolation runs in f32 on the
+    /// shader vs f64 on the CPU, but the result is rounded to the source dtype
+    /// exactly once, so the f32-rounded outputs must agree tightly.
+    #[test]
+    fn wgpu_upsample_bilinear2d_f16_bf16() {
+        let gpu = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        for dtype in [DType::F16, DType::BF16] {
+            let (atol, rtol) = match dtype {
+                DType::F16 => (1e-2f64, 5e-3f64),
+                _ => (2e-2f64, 5e-3f64),
+            };
+            for args in [
+                ((2, 2, 4, 4, false), "upx2"),
+                ((2, 3, 6, 9, false), "upx3"),
+                ((4, 4, 2, 2, false), "down"),
+                ((2, 2, 4, 4, true), "align"),
+                ((3, 3, 7, 7, false), "odd"),
+            ] {
+                let ((in_h, in_w, out_h, out_w, align), label) = args;
+                let src = gen(&[1, 2, in_h, in_w], 0.7);
+                let cpu = Tensor::from_vec(src.clone(), (1, 2, in_h, in_w), &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+                    .upsample_bilinear2d(out_h, out_w, align)
+                    .unwrap();
+                let g = Tensor::from_vec(src, (1, 2, in_h, in_w), &gpu)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+                    .upsample_bilinear2d(out_h, out_w, align)
+                    .unwrap();
+                assert_eq!(
+                    g.dims(),
+                    &[1, 2, out_h, out_w],
+                    "{dtype:?} {label} shape"
+                );
+                let got = as_f32(&g);
+                let expected = as_f32(&cpu);
+                let (max_abs, max_rel, _ulp, bad) = compare_f32_slices(&got, &expected);
+                assert!(
+                    max_abs <= atol && max_rel <= rtol,
+                    "{dtype:?} {label}: max_abs={max_abs:e} max_rel={max_rel:e} first_bad={bad:?}"
+                );
+            }
+
+            // scale-factor mode (2x), mirrors upsample_bilinear2d_with_scale.
+            let src = gen(&[1, 2, 2, 2], 0.7);
+            let cpu = Tensor::from_vec(src.clone(), (1, 2, 2, 2), &Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .upsample_bilinear2d_with_scale(2.0, 2.0, false)
+                .unwrap();
+            let g = Tensor::from_vec(src, (1, 2, 2, 2), &gpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .upsample_bilinear2d_with_scale(2.0, 2.0, false)
+                .unwrap();
+            assert_eq!(g.dims(), &[1, 2, 4, 4], "{dtype:?} scale shape");
+            let got = as_f32(&g);
+            let expected = as_f32(&cpu);
+            let (max_abs, max_rel, _ulp, bad) = compare_f32_slices(&got, &expected);
+            assert!(
+                max_abs <= atol && max_rel <= rtol,
+                "{dtype:?} scale: max_abs={max_abs:e} max_rel={max_rel:e} first_bad={bad:?}"
+            );
+        }
+    }
+
+    /// Non-contiguous narrowed input for bilinear.
+    #[test]
+    fn wgpu_upsample_bilinear2d_f16_bf16_noncontig() {
+        let gpu = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        for dtype in [DType::F16, DType::BF16] {
+            let full = gen(&[1, 2, 6, 6], 0.9);
+            let cpu_full = Tensor::from_vec(full.clone(), (1, 2, 6, 6), &Device::Cpu).unwrap();
+            let gpu_full = Tensor::from_vec(full, (1, 2, 6, 6), &gpu).unwrap();
+            let cpu = cpu_full
+                .narrow(2, 1, 3)
+                .unwrap()
+                .narrow(3, 2, 4)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .upsample_bilinear2d(6, 8, false)
+                .unwrap();
+            let g = gpu_full
+                .narrow(2, 1, 3)
+                .unwrap()
+                .narrow(3, 2, 4)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .upsample_bilinear2d(6, 8, false)
+                .unwrap();
+            assert_eq!(g.dims(), &[1, 2, 6, 8], "{dtype:?} noncontig shape");
+            let got = as_f32(&g);
+            let expected = as_f32(&cpu);
+            let (atol, rtol) = match dtype {
+                DType::F16 => (1e-2f64, 5e-3f64),
+                _ => (2e-2f64, 5e-3f64),
+            };
+            let (max_abs, max_rel, _ulp, bad) = compare_f32_slices(&got, &expected);
+            assert!(
+                max_abs <= atol && max_rel <= rtol,
+                "{dtype:?} noncontig: max_abs={max_abs:e} max_rel={max_rel:e} first_bad={bad:?}"
+            );
+        }
+    }
+
+    /// Non-contiguous narrowed input (both h and w shifted).
+    #[test]
+    fn wgpu_upsample_nearest2d_f16_bf16_noncontig() {
+        let gpu = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        for dtype in [DType::F16, DType::BF16] {
+            let full = gen(&[1, 2, 6, 6], 0.9);
+            let cpu_full = Tensor::from_vec(full.clone(), (1, 2, 6, 6), &Device::Cpu).unwrap();
+            let gpu_full = Tensor::from_vec(full, (1, 2, 6, 6), &gpu).unwrap();
+            let cpu = cpu_full
+                .narrow(2, 1, 3)
+                .unwrap()
+                .narrow(3, 2, 4)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .upsample_nearest2d(6, 8)
+                .unwrap();
+            let g = gpu_full
+                .narrow(2, 1, 3)
+                .unwrap()
+                .narrow(3, 2, 4)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .upsample_nearest2d(6, 8)
+                .unwrap();
+            assert_eq!(g.dims(), &[1, 2, 6, 8], "{dtype:?} noncontig shape");
+            let got = as_f32(&g);
+            let expected = as_f32(&cpu);
+            let (max_abs, max_rel, _ulp, bad) = compare_f32_slices(&got, &expected);
+            assert!(
+                max_abs <= 1e-9 && max_rel <= 1e-9,
+                "{dtype:?} noncontig: max_abs={max_abs:e} max_rel={max_rel:e} first_bad={bad:?}"
+            );
+        }
+    }
+
+    /// Non-contiguous (narrowed) input: the gather path materializes the strided
+    /// layout before dispatch; values must match the CPU reference for the same
+    /// strided view.
+    #[test]
+    fn wgpu_upsample_nearest1d_f16_bf16_noncontig() {
+        let gpu = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        for dtype in [DType::F16, DType::BF16] {
+            let full = gen(&[2, 3, 8], 0.9);
+            let cpu_full = Tensor::from_vec(full.clone(), (2, 3, 8), &Device::Cpu).unwrap();
+            let gpu_full = Tensor::from_vec(full, (2, 3, 8), &gpu).unwrap();
+            // Narrowed view starts at a non-zero flat offset (start=2, len=5).
+            let cpu = cpu_full
+                .narrow(2, 2, 5)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .upsample_nearest1d(10)
+                .unwrap();
+            let g = gpu_full
+                .narrow(2, 2, 5)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .upsample_nearest1d(10)
+                .unwrap();
+            assert_eq!(g.dims(), &[2, 3, 10], "{dtype:?} noncontig shape");
+            let got = as_f32(&g);
+            let expected = as_f32(&cpu);
+            let (max_abs, max_rel, _ulp, bad) = compare_f32_slices(&got, &expected);
+            assert!(
+                max_abs <= 1e-9 && max_rel <= 1e-9,
+                "{dtype:?} noncontig: max_abs={max_abs:e} max_rel={max_rel:e} first_bad={bad:?}"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 #[cfg(feature = "wgpu")]

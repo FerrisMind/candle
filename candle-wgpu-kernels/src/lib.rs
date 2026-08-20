@@ -1207,6 +1207,47 @@ pub fn pool_avg_bf16_shader(workgroup_size: u32) -> Option<String> {
     pool_bf16_shader(workgroup_size, true)
 }
 
+/// Shared native-dtype upsample variant: `mode` is one of NEAREST1D/NEAREST2D/
+/// BILINEAR2D, `src_type` is the WGSL storage element type ("f32"/"f16"/"u32"
+/// for bf16). `SRC_TYPE` is replaced token-wise and the matching SRC_F32/
+/// SRC_F16/SRC_BF16 `#ifdef` is enabled so the shader's load/store helpers
+/// (and `enable f16` for the F16 variant) are selected consistently.
+fn upsample_shader(mode: &str, src_type: &str, workgroup_size: u32) -> Option<String> {
+    let source = get("upsample.wgsl")?.source();
+    let dtype_def = match src_type {
+        "f32" => "SRC_F32",
+        "f16" => "SRC_F16",
+        _ => "SRC_BF16",
+    };
+    let defines = vec![mode.to_string(), dtype_def.to_string(), "WG_SIZE".to_string()];
+    let replacements = vec![
+        ("SRC_TYPE".to_string(), src_type.to_string()),
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+    ];
+    let pre_dtype = if src_type == "f16" {
+        DType::F16
+    } else {
+        DType::F32
+    };
+    Some(preprocess(source, &defines, &replacements, pre_dtype))
+}
+
+/// Native nearest1d upsample. `src_type` = "f32" | "f16" | "u32" (bf16 halves).
+pub fn upsample_nearest1d_shader(workgroup_size: u32, src_type: &str) -> Option<String> {
+    upsample_shader("NEAREST1D", src_type, workgroup_size)
+}
+
+/// Native nearest2d upsample. `src_type` = "f32" | "f16" | "u32" (bf16 halves).
+pub fn upsample_nearest2d_shader(workgroup_size: u32, src_type: &str) -> Option<String> {
+    upsample_shader("NEAREST2D", src_type, workgroup_size)
+}
+
+/// Native bilinear2d upsample (per-axis host weights, interpolation in f32).
+/// `src_type` = "f32" | "f16" | "u32" (bf16 halves).
+pub fn upsample_bilinear2d_shader(workgroup_size: u32, src_type: &str) -> Option<String> {
+    upsample_shader("BILINEAR2D", src_type, workgroup_size)
+}
+
 pub fn fill_inplace_shader(dtype: DType, workgroup_size: u32) -> String {
     let mut defines = vec![
         "WG_SIZE".to_string(),
@@ -1519,5 +1560,38 @@ mod tests {
             assert!(!s.contains("#ifdef"), "preprocessor must be resolved for {op}");
         }
     }
-}
+    #[test]
+    fn upsample_shaders_preprocess_modes_and_types() {
+        // Distinguish the actual `enable f16;` directive from the header comment
+        // mentioning it (comments are not stripped by preprocess).
+        let bare_enable_f16 = |s: &str| s.lines().any(|l| l.trim() == "enable f16;");
+        let any_directive = |s: &str| s.lines().any(|l| l.trim_start().starts_with('#'));
+        for (mode, accessor) in [
+            (
+                "NEAREST1D",
+                super::upsample_nearest1d_shader as fn(u32, &str) -> Option<String>,
+            ),
+            ("NEAREST2D", super::upsample_nearest2d_shader),
+            ("BILINEAR2D", super::upsample_bilinear2d_shader),
+        ] {
+            let f32s = accessor(256, "f32").expect("upsample f32");
+            assert!(f32s.contains("array<f32>"), "{mode} f32 array");
+            assert!(!bare_enable_f16(&f32s), "{mode} f32 must not keep enable f16");
+            assert!(!any_directive(&f32s), "{mode} f32 must strip all directives");
+            assert!(!f32s.contains("SRC_TYPE"), "{mode} f32 must replace SRC_TYPE");
+            assert!(f32s.contains("fn main"), "{mode} f32 entry point");
+            assert!(f32s.contains("store_dst("), "{mode} f32 body");
 
+            let f16s = accessor(256, "f16").expect("upsample f16");
+            assert!(bare_enable_f16(&f16s), "{mode} f16 must keep enable f16");
+            assert!(f16s.contains("array<f16>"), "{mode} f16 array");
+            assert!(!f16s.contains("SRC_TYPE"), "{mode} f16 must replace SRC_TYPE");
+
+            let bf16s = accessor(256, "u32").expect("upsample bf16");
+            assert!(bf16s.contains("array<u32>"), "{mode} bf16 array");
+            assert!(!bare_enable_f16(&bf16s), "{mode} bf16 must not keep enable f16");
+            assert!(bf16s.contains("atomicCompareExchangeWeak"), "{mode} bf16 CAS store");
+            assert!(!bf16s.contains("SRC_TYPE"), "{mode} bf16 must replace SRC_TYPE");
+        }
+    }
+}
