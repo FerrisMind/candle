@@ -1,0 +1,140 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "types.glsl"
+
+// Fused flash attention with variable-length sequences and paged K/V cache.
+// Vulkan counterpart of candle-flash-attn::flash_attn_with_kvcache (CUDA,
+// paged mode, block_table).
+//
+//   q: (total_q, h_q, d)                          contiguous
+//   k: (num_blocks, page_block_size, h_kv, d)     contiguous
+//   v: (num_blocks, page_block_size, h_kv, d_v)   contiguous
+//   cu_seqlens_q/k: I32, batch+1 cumulative offsets [0, l1, l1+l2, ...]
+//   block_table: I32, (batch, max_blocks_per_seq) contiguous;
+//                block_table[b * max_blocks_per_seq + i] is the physical
+//                block holding page i of sequence b (pages may be scattered
+//                and blocks unused -> holes).
+//   output: (total_q, h_q, d_v), same dtype as q
+//
+// Each invocation computes a single output row (q_row, q_head):
+//   - locate the batch b owning q_row via binary search over cu_seqlens_q,
+//   - iterate the KV range [cu_seqlens_k[b], cu_seqlens_k[b+1]), where each
+//     local kv row k_idx is remapped to its physical row via the block table:
+//       page_idx = k_idx / page_block_size
+//       page_row = k_idx % page_block_size
+//       block    = block_table[b * max_blocks_per_seq + page_idx]
+//       j_flat   = block * page_block_size + page_row
+//     (k/v are laid out as (num_blocks * page_block_size, h_kv, d/d_v)),
+//   - online softmax (running max/sum + rescale) over the causal-masked
+//     scores, accumulate V in f32, write out in dtype q.
+//
+// GQA: q head n attends to kv head n * h_kv / h_q (h_q % h_kv == 0).
+// Causal: within a sequence, only keys with local k_idx <= local q_idx attend.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer QBuf          { float data_q[]; };
+layout(binding = 1) readonly buffer KBuf          { float data_k[]; };
+layout(binding = 2) readonly buffer VBuf          { float data_v[]; };
+layout(binding = 3) readonly buffer CuQBuf        { int data_cu_q[]; };
+layout(binding = 4) readonly buffer CuKBuf        { int data_cu_k[]; };
+layout(binding = 5) readonly buffer BlockTableBuf { int data_block_table[]; };
+layout(binding = 6) writeonly buffer OBuf         { float data_o[]; };
+
+layout(push_constant) uniform params {
+    uint total_q;          // number of query rows
+    uint h_q;              // number of query heads
+    uint h_kv;             // number of key/value heads
+    uint head_dim;         // Q/K head dimension (d)
+    uint head_dim_v;       // V head dimension / output dimension (d_v)
+    uint num_seqs;         // batch size = cu_seqlens element count - 1
+    float scale;
+    uint causal;
+    uint max_seqlen_q;     // accepted for CUDA parity; actual ranges come from cu_seqlens
+    uint max_seqlen_k;
+    uint page_block_size;  // rows per page (multiple of 32)
+    uint max_blocks_per_seq; // block_table row length
+};
+
+// Returns the batch index b such that cu_q[b] <= q_row < cu_q[b+1].
+uint seq_of_row(uint q_row) {
+    uint lo = 0u;
+    uint hi = num_seqs;
+    while (lo < hi) {
+        const uint mid = (lo + hi) >> 1u;
+        if (data_cu_q[mid] <= int(q_row)) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo - 1u;
+}
+
+void main() {
+    const uint q_row = gl_GlobalInvocationID.x;
+    const uint h = gl_GlobalInvocationID.y;
+    if (q_row >= total_q || h >= h_q) {
+        return;
+    }
+
+    // GQA: map query head to key/value head (h_q % h_kv == 0).
+    const uint h_kv_use = h * h_kv / h_q;
+
+    const uint b = seq_of_row(q_row);
+    const uint q_idx = q_row - uint(data_cu_q[b]);
+    const uint kv_start = uint(data_cu_k[b]);
+    const uint kv_end = uint(data_cu_k[b + 1u]);
+
+    const uint q_base = (q_row * h_q + h) * head_dim;
+    const uint o_base = (q_row * h_q + h) * head_dim_v;
+
+    // Online softmax state; the accumulator is at most head_dim_v (<= 512).
+    float m = -1.0e30;
+    float l = 0.0;
+    float o_acc[512];
+    for (uint d = 0u; d < head_dim_v; d++) {
+        o_acc[d] = 0.0;
+    }
+
+    for (uint j = kv_start; j < kv_end; j++) {
+        const uint k_idx = j - kv_start;
+        if (causal != 0u && k_idx > q_idx) {
+            continue;
+        }
+
+        // Remap local row k_idx to a physical row via the block table.
+        const uint page_idx = k_idx / page_block_size;
+        const uint page_row = k_idx % page_block_size;
+        const uint block = uint(data_block_table[b * max_blocks_per_seq + page_idx]);
+        const uint j_flat = block * page_block_size + page_row;
+
+        const uint k_base = (j_flat * h_kv + h_kv_use) * head_dim;
+        float score = 0.0;
+        for (uint d = 0u; d < head_dim; d++) {
+            score += data_q[q_base + d] * data_k[k_base + d];
+        }
+        score *= scale;
+
+        const float m_new = max(m, score);
+        const float exp_diff = (m_new - m < 80.0) ? exp(m - m_new) : 0.0;
+        const float w = exp(score - m_new);
+
+        const uint v_base = (j_flat * h_kv + h_kv_use) * head_dim_v;
+        for (uint d = 0u; d < head_dim_v; d++) {
+            o_acc[d] = o_acc[d] * exp_diff + w * data_v[v_base + d];
+        }
+        l = l * exp_diff + w;
+        m = m_new;
+    }
+
+    const float inv_l = (l > 0.0) ? (1.0 / l) : 0.0;
+    for (uint d = 0u; d < head_dim_v; d++) {
+        data_o[o_base + d] = o_acc[d] * inv_l;
+    }
+}

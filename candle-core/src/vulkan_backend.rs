@@ -6348,6 +6348,241 @@ impl VulkanStorage {
         Ok(dst)
     }
 
+    /// Paged flash attention with variable-length sequences, the Vulkan
+    /// counterpart of candle-flash-attn::flash_attn_with_kvcache (CUDA,
+    /// paged mode with a block_table).
+    ///
+    /// k/v are rank-4 page caches:
+    ///   (num_blocks, page_block_size, h_kv, head_dim(_v))
+    /// and rows are scattered through physical pages: for local kv row
+    /// `k_idx` of sequence b,
+    ///   page_idx = k_idx / page_block_size,
+    ///   page_row = k_idx % page_block_size,
+    ///   block = block_table[b * max_blocks_per_seq + page_idx],
+    ///   j_flat = block * page_block_size + page_row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_paged(
+        &self,
+        layout: &Layout, // q: (total_q, h_q, d), contiguous
+        k: &Self,
+        k_l: &Layout, // (num_blocks, page_block_size, h_kv, d)
+        v: &Self,
+        v_l: &Layout, // (num_blocks, page_block_size, h_kv, d_v)
+        cu_seqlens_q: &Self, // I32, batch+1, contiguous
+        cu_seqlens_k: &Self, // I32, batch+1, contiguous
+        block_table: &Self,
+        block_table_l: &Layout, // I32, (batch, max_blocks_per_seq), last dim contiguous
+        page_block_size: usize,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        softmax_scale: f32,
+        causal: bool,
+    ) -> Result<Self> {
+        use crate::DType;
+
+        if !matches!(self.dtype, DType::F32 | DType::F16 | DType::BF16) {
+            return Err(Error::UnsupportedDTypeForOp(
+                self.dtype,
+                "vulkan flash_attn_paged",
+            )
+            .bt());
+        }
+        if k.dtype != self.dtype || v.dtype != self.dtype {
+            return Err(Error::Msg(
+                "flash_attn_paged requires k and v to share the dtype of q".into(),
+            )
+            .bt());
+        }
+
+        let (q, q_l) = self.materialize_contiguous(layout)?;
+        let (k, k_l) = k.materialize_contiguous(k_l)?;
+        let (v, v_l) = v.materialize_contiguous(v_l)?;
+
+        let dims_q = q_l.dims();
+        let dims_k = k_l.dims();
+        let dims_v = v_l.dims();
+        if dims_q.len() != 3 || dims_k.len() != 4 || dims_v.len() != 4 {
+            return Err(Error::Msg(
+                "flash_attn_paged expects 3D q [rows, heads, head_dim] and 4D k/v [num_blocks, page_block_size, heads, head_dim]"
+                    .into(),
+            )
+            .bt());
+        }
+        let (total_q, h_q, head_dim) = (dims_q[0], dims_q[1], dims_q[2]);
+        let (num_blocks, k_pbs, h_kv, head_dim_k) = (dims_k[0], dims_k[1], dims_k[2], dims_k[3]);
+        let (num_blocks_v, k_pbs_v, h_kv_v, head_dim_v) =
+            (dims_v[0], dims_v[1], dims_v[2], dims_v[3]);
+        if !page_block_size.is_multiple_of(32) {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged requires page_block_size to be a multiple of 32 (got {page_block_size})"
+            ))
+            .bt());
+        }
+        if k_pbs != page_block_size || k_pbs_v != page_block_size {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged page_block_size ({page_block_size}) does not match k/v shape ({k_pbs}, {k_pbs_v})"
+            ))
+            .bt());
+        }
+        if head_dim_k != head_dim {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged head dim mismatch q ({head_dim}) vs k ({head_dim_k})"
+            ))
+            .bt());
+        }
+        if num_blocks_v != num_blocks || k_pbs_v != k_pbs || h_kv_v != h_kv {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged shape mismatch k ({num_blocks}, {k_pbs}, {h_kv}) vs v ({num_blocks_v}, {k_pbs_v}, {h_kv_v})"
+            ))
+            .bt());
+        }
+        if h_q % h_kv != 0 {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged requires h_q ({h_q}) to be a multiple of h_kv ({h_kv})"
+            ))
+            .bt());
+        }
+        if head_dim > 512 || head_dim_v > 512 {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged supports head dims up to 512 (got q/k {head_dim}, v {head_dim_v})"
+            ))
+            .bt());
+        }
+
+        if cu_seqlens_q.dtype != DType::I32 || cu_seqlens_k.dtype != DType::I32 {
+            return Err(Error::Msg(
+                "flash_attn_paged requires cu_seqlens_q/k to be I32".into(),
+            )
+            .bt());
+        }
+        let num_seqs_q = cu_seqlens_q.count.checked_sub(1);
+        let num_seqs_k = cu_seqlens_k.count.checked_sub(1);
+        let (Some(batch_q), Some(batch_k)) = (num_seqs_q, num_seqs_k) else {
+            return Err(Error::Msg(
+                "flash_attn_paged requires at least 2 cu_seqlens elements".into(),
+            )
+            .bt());
+        };
+        if batch_q != batch_k {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged cu_seqlens_q ({batch_q} seqs) and cu_seqlens_k ({batch_k} seqs) mismatch"
+            ))
+            .bt());
+        }
+        let batch = batch_q;
+
+        let bt_dims = block_table_l.dims();
+        if block_table.dtype != DType::I32
+            || bt_dims.len() != 2
+            || bt_dims[0] != batch
+            || block_table_l.stride().last().copied() != Some(1)
+        {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged requires block_table to be contiguous I32 (batch={batch}, max_blocks_per_seq), got shape {bt_dims:?}"
+            ))
+            .bt());
+        }
+        let max_blocks_per_seq = bt_dims[1];
+
+        // F16/BF16 route through the F32 hub (GPU-resident conversion, exact
+        // for f16/bf16 inputs): compute in f32 like the CUDA kernel's f32
+        // accumulation, convert the result back to the input dtype.
+        if self.dtype != DType::F32 {
+            let q_f32 = q.to_dtype(&q_l, DType::F32)?;
+            let k_f32 = k.to_dtype(&k_l, DType::F32)?;
+            let v_f32 = v.to_dtype(&v_l, DType::F32)?;
+            let out = q_f32.flash_attn_paged(
+                &q_l,
+                &k_f32,
+                &k_l,
+                &v_f32,
+                &v_l,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                block_table,
+                block_table_l,
+                page_block_size,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale,
+                causal,
+            )?;
+
+            let out_l = Layout::contiguous(Shape::from_dims(&[total_q, h_q, head_dim_v]));
+            return out.to_dtype(&out_l, self.dtype);
+        }
+
+        let cu_q_shape = Shape::from_dims(&[cu_seqlens_q.count]);
+        let cu_k_shape = Shape::from_dims(&[cu_seqlens_k.count]);
+        let (cu_q, _) = cu_seqlens_q.materialize_contiguous(&Layout::contiguous(cu_q_shape))?;
+        let (cu_k, _) = cu_seqlens_k.materialize_contiguous(&Layout::contiguous(cu_k_shape))?;
+        let (block_table, _) = block_table.materialize_contiguous(block_table_l)?;
+
+        let out_shape = Shape::from_dims(&[total_q, h_q, head_dim_v]);
+        let dst = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
+        if total_q == 0 || h_q == 0 {
+            return Ok(dst);
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FlashAttnPagedParams {
+            total_q: u32,
+            h_q: u32,
+            h_kv: u32,
+            head_dim: u32,
+            head_dim_v: u32,
+            num_seqs: u32,
+            scale: f32,
+            causal: u32,
+            max_seqlen_q: u32,
+            max_seqlen_k: u32,
+            page_block_size: u32,
+            max_blocks_per_seq: u32,
+        }
+
+        let params = FlashAttnPagedParams {
+            total_q: total_q as u32,
+            h_q: h_q as u32,
+            h_kv: h_kv as u32,
+            head_dim: head_dim as u32,
+            head_dim_v: head_dim_v as u32,
+            num_seqs: batch as u32,
+            scale: softmax_scale,
+            causal: if causal { 1 } else { 0 },
+            max_seqlen_q: max_seqlen_q as u32,
+            max_seqlen_k: max_seqlen_k as u32,
+            page_block_size: page_block_size as u32,
+            max_blocks_per_seq: max_blocks_per_seq as u32,
+        };
+
+        let bindings = [
+            VulkanBinding::Storage(&q.buffer),
+            VulkanBinding::Storage(&k.buffer),
+            VulkanBinding::Storage(&v.buffer),
+            VulkanBinding::Storage(&cu_q.buffer),
+            VulkanBinding::Storage(&cu_k.buffer),
+            VulkanBinding::Storage(&block_table.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+
+        let shader_name = "flash_attn_paged";
+        let spirv = candle_vulkan_kernels::spirv(shader_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {shader_name} not generated")).bt())?;
+
+        // One thread per (q_row, q_head): x -> q_row, y -> q_head.
+        let workgroup_size = 256u32;
+        let num_workgroups_x = (total_q as u32).div_ceil(workgroup_size);
+        q.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (num_workgroups_x, h_q as u32, 1),
+        )?;
+
+        Ok(dst)
+    }
+
     pub fn sigmoid(&self, layout: &Layout) -> Result<Self> {
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan sigmoid").bt());
@@ -11791,6 +12026,319 @@ mod tests {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    // ---- flash_attn_paged (paged K/V cache with block_table) tests ----
+
+    /// CPU reference for paged flash attention. k/v are the physical page
+    /// buffers laid out as (num_blocks * page_block_size, h_kv, d); the local
+    /// kv row `k_idx` of sequence b is remapped to physical row
+    /// block_table[b * max_blocks_per_seq + k_idx / page_block_size]
+    ///   * page_block_size + k_idx % page_block_size.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_attn_reference(
+        q: &[f32],
+        h_q: usize,
+        d_qk: usize,
+        d_v: usize,
+        k: &[f32],
+        h_kv: usize,
+        v: &[f32],
+        cu_q: &[i32],
+        cu_k: &[i32],
+        block_table: &[i32],
+        max_blocks_per_seq: usize,
+        page_block_size: usize,
+        scale: f32,
+        causal: bool,
+    ) -> Vec<f32> {
+        let batch = cu_q.len() - 1;
+        let total_q = cu_q[batch] as usize;
+        let mut out = vec![0f32; total_q * h_q * d_v];
+        for i in 0..total_q {
+            let b = (0..batch)
+                .find(|&bb| {
+                    let s = cu_q[bb] as usize;
+                    let e = cu_q[bb + 1] as usize;
+                    s <= i && i < e
+                })
+                .expect("row must belong to a sequence");
+            let q_idx = i - cu_q[b] as usize;
+            let kv_start = cu_k[b] as usize;
+            let kv_end = cu_k[b + 1] as usize;
+            for h in 0..h_q {
+                let h_kv_use = h * h_kv / h_q;
+                let mut m = f64::NEG_INFINITY;
+                let mut l = 0f64;
+                let mut acc = vec![0f64; d_v];
+                for j in kv_start..kv_end {
+                    let k_idx = j - kv_start;
+                    if causal && k_idx > q_idx {
+                        continue;
+                    }
+                    let page_idx = k_idx / page_block_size;
+                    let page_row = k_idx % page_block_size;
+                    let block = block_table[b * max_blocks_per_seq + page_idx] as usize;
+                    let j_flat = block * page_block_size + page_row;
+                    let mut score = 0f64;
+                    for dd in 0..d_qk {
+                        score += q[(i * h_q + h) * d_qk + dd] as f64
+                            * k[(j_flat * h_kv + h_kv_use) * d_qk + dd] as f64;
+                    }
+                    score *= scale as f64;
+                    let m_new = m.max(score);
+                    let w = (score - m_new).exp();
+                    let exp_diff = if m_new - m < 80.0 { (m - m_new).exp() } else { 0.0 };
+                    for dd in 0..d_v {
+                        acc[dd] =
+                            acc[dd] * exp_diff + w * v[(j_flat * h_kv + h_kv_use) * d_v + dd] as f64;
+                    }
+                    l = l * exp_diff + w;
+                    m = m_new;
+                }
+                let inv_l = if l > 0.0 { 1.0 / l } else { 0.0 };
+                for dd in 0..d_v {
+                    out[(i * h_q + h) * d_v + dd] = (acc[dd] * inv_l) as f32;
+                }
+            }
+        }
+        out
+    }
+
+    /// Scatter dense per-sequence kv rows (total_kv, h_kv, d) into the
+    /// physical page buffer (num_blocks * page_block_size, h_kv, d) using the
+    /// same block_table mapping the kernel applies.
+    #[allow(clippy::too_many_arguments)]
+    fn scatter_paged_kv(
+        dense: &[f32], // (total_kv, h_kv, d)
+        h_kv: usize,
+        d: usize,
+        cu_k: &[i32],
+        block_table: &[i32],
+        max_blocks_per_seq: usize,
+        page_block_size: usize,
+        num_blocks: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0f32; num_blocks * page_block_size * h_kv * d];
+        let batch = cu_k.len() - 1;
+        for b in 0..batch {
+            let start = cu_k[b] as usize;
+            let end = cu_k[b + 1] as usize;
+            for k_idx in start..end {
+                let local = k_idx - start;
+                let page = local / page_block_size;
+                let row = local % page_block_size;
+                let block = block_table[b * max_blocks_per_seq + page] as usize;
+                let flat = block * page_block_size + row;
+                let src = k_idx * h_kv * d;
+                let dst = flat * h_kv * d;
+                out[dst..dst + h_kv * d].copy_from_slice(&dense[src..src + h_kv * d]);
+            }
+        }
+        out
+    }
+
+    /// Relative error with a configurable denominator floor: outputs with
+    /// magnitude below `floor` are treated as effectively zero (f32 round-off
+    /// dominates them), so near-zero elements are compared against the floor
+    /// instead of their own magnitude. Real indexing bugs produce O(1) errors
+    /// and are still caught.
+    fn max_relative_error_floor(actual: &[f32], expected: &[f32], floor: f32) -> f32 {
+        assert_eq!(actual.len(), expected.len());
+        let mut err = 0f32;
+        for (a, e) in actual.iter().zip(expected.iter()) {
+            let denom = e.abs().max(floor);
+            err = err.max((a - e).abs() / denom);
+        }
+        err
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn vulkan_flash_attn_paged_f32_matches_reference() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        // (h_q, h_kv, cu_q, cu_k, block_table, max_blocks_per_seq, page_block_size, causal, head_dim)
+        //
+        // Block tables intentionally use non-identity page ids and leave
+        // unused "hole" blocks so a kernel that ignores the indirection
+        // (or assumes pages are contiguous) fails loudly.
+        let cases: &[(
+            usize,
+            usize,
+            Vec<i32>,
+            Vec<i32>,
+            Vec<i32>,
+            usize,
+            usize,
+            bool,
+            usize,
+        )] = &[
+            // 2 seqs, non-causal, kv_len 34 > page 32 (2 pages, partial last
+            // page of 2 rows) and kv_len 16 (partial page); block 3 is a hole.
+            (
+                1, 1, vec![0, 3, 5], vec![0, 34, 50], vec![0, 1, 2, 3], 2, 32, false, 64,
+            ),
+            // causal, multi-page first sequence (33 rows), partial second.
+            (
+                1, 1, vec![0, 4, 6], vec![0, 33, 38], vec![0, 1, 2, 3], 2, 32, true, 64,
+            ),
+            // GQA h_q=2 h_kv=1, multi-page sequences with partial last pages
+            // (40 and 30 rows); third table column is unused padding.
+            (
+                2, 1, vec![0, 5, 9], vec![0, 40, 70], vec![0, 1, 2, 2, 3, 1], 3, 32, false, 64,
+            ),
+            // shuffled page ids [3, 1, 4, 0] with a hole (block 2 unused),
+            // head_dim 32.
+            (
+                1, 1, vec![0, 2, 4], vec![0, 40, 50], vec![3, 1, 4, 0], 2, 32, false, 32,
+            ),
+        ];
+
+        for &(h_q, h_kv, ref cu_q, ref cu_k, ref block_table, max_blocks, pbs, causal, d) in cases
+        {
+            let batch = cu_q.len() - 1;
+            let total_q = cu_q[batch] as usize;
+            let total_kv = cu_k[batch] as usize;
+            let num_blocks = block_table.iter().copied().max().unwrap() as usize + 1;
+            let d_v = d;
+            let q = varlen_deterministic_f32(total_q * h_q * d, batch as u64 * 71 + 11);
+            let k_dense = varlen_deterministic_f32(total_kv * h_kv * d, batch as u64 * 13 + 3);
+            let v_dense = varlen_deterministic_f32(total_kv * h_kv * d_v, batch as u64 * 17 + 5);
+            let k = scatter_paged_kv(
+                &k_dense, h_kv, d, cu_k, block_table, max_blocks, pbs, num_blocks,
+            );
+            let v = scatter_paged_kv(
+                &v_dense, h_kv, d_v, cu_k, block_table, max_blocks, pbs, num_blocks,
+            );
+            let scale = 0.125f32;
+
+            let q_s = device.storage_from_cpu_storage(&CpuStorage::F32(q.clone()))?;
+            let k_s = device.storage_from_cpu_storage(&CpuStorage::F32(k.clone()))?;
+            let v_s = device.storage_from_cpu_storage(&CpuStorage::F32(v.clone()))?;
+            let q_l = Layout::contiguous((total_q, h_q, d));
+            let k_l = Layout::contiguous((num_blocks, pbs, h_kv, d));
+            let v_l = Layout::contiguous((num_blocks, pbs, h_kv, d_v));
+            let cu_q_s = device.storage_from_cpu_storage(&CpuStorage::I32(cu_q.clone()))?;
+            let cu_k_s = device.storage_from_cpu_storage(&CpuStorage::I32(cu_k.clone()))?;
+            let bt_s = device.storage_from_cpu_storage(&CpuStorage::I32(block_table.clone()))?;
+            let bt_l = Layout::contiguous((batch, max_blocks));
+
+            let out = q_s.flash_attn_paged(
+                &q_l,
+                &k_s,
+                &k_l,
+                &v_s,
+                &v_l,
+                &cu_q_s,
+                &cu_k_s,
+                &bt_s,
+                &bt_l,
+                pbs,
+                total_q + 4,
+                total_kv + 7,
+                scale,
+                causal,
+            )?;
+            let cpu = out.to_cpu_storage()?;
+            let got = match &cpu {
+                CpuStorage::F32(v) => v.clone(),
+                other => crate::bail!("unexpected output dtype {other:?}"),
+            };
+            let expected = paged_attn_reference(
+                &q, h_q, d, d_v, &k, h_kv, &v, cu_q, cu_k, block_table, max_blocks, pbs, scale,
+                causal,
+            );
+            let err = max_relative_error_floor(&got, &expected, 1e-4);
+            assert!(
+                err < 2e-4,
+                "paged mismatch: h_q={h_q} h_kv={h_kv} cu_q={cu_q:?} cu_k={cu_k:?} block_table={block_table:?} pbs={pbs} causal={causal} head_dim={d} err={err}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn vulkan_flash_attn_paged_f16_matches_reference() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        // F16 routes through the F32 hub (to_dtype -> f32 kernel -> to_dtype
+        // back), so this exercises the rank-4 dtype-conversion plumbing of
+        // flash_attn_paged; tolerance reflects f16 quantization (~5e-4).
+        let cases: &[(Vec<i32>, Vec<i32>, Vec<i32>, usize, bool)] = &[
+            // scattered page ids with a hole (block 2 unused), causal
+            (vec![0, 3, 5], vec![0, 34, 50], vec![3, 1, 0, 2], 2, true),
+            // multi-page sequences with partial last pages
+            (vec![0, 5, 9], vec![0, 40, 70], vec![0, 1, 2, 2, 3, 1], 3, false),
+        ];
+        for &(ref cu_q, ref cu_k, ref block_table, max_blocks, causal) in cases {
+            let batch = cu_q.len() - 1;
+            let total_q = cu_q[batch] as usize;
+            let total_kv = cu_k[batch] as usize;
+            let (h_q, h_kv, d, pbs) = (1usize, 1usize, 64usize, 32usize);
+            let num_blocks = block_table.iter().copied().max().unwrap() as usize + 1;
+            let q = varlen_deterministic_f32(total_q * h_q * d, batch as u64 * 71 + 11);
+            let k_dense = varlen_deterministic_f32(total_kv * h_kv * d, batch as u64 * 13 + 3);
+            let v_dense = varlen_deterministic_f32(total_kv * h_kv * d, batch as u64 * 17 + 5);
+            let k = scatter_paged_kv(
+                &k_dense, h_kv, d, cu_k, block_table, max_blocks, pbs, num_blocks,
+            );
+            let v = scatter_paged_kv(
+                &v_dense, h_kv, d, cu_k, block_table, max_blocks, pbs, num_blocks,
+            );
+            let scale = 0.125f32;
+
+            let q_f16: Vec<half::f16> = q.iter().map(|&x| half::f16::from_f32(x)).collect();
+            let k_f16: Vec<half::f16> = k.iter().map(|&x| half::f16::from_f32(x)).collect();
+            let v_f16: Vec<half::f16> = v.iter().map(|&x| half::f16::from_f32(x)).collect();
+            // Reference over the exact f16-rounded inputs the kernel consumes,
+            // so the comparison isolates output f16 rounding + f32 accumulation
+            // instead of the (much larger) input quantization of f16.
+            let q_ref: Vec<f32> = q_f16.iter().map(|&x| x.to_f32()).collect();
+            let k_ref: Vec<f32> = k_f16.iter().map(|&x| x.to_f32()).collect();
+            let v_ref: Vec<f32> = v_f16.iter().map(|&x| x.to_f32()).collect();
+            let q_s = device.storage_from_cpu_storage(&CpuStorage::F16(q_f16))?;
+            let k_s = device.storage_from_cpu_storage(&CpuStorage::F16(k_f16))?;
+            let v_s = device.storage_from_cpu_storage(&CpuStorage::F16(v_f16))?;
+            let q_l = Layout::contiguous((total_q, h_q, d));
+            let k_l = Layout::contiguous((num_blocks, pbs, h_kv, d));
+            let v_l = Layout::contiguous((num_blocks, pbs, h_kv, d));
+            let cu_q_s = device.storage_from_cpu_storage(&CpuStorage::I32(cu_q.clone()))?;
+            let cu_k_s = device.storage_from_cpu_storage(&CpuStorage::I32(cu_k.clone()))?;
+            let bt_s = device.storage_from_cpu_storage(&CpuStorage::I32(block_table.clone()))?;
+            let bt_l = Layout::contiguous((batch, max_blocks));
+
+            let out = q_s.flash_attn_paged(
+                &q_l,
+                &k_s,
+                &k_l,
+                &v_s,
+                &v_l,
+                &cu_q_s,
+                &cu_k_s,
+                &bt_s,
+                &bt_l,
+                pbs,
+                total_q + 4,
+                total_kv + 7,
+                scale,
+                causal,
+            )?;
+            let cpu = out.to_cpu_storage()?;
+            let got = match &cpu {
+                CpuStorage::F16(v) => v.iter().map(|&x| x.to_f32()).collect::<Vec<f32>>(),
+                other => crate::bail!("unexpected output dtype {other:?}"),
+            };
+            let expected = paged_attn_reference(
+                &q_ref, h_q, d, d, &k_ref, h_kv, &v_ref, cu_q, cu_k, block_table, max_blocks, pbs,
+                scale, causal,
+            );
+            let err = max_relative_error_floor(&got, &expected, 1e-3);
+            assert!(
+                err < 2e-3,
+                "paged f16 mismatch: cu_q={cu_q:?} cu_k={cu_k:?} block_table={block_table:?} causal={causal} err={err}"
+            );
         }
         Ok(())
     }
