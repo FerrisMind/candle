@@ -519,6 +519,28 @@ struct Im2ColParams {
     d1: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PoolParams {
+    offset_src: u32, // in elements
+    offset_dst: u32, // in elements
+    // Strides (in elements): [0]=batch, [1]=channel, [2]=h, [3]=w.
+    stride0: u32,
+    stride1: u32,
+    stride2: u32,
+    stride3: u32,
+    ne: u32, // total output elements (b*c*out_h*out_w)
+    bc: u32,
+    c: u32,
+    out_h: u32,
+    out_w: u32,
+    kh: u32,
+    kw: u32,
+    sh: u32,
+    sw: u32,
+    _pad0: u32,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum WgpuError {
     #[error("{0}")]
@@ -9993,6 +10015,111 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         acc.ok_or_else(|| Error::Msg("pool2d empty kernel".into()).bt())
     }
 
+    /// Native F32/F16/BF16 pool2d (max or avg) through pool.wgsl, one thread
+    /// per output element. No dtype conversion and no im2col staging: non-
+    /// contiguous inputs are handled directly through the stride fields.
+    ///
+    /// Semantics mirror the CUDA/CPU path: avg accumulates in f32 and rounds
+    /// back to the source dtype; max reduces on the source dtype (for BF16 the
+    /// f32 decode is order-preserving, so comparing the f32 values is
+    /// equivalent). F16 requires SHADER_F16.
+    #[allow(clippy::too_many_arguments)]
+    fn run_pool2d_native(
+        &self,
+        layout: &Layout,
+        out_shape: &Shape,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        max_pool: bool,
+        op_name: &'static str,
+    ) -> Result<Self> {
+        match self.dtype {
+            DType::F32 | DType::F16 | DType::BF16 => {}
+            other => return Err(Error::UnsupportedDTypeForOp(other, op_name).bt()),
+        }
+        if self.dtype == DType::F16
+            && !self
+                .device
+                .inner
+                .features
+                .contains(wgpu::Features::SHADER_F16)
+        {
+            return Err(Error::Msg(format!("{op_name} f16 requires shader-f16")).bt());
+        }
+        let (_, src_strides) = dims4(layout)?;
+        let (b, c, h, w) = layout.shape().dims4()?;
+        let out_h = (h - kernel_size.0) / stride.0 + 1;
+        let out_w = (w - kernel_size.1) / stride.1 + 1;
+        let shader = match (self.dtype, max_pool) {
+            (DType::F32, true) => candle_wgpu_kernels::pool_max_f32_shader(WG_SIZE),
+            (DType::F32, false) => candle_wgpu_kernels::pool_avg_f32_shader(WG_SIZE),
+            (DType::F16, true) => candle_wgpu_kernels::pool_max_f16_shader(WG_SIZE),
+            (DType::F16, false) => candle_wgpu_kernels::pool_avg_f16_shader(WG_SIZE),
+            (DType::BF16, true) => candle_wgpu_kernels::pool_max_bf16_shader(WG_SIZE),
+            (DType::BF16, false) => candle_wgpu_kernels::pool_avg_bf16_shader(WG_SIZE),
+            _ => unreachable!(),
+        }
+        .ok_or_else(|| Error::Msg("wgpu shader pool.wgsl not embedded".into()).bt())?;
+
+        let dst = unsafe { self.device.alloc_uninit(out_shape, self.dtype)? };
+        let params = PoolParams {
+            offset_src: layout.start_offset().try_into()?,
+            offset_dst: 0,
+            // src_strides from dims4 are reversed: [0]=w, [1]=h, [2]=c, [3]=b.
+            stride0: src_strides[3],
+            stride1: src_strides[2],
+            stride2: src_strides[1],
+            stride3: src_strides[0],
+            ne: out_shape.elem_count().try_into()?,
+            bc: (b * c).try_into()?,
+            c: c.try_into()?,
+            out_h: out_h.try_into()?,
+            out_w: out_w.try_into()?,
+            kh: kernel_size.0.try_into()?,
+            kw: kernel_size.1.try_into()?,
+            sh: stride.0.try_into()?,
+            sw: stride.1.try_into()?,
+            _pad0: 0,
+        };
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-pool2d-native-params"),
+                size: std::mem::size_of::<PoolParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+        let workgroups = (out_shape.elem_count() as u32).div_ceil(WG_SIZE);
+        let label = match (max_pool, self.dtype) {
+            (true, DType::F32) => "candle-wgpu-maxpool2d-f32",
+            (true, DType::F16) => "candle-wgpu-maxpool2d-f16",
+            (true, DType::BF16) => "candle-wgpu-maxpool2d-bf16",
+            (false, DType::F32) => "candle-wgpu-avgpool2d-f32",
+            (false, DType::F16) => "candle-wgpu-avgpool2d-f16",
+            (false, DType::BF16) => "candle-wgpu-avgpool2d-bf16",
+            _ => unreachable!(),
+        };
+        self.device
+            .run_compute(&shader, &entries, &bindings, workgroups, label)?;
+        Ok(dst)
+    }
+
     pub(crate) fn quantized_index_select_f32(
         &self,
         qdtype: GgmlDType,
@@ -12119,6 +12246,25 @@ impl BackendStorage for WgpuStorage {
             (h - kernel_size.0) / stride.0 + 1,
             (w - kernel_size.1) / stride.1 + 1,
         ]);
+        // Native F16/BF16 avg-pool avoids the F32 hub round-trip
+        // (double dtype conversion + extra allocations). F16 without
+        // shader-f16 falls back to the F32 hub, matching the other f16 ops.
+        let f16_native = self.dtype == DType::F16
+            && self
+                .device
+                .inner
+                .features
+                .contains(wgpu::Features::SHADER_F16);
+        if self.dtype == DType::BF16 || f16_native {
+            return self.run_pool2d_native(
+                layout,
+                &out_shape,
+                kernel_size,
+                stride,
+                false,
+                "wgpu avg_pool2d",
+            );
+        }
         self.gpu_resident_via_f32(layout, &out_shape, "wgpu avg_pool2d", |src, src_l| {
             src.run_pool2d_im2col_f32(src_l, kernel_size, stride, false)
         })
@@ -12136,6 +12282,24 @@ impl BackendStorage for WgpuStorage {
             (h - kernel_size.0) / stride.0 + 1,
             (w - kernel_size.1) / stride.1 + 1,
         ]);
+        // Native F16/BF16 max-pool avoids the F32 hub round-trip. F16 without
+        // shader-f16 falls back to the F32 hub.
+        let f16_native = self.dtype == DType::F16
+            && self
+                .device
+                .inner
+                .features
+                .contains(wgpu::Features::SHADER_F16);
+        if self.dtype == DType::BF16 || f16_native {
+            return self.run_pool2d_native(
+                layout,
+                &out_shape,
+                kernel_size,
+                stride,
+                true,
+                "wgpu max_pool2d",
+            );
+        }
         self.gpu_resident_via_f32(layout, &out_shape, "wgpu max_pool2d", |src, src_l| {
             src.run_pool2d_im2col_f32(src_l, kernel_size, stride, true)
         })
@@ -13828,5 +13992,305 @@ mod wgpu_reduce_tests {
         assert!((got[0] - 6.0).abs() < 1e-12);
         assert!((got[1] - 15.0).abs() < 1e-12);
         assert_eq!(result.dims().to_vec(), vec![2, 1], "keepdim shape");
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "wgpu")]
+mod wgpu_pool_tests {
+    use super::*;
+    use crate::test_utils::compare_f32_slices;
+
+    /// Pool-specific tolerances: the CPU avg_pool2d reference accumulates in
+    /// the storage dtype (f16/bf16), so over k-element windows the reference
+    /// itself carries ~k*eps rounding noise. The F16/BF16 values come from the
+    /// task spec (`~1e-2 / ~2e-2` relative); F32 stays tight.
+    fn pool_tolerance(dtype: DType) -> (f64, f64) {
+        match dtype {
+            DType::F32 => (1e-4, 1e-4),
+            DType::F16 => (1e-2, 1e-2),
+            DType::BF16 => (2e-2, 2e-2),
+            _ => (1e-3, 1e-3),
+        }
+    }
+
+    fn wgpu_device() -> Option<crate::Device> {
+        match crate::Device::new_wgpu(0) {
+            Ok(crate::Device::Wgpu(dev)) => Some(crate::Device::Wgpu(dev)),
+            Ok(_) => {
+                eprintln!("skipping wgpu pool test: unexpected device variant");
+                None
+            }
+            Err(e) => {
+                eprintln!("skipping wgpu pool test: {e}");
+                None
+            }
+        }
+    }
+
+    fn wgpu_shader_f16(dev: &crate::Device) -> bool {
+        match dev {
+            crate::Device::Wgpu(dev) => {
+                dev.inner.features.contains(wgpu::Features::SHADER_F16)
+            }
+            _ => false,
+        }
+    }
+
+    fn gen_f32(n: usize, seed: u64) -> Vec<f32> {
+        // Deterministic, well-scaled data that exercises negatives and ties for max.
+        (0..n)
+            .map(|i| {
+                let x = ((i as u64).wrapping_mul(2654435761).wrapping_add(seed * 97)) as f32
+                    / 2_147_483_648.0;
+                (x - 0.5) * 3.0
+            })
+            .collect()
+    }
+
+    /// Differential check of native pool2d (F16/BF16, no F32 hub) vs the CPU
+    /// Tensor reference. `transpose_wh` makes the input non-contiguous by
+    /// swapping the H/W strides (a metadata-only view).
+    #[allow(clippy::too_many_arguments)]
+    fn check_pool(
+        label: &str,
+        dtype: DType,
+        max_pool: bool,
+        data: Vec<f32>,
+        shape: &[usize; 4],
+        kernel: (usize, usize),
+        stride: (usize, usize),
+        transpose_wh: bool,
+    ) {
+        let gpu = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        if dtype == DType::F16 && !wgpu_shader_f16(&gpu) {
+            eprintln!("skipping {label}: wgpu shader-f16 unavailable");
+            return;
+        }
+        let cpu_dev = crate::Device::Cpu;
+        let gpu_t = crate::Tensor::from_vec(data.clone(), shape, &gpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let cpu_t = crate::Tensor::from_vec(data, shape, &cpu_dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let gpu_t = if transpose_wh {
+            gpu_t.transpose(2, 3).unwrap()
+        } else {
+            gpu_t
+        };
+        let cpu_t = if transpose_wh {
+            cpu_t.transpose(2, 3).unwrap()
+        } else {
+            cpu_t
+        };
+        let g_out = if max_pool {
+            gpu_t.max_pool2d_with_stride(kernel, stride).unwrap()
+        } else {
+            gpu_t.avg_pool2d_with_stride(kernel, stride).unwrap()
+        };
+        let c_out = if max_pool {
+            cpu_t.max_pool2d_with_stride(kernel, stride).unwrap()
+        } else {
+            cpu_t.avg_pool2d_with_stride(kernel, stride).unwrap()
+        };
+        assert_eq!(
+            g_out.dims(),
+            c_out.dims(),
+            "{label}: shape mismatch gpu {:?} vs cpu {:?}",
+            g_out.dims(),
+            c_out.dims()
+        );
+        let g_vec = g_out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let c_vec = c_out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let (atol, rtol) = pool_tolerance(dtype);
+        let (max_abs, max_rel, _ulp, first_bad) = compare_f32_slices(&g_vec, &c_vec);
+        if max_abs > atol && max_rel > rtol {
+            let idx_info = match first_bad {
+                Some(i) => format!(
+                    " first at {i}: gpu={:.6e} cpu={:.6e}",
+                    g_vec[i], c_vec[i]
+                ),
+                None => String::new(),
+            };
+            panic!(
+                "{label}: abs={max_abs:.2e} rel={max_rel:.2e} tol_abs={atol:.2e} tol_rel={rtol:.2e}{idx_info}"
+            );
+        }
+    }
+
+    /// BF16 max-pool through the native pool.wgsl (u32-word halves, CAS store).
+    #[test]
+    fn wgpu_pool_bf16_max_native() {
+        for &shape in &[[1usize, 1, 4, 4], [2usize, 2, 4, 4], [1usize, 2, 5, 5]] {
+            for kernel in [(2usize, 2usize), (3usize, 3usize)] {
+                if shape[2] < kernel.0 || shape[3] < kernel.1 {
+                    continue;
+                }
+                for stride in [(1usize, 1usize), (2usize, 2usize)] {
+                    let label = format!(
+                        "bf16 max_pool shape={shape:?} k={kernel:?} s={stride:?}"
+                    );
+                    check_pool(
+                        &label,
+                        DType::BF16,
+                        true,
+                        gen_f32(shape.iter().product::<usize>(), 11),
+                        &shape,
+                        kernel,
+                        stride,
+                        false,
+                    );
+                }
+            }
+        }
+    }
+
+    /// BF16 avg-pool: f32 accumulation + round-trip to BF16.
+    #[test]
+    fn wgpu_pool_bf16_avg_native() {
+        for &shape in &[[1usize, 1, 4, 4], [2usize, 2, 6, 6], [1usize, 3, 5, 7]] {
+            for kernel in [(2usize, 2usize), (3usize, 3usize)] {
+                if shape[2] < kernel.0 || shape[3] < kernel.1 {
+                    continue;
+                }
+                for stride in [(1usize, 1usize), (2usize, 2usize)] {
+                    let label = format!(
+                        "bf16 avg_pool shape={shape:?} k={kernel:?} s={stride:?}"
+                    );
+                    check_pool(
+                        &label,
+                        DType::BF16,
+                        false,
+                        gen_f32(shape.iter().product::<usize>(), 23),
+                        &shape,
+                        kernel,
+                        stride,
+                        false,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Non-contiguous BF16 max-pool (H/W strides swapped).
+    #[test]
+    fn wgpu_pool_bf16_max_noncontig() {
+        check_pool(
+            "bf16 max_pool non-contig (2,1)/(2,1)",
+            DType::BF16,
+            true,
+            gen_f32(2 * 2 * 4 * 5, 31),
+            &[2usize, 2, 4, 5],
+            (2usize, 2usize),
+            (2usize, 1usize),
+            true,
+        );
+    }
+
+    /// F16 max-pool through native pool.wgsl (requires shader-f16).
+    #[test]
+    fn wgpu_pool_f16_max_native() {
+        for &shape in &[[1usize, 1, 4, 4], [1usize, 2, 6, 6], [2usize, 1, 5, 5]] {
+            for kernel in [(2usize, 2usize), (3usize, 3usize)] {
+                if shape[2] < kernel.0 || shape[3] < kernel.1 {
+                    continue;
+                }
+                for stride in [(1usize, 1usize), (2usize, 2usize)] {
+                    let label = format!(
+                        "f16 max_pool shape={shape:?} k={kernel:?} s={stride:?}"
+                    );
+                    check_pool(
+                        &label,
+                        DType::F16,
+                        true,
+                        gen_f32(shape.iter().product::<usize>(), 41),
+                        &shape,
+                        kernel,
+                        stride,
+                        false,
+                    );
+                }
+            }
+        }
+    }
+
+    /// F16 avg-pool with f32 accumulation, plus a non-contiguous case.
+    #[test]
+    fn wgpu_pool_f16_avg_native() {
+        for &shape in &[[1usize, 1, 4, 4], [2usize, 2, 5, 5]] {
+            for kernel in [(2usize, 2usize), (3usize, 3usize)] {
+                if shape[2] < kernel.0 || shape[3] < kernel.1 {
+                    continue;
+                }
+                for stride in [(1usize, 1usize), (2usize, 2usize)] {
+                    let label = format!(
+                        "f16 avg_pool shape={shape:?} k={kernel:?} s={stride:?}"
+                    );
+                    check_pool(
+                        &label,
+                        DType::F16,
+                        false,
+                        gen_f32(shape.iter().product::<usize>(), 53),
+                        &shape,
+                        kernel,
+                        stride,
+                        false,
+                    );
+                }
+            }
+        }
+        check_pool(
+            "f16 avg_pool non-contig (2,1)/(2,1)",
+            DType::F16,
+            false,
+            gen_f32(2 * 2 * 4 * 5, 61),
+            &[2usize, 2, 4, 5],
+            (2usize, 2usize),
+            (2usize, 1usize),
+            true,
+        );
+    }
+
+    /// Sanity: F32 still matches CPU through the legacy im2col path.
+    #[test]
+    fn wgpu_pool_f32_max_avg_sanity() {
+        check_pool(
+            "f32 max_pool sanity",
+            DType::F32,
+            true,
+            gen_f32(2 * 2 * 4 * 4, 71),
+            &[2usize, 2, 4, 4],
+            (2usize, 2usize),
+            (2usize, 2usize),
+            false,
+        );
+        check_pool(
+            "f32 avg_pool sanity",
+            DType::F32,
+            false,
+            gen_f32(2 * 2 * 4 * 4, 73),
+            &[2usize, 2, 4, 4],
+            (2usize, 2usize),
+            (2usize, 2usize),
+            false,
+        );
     }
 }
