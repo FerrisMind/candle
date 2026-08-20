@@ -6508,8 +6508,31 @@ impl VulkanStorage {
             compact.copy_strided_src(self, dst_l.start_offset(), dst_l)?;
             return Ok(());
         }
-        // Native F32 and F16 only (F16 uses packed-half CAS in set_rows_add_f16_i32).
-        if self.dtype != src.dtype || !matches!(self.dtype, DType::F32 | DType::F16) {
+        // Native: F32 (atomicAdd), F16 (packed-half CAS), U32/U8/I64/F64 via
+        // the set_rows_add_ext family (word CAS), F64 via F32 hub is NOT used —
+        // the ext kernel accumulates through the FLOAT_TYPE path.
+        if self.dtype != src.dtype
+            || !matches!(
+                self.dtype,
+                DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64 | DType::F64
+            )
+        {
+            if self.dtype == DType::BF16 && src.dtype == DType::BF16 {
+                // GPUEmulated: decode both sides to f32, scatter_add, encode back.
+                let mut dst_f32 = self.to_dtype(dst_l, DType::F32)?;
+                let src_f32 = src.to_dtype(&src_l, DType::F32)?;
+                let contig_dst = Layout::contiguous(dst_l.shape());
+                let contig_src = Layout::contiguous(src_l.shape());
+                dst_f32.run_scatter_add_last_dim_f32(
+                    &contig_dst,
+                    &ids,
+                    &ids_l,
+                    &src_f32,
+                    &contig_src,
+                )?;
+                let encoded = dst_f32.to_dtype(&contig_dst, DType::BF16)?;
+                return encoded.copy_strided_src(self, dst_l.start_offset(), &contig_dst);
+            }
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_add").bt());
         }
         let rank = dst_l.dims().len();
@@ -6583,6 +6606,10 @@ impl VulkanStorage {
         ];
         let spirv_name = match self.dtype {
             DType::F16 => "set_rows_add_f16_i32",
+            DType::U8 => "set_rows_add_u8_i32",
+            DType::U32 => "set_rows_add_u32_i32",
+            DType::I64 => "set_rows_add_i64_i32",
+            DType::F64 => "set_rows_add_f64_i32",
             _ => "set_rows_add_f32_i32",
         };
         let spirv = candle_vulkan_kernels::spirv(spirv_name)
@@ -10731,6 +10758,50 @@ mod tests {
                 "f64 mismatch at [{i}]: got {g:e}, expected {e:e}, rel_err {rel:e}"
             );
         }
+    }
+
+    #[test]
+    fn vulkan_scatter_add_u32() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let dst: Vec<u32> = vec![10, 20, 30, 40, 50, 60];
+        let ids: Vec<u32> = vec![2, 2, 0];
+        let src: Vec<u32> = vec![1, 7, 100];
+        let d = device.storage_from_cpu_storage(&CpuStorage::U32(dst.clone()))?;
+        let i = device.storage_from_cpu_storage(&CpuStorage::U32(ids.clone()))?;
+        let sv = device.storage_from_cpu_storage(&CpuStorage::U32(src.clone()))?;
+        let l = Layout::contiguous((6usize,));
+        let il = Layout::contiguous((3usize,));
+        let mut out = d.try_clone(&l)?;
+        out.scatter_add_set(&l, &i, &il, &sv, &il, 0)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::U32(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        // CPU reference with duplicate index 2.
+        let mut want = dst.clone();
+        want[2] += 1;
+        want[2] += 7;
+        want[0] += 100;
+        assert_eq!(got, want);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_argsort_f32_duplicates_stable() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        // duplicates: 5 at 0/2, 3 at 1/4
+        let vals: Vec<f32> = vec![5.0, 3.0, 5.0, 1.0, 3.0, 9.0];
+        let s = device.storage_from_cpu_storage(&CpuStorage::F32(vals))?;
+        let layout = Layout::contiguous((6usize,));
+        let out = s.argsort_last_dim(&layout, true, 6)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::U32(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        // CPU sort_by stability: equal keys keep ascending original index.
+        let want: Vec<u32> = vec![3, 1, 4, 0, 2, 5];
+        assert_eq!(got, want);
+        Ok(())
     }
 
     #[test]

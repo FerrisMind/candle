@@ -27,7 +27,21 @@ shared uvec2 dst_row[BLOCK_SIZE];
 bool should_swap(const uvec2 a, const uvec2 b, const bool needs_bounds_check) {
     const bool a_oob = needs_bounds_check ? a.x >= p.ncols : false;
     const bool b_oob = needs_bounds_check ? b.x >= p.ncols : false;
-    return a_oob || (!b_oob && a.y > b.y);
+    if (a_oob) {
+        return true;
+    }
+    if (b_oob) {
+        return false;
+    }
+    // Stable total order: (key, original index). For DESC the key is bitwise
+    // inverted so larger originals sort first, while equal keys keep the
+    // ascending original index (CPU sort_by stability in both directions).
+    const uint ka = (p.order == ASC) ? a.y : ~a.y;
+    const uint kb = (p.order == ASC) ? b.y : ~b.y;
+    if (ka == kb) {
+        return a.x > b.x;
+    }
+    return ka > kb;
 }
 
 void argsort(bool needs_bounds_check, const uint row) {
@@ -61,11 +75,7 @@ void argsort(bool needs_bounds_check, const uint row) {
     }
 
     if (col < p.ncols) {
-        if (p.order == ASC) {
-            data_d[row_offset + uint(col)] = dst_row[col].x;
-        } else {
-            data_d[row_offset + p.ncols - uint(col) - 1] = dst_row[col].x;
-        }
+        data_d[row_offset + uint(col)] = dst_row[col].x;
     }
 }
 
