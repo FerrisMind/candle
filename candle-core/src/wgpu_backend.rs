@@ -7854,6 +7854,258 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
+    /// Variable-length flash attention (CUDA `flash_attn_varlen` analogue).
+    ///
+    /// Computes `softmax(Q @ K^T * softmax_scale) @ V` per sequence with
+    /// online softmax. `q`/`k`/`v` are contiguous `(total, num_heads, head_dim)`
+    /// tensors; `cu_seqlens_q`/`cu_seqlens_k` are contiguous I32 tensors of
+    /// `batch + 1` cumulative lengths (`[0, l1, l1 + l2, ...]`). A q row with
+    /// global index `i` and its owning sequence `b` attends to the KV span
+    /// `[cu_seqlens_k[b], cu_seqlens_k[b + 1])`; with `causal = true` only KV
+    /// positions whose in-sequence index is `<=` the query's are kept
+    /// (`window_size_left = None`, `window_size_right = Some(0)` upstream).
+    ///
+    /// GQA: `num_heads_q / num_heads_kv` must be a positive integer; q head `n`
+    /// uses kv head `n * num_heads_kv / num_heads_q`.
+    ///
+    /// Dtypes: F32, F16, BF16. The kernel computes in F32 (accumulator parity
+    /// with CUDA flash-attn); non-F32 inputs are converted to F32 on the GPU
+    /// and the result is converted back to the input dtype (`rms_norm`/`rope`
+    /// F32-hub convention). Output shape is `(total_q, num_heads_q, head_dim_v)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_varlen(
+        &self,
+        layout: &Layout,
+        k: &Self,
+        k_l: &Layout,
+        v: &Self,
+        v_l: &Layout,
+        cu_seqlens_q: &Self,
+        cu_seqlens_k: &Self,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        softmax_scale: f32,
+        causal: bool,
+    ) -> Result<Self> {
+        use crate::DType;
+
+        if self.dtype != k.dtype || self.dtype != v.dtype {
+            return Err(Error::Msg(
+                "flash_attn_varlen: q/k/v dtype mismatch".into(),
+            )
+            .bt());
+        }
+        if !matches!(self.dtype, DType::F32 | DType::F16 | DType::BF16) {
+            return Err(Error::UnsupportedDTypeForOp(
+                self.dtype,
+                "wgpu flash_attn_varlen",
+            )
+            .bt());
+        }
+        if cu_seqlens_q.dtype != DType::I32 || cu_seqlens_k.dtype != DType::I32 {
+            return Err(Error::Msg(
+                "flash_attn_varlen: cu_seqlens_q/k must be I32".into(),
+            )
+            .bt());
+        }
+        if cu_seqlens_q.count < 2 || cu_seqlens_k.count < 2 {
+            return Err(Error::Msg(
+                "flash_attn_varlen: cu_seqlens need at least 2 elements".into(),
+            )
+            .bt());
+        }
+        let batch_q = cu_seqlens_q.count - 1;
+        let batch_k = cu_seqlens_k.count - 1;
+        if batch_q != batch_k {
+            return Err(Error::Msg(
+                "flash_attn_varlen: cu_seqlens_q/k batch mismatch".into(),
+            )
+            .bt());
+        }
+
+        // CUDA_reference invariants: layouts are contiguous. Copy strided or
+        // offset views to contiguous buffers so the kernel can index densely.
+        let ensure_contiguous = |src: &WgpuStorage, l: &Layout| -> Result<(WgpuStorage, Layout)> {
+            if !l.is_contiguous() || l.start_offset() != 0 {
+                let shape_ref = l.shape();
+                let mut tmp = unsafe { src.device.alloc_uninit(shape_ref, src.dtype)? };
+                src.copy_strided_src(&mut tmp, 0, l)?;
+                Ok((tmp, Layout::contiguous(shape_ref.clone())))
+            } else {
+                Ok((src.try_clone(l)?, l.clone()))
+            }
+        };
+        let (q_buf, q_l) = ensure_contiguous(self, layout)?;
+        let (k_buf, k_l) = ensure_contiguous(k, k_l)?;
+        let (v_buf, v_l) = ensure_contiguous(v, v_l)?;
+
+        // F32 compute hub for non-F32 dtypes (F16/BF16 are exactly representable
+        // in F32; accumulator stays F32 like CUDA flash-attn).
+        let to_f32 = |src: WgpuStorage, l: &Layout| -> Result<(WgpuStorage, Layout)> {
+            if src.dtype == DType::F32 {
+                Ok((src, l.clone()))
+            } else {
+                let converted = src.to_dtype(l, DType::F32)?;
+                Ok((converted, Layout::contiguous(l.shape().clone())))
+            }
+        };
+        let (q_c, q_c_l) = to_f32(q_buf, &q_l)?;
+        let (k_c, k_c_l) = to_f32(k_buf, &k_l)?;
+        let (v_c, v_c_l) = to_f32(v_buf, &v_l)?;
+
+        let q_dims = q_c_l.dims();
+        let k_dims = k_c_l.dims();
+        let v_dims = v_c_l.dims();
+        let (total_q, num_heads, head_dim) =
+            if q_dims.len() == 3 && q_dims[2] > 0 {
+                (q_dims[0], q_dims[1], q_dims[2])
+            } else {
+                return Err(Error::Msg(
+                    "flash_attn_varlen expects 3D Q tensor [total_q, h_q, d]".into(),
+                )
+                .bt());
+            };
+        let (total_kv, num_kv_heads, head_dim_kv) =
+            if k_dims.len() == 3 && k_dims[0] > 0 {
+                (k_dims[0], k_dims[1], k_dims[2])
+            } else {
+                return Err(Error::Msg(
+                    "flash_attn_varlen expects 3D K tensor [total_kv, h_kv, d]".into(),
+                )
+                .bt());
+            };
+        let head_dim_v = if v_dims.len() == 3 {
+            v_dims[2]
+        } else {
+            return Err(Error::Msg(
+                "flash_attn_varlen expects 3D V tensor [total_kv, h_kv, dv]".into(),
+            )
+            .bt());
+        };
+        if head_dim_kv != head_dim {
+            return Err(Error::Msg(format!(
+                "flash_attn_varlen: QK head dim {head_dim} != K head dim {head_dim_kv}"
+            ))
+            .bt());
+        }
+        if num_heads % num_kv_heads != 0 || num_heads < num_kv_heads {
+            return Err(Error::Msg(format!(
+                "flash_attn_varlen: GQA q heads {num_heads} not divisible by kv heads {num_kv_heads}"
+            ))
+            .bt());
+        }
+        if v_dims[0] != total_kv || v_dims[1] != num_kv_heads {
+            return Err(Error::Msg(
+                "flash_attn_varlen: K/V shapes must match (total_kv, num_kv_heads, d)".into(),
+            )
+            .bt());
+        }
+        if head_dim_v == 0 || head_dim_v > 512 {
+            return Err(Error::Msg(format!(
+                "flash_attn_varlen: head_dim_v {head_dim_v} out of supported range (1..=512)"
+            ))
+            .bt());
+        }
+
+        let out_shape = Shape::from_dims(&[total_q, num_heads, head_dim_v]);
+        let out_f32 = unsafe { q_c.device.alloc_uninit(&out_shape, DType::F32)? };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FlashAttnVarlenParams {
+            total_q: u32,
+            total_kv: u32,
+            head_dim: u32,
+            head_dim_v: u32,
+            num_heads: u32,
+            num_kv_heads: u32,
+            batch_size: u32,
+            max_seqlen_q: u32,
+            max_seqlen_k: u32,
+            offset_q: u32,
+            scale: f32,
+            causal: u32,
+        }
+
+        let param_buffer = q_c
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-flash-attn-varlen-params"),
+                size: std::mem::size_of::<FlashAttnVarlenParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, true),
+            storage_entry(4, true),
+            storage_entry(5, false),
+            uniform_entry(6),
+        ];
+        let bindings = [
+            buffer_binding(0, &q_c.buffer),
+            buffer_binding(1, &k_c.buffer),
+            buffer_binding(2, &v_c.buffer),
+            buffer_binding(3, &cu_seqlens_q.buffer),
+            buffer_binding(4, &cu_seqlens_k.buffer),
+            buffer_binding(5, &out_f32.buffer),
+            buffer_binding(6, &param_buffer),
+        ];
+
+        let shader_source = candle_wgpu_kernels::get("flash_attn_varlen.wgsl")
+            .ok_or_else(|| Error::Msg("wgpu flash_attn_varlen shader not found".into()).bt())?
+            .source();
+
+        // Dispatched as a 2D grid: x = q rows (one thread per row in chunks to
+        // respect the per-dimension workgroup cap), y = q heads.
+        let cap = wgpu_dispatch_wg_cap(&q_c.device);
+        let rows_per_dispatch = cap * WG_SIZE;
+        let mut row_base = 0u32;
+        while row_base < total_q as u32 {
+            let chunk_rows = (total_q as u32 - row_base).min(rows_per_dispatch);
+            let wg_x = chunk_rows.div_ceil(WG_SIZE);
+            let params = FlashAttnVarlenParams {
+                total_q: total_q as u32,
+                total_kv: total_kv as u32,
+                head_dim: head_dim as u32,
+                head_dim_v: head_dim_v as u32,
+                num_heads: num_heads as u32,
+                num_kv_heads: num_kv_heads as u32,
+                batch_size: batch_q as u32,
+                max_seqlen_q: max_seqlen_q as u32,
+                max_seqlen_k: max_seqlen_k as u32,
+                offset_q: row_base,
+                scale: softmax_scale,
+                causal: if causal { 1 } else { 0 },
+            };
+            q_c.device
+                .inner
+                .queue
+                .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+            q_c.device.run_compute_xyz(
+                shader_source,
+                &entries,
+                &bindings,
+                (wg_x, num_heads as u32, 1),
+                &[],
+                None,
+                "candle-wgpu-flash-attn-varlen",
+            )?;
+            row_base += chunk_rows;
+        }
+
+        if self.dtype == DType::F32 {
+            return Ok(out_f32);
+        }
+        let out_layout = Layout::contiguous(out_shape);
+        out_f32.to_dtype(&out_layout, self.dtype)
+    }
+
     pub fn ggml_rope(
         &self,
         layout: &Layout,
@@ -13828,5 +14080,408 @@ mod wgpu_reduce_tests {
         assert!((got[0] - 6.0).abs() < 1e-12);
         assert!((got[1] - 15.0).abs() < 1e-12);
         assert_eq!(result.dims().to_vec(), vec![2, 1], "keepdim shape");
+    }
+}
+
+
+#[cfg(test)]
+#[cfg(feature = "wgpu")]
+mod wgpu_flash_attn_varlen_tests {
+    use super::*;
+
+    fn wgpu_device() -> Option<WgpuDevice> {
+        match crate::Device::new_wgpu(0) {
+            Ok(crate::Device::Wgpu(dev)) => Some(dev),
+            Ok(_) => {
+                eprintln!("skipping wgpu flash_attn_varlen: unexpected device variant");
+                None
+            }
+            Err(e) => {
+                eprintln!("skipping wgpu flash_attn_varlen: {e}");
+                None
+            }
+        }
+    }
+
+    /// Deterministic pseudo-random fill in [-1, 1).
+    fn fill(vals: &mut [f32], seed: u64) {
+        let mut s = seed;
+        for x in vals.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *x = (((s >> 33) as f32) / (1u64 << 31) as f32) - 1.0;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Independent CPU reference: per-sequence two-pass softmax attention.
+    /// Each q row attends the KV span of its owning sequence (by cu_seqlens);
+    /// causal keeps KV positions with in-sequence index <= the query's.
+    fn reference_varlen(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        cu_q: &[i32],
+        cu_k: &[i32],
+        h_q: usize,
+        h_kv: usize,
+        d: usize,
+        dv: usize,
+        scale: f32,
+        causal: bool,
+    ) -> Vec<f32> {
+        let batch = cu_q.len() - 1;
+        let total_q = cu_q[batch] as usize;
+        let mut out = vec![0.0f32; total_q * h_q * dv];
+        for row in 0..total_q {
+            let mut b = 0usize;
+            for bb in 0..batch {
+                if (cu_q[bb + 1] as usize) <= row {
+                    b = bb + 1;
+                }
+            }
+            let q_local = row - cu_q[b] as usize;
+            let kv_lo = cu_k[b] as usize;
+            let kv_hi = cu_k[b + 1] as usize;
+            for h in 0..h_q {
+                let h_kv_idx = h * h_kv / h_q;
+                let mut scores = Vec::new();
+                let mut kv_pos = Vec::new();
+                for kv in kv_lo..kv_hi {
+                    let k_local = kv - kv_lo;
+                    if causal && q_local < k_local {
+                        continue;
+                    }
+                    let mut s = 0.0f32;
+                    for dd in 0..d {
+                        s += q[row * h_q * d + h * d + dd] * k[kv * h_kv * d + h_kv_idx * d + dd];
+                    }
+                    scores.push(s * scale);
+                    kv_pos.push(kv);
+                }
+                if scores.is_empty() {
+                    continue;
+                }
+                let m = scores
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &scores {
+                    sum += (s - m).exp();
+                }
+                let inv = 1.0 / sum;
+                for (i, kv) in kv_pos.iter().enumerate() {
+                    let w = (scores[i] - m).exp() * inv;
+                    for dd in 0..dv {
+                        out[row * h_q * dv + h * dv + dd] +=
+                            w * v[kv * h_kv * dv + h_kv_idx * dv + dd];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn close(a: f32, b: f32, rtol: f32, atol: f32) -> bool {
+        let diff = (a - b).abs();
+        diff <= atol + rtol * a.abs().max(b.abs())
+    }
+
+    fn download_f32(storage: &WgpuStorage) -> Result<Vec<f32>> {
+        let cpu = storage.to_cpu_storage()?;
+        match cpu {
+            CpuStorage::F32(v) => Ok(v),
+            CpuStorage::F16(v) => Ok(v.iter().map(|x| x.to_f32()).collect()),
+            CpuStorage::BF16(v) => Ok(v.iter().map(|x| x.to_f32()).collect()),
+            other => Err(Error::Msg(format!("expected float dtype, got {:?}", other)).bt()),
+        }
+    }
+
+    fn make_storage(
+        dev: &WgpuDevice,
+        dtype: DType,
+        data: &[f32],
+        shape: &[usize],
+    ) -> Result<(WgpuStorage, Layout)> {
+        let shape = Shape::from_dims(shape);
+        let f32_storage = dev.storage_from_slice(data)?;
+        let storage = if dtype == DType::F32 {
+            f32_storage
+        } else {
+            f32_storage.to_dtype(&Layout::contiguous(shape.clone()), dtype)?
+        };
+        Ok((storage, Layout::contiguous(shape)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_case(
+        dev: &WgpuDevice,
+        dtype: DType,
+        seqlens_q: &[usize],
+        seqlens_k: &[usize],
+        h_q: usize,
+        h_kv: usize,
+        d: usize,
+        dv: usize,
+        scale: f32,
+        causal: bool,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        rtol: f32,
+        atol: f32,
+    ) -> Result<()> {
+        let batch = seqlens_q.len();
+        let mut cu_q = vec![0i32; batch + 1];
+        let mut cu_k = vec![0i32; batch + 1];
+        for i in 0..batch {
+            cu_q[i + 1] = cu_q[i] + seqlens_q[i] as i32;
+            cu_k[i + 1] = cu_k[i] + seqlens_k[i] as i32;
+        }
+        let total_q = cu_q[batch] as usize;
+        let total_kv = cu_k[batch] as usize;
+        let mut q = vec![0.0f32; total_q * h_q * d];
+        let mut k = vec![0.0f32; total_kv * h_kv * d];
+        let mut v = vec![0.0f32; total_kv * h_kv * dv];
+        fill(&mut q, 12345);
+        fill(&mut k, 777);
+        fill(&mut v, 999);
+
+        let reference =
+            reference_varlen(&q, &k, &v, &cu_q, &cu_k, h_q, h_kv, d, dv, scale, causal);
+
+        let (q_s, q_l) = make_storage(dev, dtype, &q, &[total_q, h_q, d])?;
+        let (k_s, k_l) = make_storage(dev, dtype, &k, &[total_kv, h_kv, d])?;
+        let (v_s, v_l) = make_storage(dev, dtype, &v, &[total_kv, h_kv, dv])?;
+        let cu_q_s = dev.storage_from_slice(&cu_q)?;
+        let cu_k_s = dev.storage_from_slice(&cu_k)?;
+
+        let out = q_s.flash_attn_varlen(
+            &q_l,
+            &k_s,
+            &k_l,
+            &v_s,
+            &v_l,
+            &cu_q_s,
+            &cu_k_s,
+            max_seqlen_q,
+            max_seqlen_k,
+            scale,
+            causal,
+        )?;
+        assert!(out.dtype == dtype, "output dtype mismatch");
+        let got = download_f32(&out)?;
+        assert!(
+            got.len() == reference.len(),
+            "output length mismatch: {} vs {}",
+            got.len(),
+            reference.len()
+        );
+        for i in 0..got.len() {
+            let rel = if reference[i].abs() > 0.0 {
+                (got[i] - reference[i]).abs() / reference[i].abs()
+            } else {
+                (got[i] - reference[i]).abs()
+            };
+            assert!(
+                close(got[i], reference[i], rtol, atol),
+                "flash_attn_varlen mismatch at {i}: got {} ref {} rel {} (rtol {rtol})",
+                got[i],
+                reference[i],
+                rel
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_ragged_non_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, false, 8, 8, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_equal_seqs_non_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[5, 5], &[5, 5], 2, 2, 64, 64, 1.0 / 8.0, false, 5, 5, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_head_dim_32_non_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 32, 32, 1.0 / (32.0f32).sqrt(), false, 8, 8, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_head_dim_64_v32_non_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 32, 1.0 / 8.0, false, 8, 8, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_max_seqlen_larger_non_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, false, 1000, 4000, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_max_seqlen_smaller_than_actual() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, false, 2, 3, 1e-5, 1e-6)
+            .unwrap();
+    }
+    #[test]
+    fn flash_attn_varlen_f32_ragged_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_equal_seqs_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[5, 5], &[5, 5], 2, 2, 64, 64, 1.0 / 8.0, true, 5, 5, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_kv_longer_than_q_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        // q lengths [3,1,7] attend k lengths [7,5,5]; causal must mask out the
+        // extra trailing KV positions within each sequence.
+        check_case(&dev, DType::F32, &[3, 1, 7], &[7, 5, 5], 2, 2, 64, 64, 1.0 / 8.0, true, 7, 7, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_gqa_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 4, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_gqa_non_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[5, 5], &[5, 5], 4, 2, 64, 64, 1.0 / 8.0, false, 5, 5, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_head_dim_32_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 32, 32, 1.0 / (32.0f32).sqrt(), true, 8, 8, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_head_dim_64_v32_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        // head_dim_v differs from head_dim (QK dim 64, V dim 32).
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 32, 1.0 / 8.0, true, 8, 8, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_max_seqlen_larger_than_actual() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        // max_seqlen far above actual lengths must not change the result.
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, true, 1000, 4000, 1e-5, 1e-6)
+            .unwrap();
+    }
+    #[test]
+    fn flash_attn_varlen_f16_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F16, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 2e-2, 1e-3)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f16_non_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F16, &[5, 5], &[5, 5], 2, 2, 64, 64, 1.0 / 8.0, false, 5, 5, 2e-2, 1e-3)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_bf16_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::BF16, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 2e-2, 1e-3)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_bf16_non_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::BF16, &[5, 5], &[5, 5], 2, 2, 64, 64, 1.0 / 8.0, false, 5, 5, 2e-2, 1e-3)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f16_gqa() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F16, &[3, 1, 7], &[3, 1, 7], 4, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 2e-2, 1e-3)
+            .unwrap();
     }
 }
