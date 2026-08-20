@@ -223,5 +223,10 @@ vulkan 26/26, wgpu 46/46 тестов (2 ignored = задокументиров�
 | flash_attn_varlen (C2) | 81f54038 | .comp шейдер (online softmax, GQA, causal, seq_of_row бинарный поиск); F16/BF16 через F32-хаб (GPU-resident конвертация); 4 теста против f64 CPU-референса |
 | **staging pool size-class баг (критический, общий для всего бэкенда)** | 81f54038 | `acquire_staging_buffer` пулировал по next_power_of_two классам и мог выдать буфер МЕНЬШЕ запроса (напр. 1280B под запрос 1792B): map_write zero-filled хвост, копия обрезалась → шейдеры читали нули за пределами q-размера. Симптом: silent data corruption любых alternating-size upload→compute цепочек. Фикс: pop только буферов ≥ запроса, undersized возвращаются в пул; регрессионный тест vulkan_upload_staging_pool_roundtrip_integrity |
 
-### В работе (Фаза 2)
-- paged KV flash-attention (block_table, k/v ранг 4) — wgpu и vulkan, параллельные агенты в worktrees wt/paged-wgpu / wt/paged-vk.
+### Закрыто (Фаза 2 — paged KV, 2026-08-20 #3)
+| Гэп | Коммит | Механизм |
+|---|---|---|
+| paged flash-attention (block_table) wgpu | 8ef87dd4 | flash_attn_paged.wgsl: k/v ранг 4 (num_blocks, page_block_size, h_kv, d), адресация page_idx/page_row → block_table[b][page_idx] → kv_row; guard на отрицательные блоки; GQA, causal, chunked dispatch; F16/BF16 через F32-хаб. 5 тестов: multi-page + частичная последняя страница, causal, GQA, явные дырки block_table [7,3,1,5,2,0] (неиспользуемые блоки), F16 |
+| paged flash-attention (block_table) vulkan | 344de8f8 | flash_attn_paged.comp (binding 5 = block_table I32, push-constants page_block_size/max_blocks_per_seq); та же семантика/валидация (page_block_size % 32, k/v ранг 4); F16/BF16 через F32-хаб с rank-4 to_dtype. 2 теста (4 кейса F32: multi-page+partial, causal, GQA, shuffled ids [3,1,4,0] с дыркой; + F16-хаб) с floor-based метрикой (1e-4 floor) для f32-шума |
+
+Итог волны: **vulkan 48/48 passed (15 ignored), wgpu 108/108 passed, 0 ignored; clippy -D warnings = 0 по обеим фичам.** CUDA-специфичные вещи (candle-ug, CUDA Graphs) остаются вне scope; IQ/mxfp4 форматы — ограничение candle в целом.
