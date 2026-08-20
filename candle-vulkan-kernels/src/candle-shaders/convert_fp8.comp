@@ -5,35 +5,87 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
 
-#include "types.glsl"
 #include "fp8_helpers.glsl"
-#include "generic_unary_head.glsl"
+
+// Standalone F8E4M3 conversion kernel (no generic_unary_head: fp8 bytes are
+// packed 4-per-u32 word and the ggml head's A_TYPE selection via types.glsl
+// does not model a byte buffer). Mirrors the validated wgpu f8e4m3 kernel.
+//
+// Decode (DATA_A_F8E4M3): src = u32 words (4 fp8 bytes each), dst = D_TYPE.
+// Encode (DATA_D_F8E4M3): src = A_TYPE scalars, dst = u32 words (4 bytes).
+
+layout (push_constant) uniform parameter {
+    uint ne;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+} p;
+
+layout (binding = 0) readonly buffer A {
+#if defined(DATA_A_F8E4M3)
+    uint data_a[];
+#else
+    A_TYPE data_a[];
+#endif
+};
+
+layout (binding = 1) buffer D {
+#if defined(DATA_D_F8E4M3)
+    uint data_d[];
+#else
+    D_TYPE data_d[];
+#endif
+};
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
-// F8E4M3 conversion kernel. F8E4M3 is stored as uint8_t.
-// Decode: f8e4m3 → f32 (or f16 via f32 intermediate)
-// Encode:  f32 → f8e4m3 (or f16 → f32 → f8e4m3)
-
-D_TYPE convert_value(A_TYPE v) {
-#if defined(DATA_A_F8E4M3)
-    // Decode f8e4m3 → target
-    float f32_val = f8e4m3_to_f32(uint8_t(v));
-    return D_TYPE(f32_val);
-#elif defined(DATA_D_F8E4M3)
-    // Encode source → f8e4m3
-    float f32_val = float(v);
-    return D_TYPE(f32_to_f8e4m3(f32_val));
-#else
-    // Should not reach here
-    return D_TYPE(0);
-#endif
+uint get_idx() {
+    return gl_GlobalInvocationID.z * 262144u + gl_GlobalInvocationID.y * 512u + gl_GlobalInvocationID.x;
 }
+
+#if defined(DATA_A_F8E4M3)
+uint load_fp8_bits(uint i) {
+    uint word = data_a[i >> 2u];
+    return (word >> ((i & 3u) * 8u)) & 0xFFu;
+}
+#endif
+
+#if defined(DATA_D_F8E4M3)
+void store_fp8_bits(uint i, uint bits) {
+    // One thread per element writes its byte lane into the packed word via
+    // read-modify-write. Threads within a dispatch are disjoint per element,
+    // and each word's 4 lanes belong to 4 consecutive threads in the same
+    // 512-wide invocation only if aligned; to stay race-free, each thread
+    // stores the full word by re-reading siblings is impossible — instead we
+    // require the host to zero-fill and use atomicOr on the byte lane.
+    // The host dispatches with one invocation per element; atomicOr keeps
+    // concurrent lane writes correct.
+    uint shift = (i & 3u) * 8u;
+    atomicOr(data_d[i >> 2u], (bits & 0xFFu) << shift);
+}
+#endif
 
 void main() {
     const uint idx = get_idx();
     if (idx >= p.ne) {
         return;
     }
-    data_d[get_doffset() + dst_idx(idx)] = convert_value(data_a[get_aoffset() + src0_idx(idx)]);
+    // TEMP-PROBE: marker write to prove this kernel executes (remove after).
+#if defined(DATA_A_F8E4M3)
+    // Decode fp8 -> D_TYPE (f32 or f16 via f32).
+    float v = f8e4m3_to_f32(uint8_t(load_fp8_bits(idx)));
+    #if defined(USE_F16)
+    data_d[idx] = D_TYPE(v);
+    #else
+    data_d[idx] = v;
+    #endif
+#elif defined(DATA_D_F8E4M3)
+    // Encode A_TYPE (f32 or f16) -> fp8 byte with RNE, packed into words.
+    #if defined(USE_F16)
+    float v = float(data_a[idx]);
+    #else
+    float v = data_a[idx];
+    #endif
+    store_fp8_bits(idx, uint(f32_to_f8e4m3(v)));
+#endif
 }

@@ -3072,6 +3072,10 @@ fn f64_unary_opcode(op: &str) -> Result<f32> {
 fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
     let name = match (src, dst) {
         (DType::F32, DType::F32) => "cpy_f32_f32",
+                (DType::F8E4M3, DType::F32) => "convert_f8e4m3_f32",
+        (DType::F32, DType::F8E4M3) => "convert_f32_f8e4m3",
+        (DType::F8E4M3, DType::F16) => "convert_f8e4m3_f16",
+        (DType::F16, DType::F8E4M3) => "convert_f16_f8e4m3",
         (DType::F32, DType::I32) => "cpy_f32_i32",
         (DType::I32, DType::F32) => "cpy_i32_f32",
         (DType::U32, DType::F32) => "cpy_u32_f32",
@@ -3567,6 +3571,60 @@ impl VulkanStorage {
         out_f32.to_dtype(&lhs_contiguous, DType::BF16)
     }
 
+    /// F8E4M3 unary compute via decode -> f32 op -> encode (all GPU-resident;
+    /// mirrors the CUDA fp8 compute path which computes in float).
+    fn f8e4m3_unary_via_f32(
+        &self,
+        layout: &Layout,
+        f: impl FnOnce(&Self, &Layout) -> Result<Self>,
+    ) -> Result<Self> {
+        let f32_storage = self.to_dtype(layout, DType::F32)?;
+        let contiguous = if layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+        } else {
+            Layout::contiguous(layout.shape())
+        };
+        let out_f32 = f(&f32_storage, &contiguous)?;
+        out_f32.to_dtype(&contiguous, DType::F8E4M3)
+    }
+
+    fn f8e4m3_binary_via_f32(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        f: impl FnOnce(&Self, &Self, &Layout, &Layout) -> Result<Self>,
+    ) -> Result<Self> {
+        if rhs.dtype != DType::F8E4M3 {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan f8e4m3 binary").bt());
+        }
+        self.device
+            .same_device(&rhs.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: rhs.device.location(),
+                    op: "f8e4m3 binary",
+                }
+                .bt()
+            })?;
+        let lhs_f32 = self.to_dtype(lhs_layout, DType::F32)?;
+        let rhs_f32 = rhs.to_dtype(rhs_layout, DType::F32)?;
+        let lhs_contiguous = if lhs_layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(lhs_layout))
+        } else {
+            Layout::contiguous(lhs_layout.shape())
+        };
+        let rhs_contiguous = if rhs_layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(rhs_layout))
+        } else {
+            Layout::contiguous(rhs_layout.shape())
+        };
+        let out_f32 = f(&lhs_f32, &rhs_f32, &lhs_contiguous, &rhs_contiguous)?;
+        out_f32.to_dtype(&lhs_contiguous, DType::F8E4M3)
+    }
+
     fn bf16_cmp_via_f32(
         &self,
         rhs: &Self,
@@ -3764,7 +3822,20 @@ impl VulkanStorage {
             );
         }
         let count = layout.shape().elem_count();
-        let dst = unsafe { self.device.alloc_uninit(layout.shape(), dst_dtype)? };
+        // F8E4M3 destination packs 4 bytes per u32 word in conversion kernels;
+        // round the element count up so the last partial word fits.
+        let dst_shape = if dst_dtype == DType::F8E4M3 {
+            crate::Shape::from(count.div_ceil(4) * 4)
+        } else {
+            layout.shape().clone()
+        };
+        let mut dst = unsafe { self.device.alloc_uninit(&dst_shape, dst_dtype)? };
+        if dst_dtype == DType::F8E4M3 {
+            // Encode kernels pack bytes with atomicOr into u32 words; the
+            // destination must start zeroed. fill_raw supports fp8.
+            let zero = crate::scalar::Scalar::F8E4M3(float8::F8E4M3::from_bits(0));
+            dst.const_set(zero, &Layout::contiguous(layout.shape().clone()))?;
+        }
         let (src_dims, src_strides) = dims4_ggml(layout)?;
         let dst_dims = src_dims;
         let dst_strides = contiguous_strides_ggml(dst_dims);
@@ -3815,6 +3886,9 @@ impl VulkanStorage {
         let workgroups = ggml_linear_workgroups(count)?;
         self.device
             .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+        if dst_dtype == DType::F8E4M3 && dst.count != count {
+            dst.count = count;
+        }
         Ok(dst)
     }
 
@@ -8455,6 +8529,9 @@ impl BackendStorage for VulkanStorage {
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
         let gpu = || -> Result<Self> {
+            if self.dtype == DType::F8E4M3 {
+                return self.f8e4m3_unary_via_f32(layout, |src, src_l| src.affine(src_l, mul, add));
+            }
             if self.dtype == DType::BF16 {
                 return self.bf16_unary_via_f32(layout, |src, src_l| src.affine(src_l, mul, add));
             }
@@ -8481,6 +8558,9 @@ impl BackendStorage for VulkanStorage {
     }
     fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
         let gpu = || -> Result<Self> {
+            if self.dtype == DType::F8E4M3 {
+                return self.f8e4m3_unary_via_f32(layout, |src, src_l| src.powf(src_l, e));
+            }
             if self.dtype == DType::BF16 {
                 return self.bf16_unary_via_f32(layout, |src, src_l| src.powf(src_l, e));
             }
@@ -8505,6 +8585,9 @@ impl BackendStorage for VulkanStorage {
     }
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
         if alpha == 1.0 {
+            if self.dtype == DType::F8E4M3 {
+                return self.f8e4m3_unary_via_f32(layout, |src, src_l| src.elu(src_l, alpha));
+            }
             if self.dtype == DType::BF16 {
                 return self.bf16_unary_via_f32(layout, |src, src_l| src.elu(src_l, alpha));
             }
@@ -8545,6 +8628,23 @@ impl BackendStorage for VulkanStorage {
         cond.where_cond(&zero_l, self, layout, &elu_neg, layout)
     }
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
+        if self.dtype == DType::F8E4M3 {
+            // Decode -> reduce in f32 -> (for Min/Max/Sum) re-encode to fp8.
+            // ArgMin/ArgMax return u32 indices regardless of source dtype.
+            let f32_storage = self.to_dtype(layout, DType::F32)?;
+            let contiguous = Layout::contiguous(layout.shape().clone());
+            let reduced = f32_storage.reduce_op(op, &contiguous, reduce_dims)?;
+            if matches!(op, ReduceOp::ArgMin | ReduceOp::ArgMax) {
+                return Ok(reduced);
+            }
+            // Reduced dims become 1; encode back to fp8.
+            let mut out_dims = layout.dims().to_vec();
+            for &dim in reduce_dims {
+                out_dims[dim] = 1;
+            }
+            let out_layout = Layout::contiguous(crate::Shape::from(out_dims));
+            return reduced.to_dtype(&out_layout, DType::F8E4M3);
+        }
         let int_dtype = matches!(self.dtype, DType::U8 | DType::U32 | DType::I32 | DType::I64);
         if self.dtype != DType::F32
             && self.dtype != DType::F16
@@ -8661,6 +8761,24 @@ impl BackendStorage for VulkanStorage {
         gpu()
     }
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        if self.dtype == DType::F8E4M3 {
+            if rhs.dtype != DType::F8E4M3 {
+                return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan f8e4m3 cmp").bt());
+            }
+            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
+            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
+            let l = if lhs_l.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(lhs_l))
+            } else {
+                Layout::contiguous(lhs_l.shape())
+            };
+            let r = if rhs_l.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(rhs_l))
+            } else {
+                Layout::contiguous(rhs_l.shape())
+            };
+            return lhs_f32.cmp(op, &rhs_f32, &l, &r);
+        }
         if self.dtype == DType::BF16 {
             return self.bf16_cmp_via_f32(rhs, lhs_l, rhs_l, op);
         }
@@ -8676,6 +8794,15 @@ impl BackendStorage for VulkanStorage {
         self.run_cmp_u8(rhs, lhs_l, rhs_l, op)
     }
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+        if self.dtype == DType::F8E4M3
+            && !matches!(dtype, DType::F32 | DType::F16 | DType::F8E4M3)
+        {
+            // Decode to f32 then convert onward (GPU-resident; matches the
+            // CUDA cast matrix which routes fp8 through float internally).
+            let f32_storage = self.to_dtype(layout, DType::F32)?;
+            let contiguous = Layout::contiguous(layout.shape().clone());
+            return f32_storage.to_dtype(&contiguous, dtype);
+        }
         if self.dtype == DType::BF16 && !matches!(dtype, DType::F16 | DType::F32 | DType::BF16) {
             // No direct bf16 -> integer kernel exists; decompose into the
             // native bf16 -> f32 path followed by the native f32 -> dst cast,
@@ -8702,6 +8829,9 @@ impl BackendStorage for VulkanStorage {
         self.run_unary_generic_with_params_dtype(layout, spirv, 0.0, 0.0, dtype)
     }
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+        if self.dtype == DType::F8E4M3 {
+            return self.f8e4m3_unary_via_f32(layout, |src, src_l| src.unary_impl::<B>(src_l));
+        }
         if self.dtype == DType::BF16 {
             return self.bf16_unary_via_f32(layout, |src, src_l| src.unary_impl::<B>(src_l));
         }
@@ -8751,6 +8881,14 @@ impl BackendStorage for VulkanStorage {
         lhs_layout: &Layout,
         rhs_layout: &Layout,
     ) -> Result<Self> {
+        if self.dtype == DType::F8E4M3 {
+            return self.f8e4m3_binary_via_f32(
+                rhs,
+                lhs_layout,
+                rhs_layout,
+                |lhs, rhs, lhs_l, rhs_l| lhs.binary_impl::<B>(rhs, lhs_l, rhs_l),
+            );
+        }
         if self.dtype == DType::BF16 {
             return self.bf16_binary_via_f32(
                 rhs,
@@ -9766,6 +9904,7 @@ impl BackendDevice for VulkanDevice {
 mod tests {
     use super::*;
     use crate::Module;
+    use float8::F8E4M3 as f8e4m3;
 
     fn exact_q8_1_x4_bytes(xs: &[f32]) -> Vec<u8> {
         assert_eq!(xs.len() % 128, 0);
@@ -10592,6 +10731,115 @@ mod tests {
                 "f64 mismatch at [{i}]: got {g:e}, expected {e:e}, rel_err {rel:e}"
             );
         }
+    }
+
+    #[test]
+    fn vulkan_f8e4m3_convert_roundtrip() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let bits: Vec<u8> = vec![0x38, 0xC0, 0x48, 0x00, 0x80, 0x7D, 0x01];
+        let vals: Vec<f8e4m3> = bits.iter().map(|&b| f8e4m3::from_bits(b)).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(vals))?;
+        let layout = Layout::contiguous((bits.len(),));
+        let f32s = src.to_dtype(&layout, DType::F32)?;
+        let back = f32s.to_dtype(&layout, DType::F8E4M3)?;
+        let got = match back.to_cpu_storage()? {
+            CpuStorage::F8E4M3(v) => v.into_iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_eq!(got, bits);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f8e4m3_unary_relu() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let bits: Vec<u8> = vec![0x38, 0xC0, 0x00, 0x80, 0x7D, 0xB0];
+        let vals: Vec<f8e4m3> = bits.iter().map(|&b| f8e4m3::from_bits(b)).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(vals))?;
+        let layout = Layout::contiguous((bits.len(),));
+        let out = src.unary_impl::<crate::op::Relu>(&layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F8E4M3(v) => v.into_iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        // CPU reference: relu in f32 then re-quantize to e4m3.
+        for (i, &b) in bits.iter().enumerate() {
+            let v: f32 = f8e4m3::from_bits(b).to_f32();
+            let r = if v > 0.0 { v } else { 0.0 };
+            let expect = f8e4m3::from_f32(r).to_bits();
+            assert_eq!(got[i], expect);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f8e4m3_binary_add() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let a_bits: Vec<u8> = vec![0x38, 0x40, 0x30];
+        let b_bits: Vec<u8> = vec![0x38, 0x38, 0x28];
+        let a: Vec<f8e4m3> = a_bits.iter().map(|&b| f8e4m3::from_bits(b)).collect();
+        let b: Vec<f8e4m3> = b_bits.iter().map(|&b| f8e4m3::from_bits(b)).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(b))?;
+        let layout = Layout::contiguous((3usize,));
+        let out = lhs.binary_impl::<crate::op::Add>(&rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F8E4M3(v) => v.into_iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        for i in 0..3 {
+            let av: f32 = f8e4m3::from_bits(a_bits[i]).to_f32();
+            let bv: f32 = f8e4m3::from_bits(b_bits[i]).to_f32();
+            let expect = f8e4m3::from_f32(av + bv).to_bits();
+            assert_eq!(got[i], expect);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f8e4m3_reduce_sum() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let bits: Vec<u8> = vec![0x38, 0x40, 0x30, 0x48];
+        let vals: Vec<f8e4m3> = bits.iter().map(|&b| f8e4m3::from_bits(b)).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(vals))?;
+        let layout = Layout::contiguous((4usize,));
+        let out = src.reduce_op(ReduceOp::Sum, &layout, &[0])?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F8E4M3(v) => v[0].to_f32(),
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        let expect: f32 = bits
+            .iter()
+            .map(|&b| f8e4m3::from_bits(b).to_f32())
+            .sum();
+        // fp8 re-quantization tolerance
+        let expect_q = f8e4m3::from_f32(expect).to_f32();
+        assert!((got - expect_q).abs() <= expect_q.abs() * 0.15 + 1e-3);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f8e4m3_cmp_lt() -> Result<()> {
+        use crate::op::CmpOp;
+        let device = VulkanDevice::new(0)?;
+        let a_bits: Vec<u8> = vec![0x30, 0x50, 0x10];
+        let b_bits: Vec<u8> = vec![0x38, 0x48, 0x18];
+        let a: Vec<f8e4m3> = a_bits.iter().map(|&b| f8e4m3::from_bits(b)).collect();
+        let b: Vec<f8e4m3> = b_bits.iter().map(|&b| f8e4m3::from_bits(b)).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(b))?;
+        let layout = Layout::contiguous((3usize,));
+        let out = lhs.cmp(CmpOp::Lt, &rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::U8(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        for i in 0..3 {
+            let av: f32 = f8e4m3::from_bits(a_bits[i]).to_f32();
+            let bv: f32 = f8e4m3::from_bits(b_bits[i]).to_f32();
+            assert_eq!(got[i], u8::from(av < bv));
+        }
+        Ok(())
     }
 
     #[test]

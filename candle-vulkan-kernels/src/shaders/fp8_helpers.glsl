@@ -9,119 +9,101 @@
 
 // Decode an E4M3 byte into a float32_t. Matches F8E4M3::to_f32().
 float f8e4m3_to_f32(uint8_t x) {
-    // convert_fp8_to_fp16 for E4M3, then f16→f32.
-    uint sign = uint(x) & 0x80u;
-    uint exponent = ((uint(x) & 0x78u) >> 1u) + 0x2000u;
-    uint mantissa = (uint(x) & 0x07u) << 1u;
-    uint absx = uint(x) & 0x7Fu;
+    // Direct e4m3 -> f32 bit construction (positions: sign 31, exp 23..26,
+    // mantissa 20..22). The original port mixed f16-shift math from the
+    // float8 crate (which operates on ur = byte<<8) with raw-byte masks —
+    // producing wrong values. Mirrors the validated wgpu decode path.
+    uint b = uint(x);
+    uint sign = (b & 0x80u) << 24u;         // -> bit 31
+    uint exp  = (b & 0x78u) << 20u;         // 4 exp bits -> 23..26 (biased +120 handled below)
+    uint man  = (b & 0x07u) << 20u;         // into temp f32-bit position for extraction
+    uint absx = b & 0x7Fu;
 
-    uint ur;
     if (absx == 0x7Fu) {
-        // NaN — return canonical NaN
-        ur = 0x7FFFu;
-    } else if (exponent == 0x2000u) {
-        // Zero or denormal
-        if (mantissa != 0u) {
-            // Normalize denormal
-            mantissa = mantissa << 1u;
-            while ((mantissa & 0x0400u) == 0u) {
-                mantissa = mantissa << 1u;
-                exponent = exponent - 0x0400u;
-            }
-            mantissa = mantissa & 0x03FFu;
-        } else {
-            exponent = 0u;
-        }
-        ur = sign | exponent | mantissa;
-    } else {
-        ur = sign | exponent | mantissa;
+        // NaN (e4m3 has no Inf): canonical f32 NaN.
+        return uintBitsToFloat(0x7FC00000u);
     }
-
-    // Convert f16 bits to f32
-    uint s = (ur >> 15u) & 1u;
-    uint e = (ur >> 10u) & 0x1Fu;
-    uint m = ur & 0x3FFu;
-
-    uint f32;
-    if (e == 0u) {
-        // Zero or subnormal
-        if (m == 0u) {
-            f32 = s << 31u;
-        } else {
-            // Normalize subnormal
-            e = 1u;
-            while ((m & 0x400u) == 0u) {
-                m = m << 1u;
-                e = e - 1u;
-            }
-            m = m & 0x3FFu;
-            e = 127u - 15u + e;
-            f32 = (s << 31u) | (e << 23u) | (m << 13u);
+    uint e4 = (b >> 3u) & 0xFu;
+    uint m4 = b & 0x7u;
+    if (e4 == 0u) {
+        if (m4 == 0u) {
+            return uintBitsToFloat(sign);
         }
-    } else if (e == 31u) {
-        // Inf or NaN
-        f32 = (s << 31u) | 0x7F800000u | (m << 13u);
-    } else {
-        // Normal
-        e = 127u - 15u + e;
-        f32 = (s << 31u) | (e << 23u) | (m << 13u);
+        // Subnormal: value = m/8 * 2^-6
+        float v = float(m4) * 0.125 * 0.015625;
+        return uintBitsToFloat(sign) < 0.0 ? -v : v;
     }
+    // Normal: (1 + m/8) * 2^(e-7); f32 bias: e + 120
+    uint f32 = sign | ((e4 + 120u) << 23u) | (m4 << 20u);
     return uintBitsToFloat(f32);
 }
 
 // Encode a float32_t into an E4M3 byte. Matches F8E4M3::from_f32().
 // Saturates to finite max (no inf in E4M3 sat-finite mode).
 uint8_t f32_to_f8e4m3(float v) {
-    const uint FP8_MAXNORM = 0x7Eu;
-    const uint FP8_MANTISSA_MASK = 0x7u;
-    const uint FP8_EXP_BIAS = 7u;
-    const uint FP8_SIGNIFICAND_BITS = 4u;
-    // DP_HALF_ULP for f64: 1 << (53 - significand - 1) = 1 << 48
-    // But we're working in f32, so adjust: f32 has 24 significand bits.
-    // We need: round-off = 1 << (24 - significand_bits - 1) = 1 << 19
-    const uint FP32_HALF_ULP = 1u << (24u - FP8_SIGNIFICAND_BITS - 1u);
-    const uint FP8_OVERFLOW_THRESHOLD = 0x407D0000u; // f32 bits for ~448.0
-    const uint FP8_MINNORM = 0x3F900000u; // f32 bits for 2^-6 = 0.015625
-    const uint FP8_MINDENORM_O2 = 0x3F500000u; // f32 bits for 2^-7 / 2 = ~0.003906
-
+    // Direct f32 -> e4m3 encode with round-to-nearest-even, saturating to the
+    // finite max (e4m3 has no Inf). Mirrors the validated wgpu encode path
+    // (which matched the float8 crate exactly).
     uint bits = floatBitsToUint(v);
-    uint sign = (bits >> 31u) << 7u;
+    uint sign = (bits >> 24u) & 0x80u;   // capture top bit into byte position
     uint absx = bits & 0x7FFFFFFFu;
 
-    uint res;
-    if (absx <= FP8_MINDENORM_O2) {
-        res = 0u;
-    } else if ((bits & 0x7FFFFFFFu) > 0x7F800000u) {
-        // NaN → preserve as NaN
-        res = 0x7Fu;
-    } else if (absx > FP8_OVERFLOW_THRESHOLD) {
-        // Saturate to max finite
-        res = FP8_MAXNORM;
-    } else if (absx >= FP8_MINNORM) {
-        // Normal range
-        int exp = int((absx >> 23u) & 0xFFu) - 127 + int(FP8_EXP_BIAS);
-        uint mantissa = (absx >> (23u - FP8_SIGNIFICAND_BITS)) & FP8_MANTISSA_MASK;
-        res = (uint(exp) << (FP8_SIGNIFICAND_BITS - 1u)) | mantissa;
-        // Round to nearest even
-        uint round = absx & ((FP32_HALF_ULP << 1u) - 1u);
-        if ((round > FP32_HALF_ULP) || ((round == FP32_HALF_ULP) && ((mantissa & 1u) != 0u))) {
-            res = res + 1u;
-        }
-    } else {
-        // Denormal
-        int shift = 1 - int((absx >> 23u) & 0xFFu) + 127 - int(FP8_EXP_BIAS);
-        uint mantissa = ((absx >> (23u - FP8_SIGNIFICAND_BITS)) & FP8_MANTISSA_MASK)
-                      | (1u << (FP8_SIGNIFICAND_BITS - 1u));
-        res = mantissa >> uint(shift);
-        uint round = (absx | (1u << 22u)) & ((FP32_HALF_ULP << uint(shift + 1)) - 1u);
-        if ((round > (FP32_HALF_ULP << uint(shift)))
-            || ((round == (FP32_HALF_ULP << uint(shift))) && ((res & 1u) != 0u)))
-        {
-            res = res + 1u;
-        }
+    // NaN -> canonical NaN byte 0x7F
+    if (absx > 0x7F800000u) {
+        return uint8_t(0x7Fu);
+    }
+    // Inf or overflow (>= 448) -> saturate to max finite 0x7E
+    if (absx >= 0x43E00000u) {
+        return uint8_t(sign | 0x7Eu);
+    }
+    if (absx == 0u) {
+        return uint8_t(sign);
+    }
+    // Underflow to zero: < half of smallest subnormal (2^-9)
+    if (absx < 0x3B000000u) {
+        return uint8_t(sign);
     }
 
-    return uint8_t(res | sign);
+    int e32 = int((absx >> 23u) & 0xFFu) - 127;   // unbiased f32 exponent
+    uint m32 = absx & 0x7FFFFFu;                   // 23-bit mantissa
+
+    // e4m3 normal range: exponent in [-6, 8]
+    if (e32 >= -6) {
+        uint e4 = uint(e32 + 7);                   // biased e4m3 exponent
+        uint m4 = m32 >> 20u;                      // top 3 mantissa bits
+        uint rem = m32 & 0xFFFFFu;                 // rounding bits below
+        uint key = (e4 << 3u) | m4;
+        // RNE: round bit 0x80000 (half), sticky = anything below.
+        uint round_bit = (rem >> 19u) & 1u;
+        uint sticky = rem & 0x7FFFFu;
+        if (round_bit == 1u && (sticky != 0u || (key & 1u) != 0u)) {
+            key += 1u;
+        }
+        if (key >= 0x7Eu) {
+            // Overflow beyond max finite.
+            key = 0x7Eu;
+        }
+        return uint8_t(sign | key);
+    }
+    // Subnormal: value = m4/8 * 2^-6; e32 in [-9, -7]. Quantize the 24-bit
+    // fixed fraction v = all_bits * 2^(e32-23) to units of 2^-9.
+    // shift = bits dropped from the 24-bit fraction so remaining = v * 2^9.
+    int shift = 20 + (-6 - e32);   // e.g. e32=-7 -> 19, e32=-9 -> 23
+    uint quant = (0x800000u | m32) >> uint(shift);
+    uint key = quant;
+        // RNE on the dropped bits: reconstruct dropped mask
+    uint dropped_mask = (1u << uint(shift)) - 1u;
+    uint all_bits = 0x800000u | m32;
+    uint dropped = all_bits & dropped_mask;
+    uint half_way = 1u << uint(shift - 1);
+    if (dropped > half_way || (dropped == half_way && (key & 1u) != 0u)) {
+        key += 1u;
+    }
+    if (key >= 8u) {
+        // Carried into the normal range: exponent becomes 1, mantissa 0.
+        return uint8_t(sign | 0x08u);
+    }
+    return uint8_t(sign | key);
 }
 
 #endif // FP8_HELPERS_GLSL
