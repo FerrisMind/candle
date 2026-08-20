@@ -2951,7 +2951,16 @@ fn should_swap_up(a_idx: u32, b_idx: u32, row_base: u32) -> bool {{
     }}
     let a_pos = row_base + a_idx;
     let b_pos = row_base + b_idx;
-    return {swap_compare_up}(src[2u * a_pos], src[2u * a_pos + 1u], src[2u * b_pos], src[2u * b_pos + 1u]);
+    let a_lo = src[2u * a_pos];
+    let a_hi = src[2u * a_pos + 1u];
+    let b_lo = src[2u * b_pos];
+    let b_hi = src[2u * b_pos + 1u];
+    if (a_lo == b_lo && a_hi == b_hi) {{
+        // CPU sort_by stability: smaller original index first (ties do not
+        // flip with ORDER).
+        return a_idx > b_idx;
+    }}
+    return {swap_compare_up}(a_lo, a_hi, b_lo, b_hi);
 }}
 
 fn should_swap_down(a_idx: u32, b_idx: u32, row_base: u32) -> bool {{
@@ -2965,7 +2974,14 @@ fn should_swap_down(a_idx: u32, b_idx: u32, row_base: u32) -> bool {{
     }}
     let a_pos = row_base + a_idx;
     let b_pos = row_base + b_idx;
-    return {swap_compare_down}(src[2u * a_pos], src[2u * a_pos + 1u], src[2u * b_pos], src[2u * b_pos + 1u]);
+    let a_lo = src[2u * a_pos];
+    let a_hi = src[2u * a_pos + 1u];
+    let b_lo = src[2u * b_pos];
+    let b_hi = src[2u * b_pos + 1u];
+    if (a_lo == b_lo && a_hi == b_hi) {{
+        return a_idx < b_idx;
+    }}
+    return {swap_compare_down}(a_lo, a_hi, b_lo, b_hi);
 }}
 
 @compute @workgroup_size({workgroup_size})
@@ -3074,7 +3090,16 @@ fn should_swap_up(a_idx: u32, b_idx: u32, row_base: u32) -> bool {{
     }}
     let a_pos = row_base + a_idx;
     let b_pos = row_base + b_idx;
-    return {swap_compare_up}(src[2u * a_pos], src[2u * a_pos + 1u], src[2u * b_pos], src[2u * b_pos + 1u]);
+    let a_lo = src[2u * a_pos];
+    let a_hi = src[2u * a_pos + 1u];
+    let b_lo = src[2u * b_pos];
+    let b_hi = src[2u * b_pos + 1u];
+    if (a_lo == b_lo && a_hi == b_hi) {{
+        // CPU sort_by stability: smaller original index first (ties do not
+        // flip with ORDER).
+        return a_idx > b_idx;
+    }}
+    return {swap_compare_up}(a_lo, a_hi, b_lo, b_hi);
 }}
 
 fn should_swap_down(a_idx: u32, b_idx: u32, row_base: u32) -> bool {{
@@ -3088,7 +3113,14 @@ fn should_swap_down(a_idx: u32, b_idx: u32, row_base: u32) -> bool {{
     }}
     let a_pos = row_base + a_idx;
     let b_pos = row_base + b_idx;
-    return {swap_compare_down}(src[2u * a_pos], src[2u * a_pos + 1u], src[2u * b_pos], src[2u * b_pos + 1u]);
+    let a_lo = src[2u * a_pos];
+    let a_hi = src[2u * a_pos + 1u];
+    let b_lo = src[2u * b_pos];
+    let b_hi = src[2u * b_pos + 1u];
+    if (a_lo == b_lo && a_hi == b_hi) {{
+        return a_idx < b_idx;
+    }}
+    return {swap_compare_down}(a_lo, a_hi, b_lo, b_hi);
 }}
 
 @compute @workgroup_size({workgroup_size})
@@ -3202,7 +3234,16 @@ fn i64_ge(a_lo: u32, a_hi: u32, b_lo: u32, b_hi: u32) -> bool {{
 fn take_left(a_idx: u32, b_idx: u32, row_base: u32) -> bool {{
     let a_pos = row_base + a_idx;
     let b_pos = row_base + b_idx;
-    return {cmp}(src[2u * a_pos], src[2u * a_pos + 1u], src[2u * b_pos], src[2u * b_pos + 1u]);
+    let a_lo = src[2u * a_pos];
+    let a_hi = src[2u * a_pos + 1u];
+    let b_lo = src[2u * b_pos];
+    let b_hi = src[2u * b_pos + 1u];
+    if (a_lo == b_lo && a_hi == b_hi) {{
+        // Tie comparator does not flip with ORDER: smaller original index
+        // ends first in both directions (CPU sort_by stability).
+        return a_idx <= b_idx;
+    }}
+    return {cmp}(a_lo, a_hi, b_lo, b_hi);
 }}
 
 @compute @workgroup_size({WG_SIZE})
@@ -3328,7 +3369,16 @@ struct Params {{
 fn take_left(a_idx: u32, b_idx: u32, row_base: u32) -> bool {{
     let a_pos = row_base + a_idx;
     let b_pos = row_base + b_idx;
-    return {cmp}(src[2u * a_pos], src[2u * a_pos + 1u], src[2u * b_pos], src[2u * b_pos + 1u]);
+    let a_lo = src[2u * a_pos];
+    let a_hi = src[2u * a_pos + 1u];
+    let b_lo = src[2u * b_pos];
+    let b_hi = src[2u * b_pos + 1u];
+    if (a_lo == b_lo && a_hi == b_hi) {{
+        // Tie comparator does not flip with ORDER: smaller original index
+        // ends first in both directions (CPU sort_by stability).
+        return a_idx <= b_idx;
+    }}
+    return {cmp}(a_lo, a_hi, b_lo, b_hi);
 }}
 
 @compute @workgroup_size({WG_SIZE})
@@ -7425,6 +7475,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 len,
                 nm,
                 nrows,
+                sort_dtype,
             )?;
             std::mem::swap(&mut current, &mut scratch);
             len *= 2;
@@ -7443,6 +7494,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         len: usize,
         nm: usize,
         nrows: usize,
+        sort_dtype: WgpuArgsortDType,
     ) -> Result<()> {
         let (dims, strides) = dims4(layout)?;
         let (_, idx_strides) = dims4(idx_layout)?;
@@ -7494,15 +7546,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             buffer_binding(2, &idx_out.buffer),
             buffer_binding(3, &param_buffer),
         ];
-        let shader = match self.dtype {
-            DType::U32 => {
+        let shader = match (self.dtype, sort_dtype) {
+            // F8E4M3 keys live in u32 words (one byte each) and need the
+            // decode+orderable transform; plain U32/U8 keys are identity.
+            (DType::U32, WgpuArgsortDType::F8E4M3) => {
+                candle_wgpu_kernels::argsort_f8e4m3_merge_shader(WG_SIZE, asc).ok_or_else(
+                    || Error::Msg("wgpu shader argsort_merge.wgsl not embedded".into()).bt(),
+                )?
+            }
+            (DType::U32, _) => {
                 candle_wgpu_kernels::argsort_u32_merge_shader(WG_SIZE, asc).ok_or_else(|| {
                     Error::Msg("wgpu shader argsort_merge.wgsl not embedded".into()).bt()
                 })?
             }
-            DType::I64 => i64_argsort_merge_wgsl(asc),
-            DType::F64 => f64_argsort_merge_wgsl(asc),
-            DType::I32 => {
+            (DType::I64, _) => i64_argsort_merge_wgsl(asc),
+            (DType::F64, _) => f64_argsort_merge_wgsl(asc),
+            (DType::I32, _) => {
                 candle_wgpu_kernels::argsort_i32_merge_shader(WG_SIZE, asc).ok_or_else(|| {
                     Error::Msg("wgpu shader argsort_merge.wgsl not embedded".into()).bt()
                 })?
@@ -14323,7 +14382,6 @@ mod wgpu_reduce_tests {
     }
 
     #[test]
-    #[ignore = "multi-tile merge pass produces unsorted output for last_dim > WG_SIZE; tracked as follow-up"]
     fn wgpu_argsort_merge_path_asc() {
         let cpu = crate::Device::Cpu;
         let device = wgpu_device();
@@ -14338,19 +14396,55 @@ mod wgpu_reduce_tests {
     }
 
     #[test]
-    #[ignore = "multi-tile merge pass produces unsorted output for last_dim > WG_SIZE; tracked as follow-up"]
     fn wgpu_argsort_merge_path() {
-        // last_dim > WG_SIZE exercises the multi-tile merge path (f32 baseline)
+        // DESC with many duplicate keys: exercises the multi-tile merge path
+        // tie comparator (must keep CPU sort_by stability — first-index-wins
+        // in both directions).
         let cpu = crate::Device::Cpu;
         let device = wgpu_device();
+        let mut s: u64 = 7;
         let a: Vec<f32> = (0..600usize)
-            .map(|i| if i % 3 == 0 { (i as f32) * 0.5 } else { 100.0 - (i as f32) })
+            .map(|i| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                if i % 3 == 0 {
+                    (i as f32) * 0.5
+                } else {
+                    (((s >> 33) as i32 % 7) as f32) - 3.0
+                }
+            })
             .collect();
         let ga = crate::Tensor::from_slice(&a, (600,), &device).unwrap();
         let ca = crate::Tensor::from_slice(&a, (600,), &cpu).unwrap();
-        let g = ga.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
-        let c = ca.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        let g = ga.arg_sort_last_dim(false).unwrap().to_vec1::<u32>().unwrap();
+        let c = ca.arg_sort_last_dim(false).unwrap().to_vec1::<u32>().unwrap();
         assert_eq!(g, c);
+    }
+
+    #[test]
+    fn wgpu_argsort_merge_path_large_dupes() {
+        // last_dim (8192) >> WG_SIZE (256): long merge chain with heavy
+        // duplicates, both directions.
+        let cpu = crate::Device::Cpu;
+        let device = wgpu_device();
+        let mut s: u64 = 13;
+        let a: Vec<f32> = (0..8192usize)
+            .map(|i| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                if i % 2 == 0 {
+                    ((s >> 33) as i32 % 11) as f32 - 5.0
+                } else {
+                    (i as f32) * 0.25
+                }
+            })
+            .collect();
+        let ga = crate::Tensor::from_slice(&a, (8192,), &device).unwrap();
+        let ca = crate::Tensor::from_slice(&a, (8192,), &cpu).unwrap();
+        let g_asc = ga.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        let c_asc = ca.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        assert_eq!(g_asc, c_asc, "asc large merge");
+        let g_desc = ga.arg_sort_last_dim(false).unwrap().to_vec1::<u32>().unwrap();
+        let c_desc = ca.arg_sort_last_dim(false).unwrap().to_vec1::<u32>().unwrap();
+        assert_eq!(g_desc, c_desc, "desc large merge");
     }
 
     #[test]

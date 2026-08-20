@@ -285,8 +285,17 @@ fn argsort_shader_for_type(workgroup_size: u32, asc: bool, src_type: &str) -> Op
     Some(preprocess(source, &defines, &replacements, DType::F32))
 }
 
+/// F32 argsort (intra-tile). Uses the orderable-key transform (sign flip):
+/// the raw bitcast orders negative floats above all positives under
+/// unsigned comparison, which produced wrong order for any data with
+/// negatives.
 pub fn argsort_shader(workgroup_size: u32, asc: bool) -> Option<String> {
-    argsort_shader_for_type(workgroup_size, asc, "f32")
+    argsort_keyed_shader(
+        workgroup_size,
+        asc,
+        "f32",
+        "(bitcast<u32>(src[i]) ^ select(0x80000000u, 0xFFFFFFFFu, (bitcast<u32>(src[i]) & 0x80000000u) != 0u))",
+    )
 }
 
 pub fn argsort_u32_shader(workgroup_size: u32, asc: bool) -> Option<String> {
@@ -353,11 +362,19 @@ pub fn argsort_f8e4m3_shader(workgroup_size: u32, asc: bool) -> Option<String> {
     )
 }
 
-fn argsort_merge_shader_for_type(workgroup_size: u32, asc: bool, src_type: &str) -> Option<String> {
+fn argsort_merge_shader_for_type(
+    workgroup_size: u32,
+    asc: bool,
+    src_type: &str,
+    key_body: Option<&str>,
+) -> Option<String> {
     let source = get("argsort_merge.wgsl")?.source();
     let mut defines = vec!["WG_SIZE".to_string()];
     if asc {
         defines.push("ORDER == 0".to_string());
+    }
+    if key_body.is_some() {
+        defines.push("KEY_FN".to_string());
     }
     let replacements = vec![
         ("WG_SIZE".to_string(), workgroup_size.to_string()),
@@ -372,15 +389,55 @@ fn argsort_merge_shader_for_type(workgroup_size: u32, asc: bool, src_type: &str)
     ];
     let mut replacements = replacements;
     replacements.push(("SRC_TYPE".to_string(), src_type.to_string()));
+    if let Some(body) = key_body {
+        replacements.push(("KEY_BODY".to_string(), body.to_string()));
+    }
     Some(preprocess(source, &defines, &replacements, DType::F32))
 }
 
+/// F32 merge pass. The key MUST be the orderable transform (sign flip), not
+/// the raw bitcast: raw unsigned comparison orders negative floats above all
+/// positives, which produced unsorted multi-tile output.
 pub fn argsort_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
-    argsort_merge_shader_for_type(workgroup_size, asc, "f32")
+    argsort_merge_shader_for_type(
+        workgroup_size,
+        asc,
+        "f32",
+        Some("(bitcast<u32>(src[i]) ^ select(0x80000000u, 0xFFFFFFFFu, (bitcast<u32>(src[i]) & 0x80000000u) != 0u))"),
+    )
 }
 
+/// U32 merge pass (also serves U8 keys widened to u32 words: identity order).
 pub fn argsort_u32_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
-    argsort_merge_shader_for_type(workgroup_size, asc, "u32")
+    argsort_merge_shader_for_type(workgroup_size, asc, "u32", None)
+}
+
+/// F8E4M3 merge pass: storage is one f8 byte per u32 word; the key decodes
+/// the byte and applies the orderable transform (see KEY_F8E4M3 helpers in
+/// argsort_merge.wgsl).
+pub fn argsort_f8e4m3_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    let source = get("argsort_merge.wgsl")?.source();
+    let mut defines = vec![
+        "WG_SIZE".to_string(),
+        "KEY_FN".to_string(),
+        "KEY_F8E4M3".to_string(),
+    ];
+    if asc {
+        defines.push("ORDER == 0".to_string());
+    }
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        (
+            "ORDER".to_string(),
+            if asc { "0".to_string() } else { "1".to_string() },
+        ),
+        ("SRC_TYPE".to_string(), "u32".to_string()),
+        (
+            "KEY_BODY".to_string(),
+            "orderable_from_f32(decode_f8e4m3(src[i]))".to_string(),
+        ),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
 }
 
 /// Orderable-key merge pass for widened integer keys (i32 words with sign
