@@ -1904,11 +1904,25 @@ impl VulkanDevice {
                 );
             }
         };
-        // Try to pop from pool
+        // Try to pop from pool. The pool is keyed by power-of-two size class,
+        // so an entry may be SMALLER than the current request (e.g. a 1280B
+        // buffer stored under the 2048 class). Reusing it would either bail
+        // in map_write ("write larger than buffer") or silently truncate the
+        // upload, so only accept buffers at least as large as requested.
         {
             let mut pool = pool.lock().map_err(|e| Error::wrap(e.to_string()))?;
             if let Some(entry) = pool.get_mut(&size_class) {
-                if let Some(buf) = entry.pop() {
+                let mut skipped = Vec::new();
+                let mut accepted = None;
+                while let Some(buf) = entry.pop() {
+                    if buf.size >= size {
+                        accepted = Some(buf);
+                        break;
+                    }
+                    skipped.push(buf);
+                }
+                entry.extend(skipped);
+                if let Some(buf) = accepted {
                     return Ok(buf);
                 }
             }
@@ -6125,6 +6139,210 @@ impl VulkanStorage {
             &bindings,
             Some(any_as_bytes(&params)),
             (num_workgroups, 1, 1),
+        )?;
+
+        Ok(dst)
+    }
+
+    /// Fused flash attention with variable-length sequences (non-paged K/V).
+    ///
+    /// This is the Vulkan counterpart of `candle-flash-attn`'s CUDA
+    /// `flash_attn_varlen` (dense k/v, no block table) and matches its
+    /// semantics: `O = softmax(Q @ K^T * softmax_scale + causal_mask) @ V`,
+    /// computed per sequence via online softmax over the owning KV range.
+    ///
+    /// Shapes:
+    /// - `q`: `(total_q, h_q, d)` (the receiver, contiguous).
+    /// - `k`/`v`: `(total_kv, h_kv, ...)`; the last dim must be contiguous.
+    /// - `gqa`: `h_q % h_kv == 0`; q head `n` attends to kv head `n * h_kv / h_q`.
+    /// - `cu_seqlens_q`/`cu_seqlens_k`: `I32`, `batch + 1` elements, contiguous,
+    ///   cumulative sequence offsets `[0, l1, l1 + l2, ...]`.
+    /// - `causal`: within a sequence only keys whose local index `<=` the
+    ///   query's local index participate.
+    ///
+    /// `max_seqlen_q`/`max_seqlen_k` are accepted for signature parity with the
+    /// CUDA kernel; correctness only depends on the actual `cu_seqlens` ranges.
+    ///
+    /// The output has shape `(total_q, h_q, d_v)` and the dtype of `q`
+    /// (`F32`/`F16`/`BF16`), matching the CUDA reference.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_varlen(
+        &self,
+        layout: &Layout, // q: (total_q, h_q, d), contiguous
+        k: &Self,
+        k_l: &Layout, // (total_kv, h_kv, d)
+        v: &Self,
+        v_l: &Layout, // (total_kv, h_kv, d_v)
+        cu_seqlens_q: &Self, // I32, batch+1, contiguous
+        cu_seqlens_k: &Self, // I32, batch+1, contiguous
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        softmax_scale: f32,
+        causal: bool,
+    ) -> Result<Self> {
+        use crate::DType;
+
+        if !matches!(self.dtype, DType::F32 | DType::F16 | DType::BF16) {
+            return Err(Error::UnsupportedDTypeForOp(
+                self.dtype,
+                "vulkan flash_attn_varlen",
+            )
+            .bt());
+        }
+        if k.dtype != self.dtype || v.dtype != self.dtype {
+            return Err(Error::Msg(
+                "flash_attn_varlen requires k and v to share the dtype of q".into(),
+            )
+            .bt());
+        }
+
+        let (q, q_l) = self.materialize_contiguous(layout)?;
+        let (k, k_l) = k.materialize_contiguous(k_l)?;
+        let (v, v_l) = v.materialize_contiguous(v_l)?;
+
+        let dims_q = q_l.dims();
+        let dims_k = k_l.dims();
+        let dims_v = v_l.dims();
+        if dims_q.len() != 3 || dims_k.len() != 3 || dims_v.len() != 3 {
+            return Err(Error::Msg(
+                "flash_attn_varlen expects 3D tensors q/k/v [rows, heads, head_dim]".into(),
+            )
+            .bt());
+        }
+        let (total_q, h_q, head_dim) = (dims_q[0], dims_q[1], dims_q[2]);
+        let (total_kv, h_kv, head_dim_k) = (dims_k[0], dims_k[1], dims_k[2]);
+        let (total_kv_v, h_kv_v, head_dim_v) = (dims_v[0], dims_v[1], dims_v[2]);
+        if head_dim_k != head_dim {
+            return Err(Error::Msg(format!(
+                "flash_attn_varlen head dim mismatch q ({head_dim}) vs k ({head_dim_k})"
+            ))
+            .bt());
+        }
+        if total_kv_v != total_kv || h_kv_v != h_kv {
+            return Err(Error::Msg(format!(
+                "flash_attn_varlen shape mismatch k ({total_kv}, {h_kv}) vs v ({total_kv_v}, {h_kv_v})"
+            ))
+            .bt());
+        }
+        if h_q % h_kv != 0 {
+            return Err(Error::Msg(format!(
+                "flash_attn_varlen requires h_q ({h_q}) to be a multiple of h_kv ({h_kv})"
+            ))
+            .bt());
+        }
+
+        if cu_seqlens_q.dtype != DType::I32 || cu_seqlens_k.dtype != DType::I32 {
+            return Err(Error::Msg(
+                "flash_attn_varlen requires cu_seqlens_q/k to be I32".into(),
+            )
+            .bt());
+        }
+        let num_seqs_q = cu_seqlens_q.count.checked_sub(1);
+        let num_seqs_k = cu_seqlens_k.count.checked_sub(1);
+        let (Some(batch_q), Some(batch_k)) = (num_seqs_q, num_seqs_k) else {
+            return Err(Error::Msg(
+                "flash_attn_varlen requires at least 2 cu_seqlens elements".into(),
+            )
+            .bt());
+        };
+        if batch_q != batch_k {
+            return Err(Error::Msg(format!(
+                "flash_attn_varlen cu_seqlens_q ({batch_q} seqs) and cu_seqlens_k ({batch_k} seqs) mismatch"
+            ))
+            .bt());
+        }
+        let batch = batch_q;
+
+        // F16/BF16 route through the F32 hub (GPU-resident conversion, exact
+        // for f16/bf16 inputs): compute in f32 like the CUDA kernel's f32
+        // accumulation, convert the result back to the input dtype.
+        if self.dtype != DType::F32 {
+            let q_f32 = q.to_dtype(&q_l, DType::F32)?;
+            let k_f32 = k.to_dtype(&k_l, DType::F32)?;
+            let v_f32 = v.to_dtype(&v_l, DType::F32)?;
+            let out = q_f32.flash_attn_varlen(
+                &q_l,
+                &k_f32,
+                &k_l,
+                &v_f32,
+                &v_l,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale,
+                causal,
+            )?;
+
+            let out_l = Layout::contiguous(Shape::from_dims(&[total_q, h_q, head_dim_v]));
+            return out.to_dtype(&out_l, self.dtype);
+        }
+
+        let cu_q_shape = Shape::from_dims(&[cu_seqlens_q.count]);
+        let cu_k_shape = Shape::from_dims(&[cu_seqlens_k.count]);
+        let (cu_q, _) = cu_seqlens_q.materialize_contiguous(&Layout::contiguous(cu_q_shape))?;
+        let (cu_k, _) = cu_seqlens_k.materialize_contiguous(&Layout::contiguous(cu_k_shape))?;
+
+        let out_shape = Shape::from_dims(&[total_q, h_q, head_dim_v]);
+        let dst = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
+        if total_q == 0 || h_q == 0 {
+            return Ok(dst);
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FlashAttnVarLenParams {
+            total_q: u32,
+            h_q: u32,
+            h_kv: u32,
+            head_dim: u32,
+            head_dim_v: u32,
+            num_seqs: u32,
+            scale: f32,
+            causal: u32,
+            max_seqlen_q: u32,
+            max_seqlen_k: u32,
+        }
+
+        let params = FlashAttnVarLenParams {
+            total_q: total_q as u32,
+            h_q: h_q as u32,
+            h_kv: h_kv as u32,
+            head_dim: head_dim as u32,
+            head_dim_v: head_dim_v as u32,
+            num_seqs: batch as u32,
+            scale: softmax_scale,
+            causal: if causal { 1 } else { 0 },
+            max_seqlen_q: max_seqlen_q as u32,
+            max_seqlen_k: max_seqlen_k as u32,
+        };
+
+        let bindings = [
+            VulkanBinding::Storage(&q.buffer),
+            VulkanBinding::Storage(&k.buffer),
+            VulkanBinding::Storage(&v.buffer),
+            VulkanBinding::Storage(&cu_q.buffer),
+            VulkanBinding::Storage(&cu_k.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+
+        let shader_name = match self.dtype {
+            DType::F32 => "flash_attn_varlen",
+            DType::F16 => "flash_attn_varlen_f16",
+            DType::BF16 => "flash_attn_varlen_bf16",
+            _ => unreachable!("dtype checked above"),
+        };
+        let spirv = candle_vulkan_kernels::spirv(shader_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {shader_name} not generated")).bt())?;
+
+        // One thread per (q_row, q_head): x -> q_row, y -> q_head.
+        let workgroup_size = 256u32;
+        let num_workgroups_x = (total_q as u32).div_ceil(workgroup_size);
+        q.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (num_workgroups_x, h_q as u32, 1),
         )?;
 
         Ok(dst)
@@ -11370,6 +11588,208 @@ mod tests {
                     "staging pool corruption at cycle {}, byte {}: got {}, expected {}",
                     i, j, byte, expected
                 );
+            }
+        }
+        Ok(())
+    }
+
+    // ---- flash_attn_varlen (non-paged dense K/V) tests ----
+
+    /// CPU reference for variable-length attention, mirroring the CUDA
+    /// semantics: for each (row, query head) compute
+    /// `softmax(Q @ K^T * scale + causal_mask) @ V` over the owning
+    /// sequence's KV range, with the causal mask applied using local indices
+    /// and online softmax (computed in f64 for a high-precision baseline).
+    #[allow(clippy::too_many_arguments)]
+    fn varlen_attn_reference(
+        q: &[f32],
+        h_q: usize,
+        d_qk: usize,
+        d_v: usize,
+        k: &[f32],
+        h_kv: usize,
+        v: &[f32],
+        cu_q: &[i32],
+        cu_k: &[i32],
+        scale: f32,
+        causal: bool,
+    ) -> Vec<f32> {
+        let batch = cu_q.len() - 1;
+        let total_q = cu_q[batch] as usize;
+        let mut out = vec![0f32; total_q * h_q * d_v];
+        for i in 0..total_q {
+            let b = (0..batch)
+                .find(|&bb| {
+                    let s = cu_q[bb] as usize;
+                    let e = cu_q[bb + 1] as usize;
+                    s <= i && i < e
+                })
+                .expect("row must belong to a sequence");
+            let q_idx = i - cu_q[b] as usize;
+            let kv_start = cu_k[b] as usize;
+            let kv_end = cu_k[b + 1] as usize;
+            for h in 0..h_q {
+                let h_kv_use = h * h_kv / h_q;
+                let mut m = f64::NEG_INFINITY;
+                let mut l = 0f64;
+                let mut acc = vec![0f64; d_v];
+                for j in kv_start..kv_end {
+                    let k_idx = j - kv_start;
+                    if causal && k_idx > q_idx {
+                        continue;
+                    }
+                    let mut score = 0f64;
+                    for dd in 0..d_qk {
+                        score += q[(i * h_q + h) * d_qk + dd] as f64
+                            * k[(j * h_kv + h_kv_use) * d_qk + dd] as f64;
+                    }
+                    score *= scale as f64;
+                    let m_new = m.max(score);
+                    let w = (score - m_new).exp();
+                    let exp_diff = if m_new - m < 80.0 { (m - m_new).exp() } else { 0.0 };
+                    for dd in 0..d_v {
+                        acc[dd] =
+                            acc[dd] * exp_diff + w * v[(j * h_kv + h_kv_use) * d_v + dd] as f64;
+                    }
+                    l = l * exp_diff + w;
+                    m = m_new;
+                }
+                let inv_l = if l > 0.0 { 1.0 / l } else { 0.0 };
+                for dd in 0..d_v {
+                    out[(i * h_q + h) * d_v + dd] = (acc[dd] * inv_l) as f32;
+                }
+            }
+        }
+        out
+    }
+
+    fn max_relative_error(actual: &[f32], expected: &[f32]) -> f32 {
+        assert_eq!(actual.len(), expected.len());
+        let mut err = 0f32;
+        for (a, e) in actual.iter().zip(expected.iter()) {
+            let denom = e.abs().max(1e-6f32);
+            err = err.max((a - e).abs() / denom);
+        }
+        err
+    }
+
+    fn varlen_deterministic_f32(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let u = ((state >> 33) as u32) % 1000;
+                (u as f32 - 500.0) / 500.0
+            })
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn vulkan_flash_attn_varlen_f32_matches_reference() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        // (h_q, h_kv, cu_q, cu_k, causal, head_dim, rtol)
+        //
+        // rtol note: the reference is computed in f64 while the kernel is f32,
+        // so the observed error is the f32 accumulation noise floor (~1.5e-5
+        // for a 64-dim dot + online-softmax rescale, see the CUDA reference
+        // suite which effectively tolerates ~1e-4 by rounding to 4 decimals).
+        let cases: &[(usize, usize, Vec<i32>, Vec<i32>, bool, usize, f32)] = &[
+            // single ragged batch [3, 1, 7], single head, non-causal
+            (1, 1, vec![0, 3, 4, 11], vec![0, 3, 4, 11], false, 64, 2e-4),
+            // two sequences [5, 5], single head, non-causal
+            (1, 1, vec![0, 5, 10], vec![0, 5, 10], false, 64, 2e-4),
+            // q/k sequences with different lengths (q shorter than k)
+            (1, 1, vec![0, 2, 5], vec![0, 4, 7], false, 64, 2e-4),
+            // single head, head_dim 32
+            (1, 1, vec![0, 4, 9], vec![0, 4, 9], false, 32, 2e-4),
+        ];
+
+        for &(h_q, h_kv, ref cu_q, ref cu_k, _causal, d, rtol) in cases {
+            let batch = cu_q.len() - 1;
+            let total_q = cu_q[batch] as usize;
+            let total_kv = cu_k[batch] as usize;
+            let d_v = d;
+            let q = varlen_deterministic_f32(total_q * h_q * d, batch as u64 * 71 + 11);
+            let k = varlen_deterministic_f32(total_kv * h_kv * d, batch as u64 * 13 + 3);
+            let v = varlen_deterministic_f32(total_kv * h_kv * d_v, batch as u64 * 17 + 5);
+            let scale = 0.125f32;
+
+            let q_s = device.storage_from_cpu_storage(&CpuStorage::F32(q.clone()))?;
+            let k_s = device.storage_from_cpu_storage(&CpuStorage::F32(k.clone()))?;
+            let v_s = device.storage_from_cpu_storage(&CpuStorage::F32(v.clone()))?;
+            let q_l = Layout::contiguous((total_q, h_q, d));
+            let k_l = Layout::contiguous((total_kv, h_kv, d));
+            let v_l = Layout::contiguous((total_kv, h_kv, d_v));
+            let cu_q_s = device.storage_from_cpu_storage(&CpuStorage::I32(cu_q.clone()))?;
+            let cu_k_s = device.storage_from_cpu_storage(&CpuStorage::I32(cu_k.clone()))?;
+
+            // max_seqlen larger than the actual lengths to exercise the
+            // kernel's tolerance to over-estimated bounds.
+            let max_q = total_q + 4;
+            let max_k = total_kv + 7;
+
+            let out = q_s.flash_attn_varlen(
+                &q_l,
+                &k_s,
+                &k_l,
+                &v_s,
+                &v_l,
+                &cu_q_s,
+                &cu_k_s,
+                max_q,
+                max_k,
+                scale,
+                false,
+            )?;
+            let cpu = out.to_cpu_storage()?;
+            let got = match &cpu {
+                CpuStorage::F32(v) => v.clone(),
+                other => crate::bail!("unexpected output dtype {other:?}"),
+            };
+            let expected =
+                varlen_attn_reference(&q, h_q, d, d_v, &k, h_kv, &v, cu_q, cu_k, scale, false);
+            let err = max_relative_error(&got, &expected);
+            assert!(
+                err < rtol,
+                "f32 varlen mismatch: h_q={h_q} h_kv={h_kv} cu_q={cu_q:?} head_dim={d} err={err}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_upload_staging_pool_roundtrip_integrity() -> Result<()> {
+        // Regression for the staging-pool size bug: buffers are pooled by
+        // power-of-two size class, so a smaller buffer (e.g. 1280 bytes)
+        // could be handed out for a larger request (1792 bytes), truncating
+        // the upload. Alternate small/large uploads and verify every value
+        // survives the round trip, including tail elements.
+        let device = VulkanDevice::new(0)?;
+        let sizes = [
+            (320usize, 448usize), // q=1280B, k=1792B (the flash_attn varlen case)
+            (100, 260),
+            (5, 129),
+        ];
+        for &(small_len, big_len) in &sizes {
+            for _round in 0..4 {
+                let small_vals: Vec<f32> = (0..small_len).map(|i| i as f32 * 0.25).collect();
+                let big_vals: Vec<f32> = (0..big_len).map(|i| -(i as f32) * 0.5 - 1.0).collect();
+                let _small =
+                    device.storage_from_cpu_storage(&CpuStorage::F32(small_vals.clone()))?;
+                let big = device.storage_from_cpu_storage(&CpuStorage::F32(big_vals.clone()))?;
+                for (name, storage, vals) in
+                    [("small", &_small, &small_vals), ("big", &big, &big_vals)]
+                {
+                    let cpu = storage.to_cpu_storage()?;
+                    let CpuStorage::F32(got) = cpu else {
+                        crate::bail!("unexpected round-trip dtype");
+                    };
+                    assert_eq!(got.len(), vals.len(), "{name} length");
+                    for (i, (a, e)) in got.iter().zip(vals.iter()).enumerate() {
+                        assert_eq!(a, e, "{name} elem {i} (sizes {small_len}/{big_len})");
+                    }
+                }
             }
         }
         Ok(())
