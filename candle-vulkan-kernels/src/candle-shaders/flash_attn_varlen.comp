@@ -114,16 +114,7 @@ void main() {
     }
 
     const float inv_l = (l > 0.0) ? (1.0 / l) : 0.0;
-    // TEMP DEBUG: report v/k rows actually read + m/l.
-    const uint v_first = (kv_start * h_kv + h_kv_use) * head_dim_v;
-    const uint k_first = (kv_start * h_kv + h_kv_use) * head_dim;
-    data_o[o_base + 58u] = data_v[v_first + 0u];
-    data_o[o_base + 59u] = data_v[v_first + 1u];
-    data_o[o_base + 60u] = data_k[k_first + 0u];
-    data_o[o_base + 61u] = data_k[k_first + 1u];
-    data_o[o_base + 62u] = m;
-    data_o[o_base + 63u] = l;
-    for (uint d = 0u; d < 58u; d++) {
+    for (uint d = 0u; d < head_dim_v; d++) {
         data_o[o_base + d] = o_acc[d] * inv_l;
     }
 }

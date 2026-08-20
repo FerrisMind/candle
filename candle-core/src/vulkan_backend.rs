@@ -1904,11 +1904,25 @@ impl VulkanDevice {
                 );
             }
         };
-        // Try to pop from pool
+        // Try to pop from pool. The pool is keyed by power-of-two size class,
+        // so an entry may be SMALLER than the current request (e.g. a 1280B
+        // buffer stored under the 2048 class). Reusing it would either bail
+        // in map_write ("write larger than buffer") or silently truncate the
+        // upload, so only accept buffers at least as large as requested.
         {
             let mut pool = pool.lock().map_err(|e| Error::wrap(e.to_string()))?;
             if let Some(entry) = pool.get_mut(&size_class) {
-                if let Some(buf) = entry.pop() {
+                let mut skipped = Vec::new();
+                let mut accepted = None;
+                while let Some(buf) = entry.pop() {
+                    if buf.size >= size {
+                        accepted = Some(buf);
+                        break;
+                    }
+                    skipped.push(buf);
+                }
+                entry.extend(skipped);
+                if let Some(buf) = accepted {
                     return Ok(buf);
                 }
             }
@@ -6238,6 +6252,31 @@ impl VulkanStorage {
             .bt());
         }
         let batch = batch_q;
+
+        // F16/BF16 route through the F32 hub (GPU-resident conversion, exact
+        // for f16/bf16 inputs): compute in f32 like the CUDA kernel's f32
+        // accumulation, convert the result back to the input dtype.
+        if self.dtype != DType::F32 {
+            let q_f32 = q.to_dtype(&q_l, DType::F32)?;
+            let k_f32 = k.to_dtype(&k_l, DType::F32)?;
+            let v_f32 = v.to_dtype(&v_l, DType::F32)?;
+            let out = q_f32.flash_attn_varlen(
+                &q_l,
+                &k_f32,
+                &k_l,
+                &v_f32,
+                &v_l,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale,
+                causal,
+            )?;
+
+            let out_l = Layout::contiguous(Shape::from_dims(&[total_q, h_q, head_dim_v]));
+            return out.to_dtype(&out_l, self.dtype);
+        }
 
         let cu_q_shape = Shape::from_dims(&[cu_seqlens_q.count]);
         let cu_k_shape = Shape::from_dims(&[cu_seqlens_k.count]);
@@ -11647,164 +11686,6 @@ mod tests {
 
     #[test]
     #[allow(clippy::type_complexity)]
-    fn vulkan_flash_attn_varlen_f32_debug_diff() -> Result<()> {
-        // Temporary diagnostic for the q-shorter-than-k case.
-        let device = VulkanDevice::new(0)?;
-        let h_q = 1usize;
-        let h_kv = 1usize;
-        let d = 64usize;
-        let d_v = 64usize;
-        let cu_q = vec![0i32, 2, 5];
-        let cu_k = vec![0i32, 4, 7];
-        let total_q = cu_q[2] as usize;
-        let total_kv = cu_k[2] as usize;
-        let q = varlen_deterministic_f32(total_q * h_q * d, 2 * 71 + 11);
-        let k = varlen_deterministic_f32(total_kv * h_kv * d, 2 * 13 + 3);
-        let v = varlen_deterministic_f32(total_kv * h_kv * d_v, 2 * 17 + 5);
-        let scale = 0.125f32;
-        let q_s = device.storage_from_cpu_storage(&CpuStorage::F32(q.clone()))?;
-        let k_s = device.storage_from_cpu_storage(&CpuStorage::F32(k.clone()))?;
-        let v_s = device.storage_from_cpu_storage(&CpuStorage::F32(v.clone()))?;
-        let cu_q_s = device.storage_from_cpu_storage(&CpuStorage::I32(cu_q.clone()))?;
-        let cu_k_s = device.storage_from_cpu_storage(&CpuStorage::I32(cu_k.clone()))?;
-        let out = q_s.flash_attn_varlen(
-            &Layout::contiguous((total_q, h_q, d)),
-            &k_s,
-            &Layout::contiguous((total_kv, h_kv, d)),
-            &v_s,
-            &Layout::contiguous((total_kv, h_kv, d_v)),
-            &cu_q_s,
-            &cu_k_s,
-            total_q + 4,
-            total_kv + 7,
-            scale,
-            false,
-        )?;
-        let got = match out.to_cpu_storage()? {
-            CpuStorage::F32(vv) => vv,
-            other => crate::bail!("unexpected dtype {other:?}"),
-        };
-        let exp =
-            varlen_attn_reference(&q, h_q, d, d_v, &k, h_kv, &v, &cu_q, &cu_k, scale, false);
-
-        // Candidate outputs for row 2 over a few candidate (q-row, KV range).
-        let attn_row = |qrow: usize, kv_start: usize, kv_end: usize| -> Vec<f32> {
-            let h = 0usize;
-            let h_kv_use = h * h_kv / h_q;
-            let mut m = f64::NEG_INFINITY;
-            let mut l = 0f64;
-            let mut acc = vec![0f64; d_v];
-            for j in kv_start..kv_end {
-                let mut score = 0f64;
-                for dd in 0..d {
-                    score += q[(qrow * h_q + h) * d + dd] as f64
-                        * k[(j * h_kv + h_kv_use) * d + dd] as f64;
-                }
-                score *= scale as f64;
-                let m_new = m.max(score);
-                let w = (score - m_new).exp();
-                let exp_diff = if m_new - m < 80.0 { (m - m_new).exp() } else { 0.0 };
-                for dd in 0..d_v {
-                    acc[dd] = acc[dd] * exp_diff + w * v[(j * h_kv + h_kv_use) * d_v + dd] as f64;
-                }
-                l = l * exp_diff + w;
-                m = m_new;
-            }
-            let inv = if l > 0.0 { 1.0 / l } else { 0.0 };
-            (0..d_v).map(|dd| (acc[dd] * inv) as f32).collect()
-        };
-        let candidates: Vec<(String, Vec<f32>)> = vec![
-            ("q2 [0,7)".to_string(), attn_row(2, 0, 7)),
-            ("q2 [0,4)".to_string(), attn_row(2, 0, 4)),
-            ("q2 [4,7)".to_string(), attn_row(2, 4, 7)),
-            ("q0 [4,7)".to_string(), attn_row(0, 4, 7)),
-            ("q3 [4,7)".to_string(), attn_row(3, 4, 7)),
-        ];
-        let base = 2 * d_v;
-        for r in 0..5usize {
-            let dbg = &got[r * d_v + 58..r * d_v + 64];
-            eprintln!(
-                "row{r} DEBUG[58..64]=(v0={} v1={} k0={} k1={} m={} l={})",
-                dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5]
-            );
-            let kv_start = if r < 2 { 0 } else { 4 };
-            eprintln!(
-                "row{r}: exp_v0(v[{kv_start}][0])={} exp_v1={} exp_k0={} exp_k1={}",
-                v[kv_start * d_v],
-                v[kv_start * d_v + 1],
-                k[kv_start * d],
-                k[kv_start * d + 1]
-            );
-            eprintln!(
-                "row{r}: got[0..8]={:?} exp[0..8]={:?}",
-                &got[r * d_v..r * d_v + 8],
-                &exp[r * d_v..r * d_v + 8]
-            );
-        }
-        eprintln!("row2 got[0..8]={:?}", &got[base..base + 8]);
-        for (name, cand) in &candidates {
-            eprintln!("row2 {name}[0..8]={:?}", &cand[0..8]);
-        }
-        // Brute-force all (qrow, kv-range) combos against row 2 of `got`.
-        let got_row = &got[base..base + d_v];
-        // Verify the embedded shader source is the current one.
-        let src = shader_source("flash_attn_varlen").unwrap_or("");
-        eprintln!(
-            "embedded source len={} has_causal={} has_max_seqlen={}",
-            src.len(),
-            src.contains("causal != 0u"),
-            src.contains("max_seqlen_q")
-        );
-        // Check proportionality of rows 2,3,4 (shared numerator hypothesis).
-        let r2 = &got[2 * d_v..2 * d_v + d_v];
-        let r3 = &got[3 * d_v..3 * d_v + d_v];
-        let r4 = &got[4 * d_v..4 * d_v + d_v];
-        let mut r32s = Vec::new();
-        let mut r42s = Vec::new();
-        for dd in 0..d_v {
-            if r2[dd].abs() > 1e-9 {
-                r32s.push(r3[dd] / r2[dd]);
-                r42s.push(r4[dd] / r2[dd]);
-            }
-        }
-        let r32_1 = r32s[0];
-        let r42_1 = r42s[0];
-        let max_dev32 = r32s.iter().map(|r| (r - r32_1).abs()).fold(0f32, f32::max);
-        let max_dev42 = r42s.iter().map(|r| (r - r42_1).abs()).fold(0f32, f32::max);
-        eprintln!(
-            "proportionality r3/r2 mean={r32_1} maxdev={max_dev32}; r4/r2 mean={r42_1} maxdev={max_dev42}"
-        );
-        let mut qrows = Vec::new();
-        for dd in 0..d_v {
-            qrows.push(r2[dd] / r3[dd].max(1e-12));
-        }
-        eprintln!("r2/r3[0..4]={:?}", &qrows[0..4]);
-        for qrow in 0..total_q {
-            for kstart in 0..total_kv {
-                for kend in (kstart + 1)..=total_kv {
-                    let cand = attn_row(qrow, kstart, kend);
-                    let mut worst = 0f32;
-                    for (a, c) in got_row.iter().zip(cand.iter()) {
-                        let rel = (a - c).abs() / c.abs().max(1e-6);
-                        worst = worst.max(rel);
-                    }
-                    if worst < 1e-4 {
-                        eprintln!("MATCH: qrow={qrow} kstart={kstart} kend={kend} worst={worst}");
-                    }
-                }
-            }
-        }
-        for (i, (a, e)) in got.iter().zip(exp.iter()).enumerate() {
-            let rel = (a - e).abs() / e.abs().max(1e-6);
-            if rel > 1e-3 {
-                eprintln!("idx={i} row={} d={} got={a} exp={e} rel={rel}", i / d_v, i % d_v);
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[allow(clippy::type_complexity)]
     fn vulkan_flash_attn_varlen_f32_matches_reference() -> Result<()> {
         let device = VulkanDevice::new(0)?;
         // (h_q, h_kv, cu_q, cu_k, causal, head_dim, rtol)
@@ -11873,6 +11754,43 @@ mod tests {
                 err < rtol,
                 "f32 varlen mismatch: h_q={h_q} h_kv={h_kv} cu_q={cu_q:?} head_dim={d} err={err}"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_upload_staging_pool_roundtrip_integrity() -> Result<()> {
+        // Regression for the staging-pool size bug: buffers are pooled by
+        // power-of-two size class, so a smaller buffer (e.g. 1280 bytes)
+        // could be handed out for a larger request (1792 bytes), truncating
+        // the upload. Alternate small/large uploads and verify every value
+        // survives the round trip, including tail elements.
+        let device = VulkanDevice::new(0)?;
+        let sizes = [
+            (320usize, 448usize), // q=1280B, k=1792B (the flash_attn varlen case)
+            (100, 260),
+            (5, 129),
+        ];
+        for &(small_len, big_len) in &sizes {
+            for _round in 0..4 {
+                let small_vals: Vec<f32> = (0..small_len).map(|i| i as f32 * 0.25).collect();
+                let big_vals: Vec<f32> = (0..big_len).map(|i| -(i as f32) * 0.5 - 1.0).collect();
+                let _small =
+                    device.storage_from_cpu_storage(&CpuStorage::F32(small_vals.clone()))?;
+                let big = device.storage_from_cpu_storage(&CpuStorage::F32(big_vals.clone()))?;
+                for (name, storage, vals) in
+                    [("small", &_small, &small_vals), ("big", &big, &big_vals)]
+                {
+                    let cpu = storage.to_cpu_storage()?;
+                    let CpuStorage::F32(got) = cpu else {
+                        crate::bail!("unexpected round-trip dtype");
+                    };
+                    assert_eq!(got.len(), vals.len(), "{name} length");
+                    for (i, (a, e)) in got.iter().zip(vals.iter()).enumerate() {
+                        assert_eq!(a, e, "{name} elem {i} (sizes {small_len}/{big_len})");
+                    }
+                }
+            }
         }
         Ok(())
     }
