@@ -14262,34 +14262,6 @@ mod wgpu_flash_attn_varlen_tests {
             }
             Err(e) => {
                 eprintln!("skipping wgpu flash_attn_varlen: {e}");
-#[cfg(test)]
-#[cfg(feature = "wgpu")]
-mod wgpu_pool_tests {
-    use super::*;
-    use crate::test_utils::compare_f32_slices;
-
-    /// Pool-specific tolerances: the CPU avg_pool2d reference accumulates in
-    /// the storage dtype (f16/bf16), so over k-element windows the reference
-    /// itself carries ~k*eps rounding noise. The F16/BF16 values come from the
-    /// task spec (`~1e-2 / ~2e-2` relative); F32 stays tight.
-    fn pool_tolerance(dtype: DType) -> (f64, f64) {
-        match dtype {
-            DType::F32 => (1e-4, 1e-4),
-            DType::F16 => (1e-2, 1e-2),
-            DType::BF16 => (2e-2, 2e-2),
-            _ => (1e-3, 1e-3),
-        }
-    }
-
-    fn wgpu_device() -> Option<crate::Device> {
-        match crate::Device::new_wgpu(0) {
-            Ok(crate::Device::Wgpu(dev)) => Some(crate::Device::Wgpu(dev)),
-            Ok(_) => {
-                eprintln!("skipping wgpu pool test: unexpected device variant");
-                None
-            }
-            Err(e) => {
-                eprintln!("skipping wgpu pool test: {e}");
                 None
             }
         }
@@ -14675,6 +14647,42 @@ mod wgpu_pool_tests {
         };
         check_case(&dev, DType::F16, &[3, 1, 7], &[3, 1, 7], 4, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 2e-2, 1e-3)
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "wgpu")]
+mod wgpu_pool_tests {
+    use super::*;
+    use crate::test_utils::compare_f32_slices;
+
+    /// Pool-specific tolerances: the CPU avg_pool2d reference accumulates in
+    /// the storage dtype (f16/bf16), so over k-element windows the reference
+    /// itself carries ~k*eps rounding noise. The F16/BF16 values come from the
+    /// task spec (`~1e-2 / ~2e-2` relative); F32 stays tight.
+    fn pool_tolerance(dtype: DType) -> (f64, f64) {
+        match dtype {
+            DType::F32 => (1e-4, 1e-4),
+            DType::F16 => (1e-2, 1e-2),
+            DType::BF16 => (2e-2, 2e-2),
+            _ => (1e-3, 1e-3),
+        }
+    }
+
+    fn wgpu_device() -> Option<crate::Device> {
+        match crate::Device::new_wgpu(0) {
+            Ok(crate::Device::Wgpu(dev)) => Some(crate::Device::Wgpu(dev)),
+            Ok(_) => {
+                eprintln!("skipping wgpu pool test: unexpected device variant");
+                None
+            }
+            Err(e) => {
+                eprintln!("skipping wgpu pool test: {e}");
+                None
+            }
+        }
+    }
+
     fn wgpu_shader_f16(dev: &crate::Device) -> bool {
         match dev {
             crate::Device::Wgpu(dev) => {
