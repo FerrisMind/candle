@@ -1131,6 +1131,39 @@ pub fn conv2d_f32_shader(workgroup_size: u32) -> Option<String> {
     Some(preprocess(&source, &defines, &replacements, DType::F32))
 }
 
+/// Native F16 conv2d/conv1d (CUDA parity: f16 in, f32 accumulate, f16 out).
+pub fn conv2d_f16_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("conv2d.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let defines = vec![
+        "WEIGHT_F16".to_string(),
+        "INPUT_F16".to_string(),
+        "OUTPUT_F16".to_string(),
+    ];
+    let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    Some(preprocess(&source, &defines, &replacements, DType::F16))
+}
+
+/// Native BF16 conv2d/conv1d (CUDA parity: bf16 in, f32 accumulate, bf16 out;
+/// packed two-per-u32-word storage with atomic output word merge).
+pub fn conv2d_bf16_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("conv2d.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let defines = vec![
+        "WEIGHT_BF16".to_string(),
+        "INPUT_BF16".to_string(),
+        "OUTPUT_BF16".to_string(),
+    ];
+    let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    // BF16 uses only u32 bit-twiddling, no f16 scalar types: strip the f16
+    // enable so the shader also compiles on adapters without SHADER_F16.
+    Some(preprocess(&source, &defines, &replacements, DType::F32))
+}
+
 pub fn im2col_f32_shader(workgroup_size: u32) -> Option<String> {
     let source = get("im2col.wgsl")?.source().replace(
         "#include \"common_decls.tmpl\"",
