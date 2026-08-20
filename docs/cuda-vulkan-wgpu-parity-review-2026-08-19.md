@@ -202,3 +202,26 @@ vulkan 26/26, wgpu 46/46 тестов (2 ignored = задокументиров�
 2. F16/BF16 нативные conv/pool/upsample (сейчас F32-хаб) — perf-оптимизация, не функциональный гэп.
 3. candle-ug / flash-attn varlen/paged / CUDA Graphs-аналоги — вне scope op-parity (CUDA-specific экосистема).
 4. IQ-форматы и mxfp4/nvfp4 в GgmlDType — ограничение candle в целом, не VK/wgpu.
+
+## 11. СЛЕДУЮЩАЯ ВОЛНА (обновление 2026-08-20 #2, ветка wgpu/vulkan)
+
+Гейты те же: clippy -D warnings = 0 по обеим фичам; тесты: **vulkan 46/46 passed (15 ignored — задокументированные follow-up), wgpu 103/103 passed, 0 ignored** (было 90 passed / 17 ignored до волны).
+
+### Закрыто (wgpu)
+| Гэп | Коммит | Механизм |
+|---|---|---|
+| flash_attn_varlen (аналог candle-flash-attn CUDA) | e2b6e2c6 | WGSL-шейдер, online softmax, GQA, causal; 19 тестов против CPU-референса |
+| argsort merge-pass баг + 3 скрытых бага сортировки | e620dc15 | (a) f32-ключи raw bitcast → orderable-key (CUDA sort.cu трюк: XOR-маски знака); (b) DESC merge tie last-index → first-index (CPU sort_by); (c) i64/f64 без tie-break вообще → добавлен; merge-тесты un-ignored + новый large_dupes 8192 |
+| нативные F16/BF16 conv | 73b94962 | прямой dispatch без F32-хаба, 5 тестов |
+| нативные F16/BF16 pool (max+avg) | ee13b6ae/997bb5e1 | PoolParams + run_pool2d_native, 6 тестов |
+| нативные F16/BF16 upsample (nearest/bilinear 1d/2d) | 997bb5e1 | gather dispatch, 6 тестов |
+| mul_mat_bf16 маска CAS (латентный) | 1ea90f31 | `select(0x0000ffffu, 0xffff0000u, half==0u)` — плечи были перепутаны (zeroed соседняя половину); был недостижим из-за раннего F32-хаб маршрута; + value-тест BF16 matmul 3×4@4×3 vs CPU |
+
+### Закрыто (vulkan)
+| Гэп | Коммит | Механизм |
+|---|---|---|
+| flash_attn_varlen (C2) | 81f54038 | .comp шейдер (online softmax, GQA, causal, seq_of_row бинарный поиск); F16/BF16 через F32-хаб (GPU-resident конвертация); 4 теста против f64 CPU-референса |
+| **staging pool size-class баг (критический, общий для всего бэкенда)** | 81f54038 | `acquire_staging_buffer` пулировал по next_power_of_two классам и мог выдать буфер МЕНЬШЕ запроса (напр. 1280B под запрос 1792B): map_write zero-filled хвост, копия обрезалась → шейдеры читали нули за пределами q-размера. Симптом: silent data corruption любых alternating-size upload→compute цепочек. Фикс: pop только буферов ≥ запроса, undersized возвращаются в пул; регрессионный тест vulkan_upload_staging_pool_roundtrip_integrity |
+
+### В работе (Фаза 2)
+- paged KV flash-attention (block_table, k/v ранг 4) — wgpu и vulkan, параллельные агенты в worktrees wt/paged-wgpu / wt/paged-vk.
