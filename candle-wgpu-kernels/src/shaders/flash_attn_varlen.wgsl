@@ -86,7 +86,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     for (var kv: u32 = kv_start; kv < kv_end; kv++) {
         let k_local = kv - kv_start;
-        // Slice 2 adds the causal mask here (window_size_right = 0).
+        // Causal mask (CUDA window_size_left=None, window_size_right=Some(0)):
+        // keep k only if its in-sequence index <= the query's.
+        if (params.causal != 0u && q_local < k_local) { continue; }
 
         var score: f32 = 0.0;
         let k_off = k_base + k_local * params.num_kv_heads * D;

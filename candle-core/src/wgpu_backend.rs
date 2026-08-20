@@ -14303,7 +14303,7 @@ mod wgpu_flash_attn_varlen_tests {
     }
 
     #[test]
-    fn varlen_f32_ragged_non_causal() {
+    fn flash_attn_varlen_f32_ragged_non_causal() {
         let dev = match wgpu_device() {
             Some(d) => d,
             None => return,
@@ -14313,7 +14313,7 @@ mod wgpu_flash_attn_varlen_tests {
     }
 
     #[test]
-    fn varlen_f32_equal_seqs_non_causal() {
+    fn flash_attn_varlen_f32_equal_seqs_non_causal() {
         let dev = match wgpu_device() {
             Some(d) => d,
             None => return,
@@ -14323,7 +14323,7 @@ mod wgpu_flash_attn_varlen_tests {
     }
 
     #[test]
-    fn varlen_f32_head_dim_32_non_causal() {
+    fn flash_attn_varlen_f32_head_dim_32_non_causal() {
         let dev = match wgpu_device() {
             Some(d) => d,
             None => return,
@@ -14333,7 +14333,7 @@ mod wgpu_flash_attn_varlen_tests {
     }
 
     #[test]
-    fn varlen_f32_head_dim_64_v32_non_causal() {
+    fn flash_attn_varlen_f32_head_dim_64_v32_non_causal() {
         let dev = match wgpu_device() {
             Some(d) => d,
             None => return,
@@ -14343,7 +14343,7 @@ mod wgpu_flash_attn_varlen_tests {
     }
 
     #[test]
-    fn varlen_f32_max_seqlen_larger_non_causal() {
+    fn flash_attn_varlen_f32_max_seqlen_larger_non_causal() {
         let dev = match wgpu_device() {
             Some(d) => d,
             None => return,
@@ -14353,12 +14353,95 @@ mod wgpu_flash_attn_varlen_tests {
     }
 
     #[test]
-    fn varlen_f32_max_seqlen_smaller_than_actual() {
+    fn flash_attn_varlen_f32_max_seqlen_smaller_than_actual() {
         let dev = match wgpu_device() {
             Some(d) => d,
             None => return,
         };
         check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, false, 2, 3, 1e-5, 1e-6)
+            .unwrap();
+    }
+    #[test]
+    fn flash_attn_varlen_f32_ragged_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_equal_seqs_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[5, 5], &[5, 5], 2, 2, 64, 64, 1.0 / 8.0, true, 5, 5, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_kv_longer_than_q_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        // q lengths [3,1,7] attend k lengths [7,5,5]; causal must mask out the
+        // extra trailing KV positions within each sequence.
+        check_case(&dev, DType::F32, &[3, 1, 7], &[7, 5, 5], 2, 2, 64, 64, 1.0 / 8.0, true, 7, 7, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_gqa_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 4, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_gqa_non_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[5, 5], &[5, 5], 4, 2, 64, 64, 1.0 / 8.0, false, 5, 5, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_head_dim_32_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 32, 32, 1.0 / (32.0f32).sqrt(), true, 8, 8, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_head_dim_64_v32_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        // head_dim_v differs from head_dim (QK dim 64, V dim 32).
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 32, 1.0 / 8.0, true, 8, 8, 1e-5, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f32_max_seqlen_larger_than_actual() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        // max_seqlen far above actual lengths must not change the result.
+        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, true, 1000, 4000, 1e-5, 1e-6)
             .unwrap();
     }
 }
