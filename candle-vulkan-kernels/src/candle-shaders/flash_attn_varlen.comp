@@ -1,0 +1,129 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "types.glsl"
+
+// Fused flash attention with variable-length sequences (non-paged dense K/V).
+// Vulkan counterpart of candle-flash-attn::flash_attn_varlen (CUDA).
+//
+//   q: (total_q, h_q, d)            contiguous
+//   k: (total_kv, h_kv, d)          contiguous
+//   v: (total_kv, h_kv, d_v)        contiguous
+//   cu_seqlens_q/k: I32, batch+1 cumulative offsets [0, l1, l1+l2, ...]
+//   output: (total_q, h_q, d_v), same dtype as q
+//
+// Each invocation computes a single output row (q_row, q_head):
+//   - locate the batch b owning q_row via binary search over cu_seqlens_q,
+//   - iterate the KV range [cu_seqlens_k[b], cu_seqlens_k[b+1]),
+//   - online softmax (running max/sum + rescale) over the causal-masked
+//     scores, accumulate V in f32, write out in dtype q.
+//
+// GQA: q head n attends to kv head n * h_kv / h_q (h_q % h_kv == 0).
+// Causal: within a sequence, only keys with local k_idx <= local q_idx attend.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer QBuf   { float data_q[]; };
+layout(binding = 1) readonly buffer KBuf   { float data_k[]; };
+layout(binding = 2) readonly buffer VBuf   { float data_v[]; };
+layout(binding = 3) readonly buffer CuQBuf { int data_cu_q[]; };
+layout(binding = 4) readonly buffer CuKBuf { int data_cu_k[]; };
+layout(binding = 5) writeonly buffer OBuf  { float data_o[]; };
+
+layout(push_constant) uniform params {
+    uint total_q;      // number of query rows
+    uint h_q;          // number of query heads
+    uint h_kv;         // number of key/value heads
+    uint head_dim;     // Q/K head dimension (d)
+    uint head_dim_v;   // V head dimension / output dimension (d_v)
+    uint num_seqs;     // batch size = cu_seqlens element count - 1
+    float scale;
+    uint causal;
+    uint max_seqlen_q; // accepted for CUDA parity; actual ranges come from cu_seqlens
+    uint max_seqlen_k;
+};
+
+// Returns the batch index b such that cu_q[b] <= q_row < cu_q[b+1].
+uint seq_of_row(uint q_row) {
+    uint lo = 0u;
+    uint hi = num_seqs;
+    while (lo < hi) {
+        const uint mid = (lo + hi) >> 1u;
+        if (data_cu_q[mid] <= int(q_row)) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo - 1u;
+}
+
+void main() {
+    const uint q_row = gl_GlobalInvocationID.x;
+    const uint h = gl_GlobalInvocationID.y;
+    if (q_row >= total_q || h >= h_q) {
+        return;
+    }
+
+    // GQA: map query head to key/value head (h_q % h_kv == 0).
+    const uint h_kv_use = h * h_kv / h_q;
+
+    const uint b = seq_of_row(q_row);
+    const uint q_idx = q_row - uint(data_cu_q[b]);
+    const uint kv_start = uint(data_cu_k[b]);
+    const uint kv_end = uint(data_cu_k[b + 1u]);
+
+    const uint q_base = (q_row * h_q + h) * head_dim;
+    const uint o_base = (q_row * h_q + h) * head_dim_v;
+
+    // Online softmax state; the accumulator is at most head_dim_v (<= 512).
+    float m = -1.0e30;
+    float l = 0.0;
+    float o_acc[512];
+    for (uint d = 0u; d < head_dim_v; d++) {
+        o_acc[d] = 0.0;
+    }
+
+    for (uint j = kv_start; j < kv_end; j++) {
+        const uint k_idx = j - kv_start;
+        if (causal != 0u && k_idx > q_idx) {
+            continue;
+        }
+
+        const uint k_base = (j * h_kv + h_kv_use) * head_dim;
+        float score = 0.0;
+        for (uint d = 0u; d < head_dim; d++) {
+            score += data_q[q_base + d] * data_k[k_base + d];
+        }
+        score *= scale;
+
+        const float m_new = max(m, score);
+        const float exp_diff = (m_new - m < 80.0) ? exp(m - m_new) : 0.0;
+        const float w = exp(score - m_new);
+
+        const uint v_base = (j * h_kv + h_kv_use) * head_dim_v;
+        for (uint d = 0u; d < head_dim_v; d++) {
+            o_acc[d] = o_acc[d] * exp_diff + w * data_v[v_base + d];
+        }
+        l = l * exp_diff + w;
+        m = m_new;
+    }
+
+    const float inv_l = (l > 0.0) ? (1.0 / l) : 0.0;
+    // TEMP DEBUG: report v/k rows actually read + m/l.
+    const uint v_first = (kv_start * h_kv + h_kv_use) * head_dim_v;
+    const uint k_first = (kv_start * h_kv + h_kv_use) * head_dim;
+    data_o[o_base + 58u] = data_v[v_first + 0u];
+    data_o[o_base + 59u] = data_v[v_first + 1u];
+    data_o[o_base + 60u] = data_k[k_first + 0u];
+    data_o[o_base + 61u] = data_k[k_first + 1u];
+    data_o[o_base + 62u] = m;
+    data_o[o_base + 63u] = l;
+    for (uint d = 0u; d < 58u; d++) {
+        data_o[o_base + d] = o_acc[d] * inv_l;
+    }
+}

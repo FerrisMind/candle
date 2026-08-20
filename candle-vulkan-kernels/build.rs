@@ -742,6 +742,11 @@ fn generate_candle_spirv_modules(
             candle_shaders_dir.join("flash_attn.comp"),
             &["INPUT_F16"],
         ),
+        (
+            "flash_attn_varlen",
+            candle_shaders_dir.join("flash_attn_varlen.comp"),
+            &[],
+        ),
         // F8E4M3 conversion shaders
         ("convert_f8e4m3_f32", candle_shaders_dir.join("convert_fp8.comp"), &["A_TYPE=uint8_t", "D_TYPE=float", "DATA_A_F8E4M3"]),
         ("convert_f32_f8e4m3", candle_shaders_dir.join("convert_fp8.comp"), &["A_TYPE=float", "D_TYPE=uint8_t", "DATA_D_F8E4M3"]),
