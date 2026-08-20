@@ -8246,6 +8246,292 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         out_f32.to_dtype(&out_layout, self.dtype)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_paged(
+        &self,
+        layout: &Layout,
+        k: &Self,
+        k_l: &Layout,
+        v: &Self,
+        v_l: &Layout,
+        cu_seqlens_q: &Self,
+        cu_seqlens_k: &Self,
+        block_table: &Self,
+        block_table_layout: &Layout,
+        page_block_size: usize,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        softmax_scale: f32,
+        causal: bool,
+    ) -> Result<Self> {
+        use crate::DType;
+
+        if self.dtype != k.dtype || self.dtype != v.dtype {
+            return Err(Error::Msg(
+                "flash_attn_paged: q/k/v dtype mismatch".into(),
+            )
+            .bt());
+        }
+        if !matches!(self.dtype, DType::F32 | DType::F16 | DType::BF16) {
+            return Err(Error::UnsupportedDTypeForOp(
+                self.dtype,
+                "wgpu flash_attn_paged",
+            )
+            .bt());
+        }
+        if cu_seqlens_q.dtype != DType::I32 || cu_seqlens_k.dtype != DType::I32 {
+            return Err(Error::Msg(
+                "flash_attn_paged: cu_seqlens_q/k must be I32".into(),
+            )
+            .bt());
+        }
+        if block_table.dtype != DType::I32 {
+            return Err(Error::Msg(
+                "flash_attn_paged: block_table must be I32".into(),
+            )
+            .bt());
+        }
+        if cu_seqlens_q.count < 2 || cu_seqlens_k.count < 2 {
+            return Err(Error::Msg(
+                "flash_attn_paged: cu_seqlens need at least 2 elements".into(),
+            )
+            .bt());
+        }
+        let batch_q = cu_seqlens_q.count - 1;
+        let batch_k = cu_seqlens_k.count - 1;
+        if batch_q != batch_k {
+            return Err(Error::Msg(
+                "flash_attn_paged: cu_seqlens_q/k batch mismatch".into(),
+            )
+            .bt());
+        }
+
+        // CUDA_reference invariants: layouts are contiguous. Copy strided or
+        // offset views to contiguous buffers so the kernel can index densely.
+        let ensure_contiguous = |src: &WgpuStorage, l: &Layout| -> Result<(WgpuStorage, Layout)> {
+            if !l.is_contiguous() || l.start_offset() != 0 {
+                let shape_ref = l.shape();
+                let mut tmp = unsafe { src.device.alloc_uninit(shape_ref, src.dtype)? };
+                src.copy_strided_src(&mut tmp, 0, l)?;
+                Ok((tmp, Layout::contiguous(shape_ref.clone())))
+            } else {
+                Ok((src.try_clone(l)?, l.clone()))
+            }
+        };
+        let (q_buf, q_l) = ensure_contiguous(self, layout)?;
+        let (k_buf, k_l) = ensure_contiguous(k, k_l)?;
+        let (v_buf, v_l) = ensure_contiguous(v, v_l)?;
+        let (bt_buf, bt_l) = ensure_contiguous(block_table, block_table_layout)?;
+
+        // F32 compute hub for non-F32 dtypes (F16/BF16 are exactly representable
+        // in F32; accumulator stays F32 like CUDA flash-attn).
+        let to_f32 = |src: WgpuStorage, l: &Layout| -> Result<(WgpuStorage, Layout)> {
+            if src.dtype == DType::F32 {
+                Ok((src, l.clone()))
+            } else {
+                let converted = src.to_dtype(l, DType::F32)?;
+                Ok((converted, Layout::contiguous(l.shape().clone())))
+            }
+        };
+        let (q_c, q_c_l) = to_f32(q_buf, &q_l)?;
+        let (k_c, k_c_l) = to_f32(k_buf, &k_l)?;
+        let (v_c, v_c_l) = to_f32(v_buf, &v_l)?;
+
+        let q_dims = q_c_l.dims();
+        let k_dims = k_c_l.dims();
+        let v_dims = v_c_l.dims();
+        let (total_q, num_heads, head_dim) =
+            if q_dims.len() == 3 && q_dims[2] > 0 {
+                (q_dims[0], q_dims[1], q_dims[2])
+            } else {
+                return Err(Error::Msg(
+                    "flash_attn_paged expects 3D Q tensor [total_q, h_q, d]".into(),
+                )
+                .bt());
+            };
+        let (num_blocks, pbs, num_kv_heads, head_dim_kv) =
+            if k_dims.len() == 4 && k_dims[0] > 0 {
+                (k_dims[0], k_dims[1], k_dims[2], k_dims[3])
+            } else {
+                return Err(Error::Msg(
+                    "flash_attn_paged expects 4D K tensor [num_blocks, page_block_size, h_kv, d]"
+                        .into(),
+                )
+                .bt());
+            };
+        if !page_block_size.is_multiple_of(32) {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged: page_block_size must be a multiple of 32 (got {page_block_size})"
+            ))
+            .bt());
+        }
+        if pbs != page_block_size {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged: page_block_size {page_block_size} does not match K shape {k_dims:?}"
+            ))
+            .bt());
+        }
+        let head_dim_v = if v_dims.len() == 4 {
+            v_dims[3]
+        } else {
+            return Err(Error::Msg(
+                "flash_attn_paged expects 4D V tensor [num_blocks, page_block_size, h_kv, dv]"
+                    .into(),
+            )
+            .bt());
+        };
+        if head_dim_kv != head_dim {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged: QK head dim {head_dim} != K head dim {head_dim_kv}"
+            ))
+            .bt());
+        }
+        if num_heads % num_kv_heads != 0 || num_heads < num_kv_heads {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged: GQA q heads {num_heads} not divisible by kv heads {num_kv_heads}"
+            ))
+            .bt());
+        }
+        if v_dims[0] != num_blocks
+            || v_dims[1] != pbs
+            || v_dims[2] != num_kv_heads
+        {
+            return Err(Error::Msg(
+                "flash_attn_paged: K/V shapes must match (num_blocks, page_block_size, h_kv, d)"
+                    .into(),
+            )
+            .bt());
+        }
+        if head_dim_v == 0 || head_dim_v > 512 {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged: head_dim_v {head_dim_v} out of supported range (1..=512)"
+            ))
+            .bt());
+        }
+        let bt_dims = bt_l.dims();
+        if bt_dims.len() != 2 || bt_dims[0] != batch_q {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged: block_table must be I32 ({batch_q}, max_blocks_per_seq), got {bt_dims:?}"
+            ))
+            .bt());
+        }
+        let max_blocks = bt_dims[1];
+        if max_blocks == 0 {
+            return Err(Error::Msg(
+                "flash_attn_paged: block_table must have at least one column".into(),
+            )
+            .bt());
+        }
+
+        let out_shape = Shape::from_dims(&[total_q, num_heads, head_dim_v]);
+        let out_f32 = unsafe { q_c.device.alloc_uninit(&out_shape, DType::F32)? };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FlashAttnPagedParams {
+            total_q: u32,
+            num_blocks: u32,
+            head_dim: u32,
+            head_dim_v: u32,
+            num_heads: u32,
+            num_kv_heads: u32,
+            batch_size: u32,
+            max_seqlen_q: u32,
+            max_seqlen_k: u32,
+            offset_q: u32,
+            page_block_size: u32,
+            max_blocks: u32,
+            causal: u32,
+            scale: f32,
+            _pad0: u32,
+            _pad1: u32,
+        }
+
+        let param_buffer = q_c
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-flash-attn-paged-params"),
+                size: std::mem::size_of::<FlashAttnPagedParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, true),
+            storage_entry(4, true),
+            storage_entry(5, true),
+            storage_entry(6, false),
+            uniform_entry(7),
+        ];
+        let bindings = [
+            buffer_binding(0, &q_c.buffer),
+            buffer_binding(1, &k_c.buffer),
+            buffer_binding(2, &v_c.buffer),
+            buffer_binding(3, &cu_seqlens_q.buffer),
+            buffer_binding(4, &cu_seqlens_k.buffer),
+            buffer_binding(5, &bt_buf.buffer),
+            buffer_binding(6, &out_f32.buffer),
+            buffer_binding(7, &param_buffer),
+        ];
+
+        let shader_source = candle_wgpu_kernels::get("flash_attn_paged.wgsl")
+            .ok_or_else(|| Error::Msg("wgpu flash_attn_paged shader not found".into()).bt())?
+            .source();
+
+        // Dispatched as a 2D grid: x = q rows (one thread per row in chunks to
+        // respect the per-dimension workgroup cap), y = q heads.
+        let cap = wgpu_dispatch_wg_cap(&q_c.device);
+        let rows_per_dispatch = cap * WG_SIZE;
+        let mut row_base = 0u32;
+        while row_base < total_q as u32 {
+            let chunk_rows = (total_q as u32 - row_base).min(rows_per_dispatch);
+            let wg_x = chunk_rows.div_ceil(WG_SIZE);
+            let params = FlashAttnPagedParams {
+                total_q: total_q as u32,
+                num_blocks: num_blocks as u32,
+                head_dim: head_dim as u32,
+                head_dim_v: head_dim_v as u32,
+                num_heads: num_heads as u32,
+                num_kv_heads: num_kv_heads as u32,
+                batch_size: batch_q as u32,
+                max_seqlen_q: max_seqlen_q as u32,
+                max_seqlen_k: max_seqlen_k as u32,
+                offset_q: row_base,
+                page_block_size: page_block_size as u32,
+                max_blocks: max_blocks as u32,
+                causal: if causal { 1 } else { 0 },
+                scale: softmax_scale,
+                _pad0: 0,
+                _pad1: 0,
+            };
+            q_c.device
+                .inner
+                .queue
+                .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+            q_c.device.run_compute_xyz(
+                shader_source,
+                &entries,
+                &bindings,
+                (wg_x, num_heads as u32, 1),
+                &[],
+                None,
+                "candle-wgpu-flash-attn-paged",
+            )?;
+            row_base += chunk_rows;
+        }
+
+        if self.dtype == DType::F32 {
+            return Ok(out_f32);
+        }
+        let out_layout = Layout::contiguous(out_shape);
+        out_f32.to_dtype(&out_layout, self.dtype)
+    }
+
     pub fn ggml_rope(
         &self,
         layout: &Layout,
@@ -15924,5 +16210,415 @@ mod wgpu_conv_tests {
                 round_out(dtype, reference, out)
             });
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "wgpu")]
+mod wgpu_paged_fa_tests {
+    use super::*;
+
+    fn wgpu_device() -> Option<WgpuDevice> {
+        match crate::Device::new_wgpu(0) {
+            Ok(crate::Device::Wgpu(dev)) => Some(dev),
+            Ok(_) => {
+                eprintln!("skipping wgpu paged flash_attn: unexpected device variant");
+                None
+            }
+            Err(e) => {
+                eprintln!("skipping wgpu paged flash_attn: {e}");
+                None
+            }
+        }
+    }
+
+    /// Deterministic pseudo-random fill in [-1, 1).
+    fn fill(vals: &mut [f32], seed: u64) {
+        let mut s = seed;
+        for x in vals.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *x = (((s >> 33) as f32) / (1u64 << 31) as f32) - 1.0;
+        }
+    }
+
+    /// Deterministic LCG permutation of 0..n. Used to scatter block numbers so
+    /// that a sequence's pages are not laid out at consecutive blocks.
+    fn permute(n: usize, seed: u64) -> Vec<usize> {
+        let mut v: Vec<usize> = (0..n).collect();
+        let mut s = seed;
+        for i in (1..n).rev() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let j = ((s >> 33) as usize) % (i + 1);
+            v.swap(i, j);
+        }
+        v
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Independent CPU reference for the paged layout: k/v are laid out as
+    /// (num_blocks, page_block_size, h_kv, head_dim) and each KV position of a
+    /// sequence is reached through block_table (with "holes" allowed).
+    fn reference_paged(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        cu_q: &[i32],
+        cu_k: &[i32],
+        block_table: &[i32],
+        max_blocks: usize,
+        h_q: usize,
+        h_kv: usize,
+        d: usize,
+        dv: usize,
+        page_block_size: usize,
+        scale: f32,
+        causal: bool,
+    ) -> Vec<f32> {
+        let batch = cu_q.len() - 1;
+        let total_q = cu_q[batch] as usize;
+        let mut out = vec![0.0f32; total_q * h_q * dv];
+        for row in 0..total_q {
+            let mut b = 0usize;
+            for bb in 0..batch {
+                if (cu_q[bb + 1] as usize) <= row {
+                    b = bb + 1;
+                }
+            }
+            let q_local = row - cu_q[b] as usize;
+            let kv_lo = cu_k[b] as usize;
+            let kv_hi = cu_k[b + 1] as usize;
+            for h in 0..h_q {
+                let h_kv_idx = h * h_kv / h_q;
+                let mut scores = Vec::new();
+                let mut kv_rows = Vec::new();
+                for kv in kv_lo..kv_hi {
+                    let k_local = kv - kv_lo;
+                    if causal && q_local < k_local {
+                        continue;
+                    }
+                    let page_idx = k_local / page_block_size;
+                    let page_row = k_local % page_block_size;
+                    let blk = block_table[b * max_blocks + page_idx];
+                    let kv_row = blk as usize * page_block_size + page_row;
+                    let mut s = 0.0f32;
+                    for dd in 0..d {
+                        s += q[row * h_q * d + h * d + dd]
+                            * k[(kv_row * h_kv + h_kv_idx) * d + dd];
+                    }
+                    scores.push(s * scale);
+                    kv_rows.push(kv_row);
+                }
+                if scores.is_empty() {
+                    continue;
+                }
+                let m = scores
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &scores {
+                    sum += (s - m).exp();
+                }
+                let inv = 1.0 / sum;
+                for (i, kv_row) in kv_rows.iter().enumerate() {
+                    let w = (scores[i] - m).exp() * inv;
+                    for dd in 0..dv {
+                        out[row * h_q * dv + h * dv + dd] +=
+                            w * v[(kv_row * h_kv + h_kv_idx) * dv + dd];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn close(a: f32, b: f32, rtol: f32, atol: f32) -> bool {
+        let diff = (a - b).abs();
+        diff <= atol + rtol * a.abs().max(b.abs())
+    }
+
+    fn download_f32(storage: &WgpuStorage) -> Result<Vec<f32>> {
+        let cpu = storage.to_cpu_storage()?;
+        match cpu {
+            CpuStorage::F32(v) => Ok(v),
+            CpuStorage::F16(v) => Ok(v.iter().map(|x| x.to_f32()).collect()),
+            CpuStorage::BF16(v) => Ok(v.iter().map(|x| x.to_f32()).collect()),
+            other => Err(Error::Msg(format!("expected float dtype, got {:?}", other)).bt()),
+        }
+    }
+
+    fn make_storage(
+        dev: &WgpuDevice,
+        dtype: DType,
+        data: &[f32],
+        shape: &[usize],
+    ) -> Result<(WgpuStorage, Layout)> {
+        let shape = Shape::from_dims(shape);
+        let f32_storage = dev.storage_from_slice(data)?;
+        let storage = if dtype == DType::F32 {
+            f32_storage
+        } else {
+            f32_storage.to_dtype(&Layout::contiguous(shape.clone()), dtype)?
+        };
+        Ok((storage, Layout::contiguous(shape)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Core checker: builds a paged KV cache from an explicit block table and
+    /// compares the wgpu result against the CPU reference.
+    fn check_paged_case_with_table(
+        dev: &WgpuDevice,
+        dtype: DType,
+        seqlens_q: &[usize],
+        seqlens_k: &[usize],
+        block_table: &[i32],
+        num_blocks: usize,
+        max_blocks: usize,
+        h_q: usize,
+        h_kv: usize,
+        d: usize,
+        dv: usize,
+        page_block_size: usize,
+        scale: f32,
+        causal: bool,
+        rtol: f32,
+        atol: f32,
+    ) -> Result<()> {
+        let batch = seqlens_q.len();
+        let mut cu_q = vec![0i32; batch + 1];
+        let mut cu_k = vec![0i32; batch + 1];
+        for i in 0..batch {
+            cu_q[i + 1] = cu_q[i] + seqlens_q[i] as i32;
+            cu_k[i + 1] = cu_k[i] + seqlens_k[i] as i32;
+        }
+        assert_eq!(
+            block_table.len(),
+            batch * max_blocks,
+            "block_table length mismatch"
+        );
+        let total_q = cu_q[batch] as usize;
+        let num_rows = num_blocks * page_block_size;
+        let mut q = vec![0.0f32; total_q * h_q * d];
+        let mut k = vec![0.0f32; num_rows * h_kv * d];
+        let mut v = vec![0.0f32; num_rows * h_kv * dv];
+        fill(&mut q, 12345);
+        fill(&mut k, 777);
+        fill(&mut v, 999);
+
+        let reference = reference_paged(
+            &q,
+            &k,
+            &v,
+            &cu_q,
+            &cu_k,
+            block_table,
+            max_blocks,
+            h_q,
+            h_kv,
+            d,
+            dv,
+            page_block_size,
+            scale,
+            causal,
+        );
+
+        let (q_s, q_l) = make_storage(dev, dtype, &q, &[total_q, h_q, d])?;
+        let (k_s, k_l) = make_storage(
+            dev,
+            dtype,
+            &k,
+            &[num_blocks, page_block_size, h_kv, d],
+        )?;
+        let (v_s, v_l) = make_storage(
+            dev,
+            dtype,
+            &v,
+            &[num_blocks, page_block_size, h_kv, dv],
+        )?;
+        let cu_q_s = dev.storage_from_slice(&cu_q)?;
+        let cu_k_s = dev.storage_from_slice(&cu_k)?;
+        let bt_s = dev.storage_from_slice(block_table)?;
+        let bt_l = Layout::contiguous(Shape::from_dims(&[batch, max_blocks]));
+        let max_q = seqlens_q.iter().copied().max().unwrap_or(1);
+        let max_k = seqlens_k.iter().copied().max().unwrap_or(1);
+
+        let out = q_s.flash_attn_paged(
+            &q_l,
+            &k_s,
+            &k_l,
+            &v_s,
+            &v_l,
+            &cu_q_s,
+            &cu_k_s,
+            &bt_s,
+            &bt_l,
+            page_block_size,
+            max_q,
+            max_k,
+            scale,
+            causal,
+        )?;
+        assert!(out.dtype == dtype, "output dtype mismatch");
+        let got = download_f32(&out)?;
+        assert!(
+            got.len() == reference.len(),
+            "output length mismatch: {} vs {}",
+            got.len(),
+            reference.len()
+        );
+        for i in 0..got.len() {
+            let rel = if reference[i].abs() > 0.0 {
+                (got[i] - reference[i]).abs() / reference[i].abs()
+            } else {
+                (got[i] - reference[i]).abs()
+            };
+            assert!(
+                close(got[i], reference[i], rtol, atol),
+                "flash_attn_paged mismatch at {i}: got {} ref {} rel {} (rtol {rtol})",
+                got[i],
+                reference[i],
+                rel
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Builds a paged KV cache with a scattered (non-consecutive) block table
+    /// and runs the CPU-reference comparison.
+    fn check_paged_case(
+        dev: &WgpuDevice,
+        dtype: DType,
+        seqlens_q: &[usize],
+        seqlens_k: &[usize],
+        h_q: usize,
+        h_kv: usize,
+        d: usize,
+        dv: usize,
+        page_block_size: usize,
+        scale: f32,
+        causal: bool,
+        rtol: f32,
+        atol: f32,
+    ) -> Result<()> {
+        let batch = seqlens_q.len();
+        let total_pages: usize = seqlens_k
+            .iter()
+            .map(|l| l.div_ceil(page_block_size))
+            .sum();
+        // A few spare blocks so part of the pool is unused ("holes").
+        let num_blocks = total_pages + 4;
+        let max_blocks = seqlens_k
+            .iter()
+            .map(|l| l.div_ceil(page_block_size))
+            .max()
+            .unwrap_or(1);
+        let perm = permute(num_blocks, 42);
+        let mut block_table = vec![0i32; batch * max_blocks];
+        let mut next = 0usize;
+        for b in 0..batch {
+            let pages = seqlens_k[b].div_ceil(page_block_size);
+            for i in 0..pages {
+                block_table[b * max_blocks + i] = perm[next] as i32;
+                next += 1;
+            }
+        }
+        check_paged_case_with_table(
+            dev,
+            dtype,
+            seqlens_q,
+            seqlens_k,
+            &block_table,
+            num_blocks,
+            max_blocks,
+            h_q,
+            h_kv,
+            d,
+            dv,
+            page_block_size,
+            scale,
+            causal,
+            rtol,
+            atol,
+        )
+    }
+
+    #[test]
+    fn paged_f32_two_seqs_multi_page_non_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        // kv lengths are neither multiples of page_block_size=32 (partial last
+        // page) nor confined to a single page (3 and 2 pages per sequence).
+        check_paged_case(&dev, DType::F32, &[64, 20], &[80, 40], 2, 2, 64, 64, 32, 1.0 / 8.0, false, 1e-4, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn paged_f32_two_seqs_causal_multi_page() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        // causal: q sequences [50, 33], kv [80, 40]; trailing KV positions
+        // must be masked out within each sequence.
+        check_paged_case(&dev, DType::F32, &[50, 33], &[80, 40], 2, 2, 64, 64, 32, 1.0 / 8.0, true, 1e-4, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn paged_f32_gqa() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        // GQA: h_q=2 with a single KV head, causal multi-page.
+        check_paged_case(&dev, DType::F32, &[64, 20], &[80, 40], 2, 1, 64, 64, 32, 1.0 / 8.0, true, 1e-4, 1e-6)
+            .unwrap();
+    }
+
+    #[test]
+    fn paged_f32_explicit_holes() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        // Explicitly scattered block numbers (seq0 pages at 7, 3, 1; seq1 at
+        // 5, 2; blocks 0, 4, 6 unused) — the defining difference vs dense KV.
+        // head_dim_v=32 differs from d to exercise V addressing separately.
+        let seqlens_q = [50usize, 20];
+        let seqlens_k = [80usize, 33];
+        let block_table = [7i32, 3, 1, 5, 2, 0];
+        check_paged_case_with_table(
+            &dev,
+            DType::F32,
+            &seqlens_q,
+            &seqlens_k,
+            &block_table,
+            8,
+            3,
+            2,
+            2,
+            64,
+            32,
+            32,
+            1.0 / 8.0,
+            false,
+            1e-4,
+            1e-6,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn paged_f16_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        // F16 goes through the host-side F32 compute hub (same as varlen).
+        check_paged_case(&dev, DType::F16, &[50, 20], &[80, 40], 2, 2, 64, 64, 32, 1.0 / 8.0, true, 2e-2, 1e-3)
+            .unwrap();
     }
 }
