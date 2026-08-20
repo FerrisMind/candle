@@ -1141,6 +1141,72 @@ pub fn im2col_f32_shader(workgroup_size: u32) -> Option<String> {
     Some(preprocess(&source, &defines, &replacements, DType::F32))
 }
 
+fn pool_shader(workgroup_size: u32, avg: bool, dtype: DType) -> Option<String> {
+    let source = get("pool.wgsl")?.source();
+    let mut defines = vec![
+        "WG_SIZE".to_string(),
+        if avg { "POOL_AVG" } else { "POOL_MAX" }.to_string(),
+    ];
+    let mut replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    match dtype {
+        DType::F32 => {
+            defines.push("SRC_F32".to_string());
+            defines.push("DST_F32".to_string());
+            replacements.push(("SRC_TYPE".to_string(), "f32".to_string()));
+            replacements.push(("DST_TYPE".to_string(), "f32".to_string()));
+        }
+        DType::F16 => {
+            defines.push("SRC_F16".to_string());
+            defines.push("DST_F16".to_string());
+            replacements.push(("SRC_TYPE".to_string(), "f16".to_string()));
+            replacements.push(("DST_TYPE".to_string(), "f16".to_string()));
+        }
+    }
+    Some(preprocess(source, &defines, &replacements, dtype))
+}
+
+/// BF16 2D pool: tensors are u32 words with two BF16 halves per word; the
+/// shader decodes to f32, reduces there, and CAS-writes the halves back.
+fn pool_bf16_shader(workgroup_size: u32, avg: bool) -> Option<String> {
+    let source = get("pool.wgsl")?.source();
+    let defines = vec![
+        "WG_SIZE".to_string(),
+        if avg { "POOL_AVG" } else { "POOL_MAX" }.to_string(),
+        "SRC_BF16".to_string(),
+        "DST_BF16".to_string(),
+    ];
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        ("SRC_TYPE".to_string(), "u32".to_string()),
+        ("DST_TYPE".to_string(), "u32".to_string()),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
+pub fn pool_max_f32_shader(workgroup_size: u32) -> Option<String> {
+    pool_shader(workgroup_size, false, DType::F32)
+}
+
+pub fn pool_max_f16_shader(workgroup_size: u32) -> Option<String> {
+    pool_shader(workgroup_size, false, DType::F16)
+}
+
+pub fn pool_max_bf16_shader(workgroup_size: u32) -> Option<String> {
+    pool_bf16_shader(workgroup_size, false)
+}
+
+pub fn pool_avg_f32_shader(workgroup_size: u32) -> Option<String> {
+    pool_shader(workgroup_size, true, DType::F32)
+}
+
+pub fn pool_avg_f16_shader(workgroup_size: u32) -> Option<String> {
+    pool_shader(workgroup_size, true, DType::F16)
+}
+
+pub fn pool_avg_bf16_shader(workgroup_size: u32) -> Option<String> {
+    pool_bf16_shader(workgroup_size, true)
+}
+
 pub fn fill_inplace_shader(dtype: DType, workgroup_size: u32) -> String {
     let mut defines = vec![
         "WG_SIZE".to_string(),
@@ -1328,6 +1394,7 @@ fn replace_token(line: &str, name: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{shader, BinaryOp, DType, ShaderOp, UnaryOp};
+    type PoolShaderFn = fn(u32) -> Option<String>;
 
     #[test]
     fn preprocesses_rand_uniform_wgsl() {
@@ -1406,4 +1473,51 @@ mod tests {
             assert!(s.contains("fn init_shmem_src0"), "Shader for {dt:?} missing init_shmem_src0");
         }
     }
+
+    #[test]
+    fn pool_f32_shader_resolves_types() {
+        let shaders: &[(PoolShaderFn, &str)] = &[
+            (super::pool_max_f32_shader, "POOL_MAX"),
+            (super::pool_avg_f32_shader, "POOL_AVG"),
+        ];
+        for &(getter, op) in shaders {
+            let s = getter(256).expect("pool f32");
+            assert!(s.contains("@compute @workgroup_size(256)"));
+            assert!(s.contains("array<f32>"), "f32 {op} must use f32 arrays");
+            assert!(!s.contains("#ifdef"), "preprocessor must be resolved for {op}");
+            assert!(!s.contains("#endif"), "preprocessor must be resolved for {op}");
+            assert!(!s.contains("enable f16"), "f32 {op} must not keep enable f16");
+        }
+    }
+
+    #[test]
+    fn pool_f16_shader_keeps_f16_extension() {
+        let shaders: &[(PoolShaderFn, &str)] = &[
+            (super::pool_max_f16_shader, "POOL_MAX"),
+            (super::pool_avg_f16_shader, "POOL_AVG"),
+        ];
+        for &(getter, op) in shaders {
+            let s = getter(256).expect("pool f16");
+            assert!(s.contains("enable f16;"), "f16 {op} must keep enable f16");
+            assert!(s.contains("array<f16>"), "f16 {op} must use f16 arrays");
+            assert!(!s.contains("#ifdef"), "preprocessor must be resolved for {op}");
+        }
+    }
+
+    #[test]
+    fn pool_bf16_shader_uses_word_helpers() {
+        let shaders: &[(PoolShaderFn, &str)] = &[
+            (super::pool_max_bf16_shader, "POOL_MAX"),
+            (super::pool_avg_bf16_shader, "POOL_AVG"),
+        ];
+        for &(getter, op) in shaders {
+            let s = getter(256).expect("pool bf16");
+            assert!(s.contains("bf16_to_f32"), "{op} bf16 must decode halves");
+            assert!(s.contains("atomicCompareExchangeWeak"), "{op} bf16 store must be a CAS");
+            assert!(s.contains("array<u32>"), "{op} bf16 must use u32 words");
+            assert!(!s.contains("enable f16"), "bf16 {op} must not carry enable f16");
+            assert!(!s.contains("#ifdef"), "preprocessor must be resolved for {op}");
+        }
+    }
 }
+
