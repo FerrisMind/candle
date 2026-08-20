@@ -6443,6 +6443,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
     }
 
+    /// f32 hub for conv ops that lack a native-dtype shader. As of the
+    /// native F16/BF16 conv work (2687d26a / 187b3cd2), conv1d/conv2d and
+    /// conv_transpose1d/2d run native kernels for F32/F16(SHADER_F16)/BF16, so
+    /// this hub is only reached for F16 on adapters without SHADER_F16
+    /// (GPUEmulated: f32 round-trip) and for non-native dtypes (typed error).
     fn cuda_parity_conv_via_f32(
         &self,
         layout: &Layout,
