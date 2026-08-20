@@ -13791,6 +13791,19 @@ mod wgpu_reduce_tests {
     }
 
     #[test]
+    fn wgpu_argmax_f32_tie_first_index() {
+        let cpu = crate::Device::Cpu;
+        let device = wgpu_device();
+        let a: Vec<f32> = vec![1.0, 5.0, 3.0, 5.0, 5.0, 2.0, 5.0, 0.0];
+        let ga = crate::Tensor::from_slice(&a, (8,), &device).unwrap();
+        let ca = crate::Tensor::from_slice(&a, (8,), &cpu).unwrap();
+        let g = ga.argmax(0).unwrap().flatten_all().unwrap().to_vec1::<u32>().unwrap();
+        let c = ca.argmax(0).unwrap().flatten_all().unwrap().to_vec1::<u32>().unwrap();
+        assert_eq!(g, c);
+        assert_eq!(g[0], 1);
+    }
+
+    #[test]
     fn wgpu_reduce_f64_2d_dim0() {
         let dev = wgpu_device();
         let vals: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
