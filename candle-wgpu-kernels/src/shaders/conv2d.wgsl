@@ -1,11 +1,44 @@
 #include "common_decls.tmpl"
 enable f16;
 
+// BF16 tensors are stored packed two-per-u32-word (element 2i in the low
+// half, 2i+1 in the high half), same as CpuStorage::BF16 / mul_mat_bf16.
+fn bf16_bits(v: f32) -> u32 {
+    return ((bitcast<u32>(v) + (0x7fffu + ((bitcast<u32>(v) >> 16u) & 1u))) >> 16u) & 0xffffu;
+}
+fn bf16_to_f32(word: u32, half: u32) -> f32 {
+    let shift = half * 16u;
+    return bitcast<f32>(((word >> shift) & 0xffffu) << 16u);
+}
+// Output elements written by distinct threads can alias the same u32 word, so
+// the BF16 store must be an atomic read-modify-write (mul_mat_bf16 pattern).
+#if defined(OUTPUT_BF16)
+fn atomic_store_bf16(dst_elem: u32, v: f32) {
+    let wi = dst_elem / 2u;
+    let half = dst_elem % 2u;
+    let p = bf16_bits(v);
+    let shift = half * 16u;
+    // Keep the sibling half, overwrite the owned half: half==0 owns the low
+    // 16 bits so keep the high 16 (0xffff0000).
+    let keep = select(0x0000ffffu, 0xffff0000u, half == 0u);
+    loop {
+        let old = atomicLoad(&output[wi]);
+        let desired = (old & keep) | (p << shift);
+        let res = atomicCompareExchangeWeak(&output[wi], old, desired);
+        if res.exchanged {
+            break;
+        }
+    }
+}
+#endif
+
 @group(0) @binding(0)
 #if defined(WEIGHT_F32)
 var<storage, read_write> weights: array<f32>;
 #elif defined(WEIGHT_F16)
 var<storage, read_write> weights: array<f16>;
+#elif defined(WEIGHT_BF16)
+var<storage, read_write> weights: array<u32>;
 #endif
 
 @group(0) @binding(1)
@@ -13,6 +46,8 @@ var<storage, read_write> weights: array<f16>;
 var<storage, read_write> input: array<f32>;
 #elif defined(INPUT_F16)
 var<storage, read_write> input: array<f16>;
+#elif defined(INPUT_BF16)
+var<storage, read_write> input: array<u32>;
 #endif
 
 @group(0) @binding(2)
@@ -20,6 +55,8 @@ var<storage, read_write> input: array<f16>;
 var<storage, read_write> output: array<f32>;
 #elif defined(OUTPUT_F16)
 var<storage, read_write> output: array<f16>;
+#elif defined(OUTPUT_BF16)
+var<storage, read_write> output: array<atomic<u32>>;
 #endif
 
 struct Params {
@@ -55,6 +92,8 @@ fn load_weight(idx: u32) -> f32 {
         return weights[idx];
     #elif defined(WEIGHT_F16)
         return f32(weights[idx]);
+    #elif defined(WEIGHT_BF16)
+        return bf16_to_f32(weights[idx / 2u], idx % 2u);
     #endif
 }
 
@@ -63,6 +102,8 @@ fn load_input(idx: u32) -> f32 {
         return input[idx];
     #elif defined(INPUT_F16)
         return f32(input[idx]);
+    #elif defined(INPUT_BF16)
+        return bf16_to_f32(input[idx / 2u], idx % 2u);
     #endif
 }
 
@@ -71,6 +112,8 @@ fn store_output(idx: u32, val: f32) {
         output[idx] = val;
     #elif defined(OUTPUT_F16)
         output[idx] = f16(val);
+    #elif defined(OUTPUT_BF16)
+        atomic_store_bf16(idx, val);
     #endif
 }
 

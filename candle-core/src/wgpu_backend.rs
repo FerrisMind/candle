@@ -9437,6 +9437,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
+    /// Native conv2d direct shader (CUDA parity). F32 and F16 read native
+    /// scalars and accumulate in f32; BF16 reads packed two-per-u32 words,
+    /// accumulates in f32 and writes back via atomic half-word CAS. The caller
+    /// (conv2d) routes dtypes the local shader cannot express (F16 without
+    /// SHADER_F16) through the f32 hub instead.
     fn run_conv2d_f32(
         &self,
         layout: &Layout,
@@ -9444,17 +9449,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        if self.dtype != DType::F32 || kernel.dtype != DType::F32 {
-            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu conv2d").bt());
-        }
+        let shader = match self.dtype {
+            DType::F32 => candle_wgpu_kernels::conv2d_f32_shader(WG_SIZE),
+            DType::F16 if wgpu_shader_f16_enabled(&self.device) => {
+                candle_wgpu_kernels::conv2d_f16_shader(WG_SIZE)
+            }
+            DType::BF16 => candle_wgpu_kernels::conv2d_bf16_shader(WG_SIZE),
+            _ => None,
+        };
+        let shader = shader
+            .ok_or_else(|| Error::UnsupportedDTypeForOp(self.dtype, "wgpu conv2d").bt())?;
         let (input_dims, input_strides) = dims4(layout)?;
         let (kernel_dims, kernel_strides) = dims4(kernel_l)?;
         let out_shape = Shape::from(params.out_dims());
         let out_layout = Layout::contiguous(out_shape.clone());
         let (out_dims, out_strides) = dims4(&out_layout)?;
         let dst = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
-        let shader = candle_wgpu_kernels::conv2d_f32_shader(WG_SIZE)
-            .ok_or_else(|| Error::Msg("wgpu shader conv2d.wgsl not embedded".into()).bt())?;
         let params = Conv2dParams {
             offset_w: kernel_l.start_offset().try_into()?,
             offset_i: layout.start_offset().try_into()?,
@@ -12085,6 +12095,15 @@ impl BackendStorage for WgpuStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
+        // Native conv2d shader: F32 always; F16 with SHADER_F16; BF16 via
+        // packed-u32 bit-twiddling (no f16 dependency). Everything else
+        // (incl. F16 on adapters without SHADER_F16) falls back to the f32
+        // hub below (GPUEmulated).
+        let native = matches!(self.dtype, DType::F32 | DType::BF16)
+            || (self.dtype == DType::F16 && wgpu_shader_f16_enabled(&self.device));
+        if native && kernel.dtype == self.dtype {
+            return self.run_conv2d_f32(layout, kernel, kernel_l, params);
+        }
         let out_shape = Shape::from(params.out_dims());
         self.cuda_parity_conv_via_f32(
             layout,
@@ -13828,5 +13847,202 @@ mod wgpu_reduce_tests {
         assert!((got[0] - 6.0).abs() < 1e-12);
         assert!((got[1] - 15.0).abs() < 1e-12);
         assert_eq!(result.dims().to_vec(), vec![2, 1], "keepdim shape");
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "wgpu")]
+mod wgpu_conv_tests {
+    use crate::test_utils::{compare_f32_slices, diff_tolerance};
+    use crate::{Device, DType, Result, Tensor};
+
+    fn wgpu_device() -> Device {
+        Device::new_wgpu(0).expect("wgpu device")
+    }
+
+    fn gen_f32(shape: &[usize], seed: u64) -> Vec<f32> {
+        let n: usize = shape.iter().product();
+        (0..n)
+            .map(|i| {
+                let x = (i as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(seed);
+                let v = ((x >> 33) as i32 as f32) / 1.0e9;
+                v * 3.0 - 1.5
+            })
+            .collect()
+    }
+
+    /// Differential check vs a high-precision CPU reference.
+    ///
+    /// Semantic under test: native F16/BF16 conv keeps inputs in the native
+    /// dtype, accumulates in f32, rounds the result back to the native dtype
+    /// (CUDA parity). The CPU reference therefore:
+    ///   * round-trips the inputs through the target dtype (so GPU and CPU
+    ///     compute on the same quantized inputs), and
+    ///   * rounds the output back through the target dtype before comparison,
+    ///     leaving only f32 accumulation-order error.
+    ///
+    /// CPU conv itself runs in F32 (sidesteps the CPU BF16 matmul gap).
+    /// `reference == true` selects the CPU reference path.
+    fn check_conv<F>(name: &str, dtype: DType, f: F)
+    where
+        F: Fn(&Device, bool) -> Result<Tensor>,
+    {
+        let cpu_t = match f(&Device::Cpu, true) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping {name} {dtype:?}: cpu ref failed: {e}");
+                return;
+            }
+        };
+        let gpu_t = match f(&wgpu_device(), false) {
+            Ok(t) => t,
+            Err(e) => panic!("{name} {dtype:?} gpu op failed: {e}"),
+        };
+        let cpu_dim = cpu_t.dims().to_vec();
+        let gpu_dim = gpu_t.dims().to_vec();
+        assert!(cpu_dim == gpu_dim, "{name} {dtype:?} dims {cpu_dim:?} vs {gpu_dim:?}");
+        let cpu_v: Vec<f32> = cpu_t
+            .to_dtype(DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1())
+            .expect("cpu f32 vec");
+        let gpu_v: Vec<f32> = gpu_t
+            .to_dtype(DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1())
+            .expect("gpu f32 vec");
+        let (max_abs, max_rel, _ulp, first_bad) = compare_f32_slices(&gpu_v, &cpu_v);
+        let (atol, rtol) = diff_tolerance(dtype);
+        if max_abs > atol && max_rel > rtol {
+            let idx_info = match first_bad {
+                Some(i) => format!(" first at {i}: gpu={:.6e} cpu={:.6e}", gpu_v[i], cpu_v[i]),
+                None => String::new(),
+            };
+            panic!(
+                "{name} {dtype:?} out of tol: abs={max_abs:.2e} rel={max_rel:.2e} \
+                 tol_abs={atol:.2e} tol_rel={rtol:.2e}{idx_info}"
+            );
+        }
+    }
+
+    /// Apply the native-dtype quantization that the GPU kernel sees. In
+    /// reference mode the tensor stays f32 but is rounded through the target
+    /// dtype so CPU and GPU compare on identical inputs.
+    fn prepare(dtype: DType, reference: bool, t: Tensor) -> Result<Tensor> {
+        if reference {
+            if dtype == DType::F32 {
+                Ok(t)
+            } else {
+                t.to_dtype(dtype).and_then(|t| t.to_dtype(DType::F32))
+            }
+        } else {
+            t.to_dtype(dtype)
+        }
+    }
+
+    #[test]
+    fn wgpu_conv2d_f16_bf16_native() {
+        // padding>0, stride>1, dilation>1, groups=1.
+        let input_shape = [1, 2, 6, 6];
+        let kernel_shape = [3, 2, 3, 3];
+        for dtype in [DType::F16, DType::BF16] {
+            check_conv("conv2d_native", dtype, |dev, reference| {
+                let x = Tensor::from_vec(gen_f32(&input_shape, 42), input_shape.to_vec(), dev)?;
+                let w = Tensor::from_vec(gen_f32(&kernel_shape, 137), kernel_shape.to_vec(), dev)?;
+                let x = prepare(dtype, reference, x)?;
+                let w = prepare(dtype, reference, w)?;
+                let out = x.conv2d(&w, 1, 2, 2, 1)?;
+                if reference && dtype != DType::F32 {
+                    out.to_dtype(dtype).and_then(|t| t.to_dtype(DType::F32))
+                } else {
+                    Ok(out)
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn wgpu_conv2d_f16_bf16_non_contiguous() {
+        // Input carved from a wider buffer (non-contiguous last-dim view) so
+        // the shader must follow strided element access.
+        let kernel_shape = [2, 2, 3, 3];
+        for dtype in [DType::F16, DType::BF16] {
+            check_conv("conv2d_noncontig", dtype, |dev, reference| {
+                let wide_shape = [1, 2, 6, 10];
+                let mut x = Tensor::from_vec(gen_f32(&wide_shape, 7), wide_shape.to_vec(), dev)?;
+                x = x.narrow(3, 1, 6)?;
+                let w = Tensor::from_vec(gen_f32(&kernel_shape, 99), kernel_shape.to_vec(), dev)?;
+                let x = prepare(dtype, reference, x)?;
+                let w = prepare(dtype, reference, w)?;
+                let out = x.conv2d(&w, 0, 2, 1, 1)?;
+                if reference && dtype != DType::F32 {
+                    out.to_dtype(dtype).and_then(|t| t.to_dtype(DType::F32))
+                } else {
+                    Ok(out)
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn wgpu_conv1d_f16_bf16_native() {
+        let input_shape = [2, 3, 16];
+        let kernel_shape = [4, 3, 3];
+        for dtype in [DType::F16, DType::BF16] {
+            check_conv("conv1d_native", dtype, |dev, reference| {
+                let x = Tensor::from_vec(gen_f32(&input_shape, 5), input_shape.to_vec(), dev)?;
+                let w = Tensor::from_vec(gen_f32(&kernel_shape, 17), kernel_shape.to_vec(), dev)?;
+                let x = prepare(dtype, reference, x)?;
+                let w = prepare(dtype, reference, w)?;
+                let out = x.conv1d(&w, 2, 2, 1, 1)?;
+                if reference && dtype != DType::F32 {
+                    out.to_dtype(dtype).and_then(|t| t.to_dtype(DType::F32))
+                } else {
+                    Ok(out)
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn wgpu_conv_transpose2d_f16_bf16_native() {
+        let input_shape = [1, 2, 5, 5];
+        let kernel_shape = [2, 3, 3, 3];
+        for dtype in [DType::F16, DType::BF16] {
+            check_conv("conv_transpose2d_native", dtype, |dev, reference| {
+                let x = Tensor::from_vec(gen_f32(&input_shape, 21), input_shape.to_vec(), dev)?;
+                let w = Tensor::from_vec(gen_f32(&kernel_shape, 63), kernel_shape.to_vec(), dev)?;
+                let x = prepare(dtype, reference, x)?;
+                let w = prepare(dtype, reference, w)?;
+                let out = x.conv_transpose2d(&w, 1, 0, 2, 1)?;
+                if reference && dtype != DType::F32 {
+                    out.to_dtype(dtype).and_then(|t| t.to_dtype(DType::F32))
+                } else {
+                    Ok(out)
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn wgpu_conv_transpose1d_f16_bf16_native() {
+        let input_shape = [1, 2, 7];
+        let kernel_shape = [2, 3, 3];
+        for dtype in [DType::F16, DType::BF16] {
+            check_conv("conv_transpose1d_native", dtype, |dev, reference| {
+                let x = Tensor::from_vec(gen_f32(&input_shape, 31), input_shape.to_vec(), dev)?;
+                let w = Tensor::from_vec(gen_f32(&kernel_shape, 47), kernel_shape.to_vec(), dev)?;
+                let x = prepare(dtype, reference, x)?;
+                let w = prepare(dtype, reference, w)?;
+                let out = x.conv_transpose1d(&w, 1, 0, 2, 1, 1)?;
+                if reference && dtype != DType::F32 {
+                    out.to_dtype(dtype).and_then(|t| t.to_dtype(DType::F32))
+                } else {
+                    Ok(out)
+                }
+            });
+        }
     }
 }
