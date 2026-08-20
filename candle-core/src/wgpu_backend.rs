@@ -7902,15 +7902,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             )
             .bt());
         }
-        if self.dtype != DType::F32 {
-            // F16/BF16 run through a GPU-resident F32 hub (slice 3); until then
-            // reject with a typed error rather than silently converting.
-            return Err(Error::UnsupportedDTypeForOp(
-                self.dtype,
-                "wgpu flash_attn_varlen (F32 only)",
-            )
-            .bt());
-        }
         if cu_seqlens_q.dtype != DType::I32 || cu_seqlens_k.dtype != DType::I32 {
             return Err(Error::Msg(
                 "flash_attn_varlen: cu_seqlens_q/k must be I32".into(),
@@ -14442,6 +14433,55 @@ mod wgpu_flash_attn_varlen_tests {
         };
         // max_seqlen far above actual lengths must not change the result.
         check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, true, 1000, 4000, 1e-5, 1e-6)
+            .unwrap();
+    }
+    #[test]
+    fn flash_attn_varlen_f16_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F16, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 2e-2, 1e-3)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f16_non_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F16, &[5, 5], &[5, 5], 2, 2, 64, 64, 1.0 / 8.0, false, 5, 5, 2e-2, 1e-3)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_bf16_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::BF16, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 2e-2, 1e-3)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_bf16_non_causal() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::BF16, &[5, 5], &[5, 5], 2, 2, 64, 64, 1.0 / 8.0, false, 5, 5, 2e-2, 1e-3)
+            .unwrap();
+    }
+
+    #[test]
+    fn flash_attn_varlen_f16_gqa() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        check_case(&dev, DType::F16, &[3, 1, 7], &[3, 1, 7], 4, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 2e-2, 1e-3)
             .unwrap();
     }
 }
