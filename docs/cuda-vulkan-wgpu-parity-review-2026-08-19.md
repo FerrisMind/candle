@@ -168,3 +168,37 @@
 - sort-диспетчер: `sort.rs:253-268` (wgpu_fwd/vulkan_fwd → `argsort_last_dim`).
 - Шейдеры vs llama.cpp: comm/diff по `candle_refs/llama.cpp-b10455/ggml/src/ggml-vulkan/vulkan-shaders` (111 identical / 42 modified / 28 fork-only).
 - Референс-версии: cudarc 0.19.8, wgpu 29.0.4, ash 0.38 (`candle_refs/manifest.toml`).
+
+
+---
+
+## 10. СТАТУС ЗАКРЫТИЯ ГЭПОВ (обновление 2026-08-20, ветка wgpu/vulkan)
+
+Все коммиты прошли гейты: `cargo clippy --features {vulkan|wgpu} --tests -- -D warnings` = 0;
+vulkan 26/26, wgpu 46/46 тестов (2 ignored = задокументированный follow-up).
+
+### Закрыто (Vulkan)
+| Гэп | Коммит | Механизм |
+|---|---|---|
+| F64 unary/binary/cmp/reduce через F32-хаб (потеря точности) | a197388b | нативные *_f64 SPIR-V + ручные double-трансцендентальные (GLSL их не имеет) |
+| F8E4M3 compute (был storage-only) | 9ec31f93 | decode/encode исправлены (волна-1 портировала float8-крейт с ошибкой смешения f16-сдвигов), все ops через decode→f32→encode |
+| scatter_add только F32/F16 | e9104aa7 | U32/U8/I64/F64 CAS-семейство set_rows_add_ext; BF16 f32-хаб |
+| argsort нестабилен на дублях | e9104aa7 | total order (ключ, индекс), DESC инвертирует ключ но не tie |
+| Утечки/перф из аудита | d231ec93 | deferred-free cap, staging pool, FxHash pipeline cache |
+
+### Закрыто (wgpu)
+| Гэп | Коммит | Механизм |
+|---|---|---|
+| F8E4M3 конвертации + баги шейдера (сатурация exp15, NaN-декод) | 4f4922df | decode/encode с каноническим NaN и корректным порогом exp>=16 |
+| i16/i32 unary+binary+cmp | bed98e07 (W-INT) | packed i16, bitcast i32 |
+| i32/F64 reduce | 4f4922df (W-REDUCE) | I32 native, F64 через lo/hi слова, tie = first-index как CUDA |
+| scatter_add только F32/F16 | b01db2d3 | U32 atomicAdd, U8 byte-CAS, I64 word-CAS, F64/BF16 f32-хаб |
+| argsort только f32/u32/i64/f64 | 5baf6dbf | orderable-ключи u8/i16/i32/f8e4m3 + CPU-стабильные ties |
+| argmax/argmin last-index ties ≠ CUDA | (argmax-fix) | strict > + lower-index merge = first-index-wins |
+| Перф-мелочи аудита (LRU bg-cache, O(1) hot-ring, HashSet reuse) | vk-perf merge | docs/perf-memory-audit findings 1.2.5/1.2.9/1.2.10 |
+
+### Открытые follow-up (задокументированы)
+1. wgpu argsort merge-pass (last_dim > WG_SIZE) выдаёт несортированный вывод — тесты `wgpu_argsort_merge_path*` #[ignore] с reason.
+2. F16/BF16 нативные conv/pool/upsample (сейчас F32-хаб) — perf-оптимизация, не функциональный гэп.
+3. candle-ug / flash-attn varlen/paged / CUDA Graphs-аналоги — вне scope op-parity (CUDA-specific экосистема).
+4. IQ-форматы и mxfp4/nvfp4 в GgmlDType — ограничение candle в целом, не VK/wgpu.
