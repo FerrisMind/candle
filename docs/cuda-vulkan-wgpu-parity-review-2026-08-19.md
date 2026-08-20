@@ -194,8 +194,8 @@ vulkan 26/26, wgpu 46/46 тестов (2 ignored = задокументиров�
 | i32/F64 reduce | 4f4922df (W-REDUCE) | I32 native, F64 через lo/hi слова, tie = first-index как CUDA |
 | scatter_add только F32/F16 | b01db2d3 | U32 atomicAdd, U8 byte-CAS, I64 word-CAS, F64/BF16 f32-хаб |
 | argsort только f32/u32/i64/f64 | 5baf6dbf | orderable-ключи u8/i16/i32/f8e4m3 + CPU-стабильные ties |
-| argmax/argmin last-index ties ≠ CUDA | (argmax-fix) | strict > + lower-index merge = first-index-wins |
-| Перф-мелочи аудита (LRU bg-cache, O(1) hot-ring, HashSet reuse) | vk-perf merge | docs/perf-memory-audit findings 1.2.5/1.2.9/1.2.10 |
+| argmax/argmin last-index ties ≠ CUDA | 2920fd60 | strict > + lower-index merge = first-index-wins |
+| Перф-мелочи аудита (LRU bg-cache, O(1) hot-ring, HashSet reuse) | ae86a0e2 | docs/perf-memory-audit findings 1.2.5/1.2.9/1.2.10 |
 
 ### Открытые follow-up (задокументированы)
 1. wgpu argsort merge-pass (last_dim > WG_SIZE) выдаёт несортированный вывод — тесты `wgpu_argsort_merge_path*` #[ignore] с reason.
