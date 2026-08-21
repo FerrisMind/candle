@@ -12485,13 +12485,10 @@ impl BackendStorage for WgpuStorage {
         if self.dtype == DType::BF16 {
             return self.bf16_unary_via_f32(layout, |src, src_l| src.powf(src_l, e));
         }
-        if self.dtype == DType::F16
-            && !self
-                .device
-                .inner
-                .features
-                .contains(wgpu::Features::SHADER_F16)
-        {
+        // `custom_unary_wgsl` emits `array<f32>` storages, so the pow kernel is
+        // f32-only; F16 must use the f32 hub even with SHADER_F16, otherwise
+        // the f16 buffer is reinterpreted as f32 words (silent corruption).
+        if self.dtype == DType::F16 || self.dtype == DType::F64 {
             let src_f32 = self.materialize_to_f32(layout)?;
             let contiguous = if layout.dims().len() > 4 {
                 Layout::contiguous(Self::compact_rank_gt4_shape(layout))
@@ -12499,12 +12496,25 @@ impl BackendStorage for WgpuStorage {
                 Layout::contiguous(layout.shape())
             };
             let out_f32 = src_f32.powf(&contiguous, e)?;
-            return out_f32.to_dtype(&contiguous, DType::F16);
+            return out_f32.to_dtype(&contiguous, self.dtype);
+        }
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu powf").bt());
         }
         let shader = custom_unary_wgsl(&format!("pow(x, {:?})", e as f32));
         self.run_unary_like(layout, &shader, "candle-wgpu-powf")
     }
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
+        // `custom_unary_wgsl` below emits `array<f32>` storages, so the
+        // alpha != 1.0 custom path is f32-only; route F16 through the f32 hub
+        // regardless of SHADER_F16 to avoid f16-as-f32 reinterpretation.
+        // alpha == 1.0 uses the dtype-aware `unary_shader` below.
+        if self.dtype == DType::F16 && alpha != 1.0 {
+            let src_f32 = self.materialize_to_f32(layout)?;
+            let src_l = Layout::contiguous(layout.shape());
+            let out_f32 = src_f32.elu(&src_l, alpha)?;
+            return out_f32.to_dtype(&src_l, DType::F16);
+        }
         if self.dtype == DType::F16
             && !self
                 .device
