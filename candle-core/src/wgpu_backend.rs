@@ -6520,6 +6520,60 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         out_f32.to_dtype(&lhs_contiguous, DType::BF16)
     }
 
+    fn f8e4m3_unary_via_f32(
+        &self,
+        layout: &Layout,
+        f: impl FnOnce(&Self, &Layout) -> Result<Self>,
+    ) -> Result<Self> {
+        // f8 casts go through the decode shader, not copy_strided_src (no
+        // f8 support there, and 1-byte elements break COPY_BUFFER alignment).
+        let f32_storage = self.to_dtype(layout, DType::F32)?;
+        let contiguous = if layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+        } else {
+            Layout::contiguous(layout.shape())
+        };
+        let out_f32 = f(&f32_storage, &contiguous)?;
+        out_f32.to_dtype(&contiguous, DType::F8E4M3)
+    }
+
+    fn f8e4m3_binary_via_f32(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        f: impl FnOnce(&Self, &Self, &Layout, &Layout) -> Result<Self>,
+    ) -> Result<Self> {
+        if rhs.dtype != DType::F8E4M3 {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "wgpu f8e4m3 binary").bt());
+        }
+        self.device
+            .same_device(&rhs.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: rhs.device.location(),
+                    op: "f8e4m3 binary",
+                }
+                .bt()
+            })?;
+        let lhs_f32 = self.to_dtype(lhs_layout, DType::F32)?;
+        let rhs_f32 = rhs.to_dtype(rhs_layout, DType::F32)?;
+        let lhs_contiguous = if lhs_layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(lhs_layout))
+        } else {
+            Layout::contiguous(lhs_layout.shape())
+        };
+        let rhs_contiguous = if rhs_layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(rhs_layout))
+        } else {
+            Layout::contiguous(rhs_layout.shape())
+        };
+        let out_f32 = f(&lhs_f32, &rhs_f32, &lhs_contiguous, &rhs_contiguous)?;
+        out_f32.to_dtype(&lhs_contiguous, DType::F8E4M3)
+    }
+
     fn bf16_cmp_via_f32(
         &self,
         rhs: &Self,
@@ -12500,6 +12554,9 @@ impl BackendStorage for WgpuStorage {
                 let scaled = src_f32.run_scale(&src_f32_layout, mul as f32, add as f32)?;
                 scaled.to_dtype(&src_f32_layout, DType::BF16)
             }
+            DType::F8E4M3 => self.f8e4m3_unary_via_f32(layout, |src, src_l| {
+                src.run_scale(src_l, mul as f32, add as f32)
+            }),
             _ => Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu affine").bt()),
         };
         match gpu {
@@ -12514,6 +12571,12 @@ impl BackendStorage for WgpuStorage {
         // `custom_unary_wgsl` emits `array<f32>` storages, so the pow kernel is
         // f32-only; F16 must use the f32 hub even with SHADER_F16, otherwise
         // the f16 buffer is reinterpreted as f32 words (silent corruption).
+        // F8E4M3 goes through the f8 hub: the f8 decode shader casts to f32
+        // (materialize_to_f32 can't copy 1-byte elements for non-4-aligned
+        // element counts).
+        if self.dtype == DType::F8E4M3 {
+            return self.f8e4m3_unary_via_f32(layout, |src, src_l| src.powf(src_l, e));
+        }
         if self.dtype == DType::F16 || self.dtype == DType::F64 {
             let src_f32 = self.materialize_to_f32(layout)?;
             let contiguous = if layout.dims().len() > 4 {
@@ -12556,6 +12619,9 @@ impl BackendStorage for WgpuStorage {
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             if self.dtype == DType::BF16 {
                 return self.bf16_unary_via_f32(layout, |src, src_l| src.elu(src_l, alpha));
+            }
+            if self.dtype == DType::F8E4M3 {
+                return self.f8e4m3_unary_via_f32(layout, |src, src_l| src.elu(src_l, alpha));
             }
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu elu").bt());
         }
@@ -12758,6 +12824,35 @@ impl BackendStorage for WgpuStorage {
         if self.dtype == DType::BF16 {
             return self.bf16_cmp_via_f32(rhs, lhs_l, rhs_l, op);
         }
+        if self.dtype == DType::F8E4M3 {
+            if rhs.dtype != DType::F8E4M3 {
+                return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "wgpu f8e4m3 cmp").bt());
+            }
+            self.device
+                .same_device(&rhs.device)
+                .then_some(())
+                .ok_or_else(|| {
+                    Error::DeviceMismatchBinaryOp {
+                        lhs: self.device.location(),
+                        rhs: rhs.device.location(),
+                        op: "f8e4m3 cmp",
+                    }
+                    .bt()
+                })?;
+            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
+            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
+            let lhs_c = if lhs_l.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(lhs_l))
+            } else {
+                Layout::contiguous(lhs_l.shape())
+            };
+            let rhs_c = if rhs_l.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(rhs_l))
+            } else {
+                Layout::contiguous(rhs_l.shape())
+            };
+            return lhs_f32.run_cmp_u8(&rhs_f32, &lhs_c, &rhs_c, op);
+        }
         if wgpu_f16_emulates_f32(&self.device, self.dtype) {
             let lhs_f32 = self.materialize_to_f32(lhs_l)?;
             let rhs_f32 = rhs.materialize_to_f32(rhs_l)?;
@@ -12854,6 +12949,14 @@ impl BackendStorage for WgpuStorage {
                     Err(err) => Err(err),
                 };
             }
+            if self.dtype == DType::F8E4M3 {
+                return match self
+                    .f8e4m3_unary_via_f32(layout, |src, src_l| src.unary_impl::<B>(src_l))
+                {
+                    Ok(out) => Ok(out),
+                    Err(err) => Err(err),
+                };
+            }
             if matches!(self.dtype, DType::I16 | DType::I32) {
                 if layout.dims().len() > 4 {
                     let (src, src_l) = self.materialize_rank_gt4_compact(layout)?;
@@ -12922,6 +13025,17 @@ impl BackendStorage for WgpuStorage {
             let rhs_f32 = rhs.to_dtype(rhs_layout, DType::F32)?;
             let out_f32 = lhs_f32.binary_impl::<B>(&rhs_f32, &lhs_l, &rhs_l)?;
             return out_f32.to_dtype(&lhs_l, DType::F64);
+        }
+        if self.dtype == DType::F8E4M3 {
+            return match self.f8e4m3_binary_via_f32(
+                rhs,
+                lhs_layout,
+                rhs_layout,
+                |lhs, rhs, lhs_l, rhs_l| lhs.binary_impl::<B>(rhs, lhs_l, rhs_l),
+            ) {
+                Ok(out) => Ok(out),
+                Err(err) => Err(err),
+            };
         }
         if !matches!(
             self.dtype,
@@ -14435,6 +14549,205 @@ mod wgpu_f8e4m3_tests {
         let layout = Layout::contiguous(shape);
         let result = src.to_dtype(&layout, DType::I64);
         assert!(result.is_err(), "f8->i64 should be unsupported");
+    }
+
+    /// Compare GPU f8 output (decoded to f32) against an f32 CPU reference,
+    /// with a single f8 re-quantization of the reference. The 15%+1e-3 bound
+    /// absorbs rounding differences at the f8 quantization boundary between
+    /// the GPU f32 kernel and the CPU reference (~2 ULP of f8e4m3).
+    fn assert_f8_close(got: &[f32], expect: &[f32], ctx: &str) {
+        assert_eq!(got.len(), expect.len(), "{ctx}: length mismatch");
+        for (i, &e) in expect.iter().enumerate() {
+            let eq = f8e4m3::from_f32(e).to_f32();
+            let tol = eq.abs() * 0.15 + 1e-3;
+            assert!(
+                (got[i] - eq).abs() <= tol,
+                "{ctx}[{i}]: got {}, want {} (±{tol})",
+                got[i],
+                eq
+            );
+        }
+    }
+
+    /// F8E4M3 relu routed through the f32 hub.
+    #[test]
+    fn wgpu_f8e4m3_unary_relu() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        let bits: Vec<u8> = vec![0x38, 0xC0, 0x00, 0x80, 0x7D, 0xB0];
+        let layout = Layout::contiguous((2usize, 3usize));
+        let src = upload_f8e4m3(&dev, &bits).unwrap();
+        let out = src.unary_impl::<crate::op::Relu>(&layout).unwrap();
+        assert_eq!(out.dtype, DType::F8E4M3, "relu must stay f8e4m3");
+        let got = download_f32(&out.to_dtype(&layout, DType::F32).unwrap()).unwrap();
+        let expect: Vec<f32> = bits
+            .iter()
+            .map(|&b| f8e4m3::from_bits(b).to_f32().max(0.0))
+            .collect();
+        assert_f8_close(&got, &expect, "relu");
+    }
+
+    /// F8E4M3 gelu (tanh approximation, matches the wgpu GELU shader).
+    #[test]
+    fn wgpu_f8e4m3_unary_gelu() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        let bits: Vec<u8> = vec![0x38, 0x40, 0x00, 0xC0, 0xB0, 0x30];
+        let layout = Layout::contiguous((2usize, 3usize));
+        let src = upload_f8e4m3(&dev, &bits).unwrap();
+        let out = src.unary_impl::<crate::op::Gelu>(&layout).unwrap();
+        assert_eq!(out.dtype, DType::F8E4M3, "gelu must stay f8e4m3");
+        let got = download_f32(&out.to_dtype(&layout, DType::F32).unwrap()).unwrap();
+        let expect: Vec<f32> = bits
+            .iter()
+            .map(|&b| {
+                let v = f8e4m3::from_bits(b).to_f32();
+                let arg =
+                    (0.797_884_6_f32 * v * (1.0 + 0.044715 * v * v)).clamp(-9.010913, 9.010913);
+                0.5 * v * (1.0 + arg.tanh())
+            })
+            .collect();
+        assert_f8_close(&got, &expect, "gelu");
+    }
+
+    /// F8E4M3 binary add through the f32 hub.
+    #[test]
+    fn wgpu_f8e4m3_binary_add() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        let a_bits: Vec<u8> = vec![0x38, 0x40, 0x30];
+        let b_bits: Vec<u8> = vec![0x38, 0x38, 0x28];
+        let lhs = upload_f8e4m3(&dev, &a_bits).unwrap();
+        let rhs = upload_f8e4m3(&dev, &b_bits).unwrap();
+        let layout = Layout::contiguous((3usize,));
+        let out = lhs
+            .binary_impl::<crate::op::Add>(&rhs, &layout, &layout)
+            .unwrap();
+        assert_eq!(out.dtype, DType::F8E4M3, "add must stay f8e4m3");
+        let got = download_f32(&out.to_dtype(&layout, DType::F32).unwrap()).unwrap();
+        let expect: Vec<f32> = (0..3)
+            .map(|i| f8e4m3::from_bits(a_bits[i]).to_f32() + f8e4m3::from_bits(b_bits[i]).to_f32())
+            .collect();
+        assert_f8_close(&got, &expect, "add");
+    }
+
+    /// F8E4M3 binary mul through the f32 hub (negative products included).
+    #[test]
+    fn wgpu_f8e4m3_binary_mul() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        let a_bits: Vec<u8> = vec![0x40, 0x30, 0x38];
+        let b_bits: Vec<u8> = vec![0x28, 0x38, 0xC0];
+        let lhs = upload_f8e4m3(&dev, &a_bits).unwrap();
+        let rhs = upload_f8e4m3(&dev, &b_bits).unwrap();
+        let layout = Layout::contiguous((3usize,));
+        let out = lhs
+            .binary_impl::<crate::op::Mul>(&rhs, &layout, &layout)
+            .unwrap();
+        assert_eq!(out.dtype, DType::F8E4M3, "mul must stay f8e4m3");
+        let got = download_f32(&out.to_dtype(&layout, DType::F32).unwrap()).unwrap();
+        let expect: Vec<f32> = (0..3)
+            .map(|i| f8e4m3::from_bits(a_bits[i]).to_f32() * f8e4m3::from_bits(b_bits[i]).to_f32())
+            .collect();
+        assert_f8_close(&got, &expect, "mul");
+    }
+
+    /// F8E4M3 cmp produces a U8 result, comparing the f32-decoded operands.
+    #[test]
+    fn wgpu_f8e4m3_cmp_lt() {
+        use crate::op::CmpOp;
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        let a_bits: Vec<u8> = vec![0x30, 0x50, 0x10];
+        let b_bits: Vec<u8> = vec![0x38, 0x48, 0x18];
+        let lhs = upload_f8e4m3(&dev, &a_bits).unwrap();
+        let rhs = upload_f8e4m3(&dev, &b_bits).unwrap();
+        let layout = Layout::contiguous((3usize,));
+        let out = lhs.cmp(CmpOp::Lt, &rhs, &layout, &layout).unwrap();
+        assert_eq!(out.dtype, DType::U8, "cmp must produce U8");
+        let got = download_u8(&out).unwrap();
+        for i in 0..3 {
+            let av = f8e4m3::from_bits(a_bits[i]).to_f32();
+            let bv = f8e4m3::from_bits(b_bits[i]).to_f32();
+            assert_eq!(got[i], u8::from(av < bv), "cmp_lt at {i}");
+        }
+    }
+
+    /// F8E4M3 affine (mul/add in f64 applied on the f32 hub).
+    #[test]
+    fn wgpu_f8e4m3_affine() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        let bits: Vec<u8> = vec![0x38, 0x80, 0xC0, 0x48];
+        let layout = Layout::contiguous((4usize,));
+        let src = upload_f8e4m3(&dev, &bits).unwrap();
+        let out = src.affine(&layout, 0.5, 2.0).unwrap();
+        assert_eq!(out.dtype, DType::F8E4M3, "affine must stay f8e4m3");
+        let got = download_f32(&out.to_dtype(&layout, DType::F32).unwrap()).unwrap();
+        let expect: Vec<f32> = bits
+            .iter()
+            .map(|&b| f8e4m3::from_bits(b).to_f32() * 0.5 + 2.0)
+            .collect();
+        assert_f8_close(&got, &expect, "affine");
+    }
+
+    /// F8E4M3 powf through the f32 hub.
+    #[test]
+    fn wgpu_f8e4m3_powf() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        let bits: Vec<u8> = vec![0x38, 0xC0, 0x28, 0x40];
+        let layout = Layout::contiguous((4usize,));
+        let src = upload_f8e4m3(&dev, &bits).unwrap();
+        let out = src.powf(&layout, 2.0).unwrap();
+        assert_eq!(out.dtype, DType::F8E4M3, "powf must stay f8e4m3");
+        let got = download_f32(&out.to_dtype(&layout, DType::F32).unwrap()).unwrap();
+        let expect: Vec<f32> = bits
+            .iter()
+            .map(|&b| f8e4m3::from_bits(b).to_f32().powf(2.0))
+            .collect();
+        assert_f8_close(&got, &expect, "powf");
+    }
+
+    /// F8E4M3 elu through the f32 hub (alpha semantics on f32, cast back).
+    #[test]
+    fn wgpu_f8e4m3_elu() {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return,
+        };
+        let bits: Vec<u8> = vec![0x38, 0xC0, 0x00, 0xB0];
+        let layout = Layout::contiguous((4usize,));
+        let src = upload_f8e4m3(&dev, &bits).unwrap();
+        let out = src.elu(&layout, 1.0).unwrap();
+        assert_eq!(out.dtype, DType::F8E4M3, "elu must stay f8e4m3");
+        let got = download_f32(&out.to_dtype(&layout, DType::F32).unwrap()).unwrap();
+        let expect: Vec<f32> = bits
+            .iter()
+            .map(|&b| {
+                let v = f8e4m3::from_bits(b).to_f32();
+                if v > 0.0 {
+                    v
+                } else {
+                    v.exp() - 1.0
+                }
+            })
+            .collect();
+        assert_f8_close(&got, &expect, "elu");
     }
 }
 
