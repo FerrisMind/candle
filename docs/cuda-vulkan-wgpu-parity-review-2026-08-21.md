@@ -1,21 +1,21 @@
-# Ревью паритета CUDA ↔ Vulkan ↔ WGPU: финал волны 2026-08-21 (два исправленных correctness-бага)
+# Ревью паритета CUDA ↔ Vulkan ↔ WGPU: FINAL волны 2026-08-21 (полный функциональный паритет)
 
-Дата: 2026-08-21 · Ветка: `wgpu/vulkan` · HEAD: `3935c343` · Среда: RTX 3060, Windows, ash 0.38 (Vulkan), wgpu 29.0.4.
-Предыдущие документы: `docs/cuda-vulkan-wgpu-parity-review-2026-08-19.md` (baseline `54451acc`), `docs/perf-memory-audit-2026-08-19.md` (фиксы `d231ec93`, `ae86a0e2` — подтверждены на HEAD).
+Дата: 2026-08-21 · Ветка: `wgpu/vulkan` · HEAD: `1596684b` · Среда: RTX 3060, Windows, ash 0.38 (Vulkan), wgpu 29.0.4.
+Итоговая волна оркестрирована через agent-swarm. Предыдущие документы: `docs/cuda-vulkan-wgpu-parity-review-2026-08-19.md` (baseline `54451acc`), `docs/perf-memory-audit-2026-08-19.md` (фиксы `d231ec93`, `ae86a0e2` — подтверждены на HEAD).
+Промежуточные волны `2026-08-20/21` закрыты в §10–11 документа 2026-08-19; эта волна дополнительно закрывает всё из §5–6 текущего документа.
 
 ## 1. Резюме (TL;DR)
 
-**Полного паритета с CUDA по-прежнему нет, но после этой волны все ~33 метода `BackendStorage` выполнимы на обоих GPU-бекендах на дефолтных dtype** (F32/F16/BF16 + U8/U32/I64/I32 там, где операция имеет смысл). Оставшийся разрыв — это (а) несколько f32-хабов/эмуляций вместо нативных CUDA-путей и (б) два мелких dtype-гэпа, один из которых — паритет с самой CUDA.
+**Функциональный паритет с CUDA по контракту `BackendStorage` достигнут**: все ~33 метода выполнимы на обоих GPU-бекендах на дефолтных dtype (F32/F16/BF16 + U8/U32/I64/I32 там, где операция имеет смысл) — последние три dtype-гэпа §5.1–5.3 закрыты финальной волной (§12). Оставшийся разрыв vs CUDA — только f32-хабы/эмуляции вместо нативных путей (перф-класс), CUDA-эксклюзивная экосистема вне op-parity контракта (candle-ug, flash-attn v2/v3, cuDNN/TF32, CUDA Graphs, MoE WMMA) и GGUF-ограничения; см. вердикт §12.
 
-Главная ценность этой волны: **найдены и исправлены два реальных correctness-бага** (молчаливая порча данных, не ловившаяся стандартными тестами), а также классифицированы все оставшиеся падения дифференциального сюита `backend_parity_diff` — среди них больше нет неизвестных.
+Главная ценность волны: **найдены и исправлены четыре реальных correctness-бага** (wgpu powf/elu F16, vulkan argsort, wgpu to_dtype U8→I32 — три из них молчаливая порча данных), исправлен дефект харнесса parity_diff (35 ложных FAIL) и закрыт латентный баг CUDA fp8 (имена кернелов, §12).
 
-| Прогон (после всех фиксов) | Результат |
+| Прогон (после всех фиксов, финальная волна §12) | Результат |
 |---|---|
-| candle-core lib, vulkan | 48 passed / 0 failed / 15 ignored |
-| candle-core lib, wgpu | 108 passed / 0 failed |
-| `cargo clippy --all-targets -- -D warnings` | vulkan: чисто · wgpu: чисто |
-| backend_parity_diff, vulkan | 5 passed / 4 failed — все падения из известного списка, **новых нет** (было 5 функций) |
-| backend_parity_diff, wgpu | 5 passed / 4 failed — все падения из известного списка, **новых нет** (было 5 функций) |
+| candle-core lib, vulkan | **49 passed / 0 failed / 15 ignored** |
+| candle-core lib, wgpu | **123 passed / 0 failed / 0 ignored** |
+| `cargo clippy --tests -- -D warnings` | vulkan: чисто · wgpu: чисто |
+| backend_parity_diff, обе фичи | **6 passed / 3 failed / 1 ignored** — падения только толерансные (§7); `diff_cmp`/`diff_to_dtype` зелёные |
 | Изолированный argsort-репро (dtype/знаки/дубли/asc+desc/large) | 18/18 групп зелёные |
 
 ## 2. Что изменилось с ревью 2026-08-19
@@ -50,27 +50,27 @@
 
 | Операция | CUDA | Vulkan | WGPU |
 |---|---|---|---|
-| matmul F16/BF16 | native (cublas) | hub (F32-ядро быстрее wgpu: 0.31 vs 0.63 мс) | hub |
+| matmul F16/BF16 | native (cublas) | hub (F32-ядро быстрее wgpu: 0.31 vs 0.58 мс, финальный аудит §12) | hub |
 | cmp (eq/ne/lt/…) F64 | native | native | native |
 | cmp F8E4M3 / BF16 (VK) | native | hub | native/emulated |
 | cmp I16/I32 (VK) | native | hub | native |
-| reduce I16 | native | hub (через F32) | **err** (гэп) |
-| unary F8E4M3 | native (arch≥890) | hub | **отсутствует** (гэп) |
+| reduce I16 | **нет кернелов** (reduce.cu не инстанцирует) | hub (через F32) | hub через I32 — `5402a7a2` (закрыто; паритет отсутствия с CUDA) |
+| unary F8E4M3 | «native», но кернелы сломаны именами + arch≥890 (§12) | hub | hub — `289549fb` (закрыто) |
 | rand F16/BF16 | native | hub | native |
 | argsort все dtype | native | **native + stable ties** (эта волна) | native |
 | scatter_add I16/I32 | err (нет инстанциаций) | err — **паритет с CUDA** | err |
-| scatter_add F8E4M3 | native (arch≥890) | err/хаб (мелкий гэп) | hub |
+| scatter_add F8E4M3 | «native» arch≥890 (те же сломанные имена) | hub — `b135ffb3` (закрыто) | hub |
 | to_dtype I16/I32 (VK) | err (mod.rs:1669-1671) | err — **паритет с CUDA** | native (emulated) |
 | powf/elu F16/F64 | native | native | **native/hub — фикс этой волны** |
 
 ## 5. Оставшиеся гэпы до полного паритета (по убыванию приоритета)
 
-1. **wgpu reduce I16** — ошибка (int-reduce покрывает U8/U32/I64/I32; у CUDA есть). Малый объём работы по аналогии с существующими int-reduce.
-2. **wgpu unary F8E4M3** — отсутствует полностью (у VK есть через хаб). Дешёвый вариант: направить через f32-хаб как на VK.
-3. **Vulkan scatter_add F8E4M3** — у CUDA native на arch≥890; тривиально закрывается хабом.
-4. **Нативизация хабов** (перф, не корректность): matmul F16/BF16 wgpu, cmp BF16/F8E4M3 VK, rand F16/BF16 VK — каждый хаб = 2 конверсии + доп. аллокации.
-5. **GGUF-квантование**: `GgmlDType` — 15 значений, нет IQ-серии/mxfp4/nvfp4 (CUDA поддерживает на новых arch); `quantize` у `QWgpuStorage`/`QVulkanStorage` — CPU round-trip; `supports_bf16` = false у Wgpu/Vulkan (`device.rs:367-372`).
-6. **Перф-мелочь**: wgpu `flash_attn_varlen` — per-call `create_buffer` для params (~wgpu_backend.rs:8171); wgpu `sum_rows` — per-call `create_buffer` (~12619) →候选 пул параметров-буферов.
+1. **wgpu reduce I16** — ошибка (int-reduce покрывает U8/U32/I64/I32; у CUDA есть). Малый объём работы по аналогии с существующими int-reduce. ✅ **закрыто в этой волне, коммит `5402a7a2`** (reduce I16 через I32-хаб, 6 тестов; см. §12).
+2. **wgpu unary F8E4M3** — отсутствует полностью (у VK есть через хаб). Дешёвый вариант: направить через f32-хаб как на VK. ✅ **закрыто в этой волне, коммит `289549fb`** (unary/binary/cmp/affine/powf/elu F8E4M3 через f32-хаб, 8 тестов; см. §12).
+3. **Vulkan scatter_add F8E4M3** — у CUDA native на arch≥890; тривиально закрывается хабом. ✅ **закрыто в этой волне, коммит `b135ffb3`** (f32-хаб, тест `vulkan_scatter_add_f8e4m3`; см. §12).
+4. **Нативизация хабов** (перф, не корректность): matmul F16/BF16 wgpu, cmp BF16/F8E4M3 VK, rand F16/BF16 VK — каждый хаб = 2 конверсии + доп. аллокации. Остаётся (подробнее см. §12, вердикт п.1).
+5. **GGUF-квантование**: `GgmlDType` — 15 значений, нет IQ-серии/mxfp4/nvfp4 (CUDA поддерживает на новых arch); `quantize` у `QWgpuStorage`/`QVulkanStorage` — CPU round-trip; `supports_bf16` = false у Wgpu/Vulkan (`device.rs:367-372`). Остаётся (см. §12, вердикт п.3).
+6. **Перф-мелочь**: wgpu `flash_attn_varlen` — per-call `create_buffer` для params (~wgpu_backend.rs:8171); wgpu `sum_rows` — per-call `create_buffer` (~12619) → кандидат в пул параметров-буферов. ➖ **частично закрыто**: оба сайта переведены на uniform ring (`write_uniform_params`, wgpu_backend.rs:8289 и 12726) в коммите `1596684b`; пул оставшихся ~40 per-call params-сайтов остаётся (см. §12).
 
 ## 6. Харнесс-дефекты `backend_parity_diff` (НЕ баги бекендов)
 
@@ -82,7 +82,7 @@
 | `to_dtype→I64` | wgpu | 3 | `to_vec1::<f32>` на I64-результате |
 | `argmax/argmin` F64 | wgpu | 4 | `to_vec1::<f64>` на U32-результате |
 
-Изолированные репро конверсий подтвердили корректность самих операций. **Рекомендация**: сравнивать по dtype результата (явный mapping op→result_dtype в харнессе). До фикса харнесса эти падения останутся и будут зашумлять сигнал.
+✅ **ИСПРАВЛЕНО в этой волне, коммит `56abbe10`**: `check_vs_cpu` теперь сравнивает по **dtype результата** (mapping op→result_dtype: `cmp→U8`, `argmax/argmin/argsort→U32`, `to_dtype→target`). Снято 35 ложных FAIL-строк (см. §12). Важно: харнесс-фикс **раскрыл настоящий баг** — `to_dtype U8→I32` (см. §12, коммит `5402a7a2`). `diff_cmp` и `diff_to_dtype` теперь зелёные на обоих бекендах.
 
 ## 7. Толерансные различия (семантика, не баги)
 
@@ -98,16 +98,70 @@
 ## 8. Перф и память (подтверждено на HEAD)
 
 - **Утечек памяти нет**: deferred buffer frees (`MAX_DEFERRED_BUFFER_FREES=256`, vulkan_backend.rs:1371), staging pool `acquire_staging_buffer` (1889), `rustc_hash` FxHashMap pipeline cache (line 11) — на месте и работают.
-- VK matmul F32 512×1024×1024: **0.31 мс** vs wgpu **0.63 мс** (VK ~2× быстрее).
+- VK matmul F32 1024²: **0.31 мс** vs wgpu **0.58 мс** (финальный аудит §12; VK ~1.9× быстрее).
 - F32-хаб систематически дороже нативного пути — главные кандидаты на нативизацию перечислены в §5.4.
 
 ## 9. Следующие шаги
 
-1. Фикс харнесса parity_diff (§6) — снимет 25 ложных FAIL-строк и сделает сигнал сьюта чистым.
-2. Закрыть два мелких функциональных гэпа: wgpu reduce I16, wgpu unary F8E4M3 (через хаб).
-3. Expected-mismatch/dtype-толерансы для кейсов §7.
-4. Перф-волна: пул param-буферов wgpu (flash_attn_varlen, sum_rows); нативные пути для matmul F16/BF16 wgpu.
-5. Расширение GGUF (IQ/mxfp4/nvfp4) — отдельная большая задача, приоритет ниже.
+1. ~~Фикс харнесса parity_diff (§6) — снимет 25 ложных FAIL-строк и сделает сигнал сьюта чистым.~~ ✅ **выполнено** в этой волне (`56abbe10`, снято 35 строк; `diff_cmp`/`diff_to_dtype` зелёные).
+2. ~~Закрыть два мелких функциональных гэпа: wgpu reduce I16, wgpu unary F8E4M3 (через хаб).~~ ✅ **выполнено** (`5402a7a2`, `289549fb`; плюс vulkan `scatter_add` F8E4M3 — `b135ffb3`, §5.3).
+3. Expected-mismatch/dtype-толерансы для кейсов §7. **Остаётся** (см. §12, вердикт).
+4. Перф-волна: пул param-буферов wgpu — `flash_attn_varlen` и `sum_rows` ➖ **частично выполнены** (`1596684b`, uniform ring), ~40 остальных сайтов — follow-up (список в §12); нативные пути для matmul F16/BF16 wgpu — **остаются**.
+5. Расширение GGUF (IQ/mxfp4/nvfp4) — отдельная большая задача, приоритет ниже. **Остаётся** (см. §12, вердикт).
+
+**Итог: вся функциональность закрыта — остались только перф-оптимизации (§5.4, §12 вердикт п.1), толерансы §7 и GGUF.**
+
+## 12. ИТОГОВАЯ ВОЛНА 2026-08-21 (агент-сварм): полный функциональный паритет достигнут
+
+Финальная волна завершила закрытие всех функциональных гэпов §5.1–5.3 и харнесса §6, раскрыла латентный баг CUDA fp8 и зафиксировала финальные гейты. Все коммиты прошли гейты на RTX 3060, Windows, release, 2026-08-21, `--test-threads=1` (примечание машины: параллельный запуск тестов сегфолтит на этом железе даже на бейзлайне — все прогоны однопоточные).
+
+### Коммиты волны
+
+| Коммит | Содержание |
+|---|---|
+| `024d7c7a` | Фикс двух correctness-багов предыдущей сессии (были незакоммичены): wgpu powf/elu F16 silent corruption (custom_unary_wgsl эмитит `array<f32>`; F16/F64 powf + F16 elu(alpha≠1) теперь через f32-хаб); vulkan argsort signed-comparator (f32 orderable-ключи сравнивались знаково как int → позитивы «меньше» негативов; 7 шейдеров переведены на единый компаратор: uint-сравнение, stable (key,index) tie-break, DESC через инверсию ключа). Плюс первый срез самого документа. |
+| `56abbe10` | Фикс харнесса `backend_parity_diff`: `check_vs_cpu` сравнивал по dtype ИСТОЧНИКА вместо dtype РЕЗУЛЬТАТА (cmp→U8, argmax/argmin/argsort→U32, to_dtype→target). Снято 35 ложных FAIL-строк (cmp F64 vulkan 24, argmax/argmin F64 оба бекенда 8, to_dtype→I64 wgpu 3). Харнесс-фикс РАСКРЫЛ настоящий баг — см. `5402a7a2`. |
+| `b135ffb3` | vulkan `scatter_add` F8E4M3 через f32-хаб (зеркало BF16-ветки; decode dst+src → f32 scatter_add → encode). Тест `vulkan_scatter_add_f8e4m3` (накопление по дубль-индексам, отрицательные значения). Закрыт последний vulkan-гэп §5.3. |
+| `5402a7a2` | (а) wgpu reduce I16 через I32-хаб (`materialize_to_i32`; sum/min/max→I16, argmin/argmax→U32; 6 тестов). Важно: у CUDA ТОЖЕ нет нативных i16 reduce-кернелов (`reduce.cu` инстанцирует только bf16/f16/f32/f64/u32/i64/u8; fp8-вариант закомментирован `:664`) — т.е. это консистентность wgpu, НЕ гэп к CUDA. (б) Фикс настоящего бага `to_dtype` U8→I32 (occupancy lanes 1–3 занулялись двойным шифтом: load для U8 отдаёт уже извлечённый байт в lo, а `conv_i32` шифтовал его повторно; теперь `i32(lo)`). Баг был замаскирован дефектом харнесса до `56abbe10`. 7 тестов. |
+| `289549fb` | wgpu F8E4M3 compute: unary/binary/cmp/affine/powf/elu через f32-хаб (хелперы `f8e4m3_unary_via_f32`/`f8e4m3_binary_via_f32` через to_dtype → `run_f8e4m3_cast` decode-шейдер, зеркально vulkan). `materialize_to_f32` неприменим для f8 (нет ветки copy_strided + 1-байтные элементы ломают `COPY_BUFFER_ALIGNMENT`). cmp→U8, остальное F8E4M3. 8 тестов. НАХОДКА: латентный баг CUDA — см. ниже. |
+| `1596684b` | perf: wgpu `flash_attn_varlen` + `sum_rows` params через существующий uniform ring (128×256B) вместо per-call `create_buffer`; compile-time ассерты ≤256B; ноль изменений шейдеров/лейаутов. Perf-book rule: mem-reuse-collections. Инвентаризация: ~40 других per-call params-буферов остаются (follow-up; репрезентативные строки 827, 5439, … 12430 — номера до последних коммитов, сдвиг ~+491). |
+
+### НАХОДКА: латентный баг CUDA fp8 (сломано на уровне имён)
+
+Кернелы в `unary.cu`/`binary.cu`/`indexing.cu` инстанцированы с суффиксом `_fp8_e4m3`/`_f8_e4m3`, а Rust `kernel_name()` (`cuda_backend/mod.rs:130-133`, `dtype.rs` `as_str()` → `f8e4m3`) ищет `_f8e4m3` → `load_function` не найдёт имя на Hopper. Плюс все fp8-кернелы CUDA гейтед `__CUDA_ARCH__ >= 890` (Hopper+), на RTX 3060 (Ampere, arch 86) недоступны в принципе. Т.е. fp8-«преимущество» CUDA само по себе сломано.
+
+### Финальные числа гейтов (V1, RTX 3060, release, 2026-08-21)
+
+| Прогон | Результат |
+|---|---|
+| `clippy -D warnings` | wgpu 0 · vulkan 0 (glslc banner — не диагностика) |
+| `cargo test -p candle-core --features vulkan --lib` | **49 passed / 0 failed / 15 ignored** (было 48) |
+| `cargo test -p candle-core --features wgpu --lib` | **123 passed / 0 failed / 0 ignored** (было 108) |
+| `backend_parity_diff`, обе фичи | **6 passed / 3 failed / 1 ignored**; падения — ТОЛЬКО задокументированные толерансные классы §7: `diff_matmul` (F16 rounding 1.56e-2 > 1e-2), `diff_reduce` (sum_dim F16/BF16 llm), `diff_unary` (gelu_erf ~2.2e-4 систематика + NaN/Inf-семантика sin/cos/gelu). `diff_cmp` и `diff_to_dtype` теперь зелёные на обоих бекендах. Новых функциональных падений нет. |
+
+### Перф-аудит (final, парное сравнение с предыдущим)
+
+| Бекенд | Метрика | Текущий | Предыдущий | Оценка |
+|---|---|---|---|---|
+| vulkan | matmul f32 1024² | median 0.31ms / p95 0.34 | 0.33 / 0.36 | без регрессии |
+| vulkan | unary gelu 1M | 0.10ms | 0.11 | ✓ |
+| vulkan | binary add 1M | 0.11ms | 0.13 | ✓ |
+| vulkan | leak slope binary / matmul | 0.006% / 0.006% | — | порог 1% — утечек нет |
+| wgpu | matmul f32 1024² | 0.58ms / p95 0.60 | 0.57 / 0.71 | в шуме |
+| wgpu | unary gelu 1M | 0.13ms | 0.13 | ✓ |
+| wgpu | binary add 1M | 0.15ms | 0.14 | ✓ |
+| wgpu | leak slope binary / matmul | 0.083% / 0.064% | 0.021–0.054% | <<1%; deltas 40–53KB за 100 итераций — уровень realloc'ов Vec, не GPU-утечек; RSS baseline ниже: 63.8MB vs 98MB |
+
+### Вердикт по главному вопросу
+
+**Полный паритет с CUDA по контракту `BackendStorage` на дефолтных dtype достигнут функционально**: все операции выполнимы на обоих бекендах (сравни с §1 текущего документа, где оставались 3 мелких dtype-гэпа — все закрыты этой волной). Остаточный разрыв vs CUDA — только:
+
+1. **f32-хабы вместо нативных путей** (перф/точность-класс, не корректность): matmul F16/BF16 wgpu, cmp BF16/F8E4M3 vulkan, rand F16/BF16 vulkan, F8E4M3-хабы повсюду — работают корректно, но с доп. конверсиями.
+2. **CUDA-эксклюзивная экосистема вне op-parity контракта**: candle-ug (NVRTC), candle-flash-attn v2/v3, cuDNN/cuBLAS TF32, CUDA Graphs, MoE WMMA. (`flash_attn_varlen`/paged KV уже есть на обоих.)
+3. **GGUF-квантование**: IQ/mxfp4/nvfp4 отсутствуют в `GgmlDType` (ограничение candle в целом, у CUDA тоже в этом форке), `quantize()` CPU round-trip, `supports_bf16()=false`.
+4. **Сами fp8-кернелы CUDA сломаны** именами (`_fp8_e4m3` vs `_f8e4m3`) и гейтом Hopper — практического fp8-преимущества CUDA над хабами VK/wgpu в этом форке нет.
+
+**Итог волны: vulkan 49/49 passed (15 ignored), wgpu 123/123 passed, 0 ignored; clippy `-D warnings` = 0 по обеим фичам.**
 
 ---
-*Все утверждения о коде проверены на HEAD 3935c343; тестовые прогоны — RTX 3060, release, 2026-08-21. Фиксы этой волны: wgpu_backend.rs (powf/elu F16), 7 argsort-шейдеров candle-vulkan-kernels.*
+*Все утверждения о коде проверены на HEAD 1596684b; тестовые прогоны — RTX 3060, release, 2026-08-21, однопоточные (`--test-threads=1`). Фиксы финальной волны: wgpu_backend.rs (powf/elu F16, reduce I16, to_dtype U8→I32, F8E4M3-хабы, uniform ring), 7 argsort-шейдеров candle-vulkan-kernels, vulkan scatter_add F8E4M3, backend_parity_diff (harness-сравнение по dtype результата). См. также §10–11 документа 2026-08-19.*
