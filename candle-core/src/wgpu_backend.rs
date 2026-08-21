@@ -9606,25 +9606,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let flat_rhs = Layout::contiguous(rhs_l.shape().clone());
             return lhs.run_matmul_f32(&rhs, (b, m, n, k), &flat_lhs, &flat_rhs);
         }
-        if self.dtype == DType::BF16 {
-            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
-            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
-            let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
-            let rhs_f32_l = Layout::contiguous(rhs_l.shape().clone());
-            let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
-            let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
-            return out_f32.to_dtype(&out_l, DType::BF16);
-        }
-        // ponytail: F16 matmul shader writes f32 dst — must upconvert to avoid buffer overflow.
-        if self.dtype == DType::F16 {
-            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
-            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
-            let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
-            let rhs_f32_l = Layout::contiguous(rhs_l.shape().clone());
-            let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
-            let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
-            return out_f32.to_dtype(&out_l, DType::F16);
-        }
         if self.dtype != DType::F32
             && self.dtype != DType::F16
             && self.dtype != DType::BF16
@@ -9763,7 +9744,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         };
 
         let dst_shape = Shape::from(vec![b, m, n]);
-        let dst = unsafe { self.device.alloc_uninit(&dst_shape, self.dtype)? };
+        // Native F16 kernels read f16 inputs but accumulate/write f32 dst (see
+        // mul_mat.wgsl / mul_mat_reg_tile.wgsl). Allocate the f32-sized buffer so
+        // the shader does not overflow, then downconvert the result to F16 at the
+        // end. BF16's shader writes packed-bf16 directly (same byte count).
+        let native_dst_dtype = if self.dtype == DType::F16 { DType::F32 } else { self.dtype };
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, native_dst_dtype)? };
         let dst_layout = Layout::contiguous(dst_shape);
         // Contiguous LHS (..., M, K) has unit K stride.
         let lhs_k_stride = 1usize;
@@ -9888,9 +9874,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 {
                     matmul_label = "candle-wgpu-matmul-fast";
                     use_reg_tile = true;
+                    // VEC loads assume contiguous K (unit stride_0k / stride_1k),
+                    // mirroring the F32 reg-tile selection. The native inputs are
+                    // materialized contiguous here (or the RHS virtual B^T).
+                    let vectorized =
+                        params.stride_0k == 1 && params.stride_1k == 1 && m.is_multiple_of(4)
+                            && n.is_multiple_of(4);
                     shader_storage = candle_wgpu_kernels::matmul_fast_shader(
                         wgpu_kernel_dtype(DType::F16)?,
-                        false,
+                        vectorized,
                     )
                     .ok_or_else(|| {
                         Error::Msg("wgpu shader mul_mat_reg_tile.wgsl not embedded".into()).bt()
@@ -9922,14 +9914,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             }
         };
         let max_binding_bytes = self.device.inner.limits.max_storage_buffer_binding_size as usize;
-        let dst_bytes = byte_len(self.dtype, b * m * n, "wgpu matmul dst")?;
+        let dst_bytes = byte_len(native_dst_dtype, b * m * n, "wgpu matmul dst")?;
         let lhs_bytes = layout_binding_bytes(lhs, &lhs_layout);
         let rhs_bytes = layout_binding_bytes(rhs_t, &rhs_t_layout);
-        let elem_size = self.dtype.size_in_bytes();
+        let input_elem_size = self.dtype.size_in_bytes();
+        let dst_elem_size = native_dst_dtype.size_in_bytes();
         let matrix_elems = m * n;
-        let matrix_bytes = matrix_elems * elem_size;
-        let lhs_matrix_bytes = m * k * elem_size;
-        let rhs_matrix_bytes = n * k * elem_size;
+        let matrix_bytes = matrix_elems * dst_elem_size;
+        let lhs_matrix_bytes = m * k * input_elem_size;
+        let rhs_matrix_bytes = n * k * input_elem_size;
         let needs_batch_chunk = dst_bytes > max_binding_bytes
             || lhs_bytes > max_binding_bytes
             || rhs_bytes > max_binding_bytes;
@@ -9960,7 +9953,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let matrix_elems_u64 = matrix_elems as u64;
             let lhs_matrix_elems_u64 = (m * k) as u64;
             let rhs_matrix_elems_u64 = (n * k) as u64;
-            let elem_size_u64 = elem_size as u64;
+            let input_elem_size_u64 = input_elem_size as u64;
+            let dst_elem_size_u64 = dst_elem_size as u64;
             for batch_idx in 0..b {
                 let dst2_idx = batch_idx % bs02;
                 let dst3_idx = batch_idx / bs02;
@@ -9980,25 +9974,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 dispatch_params.offset_dst = 0;
                 let dst_offset_bytes = (batch_idx as u64)
                     .saturating_mul(matrix_elems_u64)
-                    .saturating_mul(elem_size_u64);
+                    .saturating_mul(dst_elem_size_u64);
                 let batch_bindings = [
                     buffer_binding_range(
                         0,
                         &rhs_t.buffer,
-                        rhs_elem_off.saturating_mul(elem_size_u64),
-                        rhs_matrix_elems_u64.saturating_mul(elem_size_u64),
+                        rhs_elem_off.saturating_mul(input_elem_size_u64),
+                        rhs_matrix_elems_u64.saturating_mul(input_elem_size_u64),
                     )?,
                     buffer_binding_range(
                         1,
                         &lhs.buffer,
-                        lhs_elem_off.saturating_mul(elem_size_u64),
-                        lhs_matrix_elems_u64.saturating_mul(elem_size_u64),
+                        lhs_elem_off.saturating_mul(input_elem_size_u64),
+                        lhs_matrix_elems_u64.saturating_mul(input_elem_size_u64),
                     )?,
                     buffer_binding_range(
                         2,
                         &dst.buffer,
                         dst_offset_bytes,
-                        matrix_elems_u64.saturating_mul(elem_size_u64),
+                        matrix_elems_u64.saturating_mul(dst_elem_size_u64),
                     )?,
                     uniform_binding_dyn(3, &param_buffer, slot)?,
                 ];
@@ -10071,6 +10065,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             )?;
         }
         drop(lhs_contiguous);
+        if native_dst_dtype != self.dtype {
+            // Native F16 kernel produced an f32 dst; round it back to F16.
+            let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
+            return dst.to_dtype(&out_l, self.dtype);
+        }
         Ok(dst)
     }
 
@@ -14162,6 +14161,177 @@ mod compute_2d_self_check {
                 x.saturating_mul(y) >= total.max(1),
                 "total={total} reported_max={reported_max} -> ({x},{y})"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod wgpu_matmul_tests {
+    use crate::test_utils::{compare_f32_slices, diff_tolerance};
+    use crate::{Device, DType, Tensor};
+
+    fn wgpu_device() -> Device {
+        Device::new_wgpu(0).expect("wgpu device")
+    }
+
+    fn gen_f32(shape: &[usize], seed: u64) -> Vec<f32> {
+        let n: usize = shape.iter().product();
+        (0..n)
+            .map(|i| {
+                let x = (i as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(seed);
+                let v = ((x >> 33) as i32 as f32) / 1.0e9;
+                v * 3.0 - 1.5
+            })
+            .collect()
+    }
+
+    /// Differential matmul check vs a CPU reference that matches the native
+    /// kernel semantics: inputs rounded through the target dtype, f32
+    /// accumulation, output rounded back to the target dtype.
+    fn check_matmul(dtype: DType, m: usize, k: usize, n: usize, non_contig: bool) {
+        let dev = wgpu_device();
+        let a32 = gen_f32(&[m, k], 42);
+        let b32 = gen_f32(&[k, n], 137);
+
+        // CPU reference: round inputs through target dtype, f32 matmul, round out.
+        let a_cpu = Tensor::from_vec(a32.clone(), (m, k), &Device::Cpu).unwrap();
+        let b_cpu = Tensor::from_vec(b32.clone(), (k, n), &Device::Cpu).unwrap();
+        let a_ref = a_cpu
+            .to_dtype(dtype)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        let b_ref = b_cpu
+            .to_dtype(dtype)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        let ref_t = a_ref.matmul(&b_ref).unwrap();
+        let ref_t = ref_t
+            .to_dtype(dtype)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        let ref_v: Vec<f32> = ref_t.flatten_all().unwrap().to_vec1().unwrap();
+
+        // GPU: native-dtype inputs into matmul.
+        let a = Tensor::from_vec(a32.clone(), (m, k), &dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let b = Tensor::from_vec(b32.clone(), (k, n), &dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let (a, b) = if non_contig {
+            // non-contiguous strided views with original dims (mirrors matmul_tests).
+            let a = a.t().unwrap().contiguous().unwrap().t().unwrap();
+            let b = b.t().unwrap().contiguous().unwrap().t().unwrap();
+            assert!(!a.is_contiguous() && !b.is_contiguous());
+            (a, b)
+        } else {
+            (a, b)
+        };
+        let c = a.matmul(&b).expect("wgpu matmul");
+        assert_eq!(c.dtype(), dtype, "output dtype must stay {dtype:?}");
+        let c_v: Vec<f32> = c
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let (max_abs, max_rel, _ulp, first_bad) = compare_f32_slices(&c_v, &ref_v);
+        let (atol, rtol) = diff_tolerance(dtype);
+        assert!(
+            max_abs <= atol || max_rel <= rtol,
+            "matmul {dtype:?} {m}x{k}x{n} non_contig={non_contig} out of tol: \
+             abs={max_abs:.2e} rel={max_rel:.2e} tol_abs={atol:.2e} tol_rel={rtol:.2e}\
+             first={:?} gpu={} cpu={}",
+            first_bad.map(|i| (c_v.get(i), ref_v.get(i))),
+            first_bad.map(|i| c_v[i]).unwrap_or(f32::NAN),
+            first_bad.map(|i| ref_v[i]).unwrap_or(f32::NAN),
+        );
+    }
+
+    #[test]
+    fn wgpu_matmul_f16_native_square() {
+        check_matmul(DType::F16, 64, 64, 64, false);
+    }
+
+    #[test]
+    fn wgpu_matmul_bf16_native_square() {
+        check_matmul(DType::BF16, 64, 64, 64, false);
+    }
+
+    #[test]
+    fn wgpu_matmul_f16_native_rect() {
+        check_matmul(DType::F16, 128, 256, 96, false);
+    }
+
+    #[test]
+    fn wgpu_matmul_bf16_native_rect() {
+        check_matmul(DType::BF16, 128, 256, 96, false);
+    }
+
+    #[test]
+    fn wgpu_matmul_f16_native_noncontig() {
+        check_matmul(DType::F16, 64, 64, 64, true);
+    }
+
+    #[test]
+    fn wgpu_matmul_bf16_native_noncontig() {
+        check_matmul(DType::BF16, 64, 64, 64, true);
+    }
+
+    /// Perf probe: median wall time for F16/BF16 1024³ matmul over N iters.
+    /// Forces a GPU sync each iter by reading the dst back to CPU.
+    /// Not meant to assert; prints a timing line for the swarm perf report.
+    #[test]
+    fn wgpu_matmul_native_timing_probe() {
+        let dev = wgpu_device();
+        let n = 1024usize;
+        let iters = 20usize;
+        let warmup = 5usize;
+        let a32 = gen_f32(&[n, n], 1);
+        let b32 = gen_f32(&[n, n], 2);
+        for dtype in [DType::F16, DType::BF16] {
+            let a = Tensor::from_vec(a32.clone(), (n, n), &dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let b = Tensor::from_vec(b32.clone(), (n, n), &dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            for _ in 0..warmup {
+                let _c = a.matmul(&b).unwrap();
+                let _ = _c
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+            }
+            let mut times = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t0 = std::time::Instant::now();
+                let c = a.matmul(&b).unwrap();
+                let _ = c
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                times.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            let median = times[iters / 2];
+            eprintln!("[perf] wgpu matmul {dtype:?} {n}x{n}x{n} native median={median:.3} ms (all={times:?})");
         }
     }
 }
