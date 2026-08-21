@@ -3639,42 +3639,6 @@ impl VulkanStorage {
         out_f32.to_dtype(&lhs_contiguous, DType::F8E4M3)
     }
 
-    fn bf16_cmp_via_f32(
-        &self,
-        rhs: &Self,
-        lhs_layout: &Layout,
-        rhs_layout: &Layout,
-        op: CmpOp,
-    ) -> Result<Self> {
-        if rhs.dtype != DType::BF16 {
-            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan bf16 cmp").bt());
-        }
-        self.device
-            .same_device(&rhs.device)
-            .then_some(())
-            .ok_or_else(|| {
-                Error::DeviceMismatchBinaryOp {
-                    lhs: self.device.location(),
-                    rhs: rhs.device.location(),
-                    op: "bf16 cmp",
-                }
-                .bt()
-            })?;
-        let lhs_f32 = self.materialize_to_f32(lhs_layout)?;
-        let rhs_f32 = rhs.materialize_to_f32(rhs_layout)?;
-        let lhs_contiguous = if lhs_layout.dims().len() > 4 {
-            Layout::contiguous(Self::compact_rank_gt4_shape(lhs_layout))
-        } else {
-            Layout::contiguous(lhs_layout.shape())
-        };
-        let rhs_contiguous = if rhs_layout.dims().len() > 4 {
-            Layout::contiguous(Self::compact_rank_gt4_shape(rhs_layout))
-        } else {
-            Layout::contiguous(rhs_layout.shape())
-        };
-        lhs_f32.run_cmp_u8(&rhs_f32, &lhs_contiguous, &rhs_contiguous, op)
-    }
-
     fn bf16_where_via_f32(
         &self,
         layout: &Layout,
@@ -3919,7 +3883,7 @@ impl VulkanStorage {
     ) -> Result<Self> {
         if !matches!(
             self.dtype,
-            DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64
+            DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64 | DType::BF16
         ) {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan cmp").bt());
         }
@@ -4020,6 +3984,7 @@ impl VulkanStorage {
             DType::U8 => "cmp_u8",
             DType::U32 => "cmp_u32",
             DType::I64 => "cmp_i64",
+            DType::BF16 => "cmp_bf16",
             _ => return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan cmp").bt()),
         };
         let spirv = candle_vulkan_kernels::spirv(spirv_name)
@@ -9275,9 +9240,7 @@ impl BackendStorage for VulkanStorage {
             };
             return lhs_f32.cmp(op, &rhs_f32, &l, &r);
         }
-        if self.dtype == DType::BF16 {
-            return self.bf16_cmp_via_f32(rhs, lhs_l, rhs_l, op);
-        }
+        // BF16 falls through to native cmp via run_cmp_u8 (packed-u16 shader).
         if self.dtype == DType::F64 {
             if !self.device.shader_float64_supported() {
                 return Err(Error::Msg(
@@ -11422,6 +11385,60 @@ mod tests {
             let av: f32 = f8e4m3::from_bits(a_bits[i]).to_f32();
             let bv: f32 = f8e4m3::from_bits(b_bits[i]).to_f32();
             assert_eq!(got[i], u8::from(av < bv));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_bf16_cmp_native_matches_reference() -> Result<()> {
+        use crate::op::CmpOp;
+        let device = VulkanDevice::new(0)?;
+        // Non-power-of-two length; covers negatives, +/- zero and NaNs.
+        let a_f32 = [
+            1.0f32, -1.0, 0.0, 3.5, -0.0, f32::NAN, 100.0, -100.0, 0.5, -2.25, 1.0, 4.0, 8.0,
+            2.0, 6.0, 7.0, 0.125, -0.5, 3.0, 2.0, -7.0, 5.0, 11.0,
+        ];
+        let b_f32 = [
+            1.0f32, -2.0, 0.0, 3.5, 0.0, f32::NAN, -100.0, 100.0, 0.25, -2.0, 1.5, 4.0, 2.0,
+            8.0, 6.0, 7.0, -0.125, 0.5, 3.0, 3.0, 7.0, -5.0, 11.0,
+        ];
+        assert_eq!(a_f32.len(), b_f32.len());
+        let len = a_f32.len();
+        let a: Vec<half::bf16> = a_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let b: Vec<half::bf16> = b_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::BF16(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::BF16(b))?;
+        let layout = Layout::contiguous((len,));
+        let ops = [CmpOp::Eq, CmpOp::Ne, CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge];
+        for op in ops {
+            let out = lhs.cmp(op, &rhs, &layout, &layout)?;
+            let got = match out.to_cpu_storage()? {
+                CpuStorage::U8(v) => v,
+                other => crate::bail!("unexpected dtype: {other:?}"),
+            };
+            for i in 0..len {
+                // bf16 -> f32 is exact, so decoded comparisons match candle's
+                // CPU bf16 cmp (which compares through f32), incl. NaN != NaN.
+                let x = half::bf16::from_f32(a_f32[i]).to_f32();
+                let y = half::bf16::from_f32(b_f32[i]).to_f32();
+                let expected = match op {
+                    CmpOp::Eq => u8::from(x == y),
+                    CmpOp::Ne => u8::from(x != y),
+                    CmpOp::Lt => u8::from(x < y),
+                    CmpOp::Le => u8::from(x <= y),
+                    CmpOp::Gt => u8::from(x > y),
+                    CmpOp::Ge => u8::from(x >= y),
+                };
+                let op_name = match op {
+                    CmpOp::Eq => "Eq",
+                    CmpOp::Ne => "Ne",
+                    CmpOp::Lt => "Lt",
+                    CmpOp::Le => "Le",
+                    CmpOp::Gt => "Gt",
+                    CmpOp::Ge => "Ge",
+                };
+                assert_eq!(got[i], expected, "op {op_name} idx {i}");
+            }
         }
         Ok(())
     }

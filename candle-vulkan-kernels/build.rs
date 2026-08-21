@@ -323,6 +323,16 @@ fn generate_candle_spirv_modules(
             ],
         ),
         (
+            "cmp_bf16",
+            candle_shaders_dir.join("cmp_bf16.comp"),
+            &[
+                "A_TYPE=uint16_t",
+                "B_TYPE=uint16_t",
+                "D_TYPE=uint8_t",
+                "FLOAT_TYPE=float",
+            ],
+        ),
+        (
             "where_u8_f32",
             candle_shaders_dir.join("where_u8.comp"),
             &["T_TYPE=float", "D_TYPE=float"],
