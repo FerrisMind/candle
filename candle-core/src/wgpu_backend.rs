@@ -1908,10 +1908,8 @@ impl WgpuDevice {
                     if cache.len() >= 256 {
                         // LRU eviction: drop the oldest quarter by tick.
                         let drop_n = cache.len() / 4;
-                        let mut ticks: Vec<(u64, WgpuElemBgKey)> = cache
-                            .iter()
-                            .map(|(k, (_, t))| (*t, k.clone()))
-                            .collect();
+                        let mut ticks: Vec<(u64, WgpuElemBgKey)> =
+                            cache.iter().map(|(k, (_, t))| (*t, k.clone())).collect();
                         ticks.sort_unstable_by_key(|(t, _)| *t);
                         for (_, k) in ticks.into_iter().take(drop_n) {
                             cache.remove(&k);
@@ -2353,7 +2351,10 @@ fn binary_shader_ex(op: &str, dtype: DType, contig: bool) -> Result<Arc<str>> {
         if dtype == DType::BF16 {
             return Ok(bf16_binary_wgsl(op));
         }
-        if matches!(dtype, DType::U8 | DType::U32 | DType::I16 | DType::I32 | DType::I64) {
+        if matches!(
+            dtype,
+            DType::U8 | DType::U32 | DType::I16 | DType::I32 | DType::I64
+        ) {
             return custom_int_binary_wgsl(op, dtype);
         }
         if op == "maximum" {
@@ -4843,10 +4844,8 @@ fn custom_int_unary_wgsl(op: &str, dtype: DType) -> Result<String> {
         // Activation ops that return 0 for integers in CPU trait impls.
         "gelu" | "erf" | "silu" | "gelu_erf" => "0",
         // Float-only ops that are `todo!()` for integers in CPU; reject.
-        "exp" | "log" | "sin" | "cos" | "tanh" | "recip" | "sqr" | "sqrt"
-        | "sigmoid" | "elu" | "clamp" => {
-            return Err(Error::UnsupportedDTypeForOp(dtype, "wgpu int unary").bt())
-        }
+        "exp" | "log" | "sin" | "cos" | "tanh" | "recip" | "sqr" | "sqrt" | "sigmoid" | "elu"
+        | "clamp" => return Err(Error::UnsupportedDTypeForOp(dtype, "wgpu int unary").bt()),
         _ => return Err(Error::Msg(format!("wgpu int unary op {op} not implemented")).bt()),
     };
     let indexing = r#"
@@ -6144,10 +6143,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 // exposes the already-extracted byte `lo = b` (0..255) so the
                 // I32 value is just the byte itself.
                 let (extra_pre, conv_i32) = match self.dtype {
-                    DType::U8 => (
-                        "",
-                        "i32(lo)",
-                    ),
+                    DType::U8 => ("", "i32(lo)"),
                     DType::I16 => (
                         "let u16v = (lo >> (16u * (i % 2u))) & 0xffffu;",
                         "select(i32(u16v), i32(u16v) - 65536, (u16v & 0x8000u) != 0u)",
@@ -7080,9 +7076,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             // Fresh ring slot per chunk so deferred multi-dispatch never
             // shares one uniform's last write.
             const _: () = assert!(size_of::<CopyParams>() <= 256);
-            let param_buffer = self
-                .device
-                .write_uniform_params(any_as_bytes(&params))?;
+            let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
             let bindings = [
                 buffer_binding(0, &self.buffer),
                 buffer_binding(1, &dst.buffer),
@@ -7393,12 +7387,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             WgpuArgsortDType::F64 => f64_argsort_wgsl(workgroup_size, asc),
             WgpuArgsortDType::I32 => candle_wgpu_kernels::argsort_i32_shader(workgroup_size, asc)
                 .ok_or_else(|| {
-                    Error::Msg("wgpu shader argsort.wgsl not embedded".into()).bt()
-                })?,
+                Error::Msg("wgpu shader argsort.wgsl not embedded".into()).bt()
+            })?,
             WgpuArgsortDType::U8 => candle_wgpu_kernels::argsort_u8_shader(workgroup_size, asc)
-                .ok_or_else(|| {
-                    Error::Msg("wgpu shader argsort.wgsl not embedded".into()).bt()
-                })?,
+                .ok_or_else(|| Error::Msg("wgpu shader argsort.wgsl not embedded".into()).bt())?,
             WgpuArgsortDType::F8E4M3 => {
                 candle_wgpu_kernels::argsort_f8e4m3_shader(workgroup_size, asc).ok_or_else(
                     || Error::Msg("wgpu shader argsort.wgsl not embedded".into()).bt(),
@@ -7493,22 +7485,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             // F8E4M3 keys live in u32 words (one byte each) and need the
             // decode+orderable transform; plain U32/U8 keys are identity.
             (DType::U32, WgpuArgsortDType::F8E4M3) => {
-                candle_wgpu_kernels::argsort_f8e4m3_merge_shader(WG_SIZE, asc).ok_or_else(
-                    || Error::Msg("wgpu shader argsort_merge.wgsl not embedded".into()).bt(),
-                )?
-            }
-            (DType::U32, _) => {
-                candle_wgpu_kernels::argsort_u32_merge_shader(WG_SIZE, asc).ok_or_else(|| {
+                candle_wgpu_kernels::argsort_f8e4m3_merge_shader(WG_SIZE, asc).ok_or_else(|| {
                     Error::Msg("wgpu shader argsort_merge.wgsl not embedded".into()).bt()
                 })?
             }
+            (DType::U32, _) => candle_wgpu_kernels::argsort_u32_merge_shader(WG_SIZE, asc)
+                .ok_or_else(|| {
+                    Error::Msg("wgpu shader argsort_merge.wgsl not embedded".into()).bt()
+                })?,
             (DType::I64, _) => i64_argsort_merge_wgsl(asc),
             (DType::F64, _) => f64_argsort_merge_wgsl(asc),
-            (DType::I32, _) => {
-                candle_wgpu_kernels::argsort_i32_merge_shader(WG_SIZE, asc).ok_or_else(|| {
+            (DType::I32, _) => candle_wgpu_kernels::argsort_i32_merge_shader(WG_SIZE, asc)
+                .ok_or_else(|| {
                     Error::Msg("wgpu shader argsort_merge.wgsl not embedded".into()).bt()
-                })?
-            }
+                })?,
             _ => candle_wgpu_kernels::argsort_merge_shader(WG_SIZE, asc).ok_or_else(|| {
                 Error::Msg("wgpu shader argsort_merge.wgsl not embedded".into()).bt()
             })?,
@@ -7625,9 +7615,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 _pad2: 0,
             };
             const _: () = assert!(size_of::<SoftmaxParams>() <= 256);
-            let param_buffer = self
-                .device
-                .write_uniform_params(any_as_bytes(&params))?;
+            let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
             let entries = [storage_entry(0, false), uniform_entry(1)];
             let bindings = [
                 buffer_binding(0, &self.buffer),
@@ -7873,9 +7861,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         };
 
         const _: () = assert!(size_of::<FlashAttnParams>() <= 256);
-        let param_buffer = q
-            .device
-            .write_uniform_params(any_as_bytes(&params))?;
+        let param_buffer = q.device.write_uniform_params(any_as_bytes(&params))?;
 
         let entries = [
             storage_entry(0, true),
@@ -7927,23 +7913,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         use crate::DType;
 
         if self.dtype != k.dtype || self.dtype != v.dtype {
-            return Err(Error::Msg(
-                "flash_attn_varlen: q/k/v dtype mismatch".into(),
-            )
-            .bt());
+            return Err(Error::Msg("flash_attn_varlen: q/k/v dtype mismatch".into()).bt());
         }
         if !matches!(self.dtype, DType::F32 | DType::F16 | DType::BF16) {
-            return Err(Error::UnsupportedDTypeForOp(
-                self.dtype,
-                "wgpu flash_attn_varlen",
-            )
-            .bt());
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu flash_attn_varlen").bt());
         }
         if cu_seqlens_q.dtype != DType::I32 || cu_seqlens_k.dtype != DType::I32 {
-            return Err(Error::Msg(
-                "flash_attn_varlen: cu_seqlens_q/k must be I32".into(),
-            )
-            .bt());
+            return Err(Error::Msg("flash_attn_varlen: cu_seqlens_q/k must be I32".into()).bt());
         }
         if cu_seqlens_q.count < 2 || cu_seqlens_k.count < 2 {
             return Err(Error::Msg(
@@ -7954,10 +7930,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let batch_q = cu_seqlens_q.count - 1;
         let batch_k = cu_seqlens_k.count - 1;
         if batch_q != batch_k {
-            return Err(Error::Msg(
-                "flash_attn_varlen: cu_seqlens_q/k batch mismatch".into(),
-            )
-            .bt());
+            return Err(Error::Msg("flash_attn_varlen: cu_seqlens_q/k batch mismatch".into()).bt());
         }
 
         // CUDA_reference invariants: layouts are contiguous. Copy strided or
@@ -7993,24 +7966,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let q_dims = q_c_l.dims();
         let k_dims = k_c_l.dims();
         let v_dims = v_c_l.dims();
-        let (total_q, num_heads, head_dim) =
-            if q_dims.len() == 3 && q_dims[2] > 0 {
-                (q_dims[0], q_dims[1], q_dims[2])
-            } else {
-                return Err(Error::Msg(
-                    "flash_attn_varlen expects 3D Q tensor [total_q, h_q, d]".into(),
-                )
-                .bt());
-            };
-        let (total_kv, num_kv_heads, head_dim_kv) =
-            if k_dims.len() == 3 && k_dims[0] > 0 {
-                (k_dims[0], k_dims[1], k_dims[2])
-            } else {
-                return Err(Error::Msg(
-                    "flash_attn_varlen expects 3D K tensor [total_kv, h_kv, d]".into(),
-                )
-                .bt());
-            };
+        let (total_q, num_heads, head_dim) = if q_dims.len() == 3 && q_dims[2] > 0 {
+            (q_dims[0], q_dims[1], q_dims[2])
+        } else {
+            return Err(Error::Msg(
+                "flash_attn_varlen expects 3D Q tensor [total_q, h_q, d]".into(),
+            )
+            .bt());
+        };
+        let (total_kv, num_kv_heads, head_dim_kv) = if k_dims.len() == 3 && k_dims[0] > 0 {
+            (k_dims[0], k_dims[1], k_dims[2])
+        } else {
+            return Err(Error::Msg(
+                "flash_attn_varlen expects 3D K tensor [total_kv, h_kv, d]".into(),
+            )
+            .bt());
+        };
         let head_dim_v = if v_dims.len() == 3 {
             v_dims[2]
         } else {
@@ -8152,43 +8123,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         use crate::DType;
 
         if self.dtype != k.dtype || self.dtype != v.dtype {
-            return Err(Error::Msg(
-                "flash_attn_paged: q/k/v dtype mismatch".into(),
-            )
-            .bt());
+            return Err(Error::Msg("flash_attn_paged: q/k/v dtype mismatch".into()).bt());
         }
         if !matches!(self.dtype, DType::F32 | DType::F16 | DType::BF16) {
-            return Err(Error::UnsupportedDTypeForOp(
-                self.dtype,
-                "wgpu flash_attn_paged",
-            )
-            .bt());
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu flash_attn_paged").bt());
         }
         if cu_seqlens_q.dtype != DType::I32 || cu_seqlens_k.dtype != DType::I32 {
-            return Err(Error::Msg(
-                "flash_attn_paged: cu_seqlens_q/k must be I32".into(),
-            )
-            .bt());
+            return Err(Error::Msg("flash_attn_paged: cu_seqlens_q/k must be I32".into()).bt());
         }
         if block_table.dtype != DType::I32 {
-            return Err(Error::Msg(
-                "flash_attn_paged: block_table must be I32".into(),
-            )
-            .bt());
+            return Err(Error::Msg("flash_attn_paged: block_table must be I32".into()).bt());
         }
         if cu_seqlens_q.count < 2 || cu_seqlens_k.count < 2 {
-            return Err(Error::Msg(
-                "flash_attn_paged: cu_seqlens need at least 2 elements".into(),
-            )
-            .bt());
+            return Err(
+                Error::Msg("flash_attn_paged: cu_seqlens need at least 2 elements".into()).bt(),
+            );
         }
         let batch_q = cu_seqlens_q.count - 1;
         let batch_k = cu_seqlens_k.count - 1;
         if batch_q != batch_k {
-            return Err(Error::Msg(
-                "flash_attn_paged: cu_seqlens_q/k batch mismatch".into(),
-            )
-            .bt());
+            return Err(Error::Msg("flash_attn_paged: cu_seqlens_q/k batch mismatch".into()).bt());
         }
 
         // CUDA_reference invariants: layouts are contiguous. Copy strided or
@@ -8225,25 +8179,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let q_dims = q_c_l.dims();
         let k_dims = k_c_l.dims();
         let v_dims = v_c_l.dims();
-        let (total_q, num_heads, head_dim) =
-            if q_dims.len() == 3 && q_dims[2] > 0 {
-                (q_dims[0], q_dims[1], q_dims[2])
-            } else {
-                return Err(Error::Msg(
-                    "flash_attn_paged expects 3D Q tensor [total_q, h_q, d]".into(),
-                )
-                .bt());
-            };
-        let (num_blocks, pbs, num_kv_heads, head_dim_kv) =
-            if k_dims.len() == 4 && k_dims[0] > 0 {
-                (k_dims[0], k_dims[1], k_dims[2], k_dims[3])
-            } else {
-                return Err(Error::Msg(
-                    "flash_attn_paged expects 4D K tensor [num_blocks, page_block_size, h_kv, d]"
-                        .into(),
-                )
-                .bt());
-            };
+        let (total_q, num_heads, head_dim) = if q_dims.len() == 3 && q_dims[2] > 0 {
+            (q_dims[0], q_dims[1], q_dims[2])
+        } else {
+            return Err(Error::Msg(
+                "flash_attn_paged expects 3D Q tensor [total_q, h_q, d]".into(),
+            )
+            .bt());
+        };
+        let (num_blocks, pbs, num_kv_heads, head_dim_kv) = if k_dims.len() == 4 && k_dims[0] > 0 {
+            (k_dims[0], k_dims[1], k_dims[2], k_dims[3])
+        } else {
+            return Err(Error::Msg(
+                "flash_attn_paged expects 4D K tensor [num_blocks, page_block_size, h_kv, d]"
+                    .into(),
+            )
+            .bt());
+        };
         if !page_block_size.is_multiple_of(32) {
             return Err(Error::Msg(format!(
                 "flash_attn_paged: page_block_size must be a multiple of 32 (got {page_block_size})"
@@ -8277,10 +8229,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             ))
             .bt());
         }
-        if v_dims[0] != num_blocks
-            || v_dims[1] != pbs
-            || v_dims[2] != num_kv_heads
-        {
+        if v_dims[0] != num_blocks || v_dims[1] != pbs || v_dims[2] != num_kv_heads {
             return Err(Error::Msg(
                 "flash_attn_paged: K/V shapes must match (num_blocks, page_block_size, h_kv, d)"
                     .into(),
@@ -8380,9 +8329,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             // could read the last chunk's params (latent overwrite hazard).
             // Eager write_buffer into a distinct slot keeps each dispatch's
             // params stable without per-call allocations.
-            let param_buffer = q_c
-                .device
-                .write_uniform_params(any_as_bytes(&params))?;
+            let param_buffer = q_c.device.write_uniform_params(any_as_bytes(&params))?;
             let bindings = [
                 buffer_binding(0, &q_c.buffer),
                 buffer_binding(1, &k_c.buffer),
@@ -8485,9 +8432,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             sections3: 0,
         };
         const _: () = assert!(size_of::<WgpuRopeParams>() <= 256);
-        let param_buffer = self
-            .device
-            .write_uniform_params(any_as_bytes(&params))?;
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -8584,9 +8529,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             eps,
         };
         const _: () = assert!(size_of::<RmsNormMulParams>() <= 256);
-        let param_buffer = self
-            .device
-            .write_uniform_params(any_as_bytes(&params))?;
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -8918,9 +8861,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             idx2: 1,
         };
         const _: () = assert!(size_of::<GetRowsParams>() <= 256);
-        let param_buffer = src
-            .device
-            .write_uniform_params(any_as_bytes(&params))?;
+        let param_buffer = src.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -9030,9 +8971,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             idx2: 1,
         };
         const _: () = assert!(size_of::<GetRowsParams>() <= 256);
-        let param_buffer = src
-            .device
-            .write_uniform_params(any_as_bytes(&params))?;
+        let param_buffer = src.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -9204,12 +9143,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // U8 (byte-lane CAS), I64 (u64-word integer CAS pair),
         // F64 (u64-word f64 CAS pair). BF16 routes via the F32 hub
         // (GPUEmulated: decode self+src to f32, add, encode back into self).
-        if self.dtype != src.dtype || !matches!(self.dtype, DType::F32 | DType::F16 | DType::U32 | DType::U8 | DType::I64) {
+        if self.dtype != src.dtype
+            || !matches!(
+                self.dtype,
+                DType::F32 | DType::F16 | DType::U32 | DType::U8 | DType::I64
+            )
+        {
             // BF16 and F64 route through the F32 hub (GPUEmulated): WGSL has no
             // u32-pair->f64 bitcast for a native CAS path.
-            if matches!(self.dtype, DType::BF16 | DType::F64)
-                && self.dtype == src.dtype
-            {
+            if matches!(self.dtype, DType::BF16 | DType::F64) && self.dtype == src.dtype {
                 let mut dst_f32 = WgpuStorage::to_dtype(self, dst_l, DType::F32)?;
                 let src_f32 = src.to_dtype(&src_l, DType::F32)?;
                 let contig_dst = Layout::contiguous(dst_l.shape());
@@ -9480,7 +9422,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // mul_mat.wgsl / mul_mat_reg_tile.wgsl). Allocate the f32-sized buffer so
         // the shader does not overflow, then downconvert the result to F16 at the
         // end. BF16's shader writes packed-bf16 directly (same byte count).
-        let native_dst_dtype = if self.dtype == DType::F16 { DType::F32 } else { self.dtype };
+        let native_dst_dtype = if self.dtype == DType::F16 {
+            DType::F32
+        } else {
+            self.dtype
+        };
         let dst = unsafe { self.device.alloc_uninit(&dst_shape, native_dst_dtype)? };
         let dst_layout = Layout::contiguous(dst_shape);
         // Contiguous LHS (..., M, K) has unit K stride.
@@ -9605,9 +9551,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     // VEC loads assume contiguous K (unit stride_0k / stride_1k),
                     // mirroring the F32 reg-tile selection. The native inputs are
                     // materialized contiguous here (or the RHS virtual B^T).
-                    let vectorized =
-                        params.stride_0k == 1 && params.stride_1k == 1 && m.is_multiple_of(4)
-                            && n.is_multiple_of(4);
+                    let vectorized = params.stride_0k == 1
+                        && params.stride_1k == 1
+                        && m.is_multiple_of(4)
+                        && n.is_multiple_of(4);
                     shader_storage = candle_wgpu_kernels::matmul_fast_shader(
                         wgpu_kernel_dtype(DType::F16)?,
                         vectorized,
@@ -9917,8 +9864,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             DType::BF16 => candle_wgpu_kernels::conv2d_bf16_shader(WG_SIZE),
             _ => None,
         };
-        let shader = shader
-            .ok_or_else(|| Error::UnsupportedDTypeForOp(self.dtype, "wgpu conv2d").bt())?;
+        let shader =
+            shader.ok_or_else(|| Error::UnsupportedDTypeForOp(self.dtype, "wgpu conv2d").bt())?;
         let (input_dims, input_strides) = dims4(layout)?;
         let (kernel_dims, kernel_strides) = dims4(kernel_l)?;
         let out_shape = Shape::from(params.out_dims());
@@ -10018,7 +9965,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let (input_native, input_l) = if native_dtype {
             self.materialize_contiguous(layout)?
         } else {
-            (self.materialize_to_f32(layout)?, Layout::contiguous(layout.shape()))
+            (
+                self.materialize_to_f32(layout)?,
+                Layout::contiguous(layout.shape()),
+            )
         };
         let (kernel_native, _kernel_native_l) = if native_dtype {
             kernel.materialize_contiguous(kernel_l)?
@@ -10033,25 +9983,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
         let input_t_view_l = input_l.transpose(1, 2)?;
         let mut input_t_owned = None;
-        let (input_t, input_mm_l) = if input_t_view_l.is_contiguous()
-            && input_t_view_l.start_offset() == 0
-        {
-            (
-                &input_native,
-                Layout::contiguous((params.b_size * params.l_in, params.c_in)),
-            )
-        } else {
-            let mut tmp = unsafe {
-                self.device
-                    .alloc_uninit(input_t_view_l.shape(), work_dtype)?
+        let (input_t, input_mm_l) =
+            if input_t_view_l.is_contiguous() && input_t_view_l.start_offset() == 0 {
+                (
+                    &input_native,
+                    Layout::contiguous((params.b_size * params.l_in, params.c_in)),
+                )
+            } else {
+                let mut tmp = unsafe {
+                    self.device
+                        .alloc_uninit(input_t_view_l.shape(), work_dtype)?
+                };
+                input_native.copy_strided_src(&mut tmp, 0, &input_t_view_l)?;
+                input_t_owned = Some(tmp);
+                (
+                    input_t_owned.as_ref().unwrap(),
+                    Layout::contiguous((params.b_size * params.l_in, params.c_in)),
+                )
             };
-            input_native.copy_strided_src(&mut tmp, 0, &input_t_view_l)?;
-            input_t_owned = Some(tmp);
-            (
-                input_t_owned.as_ref().unwrap(),
-                Layout::contiguous((params.b_size * params.l_in, params.c_in)),
-            )
-        };
 
         let cols = input_t.matmul(
             &kernel_native,
@@ -10073,10 +10022,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 Layout::contiguous((params.b_size * params.c_out, src_len)),
             )
         } else {
-            let mut tmp = unsafe {
-                self.device
-                    .alloc_uninit(src_perm_l.shape(), work_dtype)?
-            };
+            let mut tmp = unsafe { self.device.alloc_uninit(src_perm_l.shape(), work_dtype)? };
             cols.copy_strided_src(&mut tmp, 0, &src_perm_l)?;
             src_owned = Some(tmp);
             (
@@ -10176,7 +10122,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let (input_native, input_l) = if native_dtype {
             self.materialize_contiguous(layout)?
         } else {
-            (self.materialize_to_f32(layout)?, Layout::contiguous(layout.shape()))
+            (
+                self.materialize_to_f32(layout)?,
+                Layout::contiguous(layout.shape()),
+            )
         };
         let (kernel_native, _kernel_native_l) = if native_dtype {
             kernel.materialize_contiguous(kernel_l)?
@@ -10191,25 +10140,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
         let input_hw_view_l = input_l.permute(&[0, 2, 3, 1])?;
         let mut input_hw_owned = None;
-        let (input_hw, input_mm_l) = if input_hw_view_l.is_contiguous()
-            && input_hw_view_l.start_offset() == 0
-        {
-            (
-                &input_native,
-                Layout::contiguous((params.b_size * input_spatial, params.c_in)),
-            )
-        } else {
-            let mut tmp = unsafe {
-                self.device
-                    .alloc_uninit(input_hw_view_l.shape(), work_dtype)?
+        let (input_hw, input_mm_l) =
+            if input_hw_view_l.is_contiguous() && input_hw_view_l.start_offset() == 0 {
+                (
+                    &input_native,
+                    Layout::contiguous((params.b_size * input_spatial, params.c_in)),
+                )
+            } else {
+                let mut tmp = unsafe {
+                    self.device
+                        .alloc_uninit(input_hw_view_l.shape(), work_dtype)?
+                };
+                input_native.copy_strided_src(&mut tmp, 0, &input_hw_view_l)?;
+                input_hw_owned = Some(tmp);
+                (
+                    input_hw_owned.as_ref().unwrap(),
+                    Layout::contiguous((params.b_size * input_spatial, params.c_in)),
+                )
             };
-            input_native.copy_strided_src(&mut tmp, 0, &input_hw_view_l)?;
-            input_hw_owned = Some(tmp);
-            (
-                input_hw_owned.as_ref().unwrap(),
-                Layout::contiguous((params.b_size * input_spatial, params.c_in)),
-            )
-        };
 
         let cols = input_hw.matmul(
             &kernel_native,
@@ -10232,10 +10180,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 Layout::contiguous((params.b_size * params.c_out, src_len)),
             )
         } else {
-            let mut tmp = unsafe {
-                self.device
-                    .alloc_uninit(src_perm_l.shape(), work_dtype)?
-            };
+            let mut tmp = unsafe { self.device.alloc_uninit(src_perm_l.shape(), work_dtype)? };
             cols.copy_strided_src(&mut tmp, 0, &src_perm_l)?;
             src_owned = Some(tmp);
             (
@@ -10953,7 +10898,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
         let num_blocks = elem_count.div_ceil(32);
         let dst_len_bytes = num_blocks * 36;
-        let dst = unsafe { self.device.alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)? };
+        let dst = unsafe {
+            self.device
+                .alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)?
+        };
 
         #[repr(C)]
         #[derive(Clone, Copy)]
@@ -11008,7 +10956,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // bytes); the tail of the final partial workgroup is slack that the
         // consumer never reads (len_bytes truncates to num_blocks * 34).
         let dst_len_bytes = (num_wgs as usize) * 272;
-        let dst = unsafe { self.device.alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)? };
+        let dst = unsafe {
+            self.device
+                .alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)?
+        };
 
         #[repr(C)]
         #[derive(Clone, Copy)]
@@ -11062,7 +11013,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // Each workgroup writes a self-contained 8-block span (8*18 = 144
         // bytes); the final partial workgroup's slack tail is never read.
         let dst_len_bytes = (num_wgs as usize) * 144;
-        let dst = unsafe { self.device.alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)? };
+        let dst = unsafe {
+            self.device
+                .alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)?
+        };
 
         #[repr(C)]
         #[derive(Clone, Copy)]
@@ -11115,7 +11069,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // Each workgroup writes a self-contained 8-block span (8*20 = 160
         // bytes); the final partial workgroup's slack tail is never read.
         let dst_len_bytes = (num_wgs as usize) * 160;
-        let dst = unsafe { self.device.alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)? };
+        let dst = unsafe {
+            self.device
+                .alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)?
+        };
 
         #[repr(C)]
         #[derive(Clone, Copy)]
@@ -11173,7 +11130,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // Each workgroup writes a self-contained 8-block span (8*22 = 176
         // bytes); the final partial workgroup's slack tail is never read.
         let dst_len_bytes = (num_wgs as usize) * 176;
-        let dst = unsafe { self.device.alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)? };
+        let dst = unsafe {
+            self.device
+                .alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)?
+        };
 
         #[repr(C)]
         #[derive(Clone, Copy)]
@@ -11226,7 +11186,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // Each workgroup writes a self-contained 8-block span (8*24 = 192
         // bytes); the final partial workgroup's slack tail is never read.
         let dst_len_bytes = (num_wgs as usize) * 192;
-        let dst = unsafe { self.device.alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)? };
+        let dst = unsafe {
+            self.device
+                .alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)?
+        };
 
         #[repr(C)]
         #[derive(Clone, Copy)]
@@ -11489,9 +11452,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             _pad0: 0,
             _pad1: 0,
         };
-        let param_buffer = storage
-            .device
-            .write_uniform_params(any_as_bytes(&params))?;
+        let param_buffer = storage.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -11630,9 +11591,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             _pad1: 0,
         };
         const _: () = assert!(size_of::<MulMatParams>() <= 256);
-        let param_buffer = storage
-            .device
-            .write_uniform_params(any_as_bytes(&params))?;
+        let param_buffer = storage.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -11683,18 +11642,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         ids_l: &Layout,
     ) -> Result<(Self, Shape)> {
         if storage.dtype != DType::F32 {
-            return Err(Error::UnsupportedDTypeForOp(
-                storage.dtype,
-                "wgpu quantized indexed_moe",
-            )
-            .bt());
+            return Err(
+                Error::UnsupportedDTypeForOp(storage.dtype, "wgpu quantized indexed_moe").bt(),
+            );
         }
         if ids.dtype != DType::U32 && ids.dtype != DType::I32 {
-            return Err(Error::UnsupportedDTypeForOp(
-                ids.dtype,
-                "wgpu quantized indexed_moe ids",
-            )
-            .bt());
+            return Err(
+                Error::UnsupportedDTypeForOp(ids.dtype, "wgpu quantized indexed_moe ids").bt(),
+            );
         }
         let (num_experts, n, k) = qshape.dims3()?;
         let rank = layout.dims().len();
@@ -11735,29 +11690,45 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let wgpu_qdtype = wgpu_quantized_dtype(qdtype)?;
         let kernel_rhs_dtype = wgpu_kernel_dtype(src.dtype)?;
 
-        let id_shader = candle_wgpu_kernels::quantized_mul_mat_id_shader(wgpu_qdtype, kernel_rhs_dtype);
+        let id_shader =
+            candle_wgpu_kernels::quantized_mul_mat_id_shader(wgpu_qdtype, kernel_rhs_dtype);
         let gather_shader = candle_wgpu_kernels::quantized_mul_mat_id_gather_shader(64);
 
         if let (Some(id_shader), Some(gather_shader)) = (id_shader, gather_shader) {
             let gather_count = (num_experts * batch).max(1) as u64;
-            let global_gathered_expert_used = storage.device.inner.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-moe-gather-expert-used"),
-                size: (gather_count * 4).max(16),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let global_gathered_tokens = storage.device.inner.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-moe-gather-tokens"),
-                size: (gather_count * 4).max(16),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let gathered_count_ids = storage.device.inner.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-moe-gather-count-ids"),
-                size: ((num_experts as u64) * 4).max(16),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let global_gathered_expert_used =
+                storage
+                    .device
+                    .inner
+                    .device
+                    .create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("candle-wgpu-moe-gather-expert-used"),
+                        size: (gather_count * 4).max(16),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+            let global_gathered_tokens =
+                storage
+                    .device
+                    .inner
+                    .device
+                    .create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("candle-wgpu-moe-gather-tokens"),
+                        size: (gather_count * 4).max(16),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+            let gathered_count_ids =
+                storage
+                    .device
+                    .inner
+                    .device
+                    .create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("candle-wgpu-moe-gather-count-ids"),
+                        size: ((num_experts as u64) * 4).max(16),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
 
             #[repr(C)]
             #[derive(Clone, Copy)]
@@ -11843,7 +11814,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 stride_12: (input_dim1 * k) as u32,
             };
 
-            let moe_param_buf = storage.device.write_uniform_params(any_as_bytes(&moe_params))?;
+            let moe_param_buf = storage
+                .device
+                .write_uniform_params(any_as_bytes(&moe_params))?;
 
             let moe_entries = [
                 storage_entry(0, false),
@@ -11867,7 +11840,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let wg_m_count = (n as u32).div_ceil(32);
             let wg_n_count = ((batch * topk) as u32).div_ceil(32);
             let total_moe_wg = wg_m_count * wg_n_count * (num_experts as u32);
-            let (wg_x, wg_y) = compute_2d_workgroups(total_moe_wg.max(1), wgpu_dispatch_wg_cap(&storage.device));
+            let (wg_x, wg_y) =
+                compute_2d_workgroups(total_moe_wg.max(1), wgpu_dispatch_wg_cap(&storage.device));
 
             storage.device.run_compute_xyz(
                 &id_shader,
@@ -12044,23 +12018,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             }
             // F8E4M3 -> F8E4M3 (copy)
             (DType::F8E4M3, DType::F8E4M3) => {
-                let mut dst =
-                    unsafe { self.device.alloc_uninit(layout.shape(), DType::F8E4M3)? };
+                let mut dst = unsafe { self.device.alloc_uninit(layout.shape(), DType::F8E4M3)? };
                 self.copy_strided_src(&mut dst, 0, layout)?;
                 Ok(dst)
             }
-            _ => Err(Error::UnsupportedDTypeForOp(
-                self.dtype,
-                "wgpu to_dtype f8e4m3",
-            )
-            .bt()),
+            _ => Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu to_dtype f8e4m3").bt()),
         }
     }
 
     fn decode_f8e4m3_to_f32(&self, layout: &Layout) -> Result<Self> {
         if !layout.is_contiguous() || layout.start_offset() != 0 {
-            let mut materialized =
-                unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
             self.copy_strided_src(&mut materialized, 0, layout)?;
             let contiguous = Layout::contiguous(layout.shape());
             return materialized.decode_f8e4m3_to_f32(&contiguous);
@@ -12074,9 +12042,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             _pad2: 0,
         };
         const _: () = assert!(size_of::<F64CastParams>() <= 256);
-        let param_buffer = self
-            .device
-            .write_uniform_params(any_as_bytes(&params))?;
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
         let shader = f8e4m3_cast_shader(true)?;
         let entries = [
             storage_entry(0, true),
@@ -12224,8 +12190,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
     fn encode_f32_to_f8e4m3(&self, layout: &Layout) -> Result<Self> {
         if !layout.is_contiguous() || layout.start_offset() != 0 {
-            let mut materialized =
-                unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
             self.copy_strided_src(&mut materialized, 0, layout)?;
             let contiguous = Layout::contiguous(layout.shape());
             return materialized.encode_f32_to_f8e4m3(&contiguous);
@@ -12239,9 +12204,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             _pad2: 0,
         };
         const _: () = assert!(size_of::<F64CastParams>() <= 256);
-        let param_buffer = self
-            .device
-            .write_uniform_params(any_as_bytes(&params))?;
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
         let shader = f8e4m3_cast_shader(false)?;
         let entries = [
             storage_entry(0, true),
@@ -12527,9 +12490,7 @@ impl BackendStorage for WgpuStorage {
             ne1: dims[1],
             ne2: dims[2],
         };
-        let param_buffer = self
-            .device
-            .write_uniform_params(any_as_bytes(&params))?;
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -13975,7 +13936,7 @@ mod compute_2d_self_check {
 #[cfg(test)]
 mod wgpu_matmul_tests {
     use crate::test_utils::{compare_f32_slices, diff_tolerance};
-    use crate::{Device, DType, Tensor};
+    use crate::{DType, Device, Tensor};
 
     fn wgpu_device() -> Device {
         Device::new_wgpu(0).expect("wgpu device")
@@ -14005,22 +13966,10 @@ mod wgpu_matmul_tests {
         // CPU reference: round inputs through target dtype, f32 matmul, round out.
         let a_cpu = Tensor::from_vec(a32.clone(), (m, k), &Device::Cpu).unwrap();
         let b_cpu = Tensor::from_vec(b32.clone(), (k, n), &Device::Cpu).unwrap();
-        let a_ref = a_cpu
-            .to_dtype(dtype)
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap();
-        let b_ref = b_cpu
-            .to_dtype(dtype)
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap();
+        let a_ref = a_cpu.to_dtype(dtype).unwrap().to_dtype(DType::F32).unwrap();
+        let b_ref = b_cpu.to_dtype(dtype).unwrap().to_dtype(DType::F32).unwrap();
         let ref_t = a_ref.matmul(&b_ref).unwrap();
-        let ref_t = ref_t
-            .to_dtype(dtype)
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap();
+        let ref_t = ref_t.to_dtype(dtype).unwrap().to_dtype(DType::F32).unwrap();
         let ref_v: Vec<f32> = ref_t.flatten_all().unwrap().to_vec1().unwrap();
 
         // GPU: native-dtype inputs into matmul.
@@ -14150,8 +14099,6 @@ mod wgpu_f8e4m3_tests {
     use crate::{CpuStorage, DType, Error, Layout, Result, Shape};
     use float8::F8E4M3 as f8e4m3;
 
-
-
     fn wgpu_device() -> Option<WgpuDevice> {
         match crate::Device::new_wgpu(0) {
             Ok(crate::Device::Wgpu(dev)) => Some(dev),
@@ -14238,7 +14185,11 @@ mod wgpu_f8e4m3_tests {
             if cpu_round.is_nan() {
                 assert!(round_data[i].is_nan(), "expected NaN at {i}");
             } else {
-                assert_eq!(round_data[i].to_bits(), cpu_round.to_bits(), "roundtrip at {i}");
+                assert_eq!(
+                    round_data[i].to_bits(),
+                    cpu_round.to_bits(),
+                    "roundtrip at {i}"
+                );
             }
         }
     }
@@ -14365,7 +14316,11 @@ mod wgpu_f8e4m3_tests {
         let got = download_i32(&i32_storage).unwrap();
         for i in 0..bits.len() {
             let cpu_f32 = f8e4m3::from_bits(bits[i]).to_f32();
-            let cpu_i32 = if cpu_f32.is_nan() { 0i32 } else { cpu_f32 as i32 };
+            let cpu_i32 = if cpu_f32.is_nan() {
+                0i32
+            } else {
+                cpu_f32 as i32
+            };
             assert_eq!(
                 got[i], cpu_i32,
                 "f8->i32 mismatch at {i}: bits=0x{:02X}",
@@ -14729,8 +14684,16 @@ mod wgpu_int_tests {
         let cd = Tensor::from_slice(&dst, (6,), &cpu).unwrap();
         let ci = Tensor::from_slice(&ids, (3,), &cpu).unwrap();
         let cs = Tensor::from_slice(&src, (3,), &cpu).unwrap();
-        let g = gd.scatter_add(&gi, &gs, 0).unwrap().to_vec1::<u32>().unwrap();
-        let c = cd.scatter_add(&ci, &cs, 0).unwrap().to_vec1::<u32>().unwrap();
+        let g = gd
+            .scatter_add(&gi, &gs, 0)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
+        let c = cd
+            .scatter_add(&ci, &cs, 0)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
         assert_eq!(g, c);
     }
 
@@ -14747,8 +14710,16 @@ mod wgpu_int_tests {
         let cd = Tensor::from_slice(&dst, (8,), &cpu).unwrap();
         let ci = Tensor::from_slice(&ids, (3,), &cpu).unwrap();
         let cs = Tensor::from_slice(&src, (3,), &cpu).unwrap();
-        let g = gd.scatter_add(&gi, &gs, 0).unwrap().to_vec1::<u8>().unwrap();
-        let c = cd.scatter_add(&ci, &cs, 0).unwrap().to_vec1::<u8>().unwrap();
+        let g = gd
+            .scatter_add(&gi, &gs, 0)
+            .unwrap()
+            .to_vec1::<u8>()
+            .unwrap();
+        let c = cd
+            .scatter_add(&ci, &cs, 0)
+            .unwrap()
+            .to_vec1::<u8>()
+            .unwrap();
         assert_eq!(g, c);
     }
 
@@ -14765,8 +14736,16 @@ mod wgpu_int_tests {
         let cd = Tensor::from_slice(&dst, (4,), &cpu).unwrap();
         let ci = Tensor::from_slice(&ids, (4,), &cpu).unwrap();
         let cs = Tensor::from_slice(&src, (4,), &cpu).unwrap();
-        let g = gd.scatter_add(&gi, &gs, 0).unwrap().to_vec1::<i64>().unwrap();
-        let c = cd.scatter_add(&ci, &cs, 0).unwrap().to_vec1::<i64>().unwrap();
+        let g = gd
+            .scatter_add(&gi, &gs, 0)
+            .unwrap()
+            .to_vec1::<i64>()
+            .unwrap();
+        let c = cd
+            .scatter_add(&ci, &cs, 0)
+            .unwrap()
+            .to_vec1::<i64>()
+            .unwrap();
         assert_eq!(g, c);
     }
 
@@ -14783,8 +14762,16 @@ mod wgpu_int_tests {
         let cd = Tensor::from_slice(&dst, (4,), &cpu).unwrap();
         let ci = Tensor::from_slice(&ids, (3,), &cpu).unwrap();
         let cs = Tensor::from_slice(&src, (3,), &cpu).unwrap();
-        let g = gd.scatter_add(&gi, &gs, 0).unwrap().to_vec1::<f64>().unwrap();
-        let c = cd.scatter_add(&ci, &cs, 0).unwrap().to_vec1::<f64>().unwrap();
+        let g = gd
+            .scatter_add(&gi, &gs, 0)
+            .unwrap()
+            .to_vec1::<f64>()
+            .unwrap();
+        let c = cd
+            .scatter_add(&ci, &cs, 0)
+            .unwrap()
+            .to_vec1::<f64>()
+            .unwrap();
         assert_eq!(g, c);
     }
 
@@ -14854,12 +14841,30 @@ mod wgpu_int_tests {
         let gb = Tensor::from_slice(&b, (6,), &device).unwrap();
         let ca = Tensor::from_slice(&a, (6,), &cpu).unwrap();
         let cb = Tensor::from_slice(&b, (6,), &cpu).unwrap();
-        assert_eq!(ga.eq(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.eq(&cb).unwrap().to_vec1::<u8>().unwrap());
-        assert_eq!(ga.ne(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.ne(&cb).unwrap().to_vec1::<u8>().unwrap());
-        assert_eq!(ga.lt(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.lt(&cb).unwrap().to_vec1::<u8>().unwrap());
-        assert_eq!(ga.le(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.le(&cb).unwrap().to_vec1::<u8>().unwrap());
-        assert_eq!(ga.gt(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.gt(&cb).unwrap().to_vec1::<u8>().unwrap());
-        assert_eq!(ga.ge(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.ge(&cb).unwrap().to_vec1::<u8>().unwrap());
+        assert_eq!(
+            ga.eq(&gb).unwrap().to_vec1::<u8>().unwrap(),
+            ca.eq(&cb).unwrap().to_vec1::<u8>().unwrap()
+        );
+        assert_eq!(
+            ga.ne(&gb).unwrap().to_vec1::<u8>().unwrap(),
+            ca.ne(&cb).unwrap().to_vec1::<u8>().unwrap()
+        );
+        assert_eq!(
+            ga.lt(&gb).unwrap().to_vec1::<u8>().unwrap(),
+            ca.lt(&cb).unwrap().to_vec1::<u8>().unwrap()
+        );
+        assert_eq!(
+            ga.le(&gb).unwrap().to_vec1::<u8>().unwrap(),
+            ca.le(&cb).unwrap().to_vec1::<u8>().unwrap()
+        );
+        assert_eq!(
+            ga.gt(&gb).unwrap().to_vec1::<u8>().unwrap(),
+            ca.gt(&cb).unwrap().to_vec1::<u8>().unwrap()
+        );
+        assert_eq!(
+            ga.ge(&gb).unwrap().to_vec1::<u8>().unwrap(),
+            ca.ge(&cb).unwrap().to_vec1::<u8>().unwrap()
+        );
     }
 
     #[test]
@@ -14886,12 +14891,30 @@ mod wgpu_int_tests {
         let gb = Tensor::from_slice(&b, (6,), &device).unwrap();
         let ca = Tensor::from_slice(&a, (6,), &cpu).unwrap();
         let cb = Tensor::from_slice(&b, (6,), &cpu).unwrap();
-        assert_eq!(ga.eq(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.eq(&cb).unwrap().to_vec1::<u8>().unwrap());
-        assert_eq!(ga.ne(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.ne(&cb).unwrap().to_vec1::<u8>().unwrap());
-        assert_eq!(ga.lt(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.lt(&cb).unwrap().to_vec1::<u8>().unwrap());
-        assert_eq!(ga.le(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.le(&cb).unwrap().to_vec1::<u8>().unwrap());
-        assert_eq!(ga.gt(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.gt(&cb).unwrap().to_vec1::<u8>().unwrap());
-        assert_eq!(ga.ge(&gb).unwrap().to_vec1::<u8>().unwrap(), ca.ge(&cb).unwrap().to_vec1::<u8>().unwrap());
+        assert_eq!(
+            ga.eq(&gb).unwrap().to_vec1::<u8>().unwrap(),
+            ca.eq(&cb).unwrap().to_vec1::<u8>().unwrap()
+        );
+        assert_eq!(
+            ga.ne(&gb).unwrap().to_vec1::<u8>().unwrap(),
+            ca.ne(&cb).unwrap().to_vec1::<u8>().unwrap()
+        );
+        assert_eq!(
+            ga.lt(&gb).unwrap().to_vec1::<u8>().unwrap(),
+            ca.lt(&cb).unwrap().to_vec1::<u8>().unwrap()
+        );
+        assert_eq!(
+            ga.le(&gb).unwrap().to_vec1::<u8>().unwrap(),
+            ca.le(&cb).unwrap().to_vec1::<u8>().unwrap()
+        );
+        assert_eq!(
+            ga.gt(&gb).unwrap().to_vec1::<u8>().unwrap(),
+            ca.gt(&cb).unwrap().to_vec1::<u8>().unwrap()
+        );
+        assert_eq!(
+            ga.ge(&gb).unwrap().to_vec1::<u8>().unwrap(),
+            ca.ge(&cb).unwrap().to_vec1::<u8>().unwrap()
+        );
     }
 }
 
@@ -14922,8 +14945,6 @@ mod wgpu_reduce_tests {
         (data, out_dims)
     }
 
-
-
     #[test]
     fn wgpu_argsort_u8_with_duplicates() {
         let cpu = crate::Device::Cpu;
@@ -14932,8 +14953,16 @@ mod wgpu_reduce_tests {
         let a: Vec<u8> = vec![5, 3, 5, 1, 3, 9, 1, 0];
         let ga = crate::Tensor::from_slice(&a, (8,), &device).unwrap();
         let ca = crate::Tensor::from_slice(&a, (8,), &cpu).unwrap();
-        let g = ga.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
-        let c = ca.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        let g = ga
+            .arg_sort_last_dim(true)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
+        let c = ca
+            .arg_sort_last_dim(true)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
         assert_eq!(g, c);
     }
 
@@ -14943,10 +14972,17 @@ mod wgpu_reduce_tests {
         let device = wgpu_device();
         let a: Vec<i16> = vec![-5, 3, -5, 1, 0, -1, 7, -9, 2, -2];
         let ga = crate::Tensor::from_slice(&a, (10,), &device).unwrap();
-        let g32 = ga.to_dtype(crate::DType::I32).unwrap().to_vec1::<i32>().unwrap();
+        let g32 = ga
+            .to_dtype(crate::DType::I32)
+            .unwrap()
+            .to_vec1::<i32>()
+            .unwrap();
         let c32 = {
             let ca = crate::Tensor::from_slice(&a, (10,), &cpu).unwrap();
-            ca.to_dtype(crate::DType::I32).unwrap().to_vec1::<i32>().unwrap()
+            ca.to_dtype(crate::DType::I32)
+                .unwrap()
+                .to_vec1::<i32>()
+                .unwrap()
         };
         assert_eq!(g32, c32);
     }
@@ -14958,8 +14994,16 @@ mod wgpu_reduce_tests {
         let a: Vec<i16> = vec![-5, 3, -5, 1, 0, -1, 7, -9, 2, -2];
         let ga = crate::Tensor::from_slice(&a, (10,), &device).unwrap();
         let ca = crate::Tensor::from_slice(&a, (10,), &cpu).unwrap();
-        let g = ga.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
-        let c = ca.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        let g = ga
+            .arg_sort_last_dim(true)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
+        let c = ca
+            .arg_sort_last_dim(true)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
         assert_eq!(g, c);
     }
 
@@ -14970,8 +15014,16 @@ mod wgpu_reduce_tests {
         let a: Vec<i32> = vec![4, -2, 4, 0, -2, 8, 1, 3];
         let ga = crate::Tensor::from_slice(&a, (8,), &device).unwrap();
         let ca = crate::Tensor::from_slice(&a, (8,), &cpu).unwrap();
-        let g = ga.arg_sort_last_dim(false).unwrap().to_vec1::<u32>().unwrap();
-        let c = ca.arg_sort_last_dim(false).unwrap().to_vec1::<u32>().unwrap();
+        let g = ga
+            .arg_sort_last_dim(false)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
+        let c = ca
+            .arg_sort_last_dim(false)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
         assert_eq!(g, c);
     }
 
@@ -14984,8 +15036,16 @@ mod wgpu_reduce_tests {
         let a: Vec<f8> = bits.iter().map(|&b| f8::from_bits(b)).collect();
         let ga = crate::Tensor::from_slice(&a, (7,), &device).unwrap();
         let ca = crate::Tensor::from_slice(&a, (7,), &cpu).unwrap();
-        let g = ga.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
-        let c = ca.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        let g = ga
+            .arg_sort_last_dim(true)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
+        let c = ca
+            .arg_sort_last_dim(true)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
         assert_eq!(g, c);
     }
 
@@ -14994,12 +15054,26 @@ mod wgpu_reduce_tests {
         let cpu = crate::Device::Cpu;
         let device = wgpu_device();
         let a: Vec<f32> = (0..600usize)
-            .map(|i| if i % 3 == 0 { (i as f32) * 0.5 } else { 100.0 - (i as f32) })
+            .map(|i| {
+                if i % 3 == 0 {
+                    (i as f32) * 0.5
+                } else {
+                    100.0 - (i as f32)
+                }
+            })
             .collect();
         let ga = crate::Tensor::from_slice(&a, (600,), &device).unwrap();
         let ca = crate::Tensor::from_slice(&a, (600,), &cpu).unwrap();
-        let g = ga.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
-        let c = ca.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        let g = ga
+            .arg_sort_last_dim(true)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
+        let c = ca
+            .arg_sort_last_dim(true)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
         assert_eq!(g, c);
     }
 
@@ -15013,7 +15087,9 @@ mod wgpu_reduce_tests {
         let mut s: u64 = 7;
         let a: Vec<f32> = (0..600usize)
             .map(|i| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 if i % 3 == 0 {
                     (i as f32) * 0.5
                 } else {
@@ -15023,8 +15099,16 @@ mod wgpu_reduce_tests {
             .collect();
         let ga = crate::Tensor::from_slice(&a, (600,), &device).unwrap();
         let ca = crate::Tensor::from_slice(&a, (600,), &cpu).unwrap();
-        let g = ga.arg_sort_last_dim(false).unwrap().to_vec1::<u32>().unwrap();
-        let c = ca.arg_sort_last_dim(false).unwrap().to_vec1::<u32>().unwrap();
+        let g = ga
+            .arg_sort_last_dim(false)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
+        let c = ca
+            .arg_sort_last_dim(false)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
         assert_eq!(g, c);
     }
 
@@ -15037,7 +15121,9 @@ mod wgpu_reduce_tests {
         let mut s: u64 = 13;
         let a: Vec<f32> = (0..8192usize)
             .map(|i| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 if i % 2 == 0 {
                     ((s >> 33) as i32 % 11) as f32 - 5.0
                 } else {
@@ -15047,11 +15133,27 @@ mod wgpu_reduce_tests {
             .collect();
         let ga = crate::Tensor::from_slice(&a, (8192,), &device).unwrap();
         let ca = crate::Tensor::from_slice(&a, (8192,), &cpu).unwrap();
-        let g_asc = ga.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
-        let c_asc = ca.arg_sort_last_dim(true).unwrap().to_vec1::<u32>().unwrap();
+        let g_asc = ga
+            .arg_sort_last_dim(true)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
+        let c_asc = ca
+            .arg_sort_last_dim(true)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
         assert_eq!(g_asc, c_asc, "asc large merge");
-        let g_desc = ga.arg_sort_last_dim(false).unwrap().to_vec1::<u32>().unwrap();
-        let c_desc = ca.arg_sort_last_dim(false).unwrap().to_vec1::<u32>().unwrap();
+        let g_desc = ga
+            .arg_sort_last_dim(false)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
+        let c_desc = ca
+            .arg_sort_last_dim(false)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
         assert_eq!(g_desc, c_desc, "desc large merge");
     }
 
@@ -15193,7 +15295,11 @@ mod wgpu_reduce_tests {
         let got: Vec<i16> = result.flatten_all().unwrap().to_vec1().unwrap();
         // Row 0: 1-2+3-4 = -2, Row 1: 5-6+7-8 = -2, Row 2: 9-10+11-12 = -2
         assert_eq!(got, vec![-2, -2, -2], "i16 sum over dim 1 mismatch");
-        assert_eq!(result.dtype(), crate::DType::I16, "sum keepdim must stay i16");
+        assert_eq!(
+            result.dtype(),
+            crate::DType::I16,
+            "sum keepdim must stay i16"
+        );
         assert_eq!(result.dims().to_vec(), vec![3, 1], "keepdim shape");
     }
 
@@ -15407,8 +15513,20 @@ mod wgpu_reduce_tests {
         let a: Vec<f32> = vec![1.0, 5.0, 3.0, 5.0, 5.0, 2.0, 5.0, 0.0];
         let ga = crate::Tensor::from_slice(&a, (8,), &device).unwrap();
         let ca = crate::Tensor::from_slice(&a, (8,), &cpu).unwrap();
-        let g = ga.argmax(0).unwrap().flatten_all().unwrap().to_vec1::<u32>().unwrap();
-        let c = ca.argmax(0).unwrap().flatten_all().unwrap().to_vec1::<u32>().unwrap();
+        let g = ga
+            .argmax(0)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
+        let c = ca
+            .argmax(0)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap();
         assert_eq!(g, c);
         assert_eq!(g[0], 1);
     }
@@ -15499,7 +15617,11 @@ mod wgpu_upsample_tests {
                     .unwrap()
                     .upsample_nearest1d(out_l)
                     .unwrap();
-                assert_eq!(g.dims(), &[shape.0, shape.1, out_l], "{dtype:?} {label} shape");
+                assert_eq!(
+                    g.dims(),
+                    &[shape.0, shape.1, out_l],
+                    "{dtype:?} {label} shape"
+                );
                 let got = as_f32(&g);
                 let expected = as_f32(&cpu);
                 let (max_abs, max_rel, _ulp, bad) = compare_f32_slices(&got, &expected);
@@ -15540,11 +15662,7 @@ mod wgpu_upsample_tests {
                     .unwrap()
                     .upsample_nearest2d(out_h, out_w)
                     .unwrap();
-                assert_eq!(
-                    g.dims(),
-                    &[1, 2, out_h, out_w],
-                    "{dtype:?} {label} shape"
-                );
+                assert_eq!(g.dims(), &[1, 2, out_h, out_w], "{dtype:?} {label} shape");
                 let got = as_f32(&g);
                 let expected = as_f32(&cpu);
                 let (max_abs, max_rel, _ulp, bad) = compare_f32_slices(&got, &expected);
@@ -15591,11 +15709,7 @@ mod wgpu_upsample_tests {
                     .unwrap()
                     .upsample_bilinear2d(out_h, out_w, align)
                     .unwrap();
-                assert_eq!(
-                    g.dims(),
-                    &[1, 2, out_h, out_w],
-                    "{dtype:?} {label} shape"
-                );
+                assert_eq!(g.dims(), &[1, 2, out_h, out_w], "{dtype:?} {label} shape");
                 let got = as_f32(&g);
                 let expected = as_f32(&cpu);
                 let (max_abs, max_rel, _ulp, bad) = compare_f32_slices(&got, &expected);
@@ -15777,7 +15891,9 @@ mod wgpu_flash_attn_varlen_tests {
     fn fill(vals: &mut [f32], seed: u64) {
         let mut s = seed;
         for x in vals.iter_mut() {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *x = (((s >> 33) as f32) / (1u64 << 31) as f32) - 1.0;
         }
     }
@@ -15831,10 +15947,7 @@ mod wgpu_flash_attn_varlen_tests {
                 if scores.is_empty() {
                     continue;
                 }
-                let m = scores
-                    .iter()
-                    .cloned()
-                    .fold(f32::NEG_INFINITY, f32::max);
+                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0.0f32;
                 for s in &scores {
                     sum += (s - m).exp();
@@ -15916,8 +16029,7 @@ mod wgpu_flash_attn_varlen_tests {
         fill(&mut k, 777);
         fill(&mut v, 999);
 
-        let reference =
-            reference_varlen(&q, &k, &v, &cu_q, &cu_k, h_q, h_kv, d, dv, scale, causal);
+        let reference = reference_varlen(&q, &k, &v, &cu_q, &cu_k, h_q, h_kv, d, dv, scale, causal);
 
         let (q_s, q_l) = make_storage(dev, dtype, &q, &[total_q, h_q, d])?;
         let (k_s, k_l) = make_storage(dev, dtype, &k, &[total_kv, h_kv, d])?;
@@ -15969,8 +16081,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, false, 8, 8, 1e-5, 1e-6)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F32,
+            &[3, 1, 7],
+            &[3, 1, 7],
+            2,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            false,
+            8,
+            8,
+            1e-5,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -15979,8 +16106,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::F32, &[5, 5], &[5, 5], 2, 2, 64, 64, 1.0 / 8.0, false, 5, 5, 1e-5, 1e-6)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F32,
+            &[5, 5],
+            &[5, 5],
+            2,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            false,
+            5,
+            5,
+            1e-5,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -15989,8 +16131,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 32, 32, 1.0 / (32.0f32).sqrt(), false, 8, 8, 1e-5, 1e-6)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F32,
+            &[3, 1, 7],
+            &[3, 1, 7],
+            2,
+            2,
+            32,
+            32,
+            1.0 / (32.0f32).sqrt(),
+            false,
+            8,
+            8,
+            1e-5,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -15999,8 +16156,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 32, 1.0 / 8.0, false, 8, 8, 1e-5, 1e-6)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F32,
+            &[3, 1, 7],
+            &[3, 1, 7],
+            2,
+            2,
+            64,
+            32,
+            1.0 / 8.0,
+            false,
+            8,
+            8,
+            1e-5,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -16009,8 +16181,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, false, 1000, 4000, 1e-5, 1e-6)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F32,
+            &[3, 1, 7],
+            &[3, 1, 7],
+            2,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            false,
+            1000,
+            4000,
+            1e-5,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -16019,8 +16206,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, false, 2, 3, 1e-5, 1e-6)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F32,
+            &[3, 1, 7],
+            &[3, 1, 7],
+            2,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            false,
+            2,
+            3,
+            1e-5,
+            1e-6,
+        )
+        .unwrap();
     }
     #[test]
     fn flash_attn_varlen_f32_ragged_causal() {
@@ -16028,8 +16230,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 1e-5, 1e-6)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F32,
+            &[3, 1, 7],
+            &[3, 1, 7],
+            2,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            true,
+            8,
+            8,
+            1e-5,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -16038,8 +16255,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::F32, &[5, 5], &[5, 5], 2, 2, 64, 64, 1.0 / 8.0, true, 5, 5, 1e-5, 1e-6)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F32,
+            &[5, 5],
+            &[5, 5],
+            2,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            true,
+            5,
+            5,
+            1e-5,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -16050,8 +16282,23 @@ mod wgpu_flash_attn_varlen_tests {
         };
         // q lengths [3,1,7] attend k lengths [7,5,5]; causal must mask out the
         // extra trailing KV positions within each sequence.
-        check_case(&dev, DType::F32, &[3, 1, 7], &[7, 5, 5], 2, 2, 64, 64, 1.0 / 8.0, true, 7, 7, 1e-5, 1e-6)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F32,
+            &[3, 1, 7],
+            &[7, 5, 5],
+            2,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            true,
+            7,
+            7,
+            1e-5,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -16060,8 +16307,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 4, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 1e-5, 1e-6)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F32,
+            &[3, 1, 7],
+            &[3, 1, 7],
+            4,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            true,
+            8,
+            8,
+            1e-5,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -16070,8 +16332,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::F32, &[5, 5], &[5, 5], 4, 2, 64, 64, 1.0 / 8.0, false, 5, 5, 1e-5, 1e-6)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F32,
+            &[5, 5],
+            &[5, 5],
+            4,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            false,
+            5,
+            5,
+            1e-5,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -16080,8 +16357,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 32, 32, 1.0 / (32.0f32).sqrt(), true, 8, 8, 1e-5, 1e-6)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F32,
+            &[3, 1, 7],
+            &[3, 1, 7],
+            2,
+            2,
+            32,
+            32,
+            1.0 / (32.0f32).sqrt(),
+            true,
+            8,
+            8,
+            1e-5,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -16091,8 +16383,23 @@ mod wgpu_flash_attn_varlen_tests {
             None => return,
         };
         // head_dim_v differs from head_dim (QK dim 64, V dim 32).
-        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 32, 1.0 / 8.0, true, 8, 8, 1e-5, 1e-6)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F32,
+            &[3, 1, 7],
+            &[3, 1, 7],
+            2,
+            2,
+            64,
+            32,
+            1.0 / 8.0,
+            true,
+            8,
+            8,
+            1e-5,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -16102,8 +16409,23 @@ mod wgpu_flash_attn_varlen_tests {
             None => return,
         };
         // max_seqlen far above actual lengths must not change the result.
-        check_case(&dev, DType::F32, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, true, 1000, 4000, 1e-5, 1e-6)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F32,
+            &[3, 1, 7],
+            &[3, 1, 7],
+            2,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            true,
+            1000,
+            4000,
+            1e-5,
+            1e-6,
+        )
+        .unwrap();
     }
     #[test]
     fn flash_attn_varlen_f16_causal() {
@@ -16111,8 +16433,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::F16, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 2e-2, 1e-3)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F16,
+            &[3, 1, 7],
+            &[3, 1, 7],
+            2,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            true,
+            8,
+            8,
+            2e-2,
+            1e-3,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -16121,8 +16458,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::F16, &[5, 5], &[5, 5], 2, 2, 64, 64, 1.0 / 8.0, false, 5, 5, 2e-2, 1e-3)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F16,
+            &[5, 5],
+            &[5, 5],
+            2,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            false,
+            5,
+            5,
+            2e-2,
+            1e-3,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -16131,8 +16483,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::BF16, &[3, 1, 7], &[3, 1, 7], 2, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 2e-2, 1e-3)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::BF16,
+            &[3, 1, 7],
+            &[3, 1, 7],
+            2,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            true,
+            8,
+            8,
+            2e-2,
+            1e-3,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -16141,8 +16508,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::BF16, &[5, 5], &[5, 5], 2, 2, 64, 64, 1.0 / 8.0, false, 5, 5, 2e-2, 1e-3)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::BF16,
+            &[5, 5],
+            &[5, 5],
+            2,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            false,
+            5,
+            5,
+            2e-2,
+            1e-3,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -16151,8 +16533,23 @@ mod wgpu_flash_attn_varlen_tests {
             Some(d) => d,
             None => return,
         };
-        check_case(&dev, DType::F16, &[3, 1, 7], &[3, 1, 7], 4, 2, 64, 64, 1.0 / 8.0, true, 8, 8, 2e-2, 1e-3)
-            .unwrap();
+        check_case(
+            &dev,
+            DType::F16,
+            &[3, 1, 7],
+            &[3, 1, 7],
+            4,
+            2,
+            64,
+            64,
+            1.0 / 8.0,
+            true,
+            8,
+            8,
+            2e-2,
+            1e-3,
+        )
+        .unwrap();
     }
 }
 
@@ -16191,9 +16588,7 @@ mod wgpu_pool_tests {
 
     fn wgpu_shader_f16(dev: &crate::Device) -> bool {
         match dev {
-            crate::Device::Wgpu(dev) => {
-                dev.inner.features.contains(wgpu::Features::SHADER_F16)
-            }
+            crate::Device::Wgpu(dev) => dev.inner.features.contains(wgpu::Features::SHADER_F16),
             _ => false,
         }
     }
@@ -16285,10 +16680,7 @@ mod wgpu_pool_tests {
         let (max_abs, max_rel, _ulp, first_bad) = compare_f32_slices(&g_vec, &c_vec);
         if max_abs > atol && max_rel > rtol {
             let idx_info = match first_bad {
-                Some(i) => format!(
-                    " first at {i}: gpu={:.6e} cpu={:.6e}",
-                    g_vec[i], c_vec[i]
-                ),
+                Some(i) => format!(" first at {i}: gpu={:.6e} cpu={:.6e}", g_vec[i], c_vec[i]),
                 None => String::new(),
             };
             panic!(
@@ -16306,9 +16698,7 @@ mod wgpu_pool_tests {
                     continue;
                 }
                 for stride in [(1usize, 1usize), (2usize, 2usize)] {
-                    let label = format!(
-                        "bf16 max_pool shape={shape:?} k={kernel:?} s={stride:?}"
-                    );
+                    let label = format!("bf16 max_pool shape={shape:?} k={kernel:?} s={stride:?}");
                     check_pool(
                         &label,
                         DType::BF16,
@@ -16333,9 +16723,7 @@ mod wgpu_pool_tests {
                     continue;
                 }
                 for stride in [(1usize, 1usize), (2usize, 2usize)] {
-                    let label = format!(
-                        "bf16 avg_pool shape={shape:?} k={kernel:?} s={stride:?}"
-                    );
+                    let label = format!("bf16 avg_pool shape={shape:?} k={kernel:?} s={stride:?}");
                     check_pool(
                         &label,
                         DType::BF16,
@@ -16375,9 +16763,7 @@ mod wgpu_pool_tests {
                     continue;
                 }
                 for stride in [(1usize, 1usize), (2usize, 2usize)] {
-                    let label = format!(
-                        "f16 max_pool shape={shape:?} k={kernel:?} s={stride:?}"
-                    );
+                    let label = format!("f16 max_pool shape={shape:?} k={kernel:?} s={stride:?}");
                     check_pool(
                         &label,
                         DType::F16,
@@ -16402,9 +16788,7 @@ mod wgpu_pool_tests {
                     continue;
                 }
                 for stride in [(1usize, 1usize), (2usize, 2usize)] {
-                    let label = format!(
-                        "f16 avg_pool shape={shape:?} k={kernel:?} s={stride:?}"
-                    );
+                    let label = format!("f16 avg_pool shape={shape:?} k={kernel:?} s={stride:?}");
                     check_pool(
                         &label,
                         DType::F16,
@@ -16460,7 +16844,7 @@ mod wgpu_pool_tests {
 #[cfg(feature = "wgpu")]
 mod wgpu_conv_tests {
     use crate::test_utils::{compare_f32_slices, diff_tolerance};
-    use crate::{Device, DType, Result, Tensor};
+    use crate::{DType, Device, Result, Tensor};
 
     fn wgpu_device() -> Device {
         Device::new_wgpu(0).expect("wgpu device")
@@ -16513,7 +16897,10 @@ mod wgpu_conv_tests {
         };
         let cpu_dim = cpu_t.dims().to_vec();
         let gpu_dim = gpu_t.dims().to_vec();
-        assert!(cpu_dim == gpu_dim, "{name} {dtype:?} dims {cpu_dim:?} vs {gpu_dim:?}");
+        assert!(
+            cpu_dim == gpu_dim,
+            "{name} {dtype:?} dims {cpu_dim:?} vs {gpu_dim:?}"
+        );
         let cpu_v: Vec<f32> = cpu_t
             .to_dtype(DType::F32)
             .and_then(|t| t.flatten_all())
@@ -16632,14 +17019,20 @@ mod wgpu_conv_tests {
             _ => (1e-3, 1e-3),
         };
         for dtype in [DType::F16, DType::BF16] {
-            check_conv("conv_transpose2d_native", dtype, Some(tol(dtype)), |dev, reference| {
-                let x = Tensor::from_vec(gen_f32(&input_shape, 21), input_shape.to_vec(), dev)?;
-                let w = Tensor::from_vec(gen_f32(&kernel_shape, 63), kernel_shape.to_vec(), dev)?;
-                let x = prepare(dtype, reference, x)?;
-                let w = prepare(dtype, reference, w)?;
-                let out = x.conv_transpose2d(&w, 1, 0, 2, 1)?;
-                round_out(dtype, reference, out)
-            });
+            check_conv(
+                "conv_transpose2d_native",
+                dtype,
+                Some(tol(dtype)),
+                |dev, reference| {
+                    let x = Tensor::from_vec(gen_f32(&input_shape, 21), input_shape.to_vec(), dev)?;
+                    let w =
+                        Tensor::from_vec(gen_f32(&kernel_shape, 63), kernel_shape.to_vec(), dev)?;
+                    let x = prepare(dtype, reference, x)?;
+                    let w = prepare(dtype, reference, w)?;
+                    let out = x.conv_transpose2d(&w, 1, 0, 2, 1)?;
+                    round_out(dtype, reference, out)
+                },
+            );
         }
     }
 
@@ -16653,14 +17046,20 @@ mod wgpu_conv_tests {
             _ => (1e-3, 1e-3),
         };
         for dtype in [DType::F16, DType::BF16] {
-            check_conv("conv_transpose1d_native", dtype, Some(tol(dtype)), |dev, reference| {
-                let x = Tensor::from_vec(gen_f32(&input_shape, 31), input_shape.to_vec(), dev)?;
-                let w = Tensor::from_vec(gen_f32(&kernel_shape, 47), kernel_shape.to_vec(), dev)?;
-                let x = prepare(dtype, reference, x)?;
-                let w = prepare(dtype, reference, w)?;
-                let out = x.conv_transpose1d(&w, 1, 0, 2, 1, 1)?;
-                round_out(dtype, reference, out)
-            });
+            check_conv(
+                "conv_transpose1d_native",
+                dtype,
+                Some(tol(dtype)),
+                |dev, reference| {
+                    let x = Tensor::from_vec(gen_f32(&input_shape, 31), input_shape.to_vec(), dev)?;
+                    let w =
+                        Tensor::from_vec(gen_f32(&kernel_shape, 47), kernel_shape.to_vec(), dev)?;
+                    let x = prepare(dtype, reference, x)?;
+                    let w = prepare(dtype, reference, w)?;
+                    let out = x.conv_transpose1d(&w, 1, 0, 2, 1, 1)?;
+                    round_out(dtype, reference, out)
+                },
+            );
         }
     }
 }
@@ -16688,7 +17087,9 @@ mod wgpu_paged_fa_tests {
     fn fill(vals: &mut [f32], seed: u64) {
         let mut s = seed;
         for x in vals.iter_mut() {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *x = (((s >> 33) as f32) / (1u64 << 31) as f32) - 1.0;
         }
     }
@@ -16699,7 +17100,9 @@ mod wgpu_paged_fa_tests {
         let mut v: Vec<usize> = (0..n).collect();
         let mut s = seed;
         for i in (1..n).rev() {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let j = ((s >> 33) as usize) % (i + 1);
             v.swap(i, j);
         }
@@ -16754,8 +17157,7 @@ mod wgpu_paged_fa_tests {
                     let kv_row = blk as usize * page_block_size + page_row;
                     let mut s = 0.0f32;
                     for dd in 0..d {
-                        s += q[row * h_q * d + h * d + dd]
-                            * k[(kv_row * h_kv + h_kv_idx) * d + dd];
+                        s += q[row * h_q * d + h * d + dd] * k[(kv_row * h_kv + h_kv_idx) * d + dd];
                     }
                     scores.push(s * scale);
                     kv_rows.push(kv_row);
@@ -16763,10 +17165,7 @@ mod wgpu_paged_fa_tests {
                 if scores.is_empty() {
                     continue;
                 }
-                let m = scores
-                    .iter()
-                    .cloned()
-                    .fold(f32::NEG_INFINITY, f32::max);
+                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0.0f32;
                 for s in &scores {
                     sum += (s - m).exp();
@@ -16875,18 +17274,8 @@ mod wgpu_paged_fa_tests {
         );
 
         let (q_s, q_l) = make_storage(dev, dtype, &q, &[total_q, h_q, d])?;
-        let (k_s, k_l) = make_storage(
-            dev,
-            dtype,
-            &k,
-            &[num_blocks, page_block_size, h_kv, d],
-        )?;
-        let (v_s, v_l) = make_storage(
-            dev,
-            dtype,
-            &v,
-            &[num_blocks, page_block_size, h_kv, dv],
-        )?;
+        let (k_s, k_l) = make_storage(dev, dtype, &k, &[num_blocks, page_block_size, h_kv, d])?;
+        let (v_s, v_l) = make_storage(dev, dtype, &v, &[num_blocks, page_block_size, h_kv, dv])?;
         let cu_q_s = dev.storage_from_slice(&cu_q)?;
         let cu_k_s = dev.storage_from_slice(&cu_k)?;
         let bt_s = dev.storage_from_slice(block_table)?;
@@ -16954,10 +17343,7 @@ mod wgpu_paged_fa_tests {
         atol: f32,
     ) -> Result<()> {
         let batch = seqlens_q.len();
-        let total_pages: usize = seqlens_k
-            .iter()
-            .map(|l| l.div_ceil(page_block_size))
-            .sum();
+        let total_pages: usize = seqlens_k.iter().map(|l| l.div_ceil(page_block_size)).sum();
         // A few spare blocks so part of the pool is unused ("holes").
         let num_blocks = total_pages + 4;
         let max_blocks = seqlens_k
@@ -17003,8 +17389,22 @@ mod wgpu_paged_fa_tests {
         };
         // kv lengths are neither multiples of page_block_size=32 (partial last
         // page) nor confined to a single page (3 and 2 pages per sequence).
-        check_paged_case(&dev, DType::F32, &[64, 20], &[80, 40], 2, 2, 64, 64, 32, 1.0 / 8.0, false, 1e-4, 1e-6)
-            .unwrap();
+        check_paged_case(
+            &dev,
+            DType::F32,
+            &[64, 20],
+            &[80, 40],
+            2,
+            2,
+            64,
+            64,
+            32,
+            1.0 / 8.0,
+            false,
+            1e-4,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -17015,8 +17415,22 @@ mod wgpu_paged_fa_tests {
         };
         // causal: q sequences [50, 33], kv [80, 40]; trailing KV positions
         // must be masked out within each sequence.
-        check_paged_case(&dev, DType::F32, &[50, 33], &[80, 40], 2, 2, 64, 64, 32, 1.0 / 8.0, true, 1e-4, 1e-6)
-            .unwrap();
+        check_paged_case(
+            &dev,
+            DType::F32,
+            &[50, 33],
+            &[80, 40],
+            2,
+            2,
+            64,
+            64,
+            32,
+            1.0 / 8.0,
+            true,
+            1e-4,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -17026,8 +17440,22 @@ mod wgpu_paged_fa_tests {
             None => return,
         };
         // GQA: h_q=2 with a single KV head, causal multi-page.
-        check_paged_case(&dev, DType::F32, &[64, 20], &[80, 40], 2, 1, 64, 64, 32, 1.0 / 8.0, true, 1e-4, 1e-6)
-            .unwrap();
+        check_paged_case(
+            &dev,
+            DType::F32,
+            &[64, 20],
+            &[80, 40],
+            2,
+            1,
+            64,
+            64,
+            32,
+            1.0 / 8.0,
+            true,
+            1e-4,
+            1e-6,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -17070,8 +17498,22 @@ mod wgpu_paged_fa_tests {
             None => return,
         };
         // F16 goes through the host-side F32 compute hub (same as varlen).
-        check_paged_case(&dev, DType::F16, &[50, 20], &[80, 40], 2, 2, 64, 64, 32, 1.0 / 8.0, true, 2e-2, 1e-3)
-            .unwrap();
+        check_paged_case(
+            &dev,
+            DType::F16,
+            &[50, 20],
+            &[80, 40],
+            2,
+            2,
+            64,
+            64,
+            32,
+            1.0 / 8.0,
+            true,
+            2e-2,
+            1e-3,
+        )
+        .unwrap();
     }
 }
 

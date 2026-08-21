@@ -251,7 +251,10 @@ fn resolve_float_mismatch(
     if nonfinite_pair_eq || max_abs <= e.max_abs {
         (
             CaseOutcome::Pass,
-            Some(expected_note(e, if nonfinite_pair_eq { 0.0 } else { max_abs })),
+            Some(expected_note(
+                e,
+                if nonfinite_pair_eq { 0.0 } else { max_abs },
+            )),
         )
     } else {
         (
@@ -347,7 +350,15 @@ impl SuiteTracker {
         if !expected.is_empty() {
             let _ = writeln!(s, "Expected-mismatch cases exercised:");
             for r in expected {
-                let _ = writeln!(s, "  {} {}/{} {}: {}", r.op, r.dtype, r.shape, r.backend, r.expected_note.as_deref().unwrap_or(""));
+                let _ = writeln!(
+                    s,
+                    "  {} {}/{} {}: {}",
+                    r.op,
+                    r.dtype,
+                    r.shape,
+                    r.backend,
+                    r.expected_note.as_deref().unwrap_or("")
+                );
             }
         }
         s

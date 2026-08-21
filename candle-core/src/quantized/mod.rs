@@ -546,60 +546,45 @@ impl QVulkanStorage {
                 if self.dtype == GgmlDType::Q8_0 && need(32) {
                     let device = self.device();
                     let quant = crate::vulkan_backend::quantize_f32_storage_to_q8_0(
-                        device,
-                        src,
-                        elem_count,
+                        device, src, elem_count,
                     )?;
-                    self.len_bytes =
-                        elem_count / 32 * std::mem::size_of::<k_quants::BlockQ8_0>();
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ8_0>();
                     self.storage = quant;
                     return Ok(());
                 }
                 if self.dtype == GgmlDType::Q4_0 && need(32) {
                     let device = self.device();
                     let quant = crate::vulkan_backend::quantize_f32_storage_to_q4_0(
-                        device,
-                        src,
-                        elem_count,
+                        device, src, elem_count,
                     )?;
-                    self.len_bytes =
-                        elem_count / 32 * std::mem::size_of::<k_quants::BlockQ4_0>();
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ4_0>();
                     self.storage = quant;
                     return Ok(());
                 }
                 if self.dtype == GgmlDType::Q4_1 && need(32) {
                     let device = self.device();
                     let quant = crate::vulkan_backend::quantize_f32_storage_to_q4_1(
-                        device,
-                        src,
-                        elem_count,
+                        device, src, elem_count,
                     )?;
-                    self.len_bytes =
-                        elem_count / 32 * std::mem::size_of::<k_quants::BlockQ4_1>();
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ4_1>();
                     self.storage = quant;
                     return Ok(());
                 }
                 if self.dtype == GgmlDType::Q5_0 && need(32) {
                     let device = self.device();
                     let quant = crate::vulkan_backend::quantize_f32_storage_to_q5_0(
-                        device,
-                        src,
-                        elem_count,
+                        device, src, elem_count,
                     )?;
-                    self.len_bytes =
-                        elem_count / 32 * std::mem::size_of::<k_quants::BlockQ5_0>();
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ5_0>();
                     self.storage = quant;
                     return Ok(());
                 }
                 if self.dtype == GgmlDType::Q5_1 && need(32) {
                     let device = self.device();
                     let quant = crate::vulkan_backend::quantize_f32_storage_to_q5_1(
-                        device,
-                        src,
-                        elem_count,
+                        device, src, elem_count,
                     )?;
-                    self.len_bytes =
-                        elem_count / 32 * std::mem::size_of::<k_quants::BlockQ5_1>();
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ5_1>();
                     self.storage = quant;
                     return Ok(());
                 }
@@ -1656,11 +1641,8 @@ impl QTensor {
                 Err(err) => return Err(err),
             }
         }
-        if let (
-            QStorage::Wgpu(storage),
-            Storage::Wgpu(x_storage),
-            Storage::Wgpu(ids_storage),
-        ) = (&self.storage, &*x3_f32.storage(), &*ids.storage())
+        if let (QStorage::Wgpu(storage), Storage::Wgpu(x_storage), Storage::Wgpu(ids_storage)) =
+            (&self.storage, &*x3_f32.storage(), &*ids.storage())
         {
             match storage.indexed_moe_forward_f32(
                 &self.shape,

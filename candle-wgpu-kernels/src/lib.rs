@@ -323,7 +323,11 @@ pub fn argsort_keyed_shader(
         ("WG_SIZE".to_string(), workgroup_size.to_string()),
         (
             "ORDER".to_string(),
-            if asc { "0".to_string() } else { "1".to_string() },
+            if asc {
+                "0".to_string()
+            } else {
+                "1".to_string()
+            },
         ),
         ("SRC_TYPE".to_string(), src_type.to_string()),
         ("KEY_BODY".to_string(), sort_key.to_string()),
@@ -429,7 +433,11 @@ pub fn argsort_f8e4m3_merge_shader(workgroup_size: u32, asc: bool) -> Option<Str
         ("WG_SIZE".to_string(), workgroup_size.to_string()),
         (
             "ORDER".to_string(),
-            if asc { "0".to_string() } else { "1".to_string() },
+            if asc {
+                "0".to_string()
+            } else {
+                "1".to_string()
+            },
         ),
         ("SRC_TYPE".to_string(), "u32".to_string()),
         (
@@ -456,11 +464,18 @@ pub fn argsort_i32_merge_shader(workgroup_size: u32, asc: bool) -> Option<String
         ("WG_SIZE".to_string(), workgroup_size.to_string()),
         (
             "ORDER".to_string(),
-            if asc { "0".to_string() } else { "1".to_string() },
+            if asc {
+                "0".to_string()
+            } else {
+                "1".to_string()
+            },
         ),
         ("SRC_TYPE".to_string(), "i32".to_string()),
-            ("KEY_BODY".to_string(), "(bitcast<u32>(src[i]) ^ 0x80000000u)".to_string()),
-];
+        (
+            "KEY_BODY".to_string(),
+            "(bitcast<u32>(src[i]) ^ 0x80000000u)".to_string(),
+        ),
+    ];
     Some(preprocess(source, &defines, &replacements, DType::F32))
 }
 
@@ -632,7 +647,11 @@ pub fn set_rows_add_u8_shader(workgroup_size: u32) -> Option<String> {
 /// i64 scatter-add: two u32 words per element, integer carry CAS pair.
 pub fn set_rows_add_i64_shader(workgroup_size: u32) -> Option<String> {
     let source = get("set_rows.wgsl")?.source();
-    let defines = vec!["ADD".to_string(), "ADD_U32".to_string(), "ADD_I64_MODE".to_string()];
+    let defines = vec![
+        "ADD".to_string(),
+        "ADD_U32".to_string(),
+        "ADD_I64_MODE".to_string(),
+    ];
     let replacements = vec![
         ("WG_SIZE".to_string(), workgroup_size.to_string()),
         ("SRC_TYPE".to_string(), "vec2<u32>".to_string()),
@@ -642,7 +661,6 @@ pub fn set_rows_add_i64_shader(workgroup_size: u32) -> Option<String> {
     ];
     Some(preprocess(source, &defines, &replacements, DType::F32))
 }
-
 
 pub fn matmul_f32_shader() -> Option<String> {
     let source = get("mul_mat.wgsl")?.source().replace(
@@ -1309,7 +1327,11 @@ fn upsample_shader(mode: &str, src_type: &str, workgroup_size: u32) -> Option<St
         "f16" => "SRC_F16",
         _ => "SRC_BF16",
     };
-    let defines = vec![mode.to_string(), dtype_def.to_string(), "WG_SIZE".to_string()];
+    let defines = vec![
+        mode.to_string(),
+        dtype_def.to_string(),
+        "WG_SIZE".to_string(),
+    ];
     let replacements = vec![
         ("SRC_TYPE".to_string(), src_type.to_string()),
         ("WG_SIZE".to_string(), workgroup_size.to_string()),
@@ -1619,9 +1641,14 @@ mod tests {
     #[test]
     fn test_quantized_mul_mat_id_shader() {
         use super::QuantizedDType::*;
-        for dt in [Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K] {
+        for dt in [
+            Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K,
+        ] {
             let s = super::quantized_mul_mat_id_shader(dt, DType::F32).expect("moe shader");
-            assert!(s.contains("fn init_shmem_src0"), "Shader for {dt:?} missing init_shmem_src0");
+            assert!(
+                s.contains("fn init_shmem_src0"),
+                "Shader for {dt:?} missing init_shmem_src0"
+            );
         }
     }
 
@@ -1635,9 +1662,18 @@ mod tests {
             let s = getter(256).expect("pool f32");
             assert!(s.contains("@compute @workgroup_size(256)"));
             assert!(s.contains("array<f32>"), "f32 {op} must use f32 arrays");
-            assert!(!s.contains("#ifdef"), "preprocessor must be resolved for {op}");
-            assert!(!s.contains("#endif"), "preprocessor must be resolved for {op}");
-            assert!(!s.contains("enable f16"), "f32 {op} must not keep enable f16");
+            assert!(
+                !s.contains("#ifdef"),
+                "preprocessor must be resolved for {op}"
+            );
+            assert!(
+                !s.contains("#endif"),
+                "preprocessor must be resolved for {op}"
+            );
+            assert!(
+                !s.contains("enable f16"),
+                "f32 {op} must not keep enable f16"
+            );
         }
     }
 
@@ -1651,7 +1687,10 @@ mod tests {
             let s = getter(256).expect("pool f16");
             assert!(s.contains("enable f16;"), "f16 {op} must keep enable f16");
             assert!(s.contains("array<f16>"), "f16 {op} must use f16 arrays");
-            assert!(!s.contains("#ifdef"), "preprocessor must be resolved for {op}");
+            assert!(
+                !s.contains("#ifdef"),
+                "preprocessor must be resolved for {op}"
+            );
         }
     }
 
@@ -1664,10 +1703,19 @@ mod tests {
         for &(getter, op) in shaders {
             let s = getter(256).expect("pool bf16");
             assert!(s.contains("bf16_to_f32"), "{op} bf16 must decode halves");
-            assert!(s.contains("atomicCompareExchangeWeak"), "{op} bf16 store must be a CAS");
+            assert!(
+                s.contains("atomicCompareExchangeWeak"),
+                "{op} bf16 store must be a CAS"
+            );
             assert!(s.contains("array<u32>"), "{op} bf16 must use u32 words");
-            assert!(!s.contains("enable f16"), "bf16 {op} must not carry enable f16");
-            assert!(!s.contains("#ifdef"), "preprocessor must be resolved for {op}");
+            assert!(
+                !s.contains("enable f16"),
+                "bf16 {op} must not carry enable f16"
+            );
+            assert!(
+                !s.contains("#ifdef"),
+                "preprocessor must be resolved for {op}"
+            );
         }
     }
     #[test]
@@ -1686,22 +1734,43 @@ mod tests {
         ] {
             let f32s = accessor(256, "f32").expect("upsample f32");
             assert!(f32s.contains("array<f32>"), "{mode} f32 array");
-            assert!(!bare_enable_f16(&f32s), "{mode} f32 must not keep enable f16");
-            assert!(!any_directive(&f32s), "{mode} f32 must strip all directives");
-            assert!(!f32s.contains("SRC_TYPE"), "{mode} f32 must replace SRC_TYPE");
+            assert!(
+                !bare_enable_f16(&f32s),
+                "{mode} f32 must not keep enable f16"
+            );
+            assert!(
+                !any_directive(&f32s),
+                "{mode} f32 must strip all directives"
+            );
+            assert!(
+                !f32s.contains("SRC_TYPE"),
+                "{mode} f32 must replace SRC_TYPE"
+            );
             assert!(f32s.contains("fn main"), "{mode} f32 entry point");
             assert!(f32s.contains("store_dst("), "{mode} f32 body");
 
             let f16s = accessor(256, "f16").expect("upsample f16");
             assert!(bare_enable_f16(&f16s), "{mode} f16 must keep enable f16");
             assert!(f16s.contains("array<f16>"), "{mode} f16 array");
-            assert!(!f16s.contains("SRC_TYPE"), "{mode} f16 must replace SRC_TYPE");
+            assert!(
+                !f16s.contains("SRC_TYPE"),
+                "{mode} f16 must replace SRC_TYPE"
+            );
 
             let bf16s = accessor(256, "u32").expect("upsample bf16");
             assert!(bf16s.contains("array<u32>"), "{mode} bf16 array");
-            assert!(!bare_enable_f16(&bf16s), "{mode} bf16 must not keep enable f16");
-            assert!(bf16s.contains("atomicCompareExchangeWeak"), "{mode} bf16 CAS store");
-            assert!(!bf16s.contains("SRC_TYPE"), "{mode} bf16 must replace SRC_TYPE");
+            assert!(
+                !bare_enable_f16(&bf16s),
+                "{mode} bf16 must not keep enable f16"
+            );
+            assert!(
+                bf16s.contains("atomicCompareExchangeWeak"),
+                "{mode} bf16 CAS store"
+            );
+            assert!(
+                !bf16s.contains("SRC_TYPE"),
+                "{mode} bf16 must replace SRC_TYPE"
+            );
         }
     }
 }
