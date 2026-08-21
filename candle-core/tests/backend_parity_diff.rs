@@ -315,6 +315,50 @@ fn matmul_shapes() -> Vec<((usize, usize, usize), &'static str)> {
 // Comparison helpers
 // ---------------------------------------------------------------------------
 
+/// Map a `{dst:?}`-style dtype name (the debug form used in `to_dtype_*` case
+/// names) back to a `DType`.
+fn dtype_from_debug_name(s: &str) -> Option<DType> {
+    Some(match s {
+        "U8" => DType::U8,
+        "U32" => DType::U32,
+        "I16" => DType::I16,
+        "I32" => DType::I32,
+        "I64" => DType::I64,
+        "BF16" => DType::BF16,
+        "F16" => DType::F16,
+        "F32" => DType::F32,
+        "F64" => DType::F64,
+        "F8E4M3" => DType::F8E4M3,
+        "F6E2M3" => DType::F6E2M3,
+        "F6E3M2" => DType::F6E3M2,
+        "F4" => DType::F4,
+        "F8E8M0" => DType::F8E8M0,
+        _ => return None,
+    })
+}
+
+/// The dtype of the tensor that `op_name` produces for a given source `DType`.
+///
+/// Some ops emit results in a *different* dtype than their input:
+/// - element-wise comparisons (`eq`/`ne`/`le`/`ge`/`lt`/`gt`) produce `U8` masks,
+/// - `argmax`/`argmin` reduce to `U32` index tensors,
+/// - `argsort` returns `U32` index tensors,
+/// - `to_dtype` re-casts to the target dtype encoded in the case name.
+fn op_result_dtype(op_name: &str, src_dtype: DType) -> DType {
+    match op_name {
+        "eq" | "ne" | "le" | "ge" | "lt" | "gt" => DType::U8,
+        "argmax_dim" | "argmin_dim" => DType::U32,
+        "argsort_asc" | "argsort_desc" => DType::U32,
+        // Case names are formatted as `to_dtype_{src:?}_to_{dst:?}`; dtype debug
+        // forms never contain `_`, so the last `_to_` split yields the target.
+        name if name.starts_with("to_dtype_") => name
+            .rsplit_once("_to_")
+            .and_then(|(_, dst)| dtype_from_debug_name(dst))
+            .unwrap_or(src_dtype),
+        _ => src_dtype,
+    }
+}
+
 /// Run op on CPU and on `gpu_device`, compare results.
 /// Returns None on skip, Some(CaseResult) on pass/fail.
 fn check_vs_cpu<F>(
@@ -386,7 +430,15 @@ where
 
     let (atol, rtol) = diff_tolerance(dtype);
 
-    if is_integer_dtype(dtype) {
+    // The result tensor can have a different dtype than the source (cmp ops emit
+    // U8 masks, argmax/argmin/argsort emit U32 indices, to_dtype re-casts to the
+    // target dtype). Dispatch the comparison on the RESULT dtype so the results
+    // are read with the correct `to_vec1` element type, while keeping the
+    // source-dtype tolerance semantics unchanged. When the result dtype equals
+    // the source dtype this resolves to the previous behavior.
+    let result_dtype = op_result_dtype(op_name, dtype);
+
+    if is_integer_dtype(result_dtype) {
         // Exact comparison for integers
         let cpu_vec = match cpu_result.flatten_all() {
             Ok(t) => t,
@@ -421,7 +473,7 @@ where
             }
         };
 
-        match dtype {
+        match result_dtype {
             DType::U8 => {
                 let cpu = cpu_vec.to_vec1::<u8>().unwrap_or_default();
                 let gpu = gpu_vec.to_vec1::<u8>().unwrap_or_default();
@@ -599,7 +651,7 @@ where
     }
 
     // Float comparison
-    if dtype == DType::F64 {
+    if result_dtype == DType::F64 {
         let cpu_vec = match cpu_result.flatten_all().and_then(|t| t.to_vec1::<f64>()) {
             Ok(v) => v,
             Err(e) => {
