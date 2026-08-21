@@ -11421,6 +11421,209 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
+    pub fn quantize_f32_to_q4_1(&self, elem_count: usize) -> Result<WgpuStorage> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu quantize_q4_1").bt());
+        }
+        let num_blocks = elem_count.div_ceil(32);
+        let num_wgs = (num_blocks as u32).div_ceil(8);
+        // Each workgroup writes a self-contained 8-block span (8*20 = 160
+        // bytes); the final partial workgroup's slack tail is never read.
+        let dst_len_bytes = (num_wgs as usize) * 160;
+        let dst = unsafe { self.device.alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)? };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct QuantizeParams {
+            ne: u32,
+            num_blocks: u32,
+            // Scale divisor as a runtime uniform: with a compile-time divisor
+            // in the shader, wgpu/driver constant-folding defeats div_ieee and
+            // flips nibbles at rounding boundaries (probe-verified).
+            scale_bits: u32,
+        }
+
+        let params = QuantizeParams {
+            ne: elem_count as u32,
+            num_blocks: num_blocks as u32,
+            scale_bits: 15.0f32.to_bits(),
+        };
+
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-quantize-q4-1-params"),
+                size: std::mem::size_of::<QuantizeParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+
+        let shader_source = candle_wgpu_kernels::quantize_q4_1_shader()
+            .ok_or_else(|| Error::Msg("wgpu quantize_q4_1 shader not found".into()).bt())?;
+
+        self.device.run_compute_xyz(
+            &shader_source,
+            &entries,
+            &bindings,
+            (num_wgs, 1, 1),
+            &[],
+            None,
+            "candle-wgpu-quantize-q4-1",
+        )?;
+
+        Ok(dst)
+    }
+
+    pub fn quantize_f32_to_q5_0(&self, elem_count: usize) -> Result<WgpuStorage> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu quantize_q5_0").bt());
+        }
+        let num_blocks = elem_count.div_ceil(32);
+        let num_wgs = (num_blocks as u32).div_ceil(8);
+        // Each workgroup writes a self-contained 8-block span (8*22 = 176
+        // bytes); the final partial workgroup's slack tail is never read.
+        let dst_len_bytes = (num_wgs as usize) * 176;
+        let dst = unsafe { self.device.alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)? };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct QuantizeParams {
+            ne: u32,
+            num_blocks: u32,
+        }
+
+        let params = QuantizeParams {
+            ne: elem_count as u32,
+            num_blocks: num_blocks as u32,
+        };
+
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-quantize-q5-0-params"),
+                size: std::mem::size_of::<QuantizeParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+
+        let shader_source = candle_wgpu_kernels::quantize_q5_0_shader()
+            .ok_or_else(|| Error::Msg("wgpu quantize_q5_0 shader not found".into()).bt())?;
+
+        self.device.run_compute_xyz(
+            &shader_source,
+            &entries,
+            &bindings,
+            (num_wgs, 1, 1),
+            &[],
+            None,
+            "candle-wgpu-quantize-q5-0",
+        )?;
+
+        Ok(dst)
+    }
+
+    pub fn quantize_f32_to_q5_1(&self, elem_count: usize) -> Result<WgpuStorage> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu quantize_q5_1").bt());
+        }
+        let num_blocks = elem_count.div_ceil(32);
+        let num_wgs = (num_blocks as u32).div_ceil(8);
+        // Each workgroup writes a self-contained 8-block span (8*24 = 192
+        // bytes); the final partial workgroup's slack tail is never read.
+        let dst_len_bytes = (num_wgs as usize) * 192;
+        let dst = unsafe { self.device.alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)? };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct QuantizeParams {
+            ne: u32,
+            num_blocks: u32,
+            // Scale divisor as a runtime uniform (see quantize_f32_to_q4_1).
+            scale_bits: u32,
+        }
+
+        let params = QuantizeParams {
+            ne: elem_count as u32,
+            num_blocks: num_blocks as u32,
+            scale_bits: 31.0f32.to_bits(),
+        };
+
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-quantize-q5-1-params"),
+                size: std::mem::size_of::<QuantizeParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+
+        let shader_source = candle_wgpu_kernels::quantize_q5_1_shader()
+            .ok_or_else(|| Error::Msg("wgpu quantize_q5_1 shader not found".into()).bt())?;
+
+        self.device.run_compute_xyz(
+            &shader_source,
+            &entries,
+            &bindings,
+            (num_wgs, 1, 1),
+            &[],
+            None,
+            "candle-wgpu-quantize-q5-1",
+        )?;
+
+        Ok(dst)
+    }
+
     pub fn dequantize_nvfp4(&self, elem_count: usize) -> Result<WgpuStorage> {
         let dst_shape = Shape::from(elem_count);
         let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
@@ -17367,6 +17570,189 @@ mod wgpu_quantize_tests {
             assert!(
                 (a - b).abs() <= 1.0e-2,
                 "dequant mismatch at {i}: gpu {a} vs cpu {b}"
+            );
+        }
+        Ok(())
+    }
+
+    /// 128 elements = 4 blocks of 32. Sewn blocks carry byte-parity worst cases:
+    /// exact duplicates, +-0.0 min/max ties (minNum keeps -0.0, maxNum keeps
+    /// +0.0) and first-occurrence absmax ties (Q5_0 selects the *first* element
+    /// of a tied |x|). Each block is padded to 32 with a band that never
+    /// overrides the block's intended extrema.
+    fn quant_tie_fixture(dtype: GgmlDType) -> Vec<f32> {
+        fn fill(xs: &mut Vec<f32>, lo: f32, span: f32) {
+            while !xs.len().is_multiple_of(32) {
+                let i = xs.len();
+                xs.push(lo + (i % 7) as f32 * span / 6.0);
+            }
+        }
+        let mut xs = Vec::with_capacity(128);
+        // Block 0: straight-line values, distinct.
+        for i in 0..32 {
+            xs.push((i as f32) * 0.19 - 2.0);
+        }
+        // Block 1: max tie between +0.0 and -0.0 (maxNum keeps +0.0),
+        // min -2.5. Fill stays strictly negative, above the min.
+        xs.extend_from_slice(&[0.0, -0.0, -2.5, -1.25]);
+        fill(&mut xs, -2.25, 1.75);
+        // Block 2: min tie between +0.0 and -0.0 so m must be f16(-0.0) =
+        // 0x8000. Fill stays strictly positive.
+        xs.extend_from_slice(&[1.0, -0.0, 0.0, 2.0]);
+        fill(&mut xs, 0.25, 2.0);
+        // Block 3: format-specific tie cases.
+        match dtype {
+            GgmlDType::Q5_0 => {
+                xs.extend_from_slice(&[3.0, -3.0, 1.0, -1.0, 2.5, -0.0, 0.0, -0.25]);
+            }
+            _ => {
+                xs.extend_from_slice(&[3.0, 3.0, -3.0, -3.0, 0.5, 0.5, -0.0, 0.0]);
+            }
+        }
+        fill(&mut xs, 0.25, 2.0);
+        assert_eq!(xs.len(), 128);
+        xs
+    }
+
+    /// Q4_1 GPU quantize must emit the exact same bytes as the CPU path
+    /// (documented: byte-identical for Q4_1) and dequantize within tolerance.
+    #[test]
+    fn quantize_q4_1_matches_cpu_bytes() -> crate::Result<()> {
+        let wgpu = Device::new_wgpu(0)?;
+        let cpu = Device::Cpu;
+        let n = 3 * 32; // non-power-of-2, whole blocks only
+        let xs = lcg_f32(n, 0xfeed_4e11);
+        let t_gpu = Tensor::from_vec(xs.clone(), n, &wgpu)?;
+        let t_cpu = Tensor::from_vec(xs, n, &cpu)?;
+        let q_gpu = QTensor::quantize(&t_gpu, GgmlDType::Q4_1)?;
+        let q_cpu = QTensor::quantize(&t_cpu, GgmlDType::Q4_1)?;
+        assert_eq!(q_gpu.data()?.as_ref(), q_cpu.data()?.as_ref());
+        let deq_gpu = q_gpu.dequantize(&wgpu)?.to_vec1::<f32>()?;
+        let deq_cpu = q_cpu.dequantize(&cpu)?.to_vec1::<f32>()?;
+        for (i, (a, b)) in deq_gpu.iter().zip(deq_cpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1.0e-2,
+                "dequant mismatch at {i}: gpu {a} vs cpu {b}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Q5_0 GPU quantize must emit the exact same bytes as the CPU path
+    /// (documented: byte-identical for Q5_0) and dequantize within tolerance.
+    #[test]
+    fn quantize_q5_0_matches_cpu_bytes() -> crate::Result<()> {
+        let wgpu = Device::new_wgpu(0)?;
+        let cpu = Device::Cpu;
+        let n = 5 * 32; // non-power-of-2, whole blocks only
+        let xs = lcg_f32(n, 0xfeed_5e0d);
+        let t_gpu = Tensor::from_vec(xs.clone(), n, &wgpu)?;
+        let t_cpu = Tensor::from_vec(xs, n, &cpu)?;
+        let q_gpu = QTensor::quantize(&t_gpu, GgmlDType::Q5_0)?;
+        let q_cpu = QTensor::quantize(&t_cpu, GgmlDType::Q5_0)?;
+        assert_eq!(q_gpu.data()?.as_ref(), q_cpu.data()?.as_ref());
+        let deq_gpu = q_gpu.dequantize(&wgpu)?.to_vec1::<f32>()?;
+        let deq_cpu = q_cpu.dequantize(&cpu)?.to_vec1::<f32>()?;
+        for (i, (a, b)) in deq_gpu.iter().zip(deq_cpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1.0e-2,
+                "dequant mismatch at {i}: gpu {a} vs cpu {b}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Q5_1 GPU quantize must emit the exact same bytes as the CPU path
+    /// (documented: byte-identical for Q5_1) and dequantize within tolerance.
+    #[test]
+    fn quantize_q5_1_matches_cpu_bytes() -> crate::Result<()> {
+        let wgpu = Device::new_wgpu(0)?;
+        let cpu = Device::Cpu;
+        let n = 3 * 32; // non-power-of-2, whole blocks only
+        let xs = lcg_f32(n, 0xfeed_5e11);
+        let t_gpu = Tensor::from_vec(xs.clone(), n, &wgpu)?;
+        let t_cpu = Tensor::from_vec(xs, n, &cpu)?;
+        let q_gpu = QTensor::quantize(&t_gpu, GgmlDType::Q5_1)?;
+        let q_cpu = QTensor::quantize(&t_cpu, GgmlDType::Q5_1)?;
+        assert_eq!(q_gpu.data()?.as_ref(), q_cpu.data()?.as_ref());
+        let deq_gpu = q_gpu.dequantize(&wgpu)?.to_vec1::<f32>()?;
+        let deq_cpu = q_cpu.dequantize(&cpu)?.to_vec1::<f32>()?;
+        for (i, (a, b)) in deq_gpu.iter().zip(deq_cpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1.0e-2,
+                "dequant mismatch at {i}: gpu {a} vs cpu {b}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Large input spanning many workgroups (4608 = 144 blocks = 18 wgs of 8
+    /// blocks). Single-workgroup fixtures hide block-indexing bugs (see the
+    /// c91c7daf wgpu fix), so this stays mandatory.
+    #[test]
+    fn quantize_dm_large_multi_workgroup_matches_cpu() -> crate::Result<()> {
+        let wgpu = Device::new_wgpu(0)?;
+        let cpu = Device::Cpu;
+        for (dtype, seed) in [
+            (GgmlDType::Q4_1, 0x0de0_4111),
+            (GgmlDType::Q5_0, 0x0de0_5000),
+            (GgmlDType::Q5_1, 0x0de0_5111),
+        ] {
+            let n = 4608;
+            let xs = lcg_f32(n, seed);
+            let t_gpu = Tensor::from_vec(xs.clone(), n, &wgpu)?;
+            let t_cpu = Tensor::from_vec(xs, n, &cpu)?;
+            let q_gpu = QTensor::quantize(&t_gpu, dtype)?;
+            let q_cpu = QTensor::quantize(&t_cpu, dtype)?;
+            assert_eq!(
+                q_gpu.data()?.as_ref(),
+                q_cpu.data()?.as_ref(),
+                "{dtype:?} GPU quantize bytes differ from CPU at n={n}",
+            );
+        }
+        Ok(())
+    }
+
+    /// Byte-level min/max and absmax tie semantics (incl. +-0.0) must be
+    /// identical on device for Q4_1/Q5_0/Q5_1.
+    #[test]
+    fn quantize_ties_and_zero_bytes_match_cpu() -> crate::Result<()> {
+        let wgpu = Device::new_wgpu(0)?;
+        let cpu = Device::Cpu;
+        for dtype in [GgmlDType::Q4_1, GgmlDType::Q5_0, GgmlDType::Q5_1] {
+            let xs = quant_tie_fixture(dtype);
+            let n = xs.len();
+            let t_gpu = Tensor::from_vec(xs.clone(), n, &wgpu)?;
+            let t_cpu = Tensor::from_vec(xs, n, &cpu)?;
+            let q_gpu = QTensor::quantize(&t_gpu, dtype)?;
+            let q_cpu = QTensor::quantize(&t_cpu, dtype)?;
+            assert_eq!(
+                q_gpu.data()?.as_ref(),
+                q_cpu.data()?.as_ref(),
+                "{dtype:?} GPU quantize bytes differ from CPU for tie/zero fixture",
+            );
+        }
+        Ok(())
+    }
+
+    /// Not a whole number of blocks: the GPU fast-path guard does not apply
+    /// and the documented CPU path governs, so both devices must surface
+    /// identical behavior (same error via QTensor::quantize).
+    #[test]
+    fn quantize_non_multiple_takes_cpu_behavior() -> crate::Result<()> {
+        let wgpu = Device::new_wgpu(0)?;
+        let cpu = Device::Cpu;
+        let n = 3 * 32 + 4; // not a multiple of any quantized block size
+        for dtype in [GgmlDType::Q4_1, GgmlDType::Q5_0, GgmlDType::Q5_1] {
+            let xs = lcg_f32(n, 0xcafe_70dd);
+            let t_gpu = Tensor::from_vec(xs.clone(), n, &wgpu)?;
+            let t_cpu = Tensor::from_vec(xs, n, &cpu)?;
+            let err_gpu = QTensor::quantize(&t_gpu, dtype).unwrap_err();
+            let err_cpu = QTensor::quantize(&t_cpu, dtype).unwrap_err();
+            assert_eq!(
+                err_gpu.to_string(),
+                err_cpu.to_string(),
+                "{dtype:?} non-multiple input diverged from the documented CPU path",
             );
         }
         Ok(())

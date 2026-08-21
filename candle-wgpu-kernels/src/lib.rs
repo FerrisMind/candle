@@ -1370,6 +1370,18 @@ pub fn quantize_q4_0_shader() -> Option<String> {
     Some(get("quantize_q4_0.wgsl")?.source().to_string())
 }
 
+pub fn quantize_q4_1_shader() -> Option<String> {
+    Some(get("quantize_q4_1.wgsl")?.source().to_string())
+}
+
+pub fn quantize_q5_0_shader() -> Option<String> {
+    Some(get("quantize_q5_0.wgsl")?.source().to_string())
+}
+
+pub fn quantize_q5_1_shader() -> Option<String> {
+    Some(get("quantize_q5_1.wgsl")?.source().to_string())
+}
+
 pub fn dequant_nvfp4_shader() -> Option<String> {
     Some(get("dequant_nvfp4.wgsl")?.source().to_string())
 }
