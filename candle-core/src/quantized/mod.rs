@@ -268,6 +268,12 @@ impl QWgpuStorage {
                 self.storage = quant;
                 return Ok(());
             }
+            if self.dtype == GgmlDType::Q4_0 && need(32) {
+                let quant = src.quantize_f32_to_q4_0(elem_count)?;
+                self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ4_0>();
+                self.storage = quant;
+                return Ok(());
+            }
         }
         let src = src.to_cpu_storage()?;
         self.quantize_from_cpu(&src, None)

@@ -11356,6 +11356,71 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
+    pub fn quantize_f32_to_q4_0(&self, elem_count: usize) -> Result<WgpuStorage> {
+        if self.dtype != DType::F32 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu quantize_q4_0").bt());
+        }
+        let num_blocks = elem_count.div_ceil(32);
+        let num_wgs = (num_blocks as u32).div_ceil(8);
+        // Each workgroup writes a self-contained 8-block span (8*18 = 144
+        // bytes); the final partial workgroup's slack tail is never read.
+        let dst_len_bytes = (num_wgs as usize) * 144;
+        let dst = unsafe { self.device.alloc_uninit(&Shape::from(dst_len_bytes), DType::U8)? };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct QuantizeParams {
+            ne: u32,
+            num_blocks: u32,
+        }
+
+        let params = QuantizeParams {
+            ne: elem_count as u32,
+            num_blocks: num_blocks as u32,
+        };
+
+        let param_buffer = self
+            .device
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("candle-wgpu-quantize-q4-0-params"),
+                size: std::mem::size_of::<QuantizeParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        self.device
+            .inner
+            .queue
+            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+
+        let shader_source = candle_wgpu_kernels::quantize_q4_0_shader()
+            .ok_or_else(|| Error::Msg("wgpu quantize_q4_0 shader not found".into()).bt())?;
+
+        self.device.run_compute_xyz(
+            &shader_source,
+            &entries,
+            &bindings,
+            (num_wgs, 1, 1),
+            &[],
+            None,
+            "candle-wgpu-quantize-q4-0",
+        )?;
+
+        Ok(dst)
+    }
+
     pub fn dequantize_nvfp4(&self, elem_count: usize) -> Result<WgpuStorage> {
         let dst_shape = Shape::from(elem_count);
         let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
@@ -17272,6 +17337,29 @@ mod wgpu_quantize_tests {
         let t_cpu = Tensor::from_vec(lcg_f32(n, 0x0123_4567), n, &cpu)?;
         let q_gpu = QTensor::quantize(&t_gpu, GgmlDType::Q8_0)?;
         let q_cpu = QTensor::quantize(&t_cpu, GgmlDType::Q8_0)?;
+        assert_eq!(q_gpu.data()?.as_ref(), q_cpu.data()?.as_ref());
+        let deq_gpu = q_gpu.dequantize(&wgpu)?.to_vec1::<f32>()?;
+        let deq_cpu = q_cpu.dequantize(&cpu)?.to_vec1::<f32>()?;
+        for (i, (a, b)) in deq_gpu.iter().zip(deq_cpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1.0e-2,
+                "dequant mismatch at {i}: gpu {a} vs cpu {b}"
+            );
+        }
+        Ok(())
+    }
+    /// Q4_0 GPU quantize must emit the exact same bytes as the CPU path
+    /// (documented: byte-identical for Q4_0) and dequantize within tolerance.
+    #[test]
+    fn quantize_q4_0_matches_cpu_bytes() -> crate::Result<()> {
+        let wgpu = Device::new_wgpu(0)?;
+        let cpu = Device::Cpu;
+        let n = 5 * 32; // non-power-of-2, whole blocks only
+        let xs = lcg_f32(n, 0x89ab_cdef);
+        let t_gpu = Tensor::from_vec(xs, n, &wgpu)?;
+        let t_cpu = Tensor::from_vec(lcg_f32(n, 0x89ab_cdef), n, &cpu)?;
+        let q_gpu = QTensor::quantize(&t_gpu, GgmlDType::Q4_0)?;
+        let q_cpu = QTensor::quantize(&t_cpu, GgmlDType::Q4_0)?;
         assert_eq!(q_gpu.data()?.as_ref(), q_cpu.data()?.as_ref());
         let deq_gpu = q_gpu.dequantize(&wgpu)?.to_vec1::<f32>()?;
         let deq_cpu = q_cpu.dequantize(&cpu)?.to_vec1::<f32>()?;
