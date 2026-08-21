@@ -5683,16 +5683,18 @@ impl WgpuStorage {
                 chunk_params.base = base.try_into()?;
                 chunk_params.offset_false = 0;
                 chunk_params.offset_dst = 0;
-                self.device
-                    .inner
-                    .queue
-                    .write_buffer(&param_buffer, 0, any_as_bytes(&chunk_params));
+                // Per-chunk ring slot so in-flight dispatches never share a
+                // slot's last write (same-queue ordering alone is not enough
+                // under deferred batched dispatch).
+                let chunk_param_buffer = self
+                    .device
+                    .write_uniform_params(any_as_bytes(&chunk_params))?;
                 let chunk_bindings = [
                     storage_layout_binding(self, layout, 0)?,
                     storage_layout_binding(t, t_l, 1)?,
                     storage_layout_binding(f, &false_chunk_l, 2)?,
                     storage_layout_binding(&dst, &dst_chunk_l, 3)?,
-                    buffer_binding(4, &param_buffer),
+                    buffer_binding(4, &chunk_param_buffer),
                 ];
                 let workgroups = (chunk_elems as u32).div_ceil(WG_SIZE);
                 t.device.run_compute(
