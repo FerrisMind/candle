@@ -6192,13 +6192,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 "#
             ),
             DType::I32 => {
-                // For packed sub-word sources (u8/i16/bf16/f16) the load line
-                // exposes the *containing word* via `lo`/`src[i]`; decode the
-                // proper lane exactly like the load snippets do.
+                // For packed sub-word sources the load line drives the decode:
+                // i16 exposes the *containing word* via `lo` (decode the lane
+                // with `extra_pre` exactly like the load snippet), while u8
+                // exposes the already-extracted byte `lo = b` (0..255) so the
+                // I32 value is just the byte itself.
                 let (extra_pre, conv_i32) = match self.dtype {
                     DType::U8 => (
                         "",
-                        "i32((lo >> (8u * (i % 4u))) & 0xffu)",
+                        "i32(lo)",
                     ),
                     DType::I16 => (
                         "let u16v = (lo >> (16u * (i % 2u))) & 0xffffu;",
@@ -6325,6 +6327,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             self.copy_strided_src(&mut materialized, 0, layout)?;
             let contiguous = Layout::contiguous(layout.shape());
             materialized.to_dtype(&contiguous, DType::F32)
+        }
+    }
+
+    fn materialize_to_i32(&self, layout: &Layout) -> Result<Self> {
+        if self.dtype == DType::I32 {
+            if layout.is_contiguous() && layout.start_offset() == 0 {
+                self.try_clone(layout)
+            } else if layout.dims().len() > 4 {
+                let (materialized, _) = self.materialize_rank_gt4_compact(layout)?;
+                Ok(materialized)
+            } else {
+                let mut materialized =
+                    unsafe { self.device.alloc_uninit(layout.shape(), DType::I32)? };
+                self.copy_strided_src(&mut materialized, 0, layout)?;
+                Ok(materialized)
+            }
+        } else if layout.dims().len() > 4 {
+            let (materialized, compact_l) = self.materialize_rank_gt4_compact(layout)?;
+            materialized.to_dtype(&compact_l, DType::I32)
+        } else {
+            let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            self.copy_strided_src(&mut materialized, 0, layout)?;
+            let contiguous = Layout::contiguous(layout.shape());
+            materialized.to_dtype(&contiguous, DType::I32)
         }
     }
 
@@ -12575,6 +12601,24 @@ impl BackendStorage for WgpuStorage {
             let out_layout = Layout::contiguous(Shape::from(out_dims));
             return reduced.to_dtype(&out_layout, DType::F16);
         }
+        if self.dtype == DType::I16 {
+            // No native packed I16 reduce kernel: hub through I32 (exact
+            // integer values). Sum/min/max keep I16; argmin/argmax emit U32
+            // indices which must NOT be converted back.
+            return self.materialize_to_i32(layout).and_then(|src_i32| {
+                let contiguous = Layout::contiguous(layout.shape());
+                let reduced = src_i32.reduce_op(op, &contiguous, reduce_dims)?;
+                if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
+                    return Ok(reduced);
+                }
+                let mut out_dims = layout.dims().to_vec();
+                for &dim in reduce_dims {
+                    out_dims[dim] = 1;
+                }
+                let out_layout = Layout::contiguous(Shape::from(out_dims));
+                reduced.to_dtype(&out_layout, DType::I16)
+            });
+        }
         if self.dtype == DType::F64 {
             return self.run_f64_reduce(op, layout, reduce_dims);
         }
@@ -14869,6 +14913,136 @@ mod wgpu_reduce_tests {
         let got: Vec<i32> = result.flatten_all().unwrap().to_vec1().unwrap();
         assert_eq!(got, vec![6, 15], "i32 sum over dim 1");
         assert_eq!(result.dims().to_vec(), vec![2, 1], "keepdim shape");
+    }
+
+    #[test]
+    fn wgpu_reduce_i16_sum() {
+        let dev = wgpu_device();
+        let vals: Vec<i16> = vec![1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12];
+        let shape = vec![3, 4];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.sum_keepdim(1).unwrap();
+        let got: Vec<i16> = result.flatten_all().unwrap().to_vec1().unwrap();
+        // Row 0: 1-2+3-4 = -2, Row 1: 5-6+7-8 = -2, Row 2: 9-10+11-12 = -2
+        assert_eq!(got, vec![-2, -2, -2], "i16 sum over dim 1 mismatch");
+        assert_eq!(result.dtype(), crate::DType::I16, "sum keepdim must stay i16");
+        assert_eq!(result.dims().to_vec(), vec![3, 1], "keepdim shape");
+    }
+
+    #[test]
+    fn wgpu_reduce_i16_sum_all() {
+        let dev = wgpu_device();
+        let vals: Vec<i16> = vec![10, -20, 30, -40, 50, -60];
+        let shape = vec![2, 3];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.sum_all().unwrap();
+        let got: i16 = result.to_scalar().unwrap();
+        let want: i16 = vals.iter().sum();
+        assert_eq!(got, want, "i16 sum_all mismatch");
+    }
+
+    #[test]
+    fn wgpu_reduce_i16_max() {
+        let dev = wgpu_device();
+        let vals: Vec<i16> = vec![1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12];
+        let shape = vec![3, 4];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+
+        // max over dim 1
+        let result = t.max(1).unwrap();
+        let got: Vec<i16> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![3, 7, 11], "i16 max over dim 1");
+        assert_eq!(result.dtype(), crate::DType::I16, "max must stay i16");
+
+        // max over dim 0
+        let result = t.max(0).unwrap();
+        let got: Vec<i16> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![9, -2, 11, -4], "i16 max over dim 0");
+    }
+
+    #[test]
+    fn wgpu_reduce_i16_min() {
+        let dev = wgpu_device();
+        let vals: Vec<i16> = vec![1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12];
+        let shape = vec![3, 4];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+
+        // min over dim 1
+        let result = t.min(1).unwrap();
+        let got: Vec<i16> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![-4, -8, -12], "i16 min over dim 1");
+        assert_eq!(result.dtype(), crate::DType::I16, "min must stay i16");
+
+        // min over dim 0
+        let result = t.min(0).unwrap();
+        let got: Vec<i16> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![1, -10, 3, -12], "i16 min over dim 0");
+    }
+
+    #[test]
+    fn wgpu_reduce_i16_argmax_tie() {
+        let dev = wgpu_device();
+        let vals: Vec<i16> = vec![5, 3, 5, 1, 5, 2];
+        let shape = vec![1, 6];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.argmax(1).unwrap();
+        let got: Vec<u32> = result.to_vec1().unwrap();
+        assert_eq!(got, vec![0], "i16 argmax tie: first-index-wins, expected 0");
+        assert_eq!(
+            result.dtype(),
+            crate::DType::U32,
+            "argmax must return u32 indices"
+        );
+
+        let vals_i32: Vec<i32> = vals.iter().map(|&v| v as i32).collect();
+        let (cpu_got, _) = cpu_argmax_i32(&vals_i32, &shape, 1);
+        assert_eq!(got, cpu_got, "i16 argmax must match CPU exactly");
+    }
+
+    #[test]
+    fn wgpu_reduce_i16_2d_dim0() {
+        let dev = wgpu_device();
+        // mixed negative/positive values, reduce over dim 0
+        let vals: Vec<i16> = vec![1, -2, 3, -4, 5, -6];
+        let shape = vec![2, 3];
+        let t = crate::Tensor::from_vec(vals.clone(), shape.clone(), &dev).unwrap();
+        let result = t.sum_keepdim(0).unwrap();
+        let got: Vec<i16> = result.flatten_all().unwrap().to_vec1().unwrap();
+        // Row 0: [1,-2,3], Row 1: [-4,5,-6]; sum over dim 0 = [-3, 3, -3]
+        assert_eq!(got, vec![-3, 3, -3], "i16 sum over dim 0");
+        assert_eq!(
+            result.dtype(),
+            crate::DType::I16,
+            "sum over dim 0 must stay i16"
+        );
+        assert_eq!(result.dims().to_vec(), vec![1, 3], "keepdim shape");
+    }
+
+    #[test]
+    fn wgpu_to_dtype_u8_to_i32_lanes() {
+        let cpu = crate::Device::Cpu;
+        let device = wgpu_device();
+        // 4x4 covers every byte lane (values 0..=15, lane = idx % 4)
+        let vals: Vec<u8> = (0..16).collect();
+        let g = crate::Tensor::from_slice(&vals, (4, 4), &device)
+            .unwrap()
+            .to_dtype(crate::DType::I32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<i32>()
+            .unwrap();
+        let c = crate::Tensor::from_slice(&vals, (4, 4), &cpu)
+            .unwrap()
+            .to_dtype(crate::DType::I32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<i32>()
+            .unwrap();
+        assert_eq!(g, c, "u8 -> i32 must preserve every byte lane");
+        let want: Vec<i32> = (0..16).collect();
+        assert_eq!(g, want, "u8 -> i32 must equal the byte values");
     }
 
     #[test]
