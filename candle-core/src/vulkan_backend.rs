@@ -384,6 +384,19 @@ struct VulkanQuantizeQ8_1Params {
     num_blocks: u32,
 }
 
+/// Push constants for the Q4_1/Q5_0/Q5_1 quantize kernels. `scale_bits` is the
+/// f32 bit pattern of the block scale divisor, passed as runtime data so the
+/// SPIR-V optimizer cannot constant-fold the division chain (glslc rewrites
+/// `x/15.0` and `1.0/(x/15.0)` into 1-ulp-different forms, breaking exact
+/// byte parity with the CPU path).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VulkanQuantizeScaleParams {
+    ne: u32,
+    num_blocks: u32,
+    scale_bits: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VulkanDequantizeParams {
@@ -1267,6 +1280,105 @@ pub(crate) fn quantize_f32_storage_to_q4_0(
     let params = VulkanQuantizeQ8_1Params {
         ne: elem_count.try_into()?,
         num_blocks,
+    };
+    let block_groups = num_blocks.div_ceil(4);
+    let workgroups_x = block_groups.min(device.inner.max_workgroup_count_x.max(1));
+    device.run_compute_specialized(
+        spirv,
+        &[
+            VulkanBinding::Storage(&src.buffer),
+            VulkanBinding::Storage(&out.buffer),
+        ],
+        Some(any_as_bytes(&params)),
+        (workgroups_x, 1, 1),
+        Some(&[(0, 32)]),
+    )?;
+    Ok(out)
+}
+
+pub(crate) fn quantize_f32_storage_to_q4_1(
+    device: &VulkanDevice,
+    src: &VulkanStorage,
+    elem_count: usize,
+) -> Result<VulkanStorage> {
+    if src.dtype != DType::F32 {
+        return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan quantize_q4_1").bt());
+    }
+    let num_blocks: u32 = (elem_count / 32).try_into()?;
+    let out_count = (num_blocks as usize) * GgmlDType::Q4_1.type_size();
+    let out = unsafe { device.alloc_uninit(&Shape::from(out_count), DType::U8)? };
+    let spirv = candle_vulkan_kernels::spirv("quantize_q4_1")
+        .ok_or_else(|| Error::Msg("vulkan shader quantize_q4_1 not generated".into()).bt())?;
+    let params = VulkanQuantizeScaleParams {
+        ne: elem_count.try_into()?,
+        num_blocks,
+        scale_bits: 15f32.to_bits(),
+    };
+    let block_groups = num_blocks.div_ceil(4);
+    let workgroups_x = block_groups.min(device.inner.max_workgroup_count_x.max(1));
+    device.run_compute_specialized(
+        spirv,
+        &[
+            VulkanBinding::Storage(&src.buffer),
+            VulkanBinding::Storage(&out.buffer),
+        ],
+        Some(any_as_bytes(&params)),
+        (workgroups_x, 1, 1),
+        Some(&[(0, 32)]),
+    )?;
+    Ok(out)
+}
+
+pub(crate) fn quantize_f32_storage_to_q5_0(
+    device: &VulkanDevice,
+    src: &VulkanStorage,
+    elem_count: usize,
+) -> Result<VulkanStorage> {
+    if src.dtype != DType::F32 {
+        return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan quantize_q5_0").bt());
+    }
+    let num_blocks: u32 = (elem_count / 32).try_into()?;
+    let out_count = (num_blocks as usize) * GgmlDType::Q5_0.type_size();
+    let out = unsafe { device.alloc_uninit(&Shape::from(out_count), DType::U8)? };
+    let spirv = candle_vulkan_kernels::spirv("quantize_q5_0")
+        .ok_or_else(|| Error::Msg("vulkan shader quantize_q5_0 not generated".into()).bt())?;
+    let params = VulkanQuantizeScaleParams {
+        ne: elem_count.try_into()?,
+        num_blocks,
+        scale_bits: (-16f32).to_bits(),
+    };
+    let block_groups = num_blocks.div_ceil(4);
+    let workgroups_x = block_groups.min(device.inner.max_workgroup_count_x.max(1));
+    device.run_compute_specialized(
+        spirv,
+        &[
+            VulkanBinding::Storage(&src.buffer),
+            VulkanBinding::Storage(&out.buffer),
+        ],
+        Some(any_as_bytes(&params)),
+        (workgroups_x, 1, 1),
+        Some(&[(0, 32)]),
+    )?;
+    Ok(out)
+}
+
+pub(crate) fn quantize_f32_storage_to_q5_1(
+    device: &VulkanDevice,
+    src: &VulkanStorage,
+    elem_count: usize,
+) -> Result<VulkanStorage> {
+    if src.dtype != DType::F32 {
+        return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan quantize_q5_1").bt());
+    }
+    let num_blocks: u32 = (elem_count / 32).try_into()?;
+    let out_count = (num_blocks as usize) * GgmlDType::Q5_1.type_size();
+    let out = unsafe { device.alloc_uninit(&Shape::from(out_count), DType::U8)? };
+    let spirv = candle_vulkan_kernels::spirv("quantize_q5_1")
+        .ok_or_else(|| Error::Msg("vulkan shader quantize_q5_1 not generated".into()).bt())?;
+    let params = VulkanQuantizeScaleParams {
+        ne: elem_count.try_into()?,
+        num_blocks,
+        scale_bits: 31f32.to_bits(),
     };
     let block_groups = num_blocks.div_ceil(4);
     let workgroups_x = block_groups.min(device.inner.max_workgroup_count_x.max(1));
@@ -11042,6 +11154,192 @@ mod tests {
             assert!(
                 (a - b).abs() <= 1.0e-2,
                 "dequant mismatch at {i}: gpu {a} vs cpu {b}"
+            );
+        }
+        Ok(())
+    }
+
+    /// 128 elements = 4 blocks of 32. Sewn blocks carry byte-parity worst cases:
+    /// exact duplicates, +-0.0 min/max ties (minNum keeps -0.0, maxNum keeps
+    /// +0.0) and first-occurrence absmax ties (Q5_0 selects the *first* element
+    /// of a tied |x|). Each block is padded to 32 with a band that never
+    /// overrides the block's intended extrema.
+    fn quant_tie_fixture(dtype: GgmlDType) -> Vec<f32> {
+        fn fill(xs: &mut Vec<f32>, lo: f32, span: f32) {
+            while !xs.len().is_multiple_of(32) {
+                let i = xs.len();
+                xs.push(lo + (i % 7) as f32 * span / 6.0);
+            }
+        }
+        let mut xs = Vec::with_capacity(128);
+        // Block 0: straight-line values, distinct.
+        for i in 0..32 {
+            xs.push((i as f32) * 0.19 - 2.0);
+        }
+        // Block 1: max tie between +0.0 and -0.0 (maxNum keeps +0.0),
+        // min -2.5. Fill stays strictly negative, above the min.
+        xs.extend_from_slice(&[0.0, -0.0, -2.5, -1.25]);
+        fill(&mut xs, -2.25, 1.75);
+        // Block 2: min tie between +0.0 and -0.0 so m must be f16(-0.0) =
+        // 0x8000. Fill stays strictly positive.
+        xs.extend_from_slice(&[1.0, -0.0, 0.0, 2.0]);
+        fill(&mut xs, 0.25, 2.0);
+        // Block 3: format-specific tie cases.
+        match dtype {
+            GgmlDType::Q5_0 => {
+                xs.extend_from_slice(&[3.0, -3.0, 1.0, -1.0, 2.5, -0.0, 0.0, -0.25]);
+            }
+            _ => {
+                xs.extend_from_slice(&[3.0, 3.0, -3.0, -3.0, 0.5, 0.5, -0.0, 0.0]);
+            }
+        }
+        fill(&mut xs, 0.25, 2.0);
+        assert_eq!(xs.len(), 128);
+        xs
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_q4_1_matches_cpu_bytes() -> Result<()> {
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let cpu = crate::Device::Cpu;
+        let n = 3 * 32; // non-power-of-2, whole blocks only
+        let xs = quant_test_lcg(n, 0xfeed_4e11);
+        let t_vk = crate::Tensor::from_vec(xs.clone(), n, &vk)?;
+        let t_cpu = crate::Tensor::from_vec(xs, n, &cpu)?;
+        let q_vk = crate::quantized::QTensor::quantize(&t_vk, GgmlDType::Q4_1)?;
+        let q_cpu = crate::quantized::QTensor::quantize(&t_cpu, GgmlDType::Q4_1)?;
+        // Documented: Q4_1 GPU quantize is byte-identical to the CPU path.
+        assert_eq!(q_vk.data()?.as_ref(), q_cpu.data()?.as_ref());
+        let deq_vk = q_vk.dequantize(&vk)?.to_vec1::<f32>()?;
+        let deq_cpu = q_cpu.dequantize(&cpu)?.to_vec1::<f32>()?;
+        for (i, (a, b)) in deq_vk.iter().zip(deq_cpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1.0e-2,
+                "dequant mismatch at {i}: gpu {a} vs cpu {b}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_q5_0_matches_cpu_bytes() -> Result<()> {
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let cpu = crate::Device::Cpu;
+        let n = 5 * 32; // non-power-of-2, whole blocks only
+        let xs = quant_test_lcg(n, 0xfeed_5e0d);
+        let t_vk = crate::Tensor::from_vec(xs.clone(), n, &vk)?;
+        let t_cpu = crate::Tensor::from_vec(xs, n, &cpu)?;
+        let q_vk = crate::quantized::QTensor::quantize(&t_vk, GgmlDType::Q5_0)?;
+        let q_cpu = crate::quantized::QTensor::quantize(&t_cpu, GgmlDType::Q5_0)?;
+        // Documented: Q5_0 GPU quantize is byte-identical to the CPU path.
+        assert_eq!(q_vk.data()?.as_ref(), q_cpu.data()?.as_ref());
+        let deq_vk = q_vk.dequantize(&vk)?.to_vec1::<f32>()?;
+        let deq_cpu = q_cpu.dequantize(&cpu)?.to_vec1::<f32>()?;
+        for (i, (a, b)) in deq_vk.iter().zip(deq_cpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1.0e-2,
+                "dequant mismatch at {i}: gpu {a} vs cpu {b}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_q5_1_matches_cpu_bytes() -> Result<()> {
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let cpu = crate::Device::Cpu;
+        let n = 3 * 32; // non-power-of-2, whole blocks only
+        let xs = quant_test_lcg(n, 0xfeed_5e11);
+        let t_vk = crate::Tensor::from_vec(xs.clone(), n, &vk)?;
+        let t_cpu = crate::Tensor::from_vec(xs, n, &cpu)?;
+        let q_vk = crate::quantized::QTensor::quantize(&t_vk, GgmlDType::Q5_1)?;
+        let q_cpu = crate::quantized::QTensor::quantize(&t_cpu, GgmlDType::Q5_1)?;
+        // Documented: Q5_1 GPU quantize is byte-identical to the CPU path.
+        assert_eq!(q_vk.data()?.as_ref(), q_cpu.data()?.as_ref());
+        let deq_vk = q_vk.dequantize(&vk)?.to_vec1::<f32>()?;
+        let deq_cpu = q_cpu.dequantize(&cpu)?.to_vec1::<f32>()?;
+        for (i, (a, b)) in deq_vk.iter().zip(deq_cpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1.0e-2,
+                "dequant mismatch at {i}: gpu {a} vs cpu {b}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_dm_large_multi_workgroup_matches_cpu() -> Result<()> {
+        // 4608 = 144 blocks -> 36 workgroups of 4 blocks, each striding over
+        // the workgroup loop several times. Single-workgroup fixtures hide
+        // block-indexing bugs (see the c91c7daf wgpu fix) so this stays.
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let cpu = crate::Device::Cpu;
+        for (dtype, seed) in [
+            (GgmlDType::Q4_1, 0x0de0_4111),
+            (GgmlDType::Q5_0, 0x0de0_5000),
+            (GgmlDType::Q5_1, 0x0de0_5111),
+        ] {
+            let n = 4608;
+            let xs = quant_test_lcg(n, seed);
+            let t_vk = crate::Tensor::from_vec(xs.clone(), n, &vk)?;
+            let t_cpu = crate::Tensor::from_vec(xs, n, &cpu)?;
+            let q_vk = crate::quantized::QTensor::quantize(&t_vk, dtype)?;
+            let q_cpu = crate::quantized::QTensor::quantize(&t_cpu, dtype)?;
+            assert_eq!(
+                q_vk.data()?.as_ref(),
+                q_cpu.data()?.as_ref(),
+                "{dtype:?} GPU quantize bytes differ from CPU at n={n}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_ties_and_zero_bytes_match_cpu() -> Result<()> {
+        // Byte-level min/max and absmax tie semantics (incl. +-0.0) must be
+        // identical on device for Q4_1/Q5_0/Q5_1.
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let cpu = crate::Device::Cpu;
+        for dtype in [GgmlDType::Q4_1, GgmlDType::Q5_0, GgmlDType::Q5_1] {
+            let xs = quant_tie_fixture(dtype);
+            let n = xs.len();
+            let t_vk = crate::Tensor::from_vec(xs.clone(), n, &vk)?;
+            let t_cpu = crate::Tensor::from_vec(xs, n, &cpu)?;
+            let q_vk = crate::quantized::QTensor::quantize(&t_vk, dtype)?;
+            let q_cpu = crate::quantized::QTensor::quantize(&t_cpu, dtype)?;
+            assert_eq!(
+                q_vk.data()?.as_ref(),
+                q_cpu.data()?.as_ref(),
+                "{dtype:?} GPU quantize bytes differ from CPU for tie/zero fixture",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_non_multiple_takes_cpu_behavior() -> Result<()> {
+        // Not a whole number of blocks: the GPU fast-path guard does not apply
+        // and the documented CPU path governs, so both devices must surface
+        // identical behavior (same error via QTensor::quantize).
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let cpu = crate::Device::Cpu;
+        let n = 3 * 32 + 4; // not a multiple of any quantized block size
+        for dtype in [GgmlDType::Q4_1, GgmlDType::Q5_0, GgmlDType::Q5_1] {
+            let xs = quant_test_lcg(n, 0xcafe_70dd);
+            let t_vk = crate::Tensor::from_vec(xs.clone(), n, &vk)?;
+            let t_cpu = crate::Tensor::from_vec(xs, n, &cpu)?;
+            let err_vk = crate::quantized::QTensor::quantize(&t_vk, dtype).unwrap_err();
+            let err_cpu = crate::quantized::QTensor::quantize(&t_cpu, dtype).unwrap_err();
+            assert_eq!(
+                err_vk.to_string(),
+                err_cpu.to_string(),
+                "{dtype:?} non-multiple input diverged from the documented CPU path",
             );
         }
         Ok(())

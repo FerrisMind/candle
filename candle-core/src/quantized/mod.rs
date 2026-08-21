@@ -549,6 +549,42 @@ impl QVulkanStorage {
                     self.storage = quant;
                     return Ok(());
                 }
+                if self.dtype == GgmlDType::Q4_1 && need(32) {
+                    let device = self.device();
+                    let quant = crate::vulkan_backend::quantize_f32_storage_to_q4_1(
+                        device,
+                        src,
+                        elem_count,
+                    )?;
+                    self.len_bytes =
+                        elem_count / 32 * std::mem::size_of::<k_quants::BlockQ4_1>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+                if self.dtype == GgmlDType::Q5_0 && need(32) {
+                    let device = self.device();
+                    let quant = crate::vulkan_backend::quantize_f32_storage_to_q5_0(
+                        device,
+                        src,
+                        elem_count,
+                    )?;
+                    self.len_bytes =
+                        elem_count / 32 * std::mem::size_of::<k_quants::BlockQ5_0>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+                if self.dtype == GgmlDType::Q5_1 && need(32) {
+                    let device = self.device();
+                    let quant = crate::vulkan_backend::quantize_f32_storage_to_q5_1(
+                        device,
+                        src,
+                        elem_count,
+                    )?;
+                    self.len_bytes =
+                        elem_count / 32 * std::mem::size_of::<k_quants::BlockQ5_1>();
+                    self.storage = quant;
+                    return Ok(());
+                }
             }
         }
         let src = src.to_cpu_storage()?;

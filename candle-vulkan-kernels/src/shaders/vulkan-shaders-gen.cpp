@@ -831,6 +831,9 @@ void process_shaders() {
 
     string_to_spv("quantize_q8_0", "quantize_q8_0.comp", {});
     string_to_spv("quantize_q4_0", "quantize_q4_0.comp", {});
+    string_to_spv("quantize_q4_1", "quantize_q4_1.comp", {});
+    string_to_spv("quantize_q5_0", "quantize_q5_0.comp", {});
+    string_to_spv("quantize_q5_1", "quantize_q5_1.comp", {});
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
