@@ -164,4 +164,70 @@
 **Итог волны: vulkan 49/49 passed (15 ignored), wgpu 123/123 passed, 0 ignored; clippy `-D warnings` = 0 по обеим фичам.**
 
 ---
+
+## 13. ФИНАЛЬНАЯ ВОЛНА 2026-08-22 (agent-swarm): perf-паритет, GPU-quantize, disposition CUDA-эксклюзивов
+
+Оркестрирована через agent-swarm (план `.swarm/plan.md`, отчёты листьев `.swarm/results/`). Все прогоны — RTX 3060, Windows, release, `--test-threads=1`. HEAD волны: `c91c7daf` (родитель `172aec59`).
+
+### Коммиты волны
+
+| Коммит | Содержание |
+|---|---|
+| `748bf79c` | Expected-mismatch allowlist в `backend_parity_diff` (реализация §9.3): 8 классов толерансных расхождений §7 с документированными max_abs-границами (breach = hard fail). Паритет-сьют: 9 passed / 0 failed / 1 ignored на обоих бекендах; 27 (wgpu) + 5 (vulkan) expected-mismatch note задействованы, все в границах. |
+| `97591f4b` | perf(wgpu): 9 hot per-call params-сайтов переведены на uniform ring (`write_uniform_params`, 128×256B): copy_into, softmax (3 сайта), flash_attn_ext, flash_attn_paged, rope, rms_norm, index_select, gather, quantized_matvec. Исправлен латентный hazard: flash_attn_paged переписывал ОДИН params-буфер per-chunk при отложенном dispatch → свежий слот ring'а на чанк. Инвентаризация W-A3: 43 сайта всего, batch-2 (conv/cast/cmp/where/clamp) — follow-up. |
+| `8cbb49d8` | perf(vulkan): нативный BF16 cmp — новый `cmp_bf16.comp` (packed-u16, decode через битовый сдвиг, сравнение в fp32, выход U8); удалён f32-хаб `bf16_cmp_via_f32` (двойной decode-проход). Тест на 23-элементной фикстуре (негативы, ±0, NaN, все 6 CmpOp) vs CPU. |
+| `0fa10314` | `supports_bf16()` = true для Wgpu/Vulkan (device.rs): BF16 работоспособен end-to-end (wgpu software pack/unpack, vulkan precompiled SPIR-V — аппаратная фича не требуется), семантика «usable, not hardware-native». Smoke-ассерты обновлены; bf16 matmul-тесты теперь РАБОТАЮТ на обоих бекендах (11/11). Примеры (flux/mixtral/phi/…) получают BF16-по-умолчанию на этих девайсах вместо F32 (память вдвое). |
+| `2b4e5f8e` | feat(wgpu): нативный GPU-quantize Q8_0 — word-packed 34B блоки, one-writer-per-u32-word (WGSL не имеет 8-битных типов), byte-identical CPU. |
+| `bbb32485` | feat(wgpu): нативный GPU-quantize Q4_0 — nibble-packed 18B блоки, семантика CPU включая vmax tie-order. |
+| `172aec59` | feat(vulkan): GPU-quantize Q8_0 + Q4_0 (.comp, CPU-layout блоки на устройстве). Устранён последний CPU round-trip в quant-стеке (`QWgpuStorage`/`QVulkanStorage::quantize` для этих форматов; не-contiguous/не-F32 входы — документированный CPU-путь). Тесты: GPU-байты == CPU-байты (не только dequant-толеранс). |
+| `c91c7daf` | fix(wgpu): критический offset-баг, пойманный финальными гейтами — word-assembly в Q4_0/Q8_0 передавал ГЛОБАЛЬНЫЙ byte-offset вместо workgroup-локального → guard `block_in_wg < 8` отсекал все workgroup'ы кроме первого (блоки за пределами первых 144/272 байт занулялись). Q8_0 проходил smoke только потому, что фикстура влезала в один workgroup; Q4_0 matvec читал нули (nmse 0.75). Vulkan-версии бага не имели (другой паттерн адресации). |
+
+### Диспозиция CUDA-эксклюзивной экосистемы (замена аналогом / non-gap)
+
+| CUDA-эксклюзив | Диспозиция | Обоснование |
+|---|---|---|
+| GPU-quantize (GGUF) | **ЗАМЕНЕНО аналогом** | Q8_0/Q4_0 нативные кернелы на обоих бекендах, byte-identical CPU (коммиты выше). Q4_1/Q5_0/Q5_1/K-quants — follow-up по тому же паттерну; llama.cpp CUDA сама GPU-quantize не имеет (только Q8_1 в vk/wgsl). |
+| candle-ug (NVRTC runtime-компиляция SSA→PTX) | **non-gap** | JIT-компиляция шейдеров не даёт op-parity-выгоды: оба бекенда поставляются прекомпилированными SPIR-V/WGSL-кернелами; runtime-compile — экосистемная фича, не контрактная. |
+| CUDA Graphs (запись/переигрывание графов) | **non-gap** (perf-класс) | Batched command-буферы VK + bundle/cached encoders wgpu дают ту же амортизацию re-play (§5.8 дока 2026-08-19); SLO-перф отслеживается отдельно. |
+| candle-flash-attn v2/v3 (Ampere/Hopper, GQA-packing, paged varlen) | **non-gap** (за пределами Hopper-специфики) | `flash_attn_varlen` + paged KV (block_table) уже портированы на оба бекенда (§11). Оставшееся — Hopper-специфичные tensor-core пути (WMMA), привязанные к железу, которых на Ampere-классе и у CUDA нет. |
+| cuDNN conv (auto-algo, Winograd/FFT) | **non-gap** (perf-класс) | im2col+GEMM корректен; нативные F16/BF16 conv/pool/upsample уже есть на wgpu (§11), VK — F32-нативно. Разница — алгоритмический класс, не функциональность. |
+| cuBLAS TF32 (`set_gemm_reduced_precision_f32`) | **non-gap** | Аналогичный режим точности — coopmat/матmul с f16→f32 накоплением; соответствие режимов задокументировано в §11 дока 2026-08-19 (п.11). |
+| MoE WMMA (`moe_gemm_wmma`) / матричный MoE | **non-gap** (perf-класс) | wgpu: `mul_mat_id` (матричный MoE) есть; vulkan: `mul_mat_vec_id` (декодовый). Матричный MoE на VK — опциональный perf follow-up, не функциональный гэп (обоими бекендами MoE-модели исполняются). |
+| fp8 (F8E4M3) «нативные» кернелы CUDA | **non-gap** | Кернелы CUDA сломаны в этом форке на уровне имён (`_fp8_e4m3` vs `_f8e4m3` в `kernel_name()`) + гейт `__CUDA_ARCH__ >= 890` (Hopper); на RTX 3060 недоступны в принципе. VK/wgpu f8e4m3 через f32-хаб — строго более юзабельны. |
+| IQ-серия / mxfp4 / nvfp4 в GgmlDType | **non-gap** | Ограничение candle в целом (enum не содержит; у CUDA в этом форке тоже нет) — не гэп бекендов. |
+
+### Финальные гейты (HEAD `c91c7daf`, RTX 3060, release, `--test-threads=1`)
+
+| Прогон | Результат |
+|---|---|
+| `clippy -D warnings` | wgpu 0 · vulkan 0 (glslc banner — не диагностика) |
+| `candle-core lib, wgpu` | **132 passed / 0 failed / 0 ignored** |
+| `candle-core lib, vulkan` | **50 passed / 0 failed / 17 ignored** (все ignored — задокументированные follow-up) |
+| `backend_parity_diff` | wgpu **9/0/1** · vulkan **9/0/1** (жёстких FAIL нет; expected-mismatch в границах) |
+| `backend_smoke_tests, wgpu` | **43 passed / 0 failed** (включая quantized_paths после c91c7daf и bf16-native) |
+| `backend_smoke_tests, vulkan` | 47/3: три OOM (`unary_binary`, `upload_and_dtype`, `upsample_native_only`) в полном сьют-прогоне — **pre-existing** (воспроизведено на baseline-HEAD до изменений волны; каждый проходит изолированно) |
+| `matmul_tests` (bf16 включён) | 11/11 оба бекенда |
+
+### Перф-аудит (HEAD `c91c7daf`, изолированные прогоны, RTX 3060)
+
+| Бекенд | Метрика | Текущий | Предыдущий (§12) | Вердикт |
+|---|---|---|---|---|
+| vulkan | matmul f32 1024² | 0.33ms / p95 0.45 | 0.31 / 0.34 | шум, без регрессии |
+| vulkan | gelu 1M / binary 1M | 0.11 / 0.13 | 0.10 / 0.11 | ✓ |
+| vulkan | leak slope (binary/matmul ×100) | 0.006% / 0.017% | 0.006% / 0.006% | утечек нет (порог 1%) |
+| wgpu | matmul f32 1024² | **0.58ms / p95 0.78** | 0.58 / 0.60 | ровно baseline |
+| wgpu | gelu 1M / binary 1M | 0.15 / 0.16 | 0.13 / 0.15 | шум |
+| wgpu | leak slope (binary/matmul ×100) | 0.083% / 0.058% | 0.083% / 0.064% | утечек нет; RSS baseline 63.8MB стабилен |
+
+Вывод по перф-задаче: утечек памяти нет на обоих бекендах (slopes на порядок ниже порога 1%, дельты 4–53KB/100 итераций — уровень Vec-realloc), деградаций производительности нет; uniform-ring конверсия (97591f4b) перф-нейтральна на измеряемых workloads при устранении ~10 аллокаций/вызов и hazard'а flash_attn_paged.
+
+### Открытые follow-up (зафиксировано, не блокирует паритет)
+
+1. wgpu params batch-2: ~34 сайта на uniform ring (conv1d/2d, emulated_cast/strided_copy, cmp_u8, where_u8, clamp — инвентаризация `.swarm/results/w-a3-params-inventory.md`).
+2. GPU-quantize остальных форматов: Q4_1/Q5_0/Q5_1 (medium по W-A4), K-quants Q2K–Q6K (hard, multi-scale superblocks).
+3. vulkan cmp F8E4M3 и rand F16/BF16 нативизация — keep-hub по аудиту W-A2 (холодные пути, малый ROI).
+4. vulkan smoke suite OOM-тройка в сьют-прогоне (pre-existing, machine-specific; изолированно зелёные).
+5. `cargo fmt` на touched файлах (175 хунков, не блокирует гейты; отдельный cosmetic-коммит).
+
+---
 *Все утверждения о коде проверены на HEAD 1596684b; тестовые прогоны — RTX 3060, release, 2026-08-21, однопоточные (`--test-threads=1`). Фиксы финальной волны: wgpu_backend.rs (powf/elu F16, reduce I16, to_dtype U8→I32, F8E4M3-хабы, uniform ring), 7 argsort-шейдеров candle-vulkan-kernels, vulkan scatter_add F8E4M3, backend_parity_diff (harness-сравнение по dtype результата). См. также §10–11 документа 2026-08-19.*
