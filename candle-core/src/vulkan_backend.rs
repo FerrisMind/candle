@@ -6,6 +6,7 @@ use ash::vk;
 use gpu_allocator::vulkan::{
     Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc,
 };
+use gpu_allocator::AllocationSizes;
 use gpu_allocator::MemoryLocation;
 use smallvec::SmallVec;
 use rustc_hash::FxHashMap as HashMap;
@@ -10388,7 +10389,12 @@ impl BackendDevice for VulkanDevice {
             physical_device,
             debug_settings: Default::default(),
             buffer_device_address: false,
-            allocation_sizes: Default::default(),
+            // Small fixed blocks: devices used in the smoke test-suite are never destroyed (the
+            // VulkanBuffer <-> device-pool Arc cycle keeps VulkanInner alive, so vkDestroyDevice
+            // never runs) and one default 256MB device block per leaked device would exhaust 12GB
+            // VRAM across a full-suite run. Allocations larger than the block size fall back to
+            // dedicated (driver-managed) memory blocks, so large allocations are unaffected.
+            allocation_sizes: AllocationSizes::new(16 * 1024 * 1024, 16 * 1024 * 1024),
         })
         .map_err(Error::wrap)?;
         init_guard.disarm();
