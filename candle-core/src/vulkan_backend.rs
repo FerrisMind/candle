@@ -6986,6 +6986,22 @@ impl VulkanStorage {
                 let encoded = dst_f32.to_dtype(&contig_dst, DType::BF16)?;
                 return encoded.copy_strided_src(self, dst_l.start_offset(), &contig_dst);
             }
+            if self.dtype == DType::F8E4M3 && src.dtype == DType::F8E4M3 {
+                // GPUEmulated: decode both sides to f32, scatter_add, encode back.
+                let mut dst_f32 = self.to_dtype(dst_l, DType::F32)?;
+                let src_f32 = src.to_dtype(&src_l, DType::F32)?;
+                let contig_dst = Layout::contiguous(dst_l.shape());
+                let contig_src = Layout::contiguous(src_l.shape());
+                dst_f32.run_scatter_add_last_dim_f32(
+                    &contig_dst,
+                    &ids,
+                    &ids_l,
+                    &src_f32,
+                    &contig_src,
+                )?;
+                let encoded = dst_f32.to_dtype(&contig_dst, DType::F8E4M3)?;
+                return encoded.copy_strided_src(self, dst_l.start_offset(), &contig_dst);
+            }
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_add").bt());
         }
         let rank = dst_l.dims().len();
@@ -11236,6 +11252,50 @@ mod tests {
         want[2] += 7;
         want[0] += 100;
         assert_eq!(got, want);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_scatter_add_f8e4m3() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        // 3x8 dst / 3x4 ids & src with duplicate indices per row (accumulation)
+        // and negative f8 values on both sides.
+        let dst: Vec<f8e4m3> = (0..24u32)
+            .map(|i| f8e4m3::from_f32(i as f32 * 0.5 - 3.0))
+            .collect();
+        let ids: Vec<u32> = vec![2, 2, 0, 7, 5, 5, 5, 1, 3, 3, 3, 3];
+        let src: Vec<f8e4m3> = (0..12u32)
+            .map(|i| f8e4m3::from_f32(i as f32 * 0.75 - 4.5))
+            .collect();
+        let d = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(dst.clone()))?;
+        let i = device.storage_from_cpu_storage(&CpuStorage::U32(ids.clone()))?;
+        let s = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(src.clone()))?;
+        let dl = Layout::contiguous((3usize, 8));
+        let sl = Layout::contiguous((3usize, 4));
+        let mut out = d.try_clone(&dl)?;
+        out.scatter_add_set(&dl, &i, &sl, &s, &sl, 1)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F8E4M3(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        // CPU reference in f32, single re-quantization (mirrors the f32-hub path).
+        let dst_f32: Vec<f32> = dst.iter().map(|f| f.to_f32()).collect();
+        let src_f32: Vec<f32> = src.iter().map(|f| f.to_f32()).collect();
+        let mut want = dst_f32.clone();
+        for (r, row_ids) in ids.chunks_exact(4).enumerate() {
+            for (j, &idx) in row_ids.iter().enumerate() {
+                want[r * 8 + idx as usize] += src_f32[r * 4 + j];
+            }
+        }
+        // fp8 re-quantization tolerance, as in vulkan_f8e4m3_reduce_sum.
+        for (idx, (g, e)) in got.iter().zip(want.iter()).enumerate() {
+            let gv = g.to_f32();
+            let eq = f8e4m3::from_f32(*e).to_f32();
+            assert!(
+                (gv - eq).abs() <= eq.abs() * 0.15 + 1e-3,
+                "scatter_add f8e4m3 mismatch at {idx}: got {gv}, want {eq}"
+            );
+        }
         Ok(())
     }
 
