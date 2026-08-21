@@ -200,6 +200,7 @@ struct ArgsortParams {
     npr: u32,
     nrows: u32,
 }
+const _: () = assert!(size_of::<ArgsortParams>() <= 256);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -225,6 +226,7 @@ struct ArgsortMergeParams {
     nrows: u32,
     _pad0: u32,
 }
+const _: () = assert!(size_of::<ArgsortMergeParams>() <= 256);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WgpuArgsortDType {
@@ -248,6 +250,7 @@ struct CumsumParams {
     ne0: u32,
     _pad0: u32,
 }
+const _: () = assert!(size_of::<CumsumParams>() <= 256);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -465,6 +468,7 @@ struct EmulatedStridedCopyParams {
     src_ne1: u32,
     src_ne2: u32,
 }
+const _: () = assert!(size_of::<EmulatedStridedCopyParams>() <= 256);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -565,6 +569,7 @@ struct Im2ColParams {
     d0: u32,
     d1: u32,
 }
+const _: () = assert!(size_of::<Im2ColParams>() <= 256);
 
 #[derive(thiserror::Error, Debug)]
 pub enum WgpuError {
@@ -6207,20 +6212,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 _pad1: chunk_wi.try_into()?,
                 _pad2: 0,
             };
-            let param_buffer = self
-                .device
-                .inner
-                .device
-                .create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("candle-wgpu-emulated-cast-params"),
-                    size: std::mem::size_of::<F64CastParams>() as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-            self.device
-                .inner
-                .queue
-                .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+            // Per-chunk ring slot so in-flight dispatches never share a slot's last write.
+            let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
             let bindings = [
                 buffer_binding(0, &self.buffer),
                 buffer_binding(1, &dst.buffer),
@@ -6799,20 +6792,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{{body}}}
                 src_ne1: src_dims[1],
                 src_ne2: src_dims[2],
             };
-            let param_buffer = self
-                .device
-                .inner
-                .device
-                .create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("candle-wgpu-emulated-copy-params"),
-                    size: std::mem::size_of::<EmulatedStridedCopyParams>() as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-            self.device
-                .inner
-                .queue
-                .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+            // Per-chunk ring slot so in-flight dispatches never share a slot's last write.
+            let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
             let bindings = [
                 buffer_binding(0, &self.buffer),
                 buffer_binding(1, &dst.buffer),
@@ -7002,20 +6983,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             _pad1: 0,
             _pad2: 0,
         };
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-f64-cast-params"),
-                size: std::mem::size_of::<F64CastParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, true),
             storage_entry(1, false),
@@ -7401,20 +7369,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             npr: npr.try_into()?,
             nrows: nrows.try_into()?,
         };
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-argsort-params"),
-                size: std::mem::size_of::<ArgsortParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -7519,20 +7474,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             nrows: nrows.try_into()?,
             _pad0: 0,
         };
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-argsort-merge-params"),
-                size: std::mem::size_of::<ArgsortMergeParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -7609,20 +7551,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             ne0: ne0.try_into()?,
             _pad0: 0,
         };
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-cumsum-params"),
-                size: std::mem::size_of::<CumsumParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -10763,20 +10692,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             d0: 1,
             d1: 1,
         };
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-pool2d-im2col-params"),
-                size: std::mem::size_of::<Im2ColParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -10902,20 +10818,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             idx1: 1,
             idx2: 1,
         };
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-quant-get-rows-params"),
-                size: std::mem::size_of::<GetRowsParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -11020,20 +10923,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             ne0: 0,
             _pad0: 0,
         };
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-quant-raw-float-params"),
-                size: std::mem::size_of::<ArgMaxParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -11069,26 +10959,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             ne: u32,
             num_blocks: u32,
         }
+        const _: () = assert!(size_of::<QuantizeParams>() <= 256);
 
         let params = QuantizeParams {
             ne: elem_count as u32,
             num_blocks: num_blocks as u32,
         };
 
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-quantize-q8-1-params"),
-                size: std::mem::size_of::<QuantizeParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
 
         let entries = [
             storage_entry(0, true),
@@ -11136,26 +11014,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             ne: u32,
             num_blocks: u32,
         }
+        const _: () = assert!(size_of::<QuantizeParams>() <= 256);
 
         let params = QuantizeParams {
             ne: elem_count as u32,
             num_blocks: num_blocks as u32,
         };
 
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-quantize-q8-0-params"),
-                size: std::mem::size_of::<QuantizeParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
 
         let entries = [
             storage_entry(0, true),
@@ -11202,26 +11068,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             ne: u32,
             num_blocks: u32,
         }
+        const _: () = assert!(size_of::<QuantizeParams>() <= 256);
 
         let params = QuantizeParams {
             ne: elem_count as u32,
             num_blocks: num_blocks as u32,
         };
 
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-quantize-q4-0-params"),
-                size: std::mem::size_of::<QuantizeParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
 
         let entries = [
             storage_entry(0, true),
@@ -11271,6 +11125,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             // flips nibbles at rounding boundaries (probe-verified).
             scale_bits: u32,
         }
+        const _: () = assert!(size_of::<QuantizeParams>() <= 256);
 
         let params = QuantizeParams {
             ne: elem_count as u32,
@@ -11278,20 +11133,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             scale_bits: 15.0f32.to_bits(),
         };
 
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-quantize-q4-1-params"),
-                size: std::mem::size_of::<QuantizeParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
 
         let entries = [
             storage_entry(0, true),
@@ -11337,26 +11179,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             ne: u32,
             num_blocks: u32,
         }
+        const _: () = assert!(size_of::<QuantizeParams>() <= 256);
 
         let params = QuantizeParams {
             ne: elem_count as u32,
             num_blocks: num_blocks as u32,
         };
 
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-quantize-q5-0-params"),
-                size: std::mem::size_of::<QuantizeParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
 
         let entries = [
             storage_entry(0, true),
@@ -11404,6 +11234,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             // Scale divisor as a runtime uniform (see quantize_f32_to_q4_1).
             scale_bits: u32,
         }
+        const _: () = assert!(size_of::<QuantizeParams>() <= 256);
 
         let params = QuantizeParams {
             ne: elem_count as u32,
@@ -11411,20 +11242,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             scale_bits: 31.0f32.to_bits(),
         };
 
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-quantize-q5-1-params"),
-                size: std::mem::size_of::<QuantizeParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
 
         let entries = [
             storage_entry(0, true),
@@ -11462,25 +11280,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         struct DequantParams {
             nel: u32,
         }
+        const _: () = assert!(size_of::<DequantParams>() <= 256);
 
         let params = DequantParams {
             nel: elem_count as u32,
         };
 
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-dequant-nvfp4-params"),
-                size: std::mem::size_of::<DequantParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
 
         let entries = [
             storage_entry(0, true),
@@ -11520,25 +11326,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         struct DequantParams {
             nel: u32,
         }
+        const _: () = assert!(size_of::<DequantParams>() <= 256);
 
         let params = DequantParams {
             nel: elem_count as u32,
         };
 
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-dequant-mxfp4-params"),
-                size: std::mem::size_of::<DequantParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
 
         let entries = [
             storage_entry(0, true),
@@ -11695,19 +11489,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         };
         let param_buffer = storage
             .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-quant-matmul-params"),
-                size: std::mem::size_of::<MulMatParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        storage
-            .device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+            .write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -11984,6 +11766,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 n_tokens: u32,
                 stride_ids_1: u32,
             }
+            const _: () = assert!(size_of::<MulMatIdGatherParams>() <= 256);
 
             let gather_params = MulMatIdGatherParams {
                 offset_ids: 0,
@@ -11993,13 +11776,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 stride_ids_1: ids_layout.dims()[1] as u32,
             };
 
-            let gather_param_buf = storage.device.inner.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-moe-gather-params"),
-                size: std::mem::size_of::<MulMatIdGatherParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            storage.device.inner.queue.write_buffer(&gather_param_buf, 0, any_as_bytes(&gather_params));
+            let gather_param_buf = storage
+                .device
+                .write_uniform_params(any_as_bytes(&gather_params))?;
 
             let gather_entries = [
                 storage_entry(0, false),
@@ -12043,6 +11822,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 stride_02: u32,
                 stride_12: u32,
             }
+            const _: () = assert!(size_of::<MulMatIdParams>() <= 256);
 
             let block_size = qdtype.block_size();
             let moe_params = MulMatIdParams {
@@ -12061,13 +11841,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 stride_12: (input_dim1 * k) as u32,
             };
 
-            let moe_param_buf = storage.device.inner.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-moe-params"),
-                size: std::mem::size_of::<MulMatIdParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            storage.device.inner.queue.write_buffer(&moe_param_buf, 0, any_as_bytes(&moe_params));
+            let moe_param_buf = storage.device.write_uniform_params(any_as_bytes(&moe_params))?;
 
             let moe_entries = [
                 storage_entry(0, false),
@@ -12418,24 +12192,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             rows: u32,
             kx: u32,
         }
+        const _: () = assert!(size_of::<F64ReduceParams>() <= 256);
         let params = F64ReduceParams {
             rows: rows.try_into()?,
             kx: kx.try_into()?,
         };
-        let param_buffer = self
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-f64-reduce-params"),
-                size: std::mem::size_of::<F64ReduceParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, true),
             storage_entry(1, false),
