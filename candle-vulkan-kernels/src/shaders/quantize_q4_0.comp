@@ -1,0 +1,96 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout (push_constant) uniform parameter
+{
+    uint ne;
+    uint num_blocks;
+} p;
+
+#include "types.glsl"
+
+layout(constant_id = 0) const uint GROUP_SIZE = 32;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {vec4 data_a[];};
+layout (binding = 1) writeonly buffer D {block_q4_0 data_b[];};
+
+// Per-block working set: abs/value for the signed-max reduction and 32
+// nibbles. GROUP_SIZE=32 -> up to 4 blocks per workgroup.
+shared float shmem_abs[GROUP_SIZE];
+shared float shmem_val[GROUP_SIZE];
+shared uint shmem_nib[QUANT_K_Q4_0 * (GROUP_SIZE / 8)];
+
+// CPU quantize_row_q4_0: d = vmax/-8 with vmax = element at max |x| (first
+// occurrence wins ties), q = min(15, (x*id + 8.5) trunc), nibble j of qs byte
+// j packs elements j (low) and j+16 (high). Byte-identical to the host path.
+void quantize(const uint wgid) {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint blocks_per_group = GROUP_SIZE / 8;
+    const uint block_in_wg = tid / 8;
+    const uint ib = wgid * blocks_per_group + block_in_wg;
+    const uint iqs = tid % 8;
+
+    const uint a_idx = ib * 8 + iqs;
+    vec4 vals = a_idx < p.ne / 4 ? data_a[a_idx] : vec4(0.0f);
+
+    float la = 0.0;
+    float lv = 0.0;
+    if (abs(vals.x) > la) { la = abs(vals.x); lv = vals.x; }
+    if (abs(vals.y) > la) { la = abs(vals.y); lv = vals.y; }
+    if (abs(vals.z) > la) { la = abs(vals.z); lv = vals.z; }
+    if (abs(vals.w) > la) { la = abs(vals.w); lv = vals.w; }
+    shmem_abs[tid] = la;
+    shmem_val[tid] = lv;
+    barrier();
+
+    // Tie-safe reduction: strictly greater keeps the earlier element,
+    // matching CPU first-occurrence semantics.
+    [[unroll]] for (uint s = 4; s > 0; s >>= 1) {
+        if (iqs < s) {
+            if (shmem_abs[tid] < shmem_abs[tid + s]) {
+                shmem_abs[tid] = shmem_abs[tid + s];
+                shmem_val[tid] = shmem_val[tid + s];
+            }
+        }
+        barrier();
+    }
+
+    const float vmax = shmem_val[block_in_wg * 8];
+    const float d = vmax / -8.0;
+    const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
+
+    if (ib < p.num_blocks) {
+        const uint base = block_in_wg * QUANT_K_Q4_0 + iqs * 4;
+        shmem_nib[base + 0] = min(15u, uint(vals.x * d_inv + 8.5));
+        shmem_nib[base + 1] = min(15u, uint(vals.y * d_inv + 8.5));
+        shmem_nib[base + 2] = min(15u, uint(vals.z * d_inv + 8.5));
+        shmem_nib[base + 3] = min(15u, uint(vals.w * d_inv + 8.5));
+    }
+
+    barrier();
+
+    if (ib < p.num_blocks) {
+        const uint bbase = block_in_wg * QUANT_K_Q4_0;
+        const uint j = iqs * 2;
+        data_b[ib].qs[j + 0] = uint8_t(shmem_nib[bbase + j + 0] | (shmem_nib[bbase + j + 16] << 4));
+        data_b[ib].qs[j + 1] = uint8_t(shmem_nib[bbase + j + 1] | (shmem_nib[bbase + j + 17] << 4));
+    }
+
+    barrier();
+    if (iqs == 0) {
+        data_b[ib].d = float16_t(d);
+    }
+}
+
+void main() {
+    const uint bpg = GROUP_SIZE / 8;
+    uint wgid = gl_WorkGroupID.x;
+    while (wgid * bpg < p.num_blocks) {
+        quantize(wgid);
+        wgid += gl_NumWorkGroups.x;
+    }
+}

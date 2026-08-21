@@ -259,20 +259,24 @@ impl QWgpuStorage {
         // GPU-path Q8_0/Q4_0 quantize: avoids a CPU round-trip of the source
         // weights. Only for contiguous F32 sources sized to whole blocks;
         // everything else keeps the documented CPU fallback.
-        if src.dtype() == DType::F32 {
-            let elem_count = src.count();
-            let need = |bs: usize| self.dtype.block_size() == bs && elem_count.is_multiple_of(bs);
-            if self.dtype == GgmlDType::Q8_0 && need(32) {
-                let quant = src.quantize_f32_to_q8_0(elem_count)?;
-                self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ8_0>();
-                self.storage = quant;
-                return Ok(());
-            }
-            if self.dtype == GgmlDType::Q4_0 && need(32) {
-                let quant = src.quantize_f32_to_q4_0(elem_count)?;
-                self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ4_0>();
-                self.storage = quant;
-                return Ok(());
+        #[cfg(feature = "wgpu")]
+        {
+            if src.dtype() == DType::F32 {
+                let elem_count = src.count();
+                let need =
+                    |bs: usize| self.dtype.block_size() == bs && elem_count.is_multiple_of(bs);
+                if self.dtype == GgmlDType::Q8_0 && need(32) {
+                    let quant = src.quantize_f32_to_q8_0(elem_count)?;
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ8_0>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+                if self.dtype == GgmlDType::Q4_0 && need(32) {
+                    let quant = src.quantize_f32_to_q4_0(elem_count)?;
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ4_0>();
+                    self.storage = quant;
+                    return Ok(());
+                }
             }
         }
         let src = src.to_cpu_storage()?;
@@ -512,6 +516,41 @@ impl QVulkanStorage {
     }
 
     fn quantize(&mut self, src: &crate::VulkanStorage) -> Result<()> {
+        // GPU-path Q8_0/Q4_0 quantize: avoids a CPU round-trip of the source
+        // weights. Only for contiguous F32 sources sized to whole blocks;
+        // everything else keeps the documented CPU fallback.
+        #[cfg(feature = "vulkan")]
+        {
+            if src.dtype() == DType::F32 {
+                let elem_count = src.count();
+                let need =
+                    |bs: usize| self.dtype.block_size() == bs && elem_count.is_multiple_of(bs);
+                if self.dtype == GgmlDType::Q8_0 && need(32) {
+                    let device = self.device();
+                    let quant = crate::vulkan_backend::quantize_f32_storage_to_q8_0(
+                        device,
+                        src,
+                        elem_count,
+                    )?;
+                    self.len_bytes =
+                        elem_count / 32 * std::mem::size_of::<k_quants::BlockQ8_0>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+                if self.dtype == GgmlDType::Q4_0 && need(32) {
+                    let device = self.device();
+                    let quant = crate::vulkan_backend::quantize_f32_storage_to_q4_0(
+                        device,
+                        src,
+                        elem_count,
+                    )?;
+                    self.len_bytes =
+                        elem_count / 32 * std::mem::size_of::<k_quants::BlockQ4_0>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+            }
+        }
         let src = src.to_cpu_storage()?;
         self.quantize_from_cpu(&src, None)
     }
