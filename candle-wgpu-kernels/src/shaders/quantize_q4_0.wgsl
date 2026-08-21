@@ -90,9 +90,14 @@ fn main(
 
     workgroupBarrier();
 
-    // 36 words per workgroup (144 bytes / 4). One writer per word.
+    // 36 words per workgroup (144 bytes / 4). One writer per word. The
+    // assembler takes the workgroup-LOCAL byte offset (0..144), never an
+    // absolute buffer offset: `dst[wgid.x * 36 + tid]` already places the word
+    // in this workgroup's 144-byte span, and dividing a global byte offset by
+    // the 18-byte block size would yield the global block index, failing the
+    // `block_in_wg < 8` guard for every workgroup after the first.
     if (tid < 36u) {
-        dst[wgid.x * 36u + tid] = assemble_q4_word(wgid.x * 144u + tid * 4u);
+        dst[wgid.x * 36u + tid] = assemble_q4_word(tid * 4u);
     }
 }
 
