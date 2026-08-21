@@ -86,18 +86,18 @@ fn backend_smoke_vulkan_feature_flag_is_not_visible() {
 
 #[test]
 #[cfg(not(feature = "wgpu"))]
-fn backend_smoke_dummy_wgpu_does_not_claim_bf16() {
+fn backend_smoke_dummy_wgpu_claims_bf16() {
     let device = candle_core::Device::Wgpu(candle_core::WgpuDevice);
-    assert!(!device.supports_bf16());
-    assert_eq!(device.bf16_default_to_f32(), candle_core::DType::F32);
+    assert!(device.supports_bf16());
+    assert_eq!(device.bf16_default_to_f32(), candle_core::DType::BF16);
 }
 
 #[test]
 #[cfg(not(feature = "vulkan"))]
-fn backend_smoke_dummy_vulkan_does_not_claim_bf16() {
+fn backend_smoke_dummy_vulkan_claims_bf16() {
     let device = candle_core::Device::Vulkan(candle_core::VulkanDevice);
-    assert!(!device.supports_bf16());
-    assert_eq!(device.bf16_default_to_f32(), candle_core::DType::F32);
+    assert!(device.supports_bf16());
+    assert_eq!(device.bf16_default_to_f32(), candle_core::DType::BF16);
 }
 
 #[test]
@@ -1020,8 +1020,8 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_upload_and_dtype_family(device: &Device) -> Result<()> {
-    assert!(!device.supports_bf16());
-    assert_eq!(device.bf16_default_to_f32(), DType::F32);
+    assert!(device.supports_bf16());
+    assert_eq!(device.bf16_default_to_f32(), DType::BF16);
 
     let xs = Tensor::from_slice(&[-2.0f32, -1.0, 0.0, 3.0], (2, 2), device)?;
     assert_eq!(xs.to_vec2::<f32>()?, [[-2.0, -1.0], [0.0, 3.0]]);

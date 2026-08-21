@@ -364,10 +364,20 @@ impl Device {
         matches!(self, Self::Vulkan(_))
     }
 
+    /// Returns `true` when the device can execute BF16 ops end-to-end.
+    ///
+    /// This signals usable BF16 support (native or emulated), not
+    /// hardware-native storage. Cuda and Metal support BF16 natively or via
+    /// emulation on many GPUs. Wgpu and Vulkan fully implement the BF16 op set
+    /// without requiring any hardware feature: wgpu relies on software
+    /// pack/unpack kernels (`bf16_binary_wgsl`, `mul_mat_bf16.wgsl`, ...) and
+    /// Vulkan ships precompiled SPIR-V (`convert_*_bf16`, `get_rows_bf16.comp`,
+    /// `matmul_bf16`/`matmul_bf16_fp32`). CPU keeps returning `false` for
+    /// historical compatibility reasons even though BF16 math exists there.
     pub fn supports_bf16(&self) -> bool {
         match self {
-            Self::Cuda(_) | Self::Metal(_) => true,
-            Self::Cpu | Self::Wgpu(_) | Self::Vulkan(_) => false,
+            Self::Cuda(_) | Self::Metal(_) | Self::Wgpu(_) | Self::Vulkan(_) => true,
+            Self::Cpu => false,
         }
     }
 
