@@ -148,6 +148,7 @@ struct SumRowsParams {
     ne1: u32,
     ne2: u32,
 }
+const _: () = assert!(size_of::<SumRowsParams>() <= 256);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -8246,17 +8247,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             scale: f32,
             causal: u32,
         }
-
-        let param_buffer = q_c
-            .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-flash-attn-varlen-params"),
-                size: std::mem::size_of::<FlashAttnVarlenParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+        const _: () = assert!(size_of::<FlashAttnVarlenParams>() <= 256);
 
         let entries = [
             storage_entry(0, true),
@@ -8266,15 +8257,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             storage_entry(4, true),
             storage_entry(5, false),
             uniform_entry(6),
-        ];
-        let bindings = [
-            buffer_binding(0, &q_c.buffer),
-            buffer_binding(1, &k_c.buffer),
-            buffer_binding(2, &v_c.buffer),
-            buffer_binding(3, &cu_seqlens_q.buffer),
-            buffer_binding(4, &cu_seqlens_k.buffer),
-            buffer_binding(5, &out_f32.buffer),
-            buffer_binding(6, &param_buffer),
         ];
 
         let shader_source = candle_wgpu_kernels::get("flash_attn_varlen.wgsl")
@@ -8303,10 +8285,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 scale: softmax_scale,
                 causal: if causal { 1 } else { 0 },
             };
-            q_c.device
-                .inner
-                .queue
-                .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+            // Per-chunk ring slot so in-flight dispatches never share a slot's last write.
+            let param_buffer = q_c.device.write_uniform_params(any_as_bytes(&params))?;
+            let bindings = [
+                buffer_binding(0, &q_c.buffer),
+                buffer_binding(1, &k_c.buffer),
+                buffer_binding(2, &v_c.buffer),
+                buffer_binding(3, &cu_seqlens_q.buffer),
+                buffer_binding(4, &cu_seqlens_k.buffer),
+                buffer_binding(5, &out_f32.buffer),
+                buffer_binding(6, &param_buffer),
+            ];
             q_c.device.run_compute_xyz(
                 shader_source,
                 &entries,
@@ -12734,18 +12723,7 @@ impl BackendStorage for WgpuStorage {
         };
         let param_buffer = self
             .device
-            .inner
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("candle-wgpu-sum-rows-params"),
-                size: std::mem::size_of::<SumRowsParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        self.device
-            .inner
-            .queue
-            .write_buffer(&param_buffer, 0, any_as_bytes(&params));
+            .write_uniform_params(any_as_bytes(&params))?;
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
