@@ -9736,18 +9736,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     && params.stride_1k == 1;
                 if coop_ok {
                     use_warptile = true;
-                    // 128×64 dual-MMA + dbuf (best measured for squares + tall).
-                    if m.max(n) >= 512 && m.min(n) >= 64 {
-                        matmul_label = "candle-wgpu-matmul-coop";
-                        candle_wgpu_kernels::matmul_coop_shader().ok_or_else(|| {
-                            Error::Msg("wgpu shader mul_mat_coop.wgsl not embedded".into()).bt()
-                        })?
-                    } else {
-                        matmul_label = "candle-wgpu-matmul-coop64";
-                        candle_wgpu_kernels::matmul_coop_64_shader().ok_or_else(|| {
-                            Error::Msg("wgpu shader mul_mat_coop_64.wgsl not embedded".into()).bt()
-                        })?
-                    }
+                    // coop64 (64×64, 512 thr) measured faster than the 128×64
+                    // dual-MMA on BOTH squares and tall GEMMs (RTX 3060):
+                    // 1024³ 0.53 vs 0.55 sync / 0.426 vs 0.446 batch20;
+                    // 64×4096 0.545 vs 0.685 sync / 0.448 vs 0.585 batch20.
+                    matmul_label = "candle-wgpu-matmul-coop64";
+                    candle_wgpu_kernels::matmul_coop_64_shader().ok_or_else(|| {
+                        Error::Msg("wgpu shader mul_mat_coop_64.wgsl not embedded".into()).bt()
+                    })?
                 } else if m >= 64 && n >= 64 && k >= 64 && params.stride_1k == 1 {
                     matmul_label = "candle-wgpu-matmul-warptile";
                     use_warptile = true;
@@ -9936,10 +9932,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 uniform_binding_dyn(3, &param_buffer, slot)?,
             ];
             let total_wg = if use_warptile {
-                // Coop 128×64 dual / coop 64×64 / warptile 64×64 — pick by label.
-                let (bm, bn, _) = if matmul_label.ends_with("-coop") {
-                    candle_wgpu_kernels::matmul_coop_tile_shape()
-                } else if matmul_label.contains("coop64") {
+                // coop 64×64 / warptile 64×64 — pick by label.
+                let (bm, bn, _) = if matmul_label.contains("coop64") {
                     candle_wgpu_kernels::matmul_coop_64_tile_shape()
                 } else {
                     candle_wgpu_kernels::matmul_warptile_tile_shape()

@@ -49,6 +49,9 @@ const TK: u32 = 16u;
 const WG_M: u32 = 64u;
 const WG_N: u32 = 64u;
 const SG_M: u32 = 4u;
+// Panel row padding (PANEL_ROWS=TK+1, vulkan-style) was tried and REGRESSED
+// both shapes ~10%: coopLoad with a non-power-of-two leading stride generates
+// its own bank conflicts on this hardware. Keep dense TK=16 panels.
 const PANEL: u32 = WG_M * TK; // 1024
 
 var<workgroup> tile_bt: array<f16, 2048>; // 2 * PANEL
