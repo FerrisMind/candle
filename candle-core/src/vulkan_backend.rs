@@ -1133,8 +1133,15 @@ fn vulkan_q8_1_rhs_matvec_shader_name(
     n: usize,
     k: usize,
     indexed: bool,
+    // q8_1 weights (repacked to q8_0 on device) must quantize the activation
+    // (A-side) to q8_1 to reproduce the CPU QMatMul contract. The mmvq
+    // heuristic can otherwise steer small single-row matvecs onto the raw-f32
+    // activation path, which silently drops the companion A-side quantization.
+    force_q8_1_rhs: bool,
 ) -> Result<Option<(String, VulkanDmmvWorkgroup)>> {
-    if !vulkan_supports_q8_1_rhs(qdtype) || !vulkan_should_use_mmvq(device, qdtype, n, k) {
+    if !vulkan_supports_q8_1_rhs(qdtype)
+        || (!force_q8_1_rhs && !vulkan_should_use_mmvq(device, qdtype, n, k))
+    {
         return Ok(None);
     }
     // Q5_1 multi-column MMVQ (q8_1 rhs) is numerically incorrect on current
@@ -8381,6 +8388,17 @@ impl VulkanStorage {
         storage: &Self,
         layout: &Layout,
     ) -> Result<(Self, Shape)> {
+        self.quantized_matmul_impl(qdtype, qshape, storage, layout, false)
+    }
+
+    fn quantized_matmul_impl(
+        &self,
+        qdtype: GgmlDType,
+        qshape: &Shape,
+        storage: &Self,
+        layout: &Layout,
+        force_q8_1_rhs: bool,
+    ) -> Result<(Self, Shape)> {
         if storage.dtype != DType::F32 && storage.dtype != DType::F16 {
             return Err(
                 Error::UnsupportedDTypeForOp(storage.dtype, "vulkan quantized matmul").bt(),
@@ -8398,7 +8416,10 @@ impl VulkanStorage {
         }
         if qdtype == GgmlDType::Q8_1 {
             let repacked = repack_q8_1_storage_to_q8_0(&self.device, self, qshape.elem_count())?;
-            return repacked.quantized_matmul(GgmlDType::Q8_0, qshape, storage, layout);
+            // q8_1 weights must quantize the A-side (activations) to q8_1 as well
+            // to reproduce the CPU QMatMul contract. The repacked q8_0 path forces
+            // the fused q8_1-rhs kernels so the LHS quantization step is not lost.
+            return repacked.quantized_matmul_impl(GgmlDType::Q8_0, qshape, storage, layout, true);
         }
         let mut dst_dims = layout.dims().to_vec();
         dst_dims.pop();
@@ -8420,7 +8441,8 @@ impl VulkanStorage {
             };
             let flat_m = layout.shape().elem_count() / k;
             let flat_layout = Layout::contiguous(Shape::from((flat_m, k)));
-            let (dst, _) = self.quantized_matmul(qdtype, qshape, src, &flat_layout)?;
+            let (dst, _) =
+                self.quantized_matmul_impl(qdtype, qshape, src, &flat_layout, force_q8_1_rhs)?;
             drop(src_contiguous);
             return Ok((dst, dst_shape));
         }
@@ -8428,7 +8450,7 @@ impl VulkanStorage {
             && rank == 2
             && vulkan_supports_quantized_matvec_weight(qdtype)
         {
-            return self.quantized_matvec(qdtype, qshape, storage, layout);
+            return self.quantized_matvec(qdtype, qshape, storage, layout, force_q8_1_rhs);
         }
 
         let mut src_contiguous = None;
@@ -8608,6 +8630,7 @@ impl VulkanStorage {
         qshape: &Shape,
         storage: &Self,
         layout: &Layout,
+        force_q8_1_rhs: bool,
     ) -> Result<(Self, Shape)> {
         let rank = layout.dims().len();
         let (n, k) = qshape.dims2()?;
@@ -8662,7 +8685,14 @@ impl VulkanStorage {
             && self.device.inner.integer_dot_product
             && src_elem_count % 4 == 0
         {
-            vulkan_q8_1_rhs_matvec_shader_name(&self.device, qdtype, input_m, k, false)?
+            vulkan_q8_1_rhs_matvec_shader_name(
+                &self.device,
+                qdtype,
+                input_m,
+                k,
+                false,
+                force_q8_1_rhs,
+            )?
         } else {
             None
         };
@@ -8857,7 +8887,7 @@ impl VulkanStorage {
             && self.device.inner.integer_dot_product
             && src_elem_count.is_multiple_of(4)
         {
-            vulkan_q8_1_rhs_matvec_shader_name(&self.device, qdtype, batch, k, true)?
+            vulkan_q8_1_rhs_matvec_shader_name(&self.device, qdtype, batch, k, true, false)?
         } else {
             None
         };
@@ -11441,9 +11471,16 @@ mod tests {
             for (col_idx, (actual, expected)) in
                 direct_row.iter().zip(expected_row.iter()).enumerate()
             {
+                // The fused q8_1 matvec computes the per-32-block i32 dot then
+                // applies the f16 scales in a single f32 multiply, while the CPU
+                // reference accumulates 32 f32 products sequentially. At magnitude
+                // ~4742 these differ by exactly one f32 ulp (2^-11), which is the
+                // physical f32 floor; use a relative tolerance with an absolute
+                // floor instead of demanding bit-identical f32.
+                let rel_err = (actual - expected).abs() / expected.abs().max(1e-6);
                 assert!(
-                    (actual - expected).abs() <= 1e-6,
-                    "direct q8_1 vulkan_fwd mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}"
+                    (actual - expected).abs() <= expected.abs() * 1e-5 + 1e-6,
+                    "direct q8_1 vulkan_fwd mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}, rel_err {rel_err:.2e}"
                 );
             }
         }
@@ -11455,9 +11492,12 @@ mod tests {
             for (col_idx, (actual, expected)) in
                 actual_row.iter().zip(expected_row.iter()).enumerate()
             {
+                // See the direct-path comment above: 1e-6 absolute at ~4742 is
+                // below one f32 ulp; compare relative with an absolute floor.
+                let rel_err = (actual - expected).abs() / expected.abs().max(1e-6);
                 assert!(
-                    (actual - expected).abs() <= 1e-6,
-                    "q8_1 qmatmul mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}"
+                    (actual - expected).abs() <= expected.abs() * 1e-5 + 1e-6,
+                    "q8_1 qmatmul mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}, rel_err {rel_err:.2e}"
                 );
             }
         }
@@ -11500,9 +11540,11 @@ mod tests {
             for (col_idx, (actual, expected)) in
                 actual_row.iter().zip(expected_row.iter()).enumerate()
             {
+                // 1e-6 absolute at ~4742 is below one f32 ulp; compare relative.
+                let rel_err = (actual - expected).abs() / expected.abs().max(1e-6);
                 assert!(
-                    (actual - expected).abs() <= 1e-6,
-                    "q8_1 qmatmul no-warmup mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}"
+                    (actual - expected).abs() <= expected.abs() * 1e-5 + 1e-6,
+                    "q8_1 qmatmul no-warmup mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}, rel_err {rel_err:.2e}"
                 );
             }
         }
