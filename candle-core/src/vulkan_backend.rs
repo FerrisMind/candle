@@ -1246,9 +1246,10 @@ pub(crate) fn quantize_f32_storage_to_q8_0(
     let out = unsafe { device.alloc_uninit(&Shape::from(out_count), DType::U8)? };
     let spirv = candle_vulkan_kernels::spirv("quantize_q8_0")
         .ok_or_else(|| Error::Msg("vulkan shader quantize_q8_0 not generated".into()).bt())?;
-    let params = VulkanQuantizeQ8_1Params {
+    let params = VulkanQuantizeScaleParams {
         ne: elem_count.try_into()?,
         num_blocks,
+        scale_bits: 127f32.to_bits(),
     };
     let block_groups = num_blocks.div_ceil(4);
     let workgroups_x = block_groups.min(device.inner.max_workgroup_count_x.max(1));
@@ -1278,9 +1279,10 @@ pub(crate) fn quantize_f32_storage_to_q4_0(
     let out = unsafe { device.alloc_uninit(&Shape::from(out_count), DType::U8)? };
     let spirv = candle_vulkan_kernels::spirv("quantize_q4_0")
         .ok_or_else(|| Error::Msg("vulkan shader quantize_q4_0 not generated".into()).bt())?;
-    let params = VulkanQuantizeQ8_1Params {
+    let params = VulkanQuantizeScaleParams {
         ne: elem_count.try_into()?,
         num_blocks,
+        scale_bits: (-8f32).to_bits(),
     };
     let block_groups = num_blocks.div_ceil(4);
     let workgroups_x = block_groups.min(device.inner.max_workgroup_count_x.max(1));

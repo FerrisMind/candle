@@ -8,6 +8,7 @@ layout (push_constant) uniform parameter
 {
     uint ne;
     uint num_blocks;
+    uint scale_bits;
 } p;
 
 #include "types.glsl"
@@ -19,6 +20,28 @@ layout (binding = 0) readonly buffer A {vec4 data_a[];};
 layout (binding = 1) writeonly buffer D {block_q8_0 data_b[];};
 
 shared float shmem[GROUP_SIZE];
+
+// Vulkan permits division to be up to 2 ulp off the IEEE result and this
+// driver's OpFDiv is off by ~1 ulp for some operands, breaking exact byte
+// parity with the CPU quantizer. Correct it: the true quotient is within 2 ulp
+// of the driver's, so pick whichever of the 5 surrounding f32 values minimizes
+// the (correctly rounded, fma) residual. Bit/control-flow ops prevent the
+// optimizer from algebraically collapsing this back into a plain division.
+float div_ieee(float a, float b) {
+    float q = a / b;
+    int qb = floatBitsToInt(q);
+    float best = abs(fma(b, q, -a));
+    int bidx = 0;
+    float r = abs(fma(b, intBitsToFloat(qb + 1), -a));
+    if (r < best) { best = r; bidx = 1; }
+    r = abs(fma(b, intBitsToFloat(qb + 2), -a));
+    if (r < best) { best = r; bidx = 2; }
+    r = abs(fma(b, intBitsToFloat(qb - 1), -a));
+    if (r < best) { best = r; bidx = -1; }
+    r = abs(fma(b, intBitsToFloat(qb - 2), -a));
+    if (r < best) { best = r; bidx = -2; }
+    return intBitsToFloat(qb + bidx);
+}
 
 // CPU quantize_row_q8_0: d = amax/127, id = 1/d, q = round(x*id) as i8,
 // stored as a raw 34-byte block {f16 d, i8 qs[32]}. Mirrors the host path
@@ -44,8 +67,12 @@ void quantize(const uint wgid) {
     }
 
     const float amax = shmem[block_in_wg * 8];
-    const float d = amax / 127.0;
-    const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
+    // scale comes in as runtime data so the driver cannot constant-fold
+    // `/scale` or `1.0/d` into algebraic forms that differ by 1 ulp from the
+    // CPU reference (watch out: glslc rewrites x/127.0 and 1.0/(x/127.0)).
+    const float scale = uintBitsToFloat(p.scale_bits);
+    const float d = div_ieee(amax, scale);
+    const float d_inv = d != 0.0 ? div_ieee(1.0, d) : 0.0;
     vals = round(vals * d_inv);
 
     if (ib < p.num_blocks) {
