@@ -383,6 +383,7 @@ struct VulkanMatVecIdParams {
 struct VulkanQuantizeQ8_1Params {
     ne: u32,
     num_blocks: u32,
+    scale_bits: u32,
 }
 
 /// Push constants for the Q4_1/Q5_0/Q5_1 quantize kernels. `scale_bits` is the
@@ -1179,6 +1180,7 @@ fn quantize_f32_storage_to_q8_1_x4(
     let params = VulkanQuantizeQ8_1Params {
         ne: elem_count.try_into()?,
         num_blocks,
+        scale_bits: 127f32.to_bits(),
     };
     let workgroups_x = num_blocks.min(device.inner.max_workgroup_count_x.max(1));
     device.run_compute_specialized(
