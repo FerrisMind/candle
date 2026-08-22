@@ -11,6 +11,7 @@ use gpu_allocator::MemoryLocation;
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::ffi::{CStr, CString};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::trace_span;
 
@@ -540,6 +541,9 @@ struct VulkanInner {
     reusable_compute_submissions: Mutex<Vec<VulkanSubmissionResources>>,
     reusable_transfer_submissions: Mutex<Vec<VulkanSubmissionResources>>,
     deferred_buffer_frees: Mutex<Vec<VulkanDeferredBuffer>>,
+    /// Hot-path counter tracking ops since the last amortized submission cleanup.
+    /// See `cleanup_pending_submissions_amortized` / `CLEANUP_DEBT_THRESHOLD`.
+    alloc_cleanup_debt: AtomicU32,
     /// Pool of reusable upload staging buffers, keyed by size class (power-of-two).
     upload_staging_pool: Mutex<HashMap<usize, Vec<Arc<VulkanBuffer>>>>,
     /// Pool of reusable readback staging buffers, keyed by size class (power-of-two).
@@ -1558,7 +1562,12 @@ impl VulkanDevice {
     const MAX_BATCH_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
     const MAX_BATCH_COMPUTE_BYTES: usize = 512 * 1024 * 1024;
     /// Maximum number of deferred buffer frees before forcing a drain.
-    const MAX_DEFERRED_BUFFER_FREES: usize = 256;
+    const MAX_DEFERRED_BUFFER_FREES: usize = 512;
+    /// Amortize the per-op `cleanup_pending_submissions(false)` fence-poll + multi-lock
+    /// cascade over this many hot-path ops (alloc/copy/dispatch). Kept small so fences
+    /// still get polled and deferred buffers/caps still get drained promptly, but large
+    /// enough to remove ~all of the per-op host overhead from the decode loop.
+    const CLEANUP_DEBT_THRESHOLD: u32 = 32;
     /// Maximum number of staging buffers per size class in the pool.
     const MAX_STAGING_PER_SIZE_CLASS: usize = 32;
 
@@ -1978,7 +1987,7 @@ impl VulkanDevice {
         is_staging: bool,
         staging_kind: StagingKind,
     ) -> Result<Arc<VulkanBuffer>> {
-        self.cleanup_pending_submissions(false)?;
+        self.cleanup_pending_submissions_amortized()?;
         let mut info = vk::BufferCreateInfo::default()
             .size(size as u64)
             .usage(usage);
@@ -2243,6 +2252,47 @@ impl VulkanDevice {
         self.cleanup_pending_submissions_impl(wait, None)
     }
 
+    /// Hot-path variant of `cleanup_pending_submissions(false)` that amortizes the
+    /// expensive fence-poll + multi-lock cascade over `CLEANUP_DEBT_THRESHOLD` ops
+    /// instead of running it on every alloc/copy/dispatch. Called from the per-op
+    /// fast path (each buffer creation, copy submission and compute dispatch).
+    ///
+    /// Correctness is preserved because the force-drain safety boundary is still
+    /// guarded: `deferred_buffer_frees` is capped before overflow (a single cheap
+    /// lock check triggers a real cleanup when it nears `MAX_DEFERRED_BUFFER_FREES`),
+    /// and the deferred cap overflow still forces a full pipe drain inside
+    /// `cleanup_pending_submissions_impl`. Fences are still polled and staging
+    /// pending still retired on every amortized cleanup.
+    fn cleanup_pending_submissions_amortized(&self) -> Result<()> {
+        // Cheap guard: if the deferred free list is already near its cap, don't
+        // skip — run the real cleanup so the force-drain boundary honors the cap.
+        let deferred_near_cap = {
+            let deferred = self
+                .inner
+                .deferred_buffer_frees
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            deferred.len() + (Self::CLEANUP_DEBT_THRESHOLD as usize)
+                > Self::MAX_DEFERRED_BUFFER_FREES
+        };
+        if deferred_near_cap {
+            return self.cleanup_pending_submissions(false);
+        }
+        let debt = self
+            .inner
+            .alloc_cleanup_debt
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        if debt >= Self::CLEANUP_DEBT_THRESHOLD {
+            // Preserve the overflow (not the whole count) so we don't lose ops.
+            self.inner
+                .alloc_cleanup_debt
+                .fetch_sub(Self::CLEANUP_DEBT_THRESHOLD, Ordering::Relaxed);
+            return self.cleanup_pending_submissions(false);
+        }
+        Ok(())
+    }
+
     fn cleanup_pending_submissions_impl(
         &self,
         wait: bool,
@@ -2502,7 +2552,7 @@ impl VulkanDevice {
         if regions.is_empty() {
             return Ok(());
         }
-        self.cleanup_pending_submissions(false)?;
+        self.cleanup_pending_submissions_amortized()?;
         let (queue, queue_family_index, queue_kind) = self.copy_queue_and_family(prefer_transfer);
         if queue_kind == SubmissionQueueKind::Compute {
             self.wait_for_transfer_dependencies()?;
@@ -2720,7 +2770,7 @@ impl VulkanDevice {
         )
         .entered();
         self.wait_for_transfer_dependencies()?;
-        self.cleanup_pending_submissions(false)?;
+        self.cleanup_pending_submissions_amortized()?;
         let binding_signature = bindings
             .iter()
             .map(|binding| binding.descriptor_type().as_raw() as u32)
@@ -10471,6 +10521,7 @@ impl BackendDevice for VulkanDevice {
             reusable_compute_submissions: Mutex::new(Vec::new()),
             reusable_transfer_submissions: Mutex::new(Vec::new()),
             deferred_buffer_frees: Mutex::new(Vec::new()),
+            alloc_cleanup_debt: AtomicU32::new(0),
             upload_staging_pool: Mutex::new(HashMap::default()),
             readback_staging_pool: Mutex::new(HashMap::default()),
             staging_pending_return: Mutex::new(Vec::new()),
