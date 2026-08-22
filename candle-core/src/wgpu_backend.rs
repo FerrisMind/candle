@@ -1171,6 +1171,15 @@ impl WgpuDevice {
             let _ = self.cleanup_pending_submissions(false);
             self.prune_buffer_registry();
         }
+        // Recycle dropped storage buffers back into the free pool without
+        // waiting for `synchronize()`. The prefill / KV-cat loop allocates
+        // ~112 fresh buffers per token and never calls `synchronize()` inside
+        // the loop, so without an opportunistic flush the free size-class pool
+        // stays empty and `create_buffer` keeps asking gpu-allocator for a fresh
+        // device block per alloc (256 MiB default) → Out-Of-Memory while only
+        // ~1 GiB VRAM is used. Poll-only (never `wait_indefinitely`) so we do
+        // not serialize the pipeline.
+        self.maybe_flush_storage_pool_pending();
         if let Ok(mut pool) = self.inner.storage_buffer_pool.lock() {
             if let Some(bucket) = pool.get_mut(&key) {
                 if let Some(arc) = bucket.pop() {
@@ -1187,6 +1196,46 @@ impl WgpuDevice {
             mapped_at_creation: false,
         });
         Arc::new(buffer)
+    }
+
+    /// Opportunistically recycle dropped storage buffers back into the free
+    /// size-class pool while the loop is running. The prefill / KV-cat bench
+    /// loop creates ~112 fresh storage buffers per token and only calls
+    /// [`Self::synchronize`] once after the whole run, so the deferred
+    /// `storage_pool_pending` backlog (which normally requires a GPU drain to be
+    /// promoted) would sit uncapped at 512 while `create_storage_buffer_arc`
+    /// keeps requesting fresh gpu-allocator device blocks → OOM at low VRAM.
+    ///
+    /// Once the pending backlog reaches a threshold we poll (`PollType::Poll`,
+    /// never `wait_indefinitely`), recycle completed submissions (their
+    /// sole-owner buffers land in `storage_pool_pending`), then promote pending
+    /// → free pool. Subsequent allocs in the same iteration can reuse those
+    /// buffers instead of carving new device blocks.
+    ///
+    /// Threshold is overridable with `CANDLE_WGPU_POOL_FLUSH_PENDING` (parsed
+    /// once and cached); `0` disables the opportunistic flush for diagnosis.
+    fn maybe_flush_storage_pool_pending(&self) {
+        const DEFAULT_THRESHOLD: usize = 64;
+        static THRESHOLD: OnceLock<usize> = OnceLock::new();
+        let threshold = *THRESHOLD.get_or_init(|| {
+            std::env::var("CANDLE_WGPU_POOL_FLUSH_PENDING")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_THRESHOLD)
+        });
+        if threshold == 0 {
+            return;
+        }
+        let backlog = match self.inner.storage_pool_pending.lock() {
+            Ok(g) => g.len(),
+            Err(_) => return,
+        };
+        if backlog < threshold {
+            return;
+        }
+        // Poll-only: recycle completed submissions, then promote pending → free.
+        let _ = self.cleanup_pending_submissions(false);
+        self.flush_storage_pool_pending();
     }
 
     /// After GPU drain, promote pending_free → free for hot-ring reuse.
@@ -1239,6 +1288,16 @@ impl WgpuDevice {
 
     /// Promote deferred pool recycles into the free size-class pool (GPU idle).
     fn flush_storage_pool_pending(&self) {
+        // D2.3: bound the free pool by TOTAL bytes, not just per-bucket count.
+        // The prefill loop allocates monotonically-growing KV-cat/repeat_kv
+        // buffers (a fresh size-class per sequence length L) that are never
+        // requested again; without a hard byte cap the free pool accumulated
+        // ~22k buffers (~11 GiB, one gpu-allocator block per forward) and
+        // OOM'd at ~456 MiB reason regardless of reuse. Once the byte cap is
+        // exceeded we DROP the Arc so the wgpu buffer is destroyed and its
+        // sub-allocation returns to gpu-allocator, instead of recycling it.
+        const BUCKET_CAP: usize = 8;
+        const MAX_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB of pooled buffers
         let pending = match self.inner.storage_pool_pending.lock() {
             Ok(mut g) => std::mem::take(&mut *g),
             Err(_) => return,
@@ -1247,12 +1306,19 @@ impl WgpuDevice {
             return;
         }
         if let Ok(mut pool) = self.inner.storage_buffer_pool.lock() {
+            let mut total_bytes: usize = pool
+                .values()
+                .flatten()
+                .map(|b| b.size() as usize)
+                .sum();
             for buffer in pending {
-                let key = buffer.size();
-                let bucket = pool.entry(key).or_default();
-                if bucket.len() < 64 {
+                let size = buffer.size() as usize;
+                let bucket = pool.entry(size as u64).or_default();
+                if bucket.len() < BUCKET_CAP && total_bytes + size <= MAX_BYTES {
+                    total_bytes += size;
                     bucket.push(buffer);
                 }
+                // else: drop `buffer` → wgpu Buffer destroyed → block freed.
             }
         }
     }
@@ -13705,6 +13771,11 @@ impl BackendDevice for WgpuDevice {
                 required_features,
                 required_limits: required_limits.clone(),
                 experimental_features,
+                // Favor smaller gpu-allocator device blocks (MemoryUsage ⇒ 8–64
+                // MiB vs Performance ⇒ 128–256 MiB). The KV-cat loop allocates
+                // many small buffers that are recycled, so large blocks carve
+                // fresh VRAM per alloc and never get returned → OOM at low VRAM.
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
                 ..Default::default()
             })) {
                 Ok(dq) => dq,
@@ -13717,6 +13788,7 @@ impl BackendDevice for WgpuDevice {
                         required_features,
                         required_limits: required_limits.clone(),
                         experimental_features,
+                        memory_hints: wgpu::MemoryHints::MemoryUsage,
                         ..Default::default()
                     }))
                     .map_err(|e2| {
