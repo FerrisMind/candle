@@ -2610,7 +2610,13 @@ impl VulkanDevice {
             "read_buffer_after_copy_record",
         )?;
         self.cleanup_pending_submissions(true)?;
-        self.map_read_host_buffer(staging.as_ref())
+        let mut bytes = self.map_read_host_buffer(staging.as_ref())?;
+        // The GPU copy above wrote exactly `buffer.size` bytes into the staging
+        // buffer, which may be a recycled pooled buffer whose capacity exceeds
+        // `buffer.size`. Truncate the readback to the bytes actually written so a
+        // larger pooled buffer cannot leak stale tail bytes to the caller.
+        bytes.truncate(buffer.size);
+        Ok(bytes)
     }
 
     fn run_compute(
