@@ -8971,6 +8971,15 @@ impl Drop for VulkanBuffer {
                         return;
                     }
                 }
+                // Non-staging buffers always route through the device-level
+                // deferred-free list: the actual `allocator.free` runs in
+                // `destroy_deferred_buffers` under the allocator lock (never
+                // here — VulkanBuffer::drop can run while that lock is held).
+                // Without this, allocator sub-blocks are only reclaimed when a
+                // submission cycle happens to observe the buffer; test-suite
+                // devices that never run another op leak their first blocks
+                // for the process lifetime (compounding across the smoke
+                // suite's ~44 leaked devices).
                 if let Ok(mut deferred) = self.device.inner.deferred_buffer_frees.lock() {
                     deferred.push(VulkanDeferredBuffer {
                         buffer: self.buffer,
@@ -10375,60 +10384,80 @@ impl BackendDevice for VulkanDevice {
             physical_device,
             debug_settings: Default::default(),
             buffer_device_address: false,
-            // Small fixed blocks: devices used in the smoke test-suite are never destroyed (the
-            // VulkanBuffer <-> device-pool Arc cycle keeps VulkanInner alive, so vkDestroyDevice
-            // never runs) and one default 256MB device block per leaked device would exhaust 12GB
-            // VRAM across a full-suite run. Allocations larger than the block size fall back to
-            // dedicated (driver-managed) memory blocks, so large allocations are unaffected.
-            allocation_sizes: AllocationSizes::new(16 * 1024 * 1024, 16 * 1024 * 1024),
+            // Default 256MB initial blocks (measured: a 16MB cap — even with
+            // growth to 256MB — regressed batched large-matmul ~3x from
+            // allocator block cycling). The smoke-test-suite OOM those caps
+            // fixed is instead handled by the per-device block ceiling below.
+            allocation_sizes: AllocationSizes::new(256 * 1024 * 1024, 64 * 1024 * 1024),
         })
         .map_err(Error::wrap)?;
         init_guard.disarm();
-        Ok(Self {
-            inner: Arc::new(VulkanInner {
-                ordinal,
-                physical_device_name,
-                physical_device_type,
-                _entry: entry,
-                instance,
-                physical_device,
-                vendor_id,
-                integer_dot_product,
-                shader_float64,
-                cooperative_matrix,
-                subgroup_arithmetic,
-                subgroup_size,
-                subgroup_size_control,
-                compute_full_subgroups,
-                subgroup_min_size,
-                subgroup_max_size,
-                max_workgroup_size_log2,
-                max_workgroup_count_x,
-                max_workgroup_count_y,
-                max_push_constants_size,
-                robust_buffer_access,
-                vulkan_memory_model,
-                non_coherent_atom_size,
-                device,
-                driver_pipeline_cache,
-                queue_family_index,
-                queue,
-                transfer_queue_family_index,
-                transfer_queue,
-                allocator: Mutex::new(Some(allocator)),
-                seed_value: RwLock::new(299_792_458),
-                pipeline_cache: Mutex::new(HashMap::default()),
-                pending_submissions: Mutex::new(Vec::new()),
-                active_compute_batch: Mutex::new(None),
-                active_transfer_batch: Mutex::new(None),
-                reusable_compute_submissions: Mutex::new(Vec::new()),
-                reusable_transfer_submissions: Mutex::new(Vec::new()),
-                deferred_buffer_frees: Mutex::new(Vec::new()),
-                upload_staging_pool: Mutex::new(HashMap::default()),
-                readback_staging_pool: Mutex::new(HashMap::default()),
-                staging_pending_return: Mutex::new(Vec::new()),
-            }),
-        })
+        let inner = Arc::new(VulkanInner {
+            ordinal,
+            physical_device_name,
+            physical_device_type,
+            _entry: entry,
+            instance,
+            physical_device,
+            vendor_id,
+            integer_dot_product,
+            shader_float64,
+            cooperative_matrix,
+            subgroup_arithmetic,
+            subgroup_size,
+            subgroup_size_control,
+            compute_full_subgroups,
+            subgroup_min_size,
+            subgroup_max_size,
+            max_workgroup_size_log2,
+            max_workgroup_count_x,
+            max_workgroup_count_y,
+            max_push_constants_size,
+            robust_buffer_access,
+            vulkan_memory_model,
+            non_coherent_atom_size,
+            device,
+            driver_pipeline_cache,
+            queue_family_index,
+            queue,
+            transfer_queue_family_index,
+            transfer_queue,
+            allocator: Mutex::new(Some(allocator)),
+            seed_value: RwLock::new(299_792_458),
+            pipeline_cache: Mutex::new(HashMap::default()),
+            pending_submissions: Mutex::new(Vec::new()),
+            active_compute_batch: Mutex::new(None),
+            active_transfer_batch: Mutex::new(None),
+            reusable_compute_submissions: Mutex::new(Vec::new()),
+            reusable_transfer_submissions: Mutex::new(Vec::new()),
+            deferred_buffer_frees: Mutex::new(Vec::new()),
+            upload_staging_pool: Mutex::new(HashMap::default()),
+            readback_staging_pool: Mutex::new(HashMap::default()),
+            staging_pending_return: Mutex::new(Vec::new()),
+        });
+        // Device cache: `Device::new_vulkan(ordinal)` is called per test /
+        // per component in the wild, but VulkanInner holds GPU resources that
+        // are never reclaimed while any VulkanBuffer exists (the buffer ->
+        // Arc<VulkanInner> -> pool -> Arc<VulkanBuffer> cycle keeps the device
+        // alive), so repeated construction leaks ~a device's full allocator
+        // footprint each time (the smoke suite exhausted 12GB after ~24
+        // devices). Dedup by ordinal: the first construction wins and later
+        // calls share it. `same_device` is Arc::ptr_eq, so sharing is
+        // semantically indistinguishable from re-construction.
+        static DEVICE_CACHE: std::sync::OnceLock<
+            Mutex<Vec<Arc<VulkanInner>>>,
+        > = std::sync::OnceLock::new();
+        let cache = DEVICE_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+        if let Ok(mut devices) = cache.lock() {
+            if let Some(existing) = devices.iter().find(|d| d.ordinal == ordinal) {
+                drop(inner);
+                return Ok(Self {
+                    inner: existing.clone(),
+                });
+            }
+            devices.push(inner.clone());
+        }
+        Ok(Self { inner })
     }
 
     fn location(&self) -> crate::DeviceLocation {
