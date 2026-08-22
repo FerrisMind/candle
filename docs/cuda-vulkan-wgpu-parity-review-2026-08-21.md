@@ -305,12 +305,13 @@ Byte-parity тесты (сравнение GPU-байт с CPU-байтами, �
 
 1. ~~wgpu matmul SLO-гэп 1.43x + escalation (wgpu-upgrade с subgroup matrices)~~ **ЗАКРЫТО (W-U1 probe, `wgpu/vulkan` не тронут)**: остаточный гэп 1024³ 0.4332 vs CUDA 0.3032 (**1.43x**) — **окончательно установленный платформенный предел** cooperative-матриц gfx-rs wgpu на RTX 3060; все 4 рычага (структурный порт / materialize B^T / push constants / dependency upgrade) исчерпаны с A/B-данными — ссылки на все 4 отчёта: `.swarm/results/w-m1a-coop-shader.md`, `w-m1b-materialize-bt.md`, `w-m1c-push-constants.md`, `w-u1-wgpu-upgrade-probe.md`. SUBGROUP_MATRIX не существует ни в одной версии wgpu (ни 29.x, ни 30.0.1, ни trunk, CHANGELOG — 0 упоминаний); `mul_mat_subgroup_matrix.wgsl` — мёртвый порт из Dawn-бекенда ggml-webgpu (llama.cpp), `enable chromium_experimental_subgroup_matrix;` = hard parse-error naga (UnknownEnableExtension), в gfx-rs расширение отсутствует; upgrade = большой API churn (`VertexState.buffers` → `&[Option<_>]`, `DeviceDescriptor.default_queue`, etc.) без SLO-выигрыша. Возможное будущее (не действие волны): патч/форк wgpu с нативным SUBGROUP_MATRIX либо новое поколение coop-шейдеров (`enable wgpu_cooperative_matrix`).
 2. K-quants Q2K–Q6K GPU-quantize (callers — только offline CLI/тесты).
-3. `vulkan_perf_staging_pool` + 2 q8_1 qmatmul reference-теста — пре-existing, environment (верифицировано на базовом коммите), не фиксилось.
+3. ~~`vulkan_perf_staging_pool` + 2 q8_1 qmatmul reference-теста — пре-existing, environment~~ **q8_1 reference ЗАКРЫТО (`67e07ec5`)**: real численный баг (пропуск A-side q8_1-квантования на MMVQ-matvec-пути), не environment. Остаются 2 pre-existing фейла `--ignored`-свиты: `vulkan_perf_staging_pool` + `quantize_q8_1_x4` (общий прогон; оба проходят standalone — process-level ordering pollution staging-пула, W-N2 root-caused до stale f32-хвоста в readback staging-буфере) — кандидат на следующий перф-этап.
 4. MoE scratch buffer pooling.
 5. IQ/mxfp4/nvfp4 — ограничение candle в целом (у CUDA в этом форке тоже нет).
 6. wgpu small-op dispatch overhead ~50–90µs (IMMEDIATES-стайл для самых маленьких struct-ов) — perf-класс.
 7. ~~Латентный риск `1.0/d` driver-division в старых vulkan-кернелах Q8_0/Q4_0~~ **ЗАКРЫТО в волне #3 (`59d6db30` Q8_0, `ce78acf0` Q4_0, `0385542d` Q8_1)**: runtime scale-делитель через push constants (паттерн VulkanQuantizeScaleParams), glslc constant-folds литеральные делители; хазард остаётся только в мёртвых не-диспатчащихся `copy_to_quant`-вариантах (`cpy_f32_q*`/`set_rows_q*`) — задокументировано.
 8. ~~vulkan gpu-allocator 16MB-кап: batch-режим больших matmul ~3.1x медленнее~~ **ЗАКРЫТО в `c239e5b4`**: device-cache (дедуп `VulkanInner` по ordinal) устранил OOM-утечку без капа; аллокатор на дефолтных 256MB/64MB блоках; smoke 50/50, batch20 восстановлен. Долгосрочный follow-up (низкий приоритет): разрыв Arc-цикла VulkanBuffer↔пулы, чтобы `vkDestroyDevice` реально срабатывал.
+9. wgpu q8_1 same-class check (**НЕ запускался — волна остановлена пользователем, добавить в следующую**): проверить, нет ли у wgpu-диспетчера того же класса пропуска A-side q8_1-квантования на matvec-пути с малым k (smoke `q8_1_activation_matmul_reference` сейчас зелёный, но малый k не покрыт — не проверено).
 
 ### Волна 2026-08-22 #3 (div_ieee завершение + SLO-исследование wgpu matmul)
 
@@ -331,6 +332,18 @@ Byte-parity тесты (сравнение GPU-байт с CPU-байтами, �
 Финальные гейты волны #3 (HEAD `0385542d`, `--test-threads=1`): lib wgpu **138/0**, vulkan **50/0+23 ignored**; smoke wgpu **43/0**, vulkan **50/0**; parity_diff **9/0/1** оба; matmul_tests **11/0** оба; clippy `-D warnings` 0/0 оба (glslc banner — не диагностика); `fmt --check` чисто.
 
 *Все прогоны §14 — HEAD `0385542d`, RTX 3060, release, `--test-threads=1`, 2026-08-22. Полные отчёты листьев — `.swarm/results/`.*
+
+### Волна 2026-08-22 #4 (числовая корректность: закрыт последний падающий тест)
+
+**Закрыт многолетний падающий тест — real numerical bug found & fixed (`67e07ec5`).** `vulkan_q8_1_qmatmul_matches_cpu_reference` (+`_no_warmup`). Root cause: Q8_1-веса (repack q8_1→q8_0) на matvec-пути с n=1, k≤4096 на NVIDIA уводились эвристикой `vulkan_should_use_mmvq` на сырой f32-MMVQ-путь **без q8_1-квантования A-side (активаций)** — CPU-контракт (как llama.cpp: src1 квантуется в vec_dot_type=Q8_1) нарушался → систематическая ошибка 5.09e-4 (= ровно ошибка LHS-квантования). Fix: флаг `force_q8_1_rhs` через dispatch (`quantized_matmul`/`quantized_matmat`/matvec) — Q8_1-веса всегда идут в fused q8_1-rhs кернелы с A-side квантованием.
+
+Остаточная дельта GPU vs CPU = ровно **1 ULP f32 на 4742 (2^-11)**: fused int32-dot + одно f32-умножение vs последовательная f32-аккумуляция CPU — физический пол, не баг. Абс-ассерт `1e-6` при величине 4742 требовал 2.1e-10 rel (500x ниже f32-эпсилона) — harness-баг; заменён на rel `expected.abs()*1e-5 + 1e-6` (прецедент — `assert_f64_close` в той же свите).
+
+**Числовая корректность обоих бекендов — полный зелёный статус.** `gpu_numerical_diff_tests` + `gpu_parity_matrix_tests` зелёные (cuda+vulkan, cuda+wgpu); все reference/byte-parity тесты зелёные. Из `--ignored`-свиты vulkan остаются 2 pre-existing фейла: `vulkan_perf_staging_pool` + `quantize_q8_1_x4` (в общем прогоне; оба проходят standalone — process-level ordering pollution staging-пула, W-N2 root-caused до stale f32-хвоста в readback staging-буфера; кандидат на следующий перф-этап).
+
+**wgpu q8_1 same-class check — НЕ запускался** (пользователь остановил волну) → открытый follow-up: проверить, нет ли у wgpu-диспетчера того же класса пропуска A-side квантования для q8_1 (smoke-тест `q8_1_activation_matmul_reference` сейчас зелёный, но покрывает ли он matvec-путь с малым k — не проверено).
+
+*Прогоны волны #4 — HEAD `67e07ec5`, RTX 3060, release, `--test-threads=1`, 2026-08-22.*
 
 ---
 *Все утверждения о коде проверены на HEAD 1596684b; тестовые прогоны — RTX 3060, release, 2026-08-21, однопоточные (`--test-threads=1`). Фиксы финальной волны: wgpu_backend.rs (powf/elu F16, reduce I16, to_dtype U8→I32, F8E4M3-хабы, uniform ring), 7 argsort-шейдеров candle-vulkan-kernels, vulkan scatter_add F8E4M3, backend_parity_diff (harness-сравнение по dtype результата). См. также §10–11 документа 2026-08-19.*
