@@ -8,6 +8,7 @@ layout (push_constant) uniform parameter
 {
     uint ne;
     uint num_blocks;
+    uint scale_bits;
 } p;
 
 #include "types.glsl"
@@ -23,6 +24,28 @@ layout (binding = 1) writeonly buffer D {block_q4_0 data_b[];};
 shared float shmem_abs[GROUP_SIZE];
 shared float shmem_val[GROUP_SIZE];
 shared uint shmem_nib[QUANT_K_Q4_0 * (GROUP_SIZE / 8)];
+
+// Vulkan permits division to be up to 2 ulp off the IEEE result and this
+// driver's OpFDiv is off by ~1 ulp for some operands, breaking exact byte
+// parity with the CPU quantizer. Correct it: the true quotient is within 2 ulp
+// of the driver's, so pick whichever of the 5 surrounding f32 values minimizes
+// the (correctly rounded, fma) residual. Bit/control-flow ops prevent the
+// optimizer from algebraically collapsing this back into a plain division.
+float div_ieee(float a, float b) {
+    float q = a / b;
+    int qb = floatBitsToInt(q);
+    float best = abs(fma(b, q, -a));
+    int bidx = 0;
+    float r = abs(fma(b, intBitsToFloat(qb + 1), -a));
+    if (r < best) { best = r; bidx = 1; }
+    r = abs(fma(b, intBitsToFloat(qb + 2), -a));
+    if (r < best) { best = r; bidx = 2; }
+    r = abs(fma(b, intBitsToFloat(qb - 1), -a));
+    if (r < best) { best = r; bidx = -1; }
+    r = abs(fma(b, intBitsToFloat(qb - 2), -a));
+    if (r < best) { best = r; bidx = -2; }
+    return intBitsToFloat(qb + bidx);
+}
 
 // CPU quantize_row_q4_0: d = vmax/-8 with vmax = element at max |x| (first
 // occurrence wins ties), q = min(15, (x*id + 8.5) trunc), nibble j of qs byte
@@ -60,8 +83,12 @@ void quantize(const uint wgid) {
     }
 
     const float vmax = shmem_val[block_in_wg * 8];
-    const float d = vmax / -8.0;
-    const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
+    // scale comes in as runtime data so the driver cannot constant-fold
+    // `/scale` or `1.0/d` into algebraic forms that differ by 1 ulp from the
+    // CPU reference (watch out: glslc rewrites x/-8.0 and 1.0/(x/-8.0)).
+    const float scale = uintBitsToFloat(p.scale_bits);
+    const float d = div_ieee(vmax, scale);
+    const float d_inv = d != 0.0 ? div_ieee(1.0, d) : 0.0;
 
     if (ib < p.num_blocks) {
         const uint base = block_in_wg * QUANT_K_Q4_0 + iqs * 4;
