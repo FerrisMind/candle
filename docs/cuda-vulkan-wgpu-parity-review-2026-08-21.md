@@ -230,4 +230,89 @@
 5. `cargo fmt` на touched файлах (175 хунков, не блокирует гейты; отдельный cosmetic-коммит).
 
 ---
+
+## 14. ВОЛНА ЗАКРЫТИЯ 2026-08-22 (agent-swarm): GPU-quantize завершён, uniform-ring params завершён, CUDA-baseline вердикты по SLO/TF32/CUDA-Graphs, OOM-фикс
+
+Оркестрирована через agent-swarm (отчёты листьев `.swarm/results/`). Все прогоны — RTX 3060, Windows, release, `--test-threads=1`. HEAD волны: `c91c7daf` → `2e376d89`.
+
+### Коммиты волны
+
+| Коммит | Содержание |
+|---|---|
+| `02e98766` | feat(vulkan): нативный GPU-quantize Q4_1/Q5_0/Q5_1 — byte-identical CPU. Три numeric-parity-фикса: glslc алгебраически переписывает fp-деление (`x/15.0 → x*0.0666…`), что ломает побитовый паритет → делитель передан runtime uniform'ом (`VulkanQuantizeScaleParams.scale_bits`); NVIDIA OpFDiv на RTX 3060 на ~1 ulp ниже корректно-округлённого → `div_ieee` (выбор f32-кандидата по FMA-residual `|fma(b,q,-a)|`, optimizer-proof, в SPIR-V — OpExtInst Fma + 21 OpBitcast); ±0.0 tie-семантика min/max → `minNum`/`maxNum` (rust_min/rust_max). |
+| `37d8b318` | fix(vulkan): gpu-allocator block cap 16MB (`AllocationSizes::new(16MB,16MB)`) — Arc-cycle утечка тестовых девайсов (каждый держал 256MB default block) приводила к OOM в сьют-прогоне на ~44 девайсах; smoke 47/3 → 50/50. Large-аллокации не регрессируют: dedicated-block путь не ограничен капом (verified по исходникам gpu-allocator 0.28.0 + vulkan/mod.rs:485). Pre-existing, НЕ фиксилось: `vulkan_perf_staging_pool` + 2 q8_1 qmatmul reference-теста падают и на базовом коммите (environment). |
+| `ff995d09` | feat(wgpu): нативный GPU-quantize Q4_1/Q5_0/Q5_1 — word-assembly (160/176/192 B на workgroup, one-writer-per-u32-word), workgroup-LOCAL byte-offset (урок `c91c7daf`). 3 бага найдено и исправлено: constant-divisor specialization WGSL/драйвера побеждает `div_ieee` (литерал 15.0 → raw-частное 1 ulp HIGH) → runtime uniform `scale_bits` (15.0/31.0 to_bits); Q5 nibble-masking `&0xF` (lo/hi 5-бит, spill бита 4 в соседний nibble); Rust tie-семантика `minNum`/`maxNum` + Q5_0 absmax first-occurrence. |
+| `577cec68` | perf(wgpu): все большие F32 GEMM → coop64 (dual 128x64 регрессировал оба шейпа на RTX 3060): 1024³ 0.55→0.53 sync / 0.446→0.426 batch; 64×4096 0.685→0.55 sync / 0.585→0.448 batch. K-panel padding (TK+1) РЕГРЕСС ~10% (задокументировано в заголовке шейдера, coopLoad с non-power-of-two stride сам создаёт конфликты). ЧЕСТНЫЙ ВЕРДИКТ: SLO wgpu matmul 1.30x всё ещё НЕ выполнен (sync 1.66–1.81x / batch 1.40–1.58x); tuning-пространство семейства шейдеров исчерпано (заголовок шейдера документирует отвергнутые конфиги: N-coalesced ±pad, BK=64, 128-thr, materialize B^T, K-panel=32); закрытие требует структурного rewrite (vulkan BM=BN=64 warp-partitioned coopMatLoad-from-shared layout) либо wgpu-upgrade с `subgroup_matrix` — кандидат следующей волны. |
+| `8ebabc27` | perf(wgpu): params batch A — 17 single-dispatch сайтов на uniform ring. |
+| `23845505` | perf(wgpu): params batches B+C — 20 сайтов (chunk-loops со свежим слотом ring'а на чанк; холодные сайты). ВСЕ wgpu params-сайты теперь на ring — оставшиеся 7 `create_buffer` — пулы/внутренности/MoE-scratch. |
+| `224eb6c9` | fix(wgpu): `run_where_u8_cond` chunked-путь — перезапись слота ring'а (deferred-batch overwrite hazard, находка W-P2-аудита). |
+| `2e376d89` | style: cargo fmt на файлах паритет-волны. |
+
+### CUDA-baseline вердикты (W-B1, `.swarm/results/w-b1-cuda-baseline.md`)
+
+Matmul sync/batch20 medians (ms; прогон W-B1 на HEAD `ae55bc2e`, GPU без контенции; для wgpu ЧП-столбец — актуальные значения после `577cec68`):
+
+| Бекенд | matmul_1024³ sync / batch20 | matmul_64×4096⁴ sync / batch20 | SLO-вердикт (sync) |
+|---|---|---|---|
+| cuda | 0.3176 / 0.3032 | 0.3022 / 0.2832 | baseline |
+| vulkan | 0.2985 / 0.2093 | 0.3361 / 0.2538 | **0.94x / 1.11x — PASS** |
+| wgpu | 0.5385 / 0.4494 → **0.53 / 0.426** | 0.6841 / 0.5921 → **0.55 / 0.448** | 1.70x → **1.66x** / 2.26x → **1.81x — FAIL** (SLO 1.30x) |
+
+**TF32: аналог НЕ нужен.** candle-CUDA честный FP32 — `MM_F32_REDUCED_PRECISION=false` по умолчанию, `CUBLAS_COMPUTE_32F` (подтверждено cpu−cuda max err ~2e-4, mean ~1e-5); vulkan 0.94–1.13x ≤ SLO 1.15x и без TF32; coopmat f16→f32-accum уже покрывает reduced-precision режим. Numeric-caveat (задокументировать): cpu−vk/cpu−wgpu max err 0.02–0.08 (mean 3.7e-3–1.5e-2) — на 2–3 порядка выше cpu−cuda из-за f16-input MMA — тот же numeric-класс, что у vulkan-coopmat.
+
+**CUDA Graphs: аналог НЕ нужен.** cuda batch20/sync ≥ 0.6 на всех op/шейпах (0.64–0.96, маленькие тоже); условие «cuda-ratio заметно ниже» не срабатывает нигде — где vk/wgpu < 0.5 (0.23–0.43), там cuda ВЫШЕ (0.64–0.91). Watch-item: vk/wgpu small-op fixed dispatch overhead ~50–90µs sync vs ~10–25µs amortized — их собственный гэп, не вопрос graphs-эмуляции.
+
+**candle-ug (NVRTC JIT SSA→PTX): work-without.** Единственный caller — unit-тест; оба бекенда поставляются прекомпилированными SPIR-V/WGSL-кернелами; runtime-compile — экосистемная фича, не контрактная.
+
+### GPU-quantize: статус после волны
+
+| Формат | wgpu | vulkan | Статус |
+|---|---|---|---|
+| Q8_0 | Native (`2b4e5f8e`) | Native (`172aec59`) | byte-identical CPU |
+| Q4_0 | Native (`bbb32485`) | Native (`172aec59`) | byte-identical CPU (включая vmax tie-order) |
+| Q4_1 | Native (`ff995d09`) | Native (`02e98766`) | byte-identical CPU, byte-parity тесты |
+| Q5_0 | Native (`ff995d09`) | Native (`02e98766`) | byte-identical CPU, byte-parity тесты |
+| Q5_1 | Native (`ff995d09`) | Native (`02e98766`) | byte-identical CPU, byte-parity тесты |
+| Q8_1 (активации) | Native (pre-existing kernel) | Native (pre-existing kernel) | quant-путь qmatmul |
+| Q2K–Q6K | deferral | deferral | callers — только offline CLI/тесты; dequant уже нативный |
+
+Byte-parity тесты (сравнение GPU-байт с CPU-байтами, не dequant-толеранс): wgpu `wgpu_quantize_tests` / vulkan `vulkan_quantize` — по 9/9: matches_cpu_bytes (LCG-фикстуры), dm_large_multi_workgroup (4608 эл. = 144 блока, 18/36 workgroup'ов), ties_and_zero_bytes (±0.0 min/max ties, first-occurrence absmax, 0x8000 m), non_multiple_takes_cpu_behavior (n%32≠0 → идентичная error-поверхность). Новые тесты — `#[ignore]` (нужна GPU). Замеры времени не проводились в отдельных лефах; подробности находок (glslc algebraic rewrite, driver-специфичный OpFDiv 1-ulp, constant-divisor specialization, Q5 nibble masking) — `.swarm/results/w-q1-quant-vk.md`, `.swarm/results/w-q2-quant-wgpu.md`.
+
+### Финальные гейты (HEAD `2e376d89`, RTX 3060, release, `--test-threads=1`)
+
+| Прогон | Результат |
+|---|---|
+| `clippy -D warnings` | wgpu 0 · vulkan 0 (glslc banner — не диагностика) |
+| `candle-core lib, wgpu` | **138 passed / 0 failed / 0 ignored** |
+| `candle-core lib, vulkan` | **50 passed / 0 failed / 23 ignored** (6 новых GPU-quantize — `--ignored vulkan_quantize` → 9/9) |
+| `backend_parity_diff` | wgpu **9/0/1** · vulkan **9/0/1** |
+| `backend_smoke_tests, wgpu` | **43 passed / 0 failed** |
+| `backend_smoke_tests, vulkan` | **50 passed / 0 failed** (OOM-тройка устранена `37d8b318`) |
+| microbench spot-check | см. таблицу ниже |
+
+### Перф spot-check (гейт 9, HEAD `2e376d89`, `backend_parity_microbench`, 2 прогона)
+
+| Бекенд | op | sync median | batch20 median | Ожидание | Вердикт |
+|---|---|---|---|---|---|
+| vulkan | matmul_1024³ | 0.3063 / 0.3145 | **0.7071 / 0.7160** | sync ~0.30 | sync ✓; batch20 — РЕГРЕССИЯ (см. ниже) |
+| vulkan | matmul_64×4096⁴ | 0.3274 / 0.3324 | 0.2722 / 0.2725 | sync ~0.33 | ✓ |
+| wgpu | matmul_1024³ | 0.5306 / 0.5230 | 0.4243 / 0.4245 | 0.51–0.535 / 0.42–0.45 | ✓ (coop64-улучшение держится) |
+| wgpu | matmul_64×4096⁴ | 0.5513 / 0.5528 | 0.4477 / 0.4487 | 0.54–0.56 / 0.44–0.45 | ✓ |
+
+**Находка (A/B, не скрыта):** vulkan gpu-allocator кап 16MB (`37d8b318`) вносит ~3.1x регрессию именно в batch-режиме больших matmul — 1024³ batch20 0.707/0.716 против 0.2297–0.23 на `Default::default()` (256MB-блоки) и 0.2093/0.2232 pre-fix. Механизм: batch-пачка держит ~20 pending 12MB-выходов → каждый попадает в отдельный 16MB-блок, allocation churn в амортизированной пер-оп метрике. Sync-медианы НЕ затронуты (0.306 vs 0.312). OOM-фикс оставлен как есть (коммит волны — docs only); сужение гранулярности (range-блоки / `with_max_device_memblock_size`, ре-верификация OOM-сьюта) — follow-up 8.
+
+### Оставшиеся follow-up (зафиксировано, не блокирует паритет)
+
+1. wgpu matmul SLO-гэп 1.40–1.81x — структурный rewrite шейдера (кандидат следующей волны; см. честный вердикт `577cec68`).
+2. K-quants Q2K–Q6K GPU-quantize (callers — только offline CLI/тесты).
+3. `vulkan_perf_staging_pool` + 2 q8_1 qmatmul reference-теста — пре-existing, environment (верифицировано на базовом коммите), не фиксилось.
+4. MoE scratch buffer pooling.
+5. IQ/mxfp4/nvfp4 — ограничение candle в целом (у CUDA в этом форке тоже нет).
+6. wgpu small-op dispatch overhead ~50–90µs (IMMEDIATES-стайл для самых маленьких struct-ов) — perf-класс.
+7. Латентный риск `1.0/d` driver-division в старых vulkan-кернелах Q8_0/Q4_0 (новые кернелы используют `div_ieee`, старые — нет).
+8. vulkan gpu-allocator 16MB-кап (`37d8b318`): batch-режим больших matmul (~1024³) ~3.1x медленнее (0.71 vs 0.23ms) — sync не тронут; кандидат — range-блоки / `with_max_device_memblock_size` с ре-верификацией OOM-сьюта (не фиксилось в этой волне).
+
+*Все прогоны §14 — HEAD `2e376d89`, RTX 3060, release, `--test-threads=1`, 2026-08-22. Полные отчёты листьев — `.swarm/results/`.*
+
+---
 *Все утверждения о коде проверены на HEAD 1596684b; тестовые прогоны — RTX 3060, release, 2026-08-21, однопоточные (`--test-threads=1`). Фиксы финальной волны: wgpu_backend.rs (powf/elu F16, reduce I16, to_dtype U8→I32, F8E4M3-хабы, uniform ring), 7 argsort-шейдеров candle-vulkan-kernels, vulkan scatter_add F8E4M3, backend_parity_diff (harness-сравнение по dtype результата). См. также §10–11 документа 2026-08-19.*
