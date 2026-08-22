@@ -741,10 +741,19 @@ fn parity_flash_attn_features(under_test: &Device, _cuda: &Device) -> Result<()>
                 _ => unreachable!(),
             };
             let out = candle_core::VulkanStorage::flash_attn(
-                q_s, q_l, k_s, k_l, v_s, v_l,
-                1.0 / (d as f32).sqrt(), true,
+                q_s,
+                q_l,
+                k_s,
+                k_l,
+                v_s,
+                v_l,
+                1.0 / (d as f32).sqrt(),
+                true,
             )?;
-            assert_eq!(out.to_cpu_storage()?.as_slice::<f32>()?.len(), b * h * s * d);
+            assert_eq!(
+                out.to_cpu_storage()?.as_slice::<f32>()?.len(),
+                b * h * s * d
+            );
 
             let alibi = Tensor::from_vec(vec![0.5f32, 0.25f32], (h,), under_test)?;
             let (alibi_g, _) = alibi.storage_and_layout();
@@ -753,11 +762,23 @@ fn parity_flash_attn_features(under_test: &Device, _cuda: &Device) -> Result<()>
                 _ => unreachable!(),
             };
             let out_ext = candle_core::VulkanStorage::flash_attn_ext(
-                q_s, q_l, k_s, k_l, v_s, v_l,
-                Some(alibi_s), Some(2), Some(0), Some(30.0),
-                1.0 / (d as f32).sqrt(), true,
+                q_s,
+                q_l,
+                k_s,
+                k_l,
+                v_s,
+                v_l,
+                Some(alibi_s),
+                Some(2),
+                Some(0),
+                Some(30.0),
+                1.0 / (d as f32).sqrt(),
+                true,
             )?;
-            assert_eq!(out_ext.to_cpu_storage()?.as_slice::<f32>()?.len(), b * h * s * d);
+            assert_eq!(
+                out_ext.to_cpu_storage()?.as_slice::<f32>()?.len(),
+                b * h * s * d
+            );
         }
         #[cfg(feature = "wgpu")]
         Device::Wgpu(_) => {
@@ -777,10 +798,19 @@ fn parity_flash_attn_features(under_test: &Device, _cuda: &Device) -> Result<()>
                 _ => unreachable!(),
             };
             let out = candle_core::WgpuStorage::flash_attn(
-                q_s, q_l, k_s, k_l, v_s, v_l,
-                1.0 / (d as f32).sqrt(), true,
+                q_s,
+                q_l,
+                k_s,
+                k_l,
+                v_s,
+                v_l,
+                1.0 / (d as f32).sqrt(),
+                true,
             )?;
-            assert_eq!(out.to_cpu_storage()?.as_slice::<f32>()?.len(), b * h * s * d);
+            assert_eq!(
+                out.to_cpu_storage()?.as_slice::<f32>()?.len(),
+                b * h * s * d
+            );
 
             let alibi = Tensor::from_vec(vec![0.5f32, 0.25f32], (h,), under_test)?;
             let (alibi_g, _) = alibi.storage_and_layout();
@@ -789,11 +819,23 @@ fn parity_flash_attn_features(under_test: &Device, _cuda: &Device) -> Result<()>
                 _ => unreachable!(),
             };
             let out_ext = candle_core::WgpuStorage::flash_attn_ext(
-                q_s, q_l, k_s, k_l, v_s, v_l,
-                Some(alibi_s), Some(2), Some(0), Some(30.0),
-                1.0 / (d as f32).sqrt(), true,
+                q_s,
+                q_l,
+                k_s,
+                k_l,
+                v_s,
+                v_l,
+                Some(alibi_s),
+                Some(2),
+                Some(0),
+                Some(30.0),
+                1.0 / (d as f32).sqrt(),
+                true,
             )?;
-            assert_eq!(out_ext.to_cpu_storage()?.as_slice::<f32>()?.len(), b * h * s * d);
+            assert_eq!(
+                out_ext.to_cpu_storage()?.as_slice::<f32>()?.len(),
+                b * h * s * d
+            );
         }
         _ => {}
     }

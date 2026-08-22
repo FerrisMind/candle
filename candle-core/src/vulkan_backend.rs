@@ -10444,9 +10444,8 @@ impl BackendDevice for VulkanDevice {
         // devices). Dedup by ordinal: the first construction wins and later
         // calls share it. `same_device` is Arc::ptr_eq, so sharing is
         // semantically indistinguishable from re-construction.
-        static DEVICE_CACHE: std::sync::OnceLock<
-            Mutex<Vec<Arc<VulkanInner>>>,
-        > = std::sync::OnceLock::new();
+        static DEVICE_CACHE: std::sync::OnceLock<Mutex<Vec<Arc<VulkanInner>>>> =
+            std::sync::OnceLock::new();
         let cache = DEVICE_CACHE.get_or_init(|| Mutex::new(Vec::new()));
         if let Ok(mut devices) = cache.lock() {
             if let Some(existing) = devices.iter().find(|d| d.ordinal == ordinal) {

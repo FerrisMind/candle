@@ -25,13 +25,17 @@ fn gpu_f32_to_bf16_and_matmul_dtype() -> candle_core::Result<()> {
     assert_eq!(out.dtype(), DType::BF16, "bf16 matmul output dtype");
     // Value check (odd output width exercises packed-half word handling).
     let lhs3 = Tensor::from_vec(
-        vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        vec![
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ],
         (3, 4),
         &dev,
     )?
     .to_dtype(DType::BF16)?;
     let rhs3 = Tensor::from_vec(
-        vec![1.0f32, 0.5, 0.0, 2.0, 1.0, 0.0, 0.0, 1.0, 3.0, 1.0, 0.0, 2.0],
+        vec![
+            1.0f32, 0.5, 0.0, 2.0, 1.0, 0.0, 0.0, 1.0, 3.0, 1.0, 0.0, 2.0,
+        ],
         (4, 3),
         &dev,
     )?
@@ -44,7 +48,11 @@ fn gpu_f32_to_bf16_and_matmul_dtype() -> candle_core::Result<()> {
     let cout = lhs3
         .to_device(&candle_core::Device::Cpu)?
         .to_dtype(DType::F32)?
-        .matmul(&rhs3.to_device(&candle_core::Device::Cpu)?.to_dtype(DType::F32)?)?
+        .matmul(
+            &rhs3
+                .to_device(&candle_core::Device::Cpu)?
+                .to_dtype(DType::F32)?,
+        )?
         .to_dtype(DType::BF16)?
         .to_dtype(DType::F32)?
         .flatten_all()?
