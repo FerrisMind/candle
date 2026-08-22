@@ -303,16 +303,34 @@ Byte-parity тесты (сравнение GPU-байт с CPU-байтами, �
 
 ### Оставшиеся follow-up (зафиксировано, не блокирует паритет)
 
-1. wgpu matmul SLO-гэп 1.40–1.81x — структурный rewrite шейдера (кандидат следующей волны; см. честный вердикт `577cec68`).
+1. wgpu matmul SLO-гэп 1.40–1.81x — **исследован до предела (волна #3)**: все 3 рычага плана W-R1 проверены A/B с честными негативными результатами (W-M1a coop-shader порт, W-M1b materialize B^T, W-M1c push constants — см. §14 волна #3); остаточный гэп 1024³ 0.4332 vs CUDA 0.3032 (1.43x) — чистый шейдерный предел cooperative-матриц wgpu 29 на RTX 3060; escalation — апгрейд wgpu с нативными subgroup matrices (wgpu 29 не имеет SUBGROUP_MATRIX feature bit).
 2. K-quants Q2K–Q6K GPU-quantize (callers — только offline CLI/тесты).
 3. `vulkan_perf_staging_pool` + 2 q8_1 qmatmul reference-теста — пре-existing, environment (верифицировано на базовом коммите), не фиксилось.
 4. MoE scratch buffer pooling.
 5. IQ/mxfp4/nvfp4 — ограничение candle в целом (у CUDA в этом форке тоже нет).
 6. wgpu small-op dispatch overhead ~50–90µs (IMMEDIATES-стайл для самых маленьких struct-ов) — perf-класс.
-7. Латентный риск `1.0/d` driver-division в старых vulkan-кернелах Q8_0/Q4_0 (новые кернелы используют `div_ieee`, старые — нет).
+7. ~~Латентный риск `1.0/d` driver-division в старых vulkan-кернелах Q8_0/Q4_0~~ **ЗАКРЫТО в волне #3 (`59d6db30` Q8_0, `ce78acf0` Q4_0, `0385542d` Q8_1)**: runtime scale-делитель через push constants (паттерн VulkanQuantizeScaleParams), glslc constant-folds литеральные делители; хазард остаётся только в мёртвых не-диспатчащихся `copy_to_quant`-вариантах (`cpy_f32_q*`/`set_rows_q*`) — задокументировано.
 8. ~~vulkan gpu-allocator 16MB-кап: batch-режим больших matmul ~3.1x медленнее~~ **ЗАКРЫТО в `c239e5b4`**: device-cache (дедуп `VulkanInner` по ordinal) устранил OOM-утечку без капа; аллокатор на дефолтных 256MB/64MB блоках; smoke 50/50, batch20 восстановлен. Долгосрочный follow-up (низкий приоритет): разрыв Arc-цикла VulkanBuffer↔пулы, чтобы `vkDestroyDevice` реально срабатывал.
 
-*Все прогоны §14 — HEAD `2e376d89`, RTX 3060, release, `--test-threads=1`, 2026-08-22. Полные отчёты листьев — `.swarm/results/`.*
+### Волна 2026-08-22 #3 (div_ieee завершение + SLO-исследование wgpu matmul)
+
+**div_ieee — все живые дивизион-хазарды vulkan закрыты.** Серия `59d6db30` (Q8_0), `ce78acf0` (Q4_0), `0385542d` (Q8_1): scale-делитель передан как runtime-значение через push constants (паттерн `VulkanQuantizeScaleParams`), т.к. glslc constant-folds литеральные делители. Dequant/matvec/matmul-пути Q8_0/Q4_0 читают `d` из блока и только умножают — хазарда нет. Мёртвые `copy_to_quant`-варианты (`cpy_f32_q*`/`set_rows_q*`) скомпилированы, но не диспатчатся — только задокументированы. Pre-existing fail `vulkan_q8_1_qmatmul_matches_cpu_reference` подтверждён на базовом коммите (не регрессия).
+
+**SLO-исследование wgpu matmul — все 3 рычага плана W-R1 проверены эмпирически (A/B), все — честные негативные результаты, ничего не уехало в дерево:**
+
+| Рычаг | Реализация / A/B | Результат | Вердикт |
+|---|---|---|---|
+| W-M1a coop-shader (`.swarm/results/w-m1a-coop-shader.md`) | структурный порт vulkan COOPMAT: BK=64, 2 барьера/панель, vec4 loaders; 5 вариантов | ВСЕ регрессируют: t1 128-thr BK=64 **−1.64x**; лучший t4 **−1.11x**; t5 coalesced-BT-only **−1.04x** | coopLoad wgpu 29 оптимален на dense stride-16 16x16 блоке; расширение K-панели теряет double-buffer overlap быстрее, чем экономит барьеры; Naga uniformity блокирует vulkan-style вложенный аккумулятор. coop64 (512-thr dense-16 double-buffered) = локальный оптимум. Reverted |
+| W-M1b materialize-BT (`.swarm/results/w-m1b-materialize-bt.md`) | materialize B^T для квадратов (m.min(n) ≥ 256) | регресс ~**+15%** на 1024³ batch (0.4332→0.4866), **~2x** на 256³ batch; transpose стоит 0.06–0.08ms/call | GEMM от coalesced BT ничего не получает (согласуется с t5). Reverted |
+| W-M1c push-constants (`.swarm/results/w-m1c-push-constants.md`) | push constants / IMMEDIATES для matmul-параметров + warptile-fallback repair | регресс: 256³ batch **+42%**, 1024³/tall +4%; reg_tile строго хуже warptile (256³ 1.05 vs 0.25 sync; 1024³ 7.17 vs 4.89) | ring уже делает deferred coalesced `write_buffer` одним вызовом на run-слот + cached bind group + dynamic offset; `set_immediates` строго дороже; reg_tile — не routing-дефект, а структурный предел (4x4/thread 32x32 tile vs 64x64 BK=32). Reverted |
+
+**Вердикт:** остаточный гэп wgpu 1024³ = **0.4332 vs CUDA 0.3032 (1.43x)** — чистый шейдерный предел wgpu 29 cooperative-матриц на RTX 3060 (+~0.15ms kernel time); host-путь уже оптимален. Все рычаги W-R1 исчерпаны с данными. Escalation: апгрейд wgpu с нативными subgroup matrices (`mul_mat_subgroup_matrix.wgsl` готов; wgpu 29 не имеет SUBGROUP_MATRIX feature bit).
+
+**K-quants Q2K–Q6K GPU-quantize — НЕ гэп паритета.** У CUDA `quantize()`/`quantize_imatrix()` сами делают CPU round-trip (`cuda.rs:704-721`: `clone_dtoh` → CPU quantize → `memcpy_htod`); vulkan/wgpu для K-quants делают ровно то же (`to_cpu_storage()` + `quantize_from_cpu()`, `mod.rs:536-598`) = паритет. Форк уже ПРЕВЫШАЕТ CUDA по GPU-quantize целиком (6 нативных форматов vs 0 у CUDA). Follow-up остаётся только как optional enhancement (callers — offline CLI/тесты).
+
+Финальные гейты волны #3 (HEAD `0385542d`, `--test-threads=1`): lib wgpu **138/0**, vulkan **50/0+23 ignored**; smoke wgpu **43/0**, vulkan **50/0**; parity_diff **9/0/1** оба; matmul_tests **11/0** оба; clippy `-D warnings` 0/0 оба (glslc banner — не диагностика); `fmt --check` чисто.
+
+*Все прогоны §14 — HEAD `0385542d`, RTX 3060, release, `--test-threads=1`, 2026-08-22. Полные отчёты листьев — `.swarm/results/`.*
 
 ---
 *Все утверждения о коде проверены на HEAD 1596684b; тестовые прогоны — RTX 3060, release, 2026-08-21, однопоточные (`--test-threads=1`). Фиксы финальной волны: wgpu_backend.rs (powf/elu F16, reduce I16, to_dtype U8→I32, F8E4M3-хабы, uniform ring), 7 argsort-шейдеров candle-vulkan-kernels, vulkan scatter_add F8E4M3, backend_parity_diff (harness-сравнение по dtype результата). См. также §10–11 документа 2026-08-19.*
