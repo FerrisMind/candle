@@ -684,6 +684,9 @@ struct WgpuActiveBatch {
     /// Compute dispatches held until encode_pending_dispatches (one pass).
     pending_dispatches: Vec<WgpuPendingDispatch>,
     dispatch_count: u32,
+    /// `copy_buffer_to_buffer` ops recorded directly onto `encoder`. Tracked so
+    /// `flush_active_batch` knows a batch holding only copies is non-empty.
+    copy_count: u32,
 }
 
 impl std::fmt::Debug for WgpuActiveBatch {
@@ -692,6 +695,7 @@ impl std::fmt::Debug for WgpuActiveBatch {
             .field("retained_buffers", &self.retained_buffers.len())
             .field("pending_dispatches", &self.pending_dispatches.len())
             .field("dispatch_count", &self.dispatch_count)
+            .field("copy_count", &self.copy_count)
             .finish_non_exhaustive()
     }
 }
@@ -1567,6 +1571,7 @@ impl WgpuDevice {
             retained_buffers: Vec::new(),
             pending_dispatches: Vec::new(),
             dispatch_count: 0,
+            copy_count: 0,
         })
     }
 
@@ -1665,7 +1670,10 @@ impl WgpuDevice {
         let Some(batch) = batch else {
             return Ok(false);
         };
-        if batch.dispatch_count == 0 && batch.pending_dispatches.is_empty() {
+        if batch.dispatch_count == 0
+            && batch.pending_dispatches.is_empty()
+            && batch.copy_count == 0
+        {
             let mut slot = self
                 .inner
                 .active_batch
@@ -1716,6 +1724,43 @@ impl WgpuDevice {
         if slot.is_none() {
             *slot = Some(self.begin_active_batch()?);
         }
+        Ok(())
+    }
+
+    /// Record a device-to-device copy onto the active batch instead of issuing a
+    /// standalone `queue.submit` per copy. Mirrors the vulkan backend, which
+    /// records every copy onto one command buffer. Commands within a single
+    /// wgpu encoder execute in program order, so first encoding any pending
+    /// deferred computes (which may have produced `src`) keeps copy-after-write
+    /// ordering correct, and later dispatches encoded after this copy observe
+    /// its output. Both source and destination buffers are retained until the
+    /// batch submission completes (via `WgpuPendingSubmission.retained_buffers`)
+    /// so a recycled/reused buffer can never be read while in flight.
+    fn record_buffer_copy(
+        &self,
+        src: &Arc<wgpu::Buffer>,
+        src_offset: u64,
+        dst: &Arc<wgpu::Buffer>,
+        dst_offset: u64,
+        size: u64,
+    ) -> Result<()> {
+        self.ensure_active_batch()?;
+        let mut slot = self
+            .inner
+            .active_batch
+            .lock()
+            .map_err(|e| Error::wrap(e.to_string()))?;
+        let batch = slot
+            .as_mut()
+            .ok_or_else(|| Error::msg("wgpu active batch missing after ensure"))?;
+        // Encode any pending computes first: a copy must observe the output of
+        // dispatches recorded earlier (same-encoder program order).
+        WgpuDevice::encode_pending_dispatches(self, batch);
+        batch
+            .encoder
+            .copy_buffer_to_buffer(src, src_offset, dst, dst_offset, size);
+        WgpuDevice::retain_buffers_into(batch, vec![src.clone(), dst.clone()]);
+        batch.copy_count += 1;
         Ok(())
     }
 
@@ -13553,22 +13598,13 @@ impl BackendStorage for WgpuStorage {
                 _ => Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu copy_strided").bt()),
             };
         }
-        let mut encoder =
-            self.device
-                .inner
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("candle-wgpu-copy"),
-                });
-        encoder.copy_buffer_to_buffer(
+        self.device.record_buffer_copy(
             &self.buffer,
             src_offset as u64,
             &dst.buffer,
             dst_byte_offset as u64,
             size as u64,
-        );
-        self.device.flush_before_standalone_submit()?;
-        self.device.inner.queue.submit([encoder.finish()]);
+        )?;
         Ok(())
     }
 
@@ -13593,26 +13629,36 @@ impl BackendStorage for WgpuStorage {
         if elem_size == 0 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu copy2d").bt());
         }
-        let mut encoder =
-            self.device
-                .inner
+        self.device.ensure_active_batch()?;
+        {
+            let mut slot = self
                 .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("candle-wgpu-copy2d"),
-                });
-        for i1 in 0..d1 {
-            let src = (i1 * src_stride1 + src_offset) * elem_size;
-            let dst_offset = (i1 * dst_stride1 + dst_offset) * elem_size;
-            encoder.copy_buffer_to_buffer(
-                &self.buffer,
-                src as u64,
-                &dst.buffer,
-                dst_offset as u64,
-                (d2 * elem_size) as u64,
+                .inner
+                .active_batch
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            let batch = slot
+                .as_mut()
+                .ok_or_else(|| Error::msg("wgpu active batch missing after ensure"))?;
+            // Encode any pending computes first so these copies observe them.
+            WgpuDevice::encode_pending_dispatches(&self.device, batch);
+            for i1 in 0..d1 {
+                let src = (i1 * src_stride1 + src_offset) * elem_size;
+                let dst_off = (i1 * dst_stride1 + dst_offset) * elem_size;
+                batch.encoder.copy_buffer_to_buffer(
+                    &self.buffer,
+                    src as u64,
+                    &dst.buffer,
+                    dst_off as u64,
+                    (d2 * elem_size) as u64,
+                );
+            }
+            WgpuDevice::retain_buffers_into(
+                batch,
+                vec![self.buffer.clone(), dst.buffer.clone()],
             );
+            batch.copy_count += 1;
         }
-        self.device.flush_before_standalone_submit()?;
-        self.device.inner.queue.submit([encoder.finish()]);
         Ok(())
     }
 
