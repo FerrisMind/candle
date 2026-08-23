@@ -15,7 +15,7 @@ use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Result, Storage, Tensor};
 use candle_nn::attention::cpu_flash::causal::causal_decode_f32_interleaved;
 use candle_nn::attention::{flash_attn, AttnMask};
-use candle_nn::kv_cache::{ConcatKvCache, InterleavedKvCache, RawInterleavedKvCache};
+use candle_nn::kv_cache::{ConcatKvCache, GrowableKvCache, InterleavedKvCache, RawInterleavedKvCache};
 use candle_nn::{Activation, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -155,6 +155,33 @@ impl RotaryEmbedding {
     }
 }
 
+/// Union KV-cache type selecting between the amortized O(1)-per-token
+/// `GrowableKvCache` (used on Vulkan/WGPU, where the O(N²) re-copy of
+/// `ConcatKvCache::append` dominates prefill) and the original `ConcatKvCache`
+/// (used untouched on CPU/CUDA/Metal). Both implement the same `append`/`reset`
+/// contract; only the dispatch differs, so the CUDA/Metal path is unchanged.
+#[derive(Debug, Clone)]
+enum AttentionKvCache {
+    Concat(ConcatKvCache),
+    Growable(GrowableKvCache),
+}
+
+impl AttentionKvCache {
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        match self {
+            Self::Concat(c) => c.append(k, v),
+            Self::Growable(c) => c.append(k, v),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Concat(c) => c.reset(),
+            Self::Growable(c) => c.reset(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AttentionWeights {
     q_proj: QMatMul,
@@ -169,7 +196,7 @@ struct AttentionWeights {
     head_dim: usize,
     hidden_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    kv_cache: Option<ConcatKvCache>,
+    kv_cache: Option<AttentionKvCache>,
     interleaved_cache: Option<InterleavedKvCache>,
     raw_cache: Option<RawInterleavedKvCache>,
     span_attn: tracing::Span,
@@ -199,12 +226,16 @@ impl AttentionWeights {
         let k_norm = gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), rms_norm_eps)?;
 
         // CPU: use interleaved + raw caches for flash attention
-        // GPU: use standard concat KV cache (fallback path)
+        // GPU: standard KV-cache path. Vulkan/WGPU use the in-place growable cache
+        // (the O(N²) re-copy in ConcatKvCache dominates prefill); CPU/CUDA/Metal keep
+        // the original ConcatKvCache untouched.
         let on_cpu = device.is_cpu();
         let kv_cache = if on_cpu {
             None
+        } else if device.is_vulkan() || device.is_wgpu() {
+            Some(AttentionKvCache::Growable(GrowableKvCache::new(2)))
         } else {
-            Some(ConcatKvCache::new(2))
+            Some(AttentionKvCache::Concat(ConcatKvCache::new(2)))
         };
         let interleaved_cache = if on_cpu {
             Some(InterleavedKvCache::new(head_dim))
