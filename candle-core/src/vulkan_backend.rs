@@ -3699,6 +3699,31 @@ impl VulkanStorage {
         Ok(dst)
     }
 
+    /// True when a rank >= 3 layout can be treated as a SINGLE flat batch dimension
+    /// of arbitrary (possibly non-compact) `batch_stride` for the m == 1 batched GEMV
+    /// kernels (`batched_gemv_f32` / `ctx_gemv_f32`).
+    ///
+    /// Two requirements:
+    ///   * every batch dim before the innermost one (`dims[..rank-3]`) is size 1, so
+    ///     flattening `batch = product(dims[..rank-2])` has a UNIFORM stride
+    ///     (`stride[rank-3]`) — one batch index maps linearly to one row of matrices;
+    ///   * the trailing two dims `(rows, cols)` (the per-batch block the kernel
+    ///     reduces/maps over) are contiguous (`stride[rank-2] == cols` and
+    ///     `stride[rank-1] == 1`), so the kernel's `row*cols + col` addressing holds.
+    ///
+    /// This is exactly the shape produced by a `narrow`ed prefix of a grown KV-cache
+    /// backing buffer (capacity > live length): the batch stride is the capacity
+    /// stride instead of the compact `rows*cols`. A fully contiguous layout also
+    /// passes; a genuinely strided-within-batch view fails and falls back to the
+    /// generic per-batch path (correct, slower).
+    fn batched_gemv_inner_contiguous(l: &Layout) -> bool {
+        let rank = l.dims().len();
+        if rank < 3 || l.dims()[..rank - 3].iter().any(|&d| d != 1) {
+            return false;
+        }
+        l.stride()[rank - 2] == l.dims()[rank - 1] && l.stride()[rank - 1] == 1
+    }
+
     /// m == 1 batched GEMV in a SINGLE dispatch over all `batch` matrices.
     ///
     /// This is the shape of the attention score/ctx matmuls during autoregressive
@@ -3726,6 +3751,20 @@ impl VulkanStorage {
         debug_assert_eq!(m, 1);
         let dst_shape = Shape::from(vec![b, 1, n]);
         let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        // Batch strides come from the layouts so a `narrow`ed prefix of a grown
+        // KV-cache backing buffer (capacity > live length, batch stride == capacity
+        // stride) routes correctly; a compact batch preserves stride == n*k/m*k.
+        let rank = rhs_t_layout.dims().len();
+        let batch_stride_a = if lhs_layout.dims().len() >= 3 {
+            lhs_layout.stride()[lhs_layout.dims().len() - 3]
+        } else {
+            m * k
+        };
+        let batch_stride_b = if rank >= 3 {
+            rhs_t_layout.stride()[rank - 3]
+        } else {
+            n * k
+        };
         let params = VulkanBatchedGemvParams {
             k_dim: k.try_into()?,
             n_dim: n.try_into()?,
@@ -3733,8 +3772,8 @@ impl VulkanStorage {
             offset_a: lhs_layout.start_offset().try_into()?,
             offset_b: rhs_t_layout.start_offset().try_into()?,
             offset_d: 0,
-            batch_stride_a: (m * k).try_into()?,
-            batch_stride_b: (n * k).try_into()?,
+            batch_stride_a: batch_stride_a.try_into()?,
+            batch_stride_b: batch_stride_b.try_into()?,
             batch_stride_d: n.try_into()?,
         };
         let bindings = [
@@ -3782,6 +3821,19 @@ impl VulkanStorage {
         debug_assert_eq!(m, 1);
         let dst_shape = Shape::from(vec![b, 1, n]);
         let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        // Stride-aware (see `run_batched_gemv_f32`): read V's actual batch stride so a
+        // `narrow`ed grown expanded-KV-cache view (capacity > live length) routes here.
+        let rhs_rank = rhs_layout.dims().len();
+        let batch_stride_a = if lhs_layout.dims().len() >= 3 {
+            lhs_layout.stride()[lhs_layout.dims().len() - 3]
+        } else {
+            m * k
+        };
+        let batch_stride_b = if rhs_rank >= 3 {
+            rhs_layout.stride()[rhs_rank - 3]
+        } else {
+            k * n
+        };
         let params = VulkanBatchedGemvParams {
             k_dim: k.try_into()?,
             n_dim: n.try_into()?,
@@ -3789,8 +3841,8 @@ impl VulkanStorage {
             offset_a: lhs_layout.start_offset().try_into()?,
             offset_b: rhs_layout.start_offset().try_into()?,
             offset_d: 0,
-            batch_stride_a: (m * k).try_into()?,
-            batch_stride_b: (k * n).try_into()?,
+            batch_stride_a: batch_stride_a.try_into()?,
+            batch_stride_b: batch_stride_b.try_into()?,
             batch_stride_d: n.try_into()?,
         };
         // A (lhs/scores) on binding 0, V (rhs, natural layout) on binding 1.
@@ -7533,9 +7585,11 @@ impl VulkanStorage {
         // (batch, k, n) layout — reduce over the outer k (kv), output over the
         // inner n (head_dim). Reading V natively skips the generic per-step
         // (batch, n, k) V-transpose materialization below (the pp4096 residual).
-        // Only fires when the RHS is already contiguous in natural layout: the
-        // SCORE matmul's key^T view is strided and never matches (so the score
-        // path and every non-natural shape keep their existing dispatch).
+        // Only fires when the RHS is a batch of contiguous (k, n) blocks (native
+        // layout, including a `narrow`ed grown cache whose batch stride is the
+        // capacity stride): the SCORE matmul's key^T view has a strided inner dim
+        // and never matches batched_gemv_inner_contiguous (so it keeps its own
+        // dispatch below), as do every non-natural shape.
         if rank > 2
             && self.dtype == DType::F32
             && m == 1
@@ -7543,8 +7597,7 @@ impl VulkanStorage {
             && lhs_l.dims()[..rank - 2] == rhs_l.dims()[..rank - 2]
             && lhs_layout.is_contiguous()
             && lhs_layout.start_offset() == 0
-            && rhs_l.is_contiguous()
-            && rhs_l.start_offset() == 0
+            && Self::batched_gemv_inner_contiguous(rhs_l)
         {
             let dst = lhs.run_ctx_gemv_f32(rhs, &lhs_layout, rhs_l, b, m, n, k)?;
             drop(lhs_contiguous);
@@ -7572,7 +7625,24 @@ impl VulkanStorage {
                 || vulkan_spirv_exists("matmul_f32_f32_virtual_fp32"));
 
         let rhs_t_src_layout = rhs_l.transpose(rank - 2, rank - 1)?;
+        // m == 1 batched-GEMV SCORE path (dispatched below for rank > 2): when the
+        // RHS is a batch of contiguous (n, k) blocks but the batch stride is
+        // non-compact (a `narrow`ed grown KV-cache backing buffer), keep the strided
+        // transpose view instead of materializing a full B^T copy — the single-
+        // dispatch GEMV reads it directly via the `batch_stride` push-constant. A
+        // fully-contiguous view takes the `other` branch; any genuinely intra-block
+        // strided view fails and falls back to the generic materialize (correct,
+        // slower).
+        let m1_batched_inner_contig = rank > 2
+            && self.dtype == DType::F32
+            && m == 1
+            && !vulkan_dense_gemm_prefers_tiled(m, n, k)
+            && Self::batched_gemv_inner_contiguous(&rhs_t_src_layout)
+            && lhs_l.dims()[..rank - 2] == rhs_l.dims()[..rank - 2]
+            && lhs_layout.is_contiguous()
+            && lhs_layout.start_offset() == 0;
         let rhs_t_contiguous = if rhs_virtual_bt
+            || m1_batched_inner_contig
             || (rhs_t_src_layout.is_contiguous() && rhs_t_src_layout.start_offset() == 0)
         {
             None
@@ -7667,10 +7737,13 @@ impl VulkanStorage {
             && !vulkan_dense_gemm_prefers_tiled(m, n, k)
         {
             // m == 1 batched (attention score/ctx shapes): run every batch in ONE
-            // GEMV dispatch instead of one per-head alloc/copy/dispatch. Keep the
-            // contiguous-only guard so any exotic strided view falls back to the
-            // per-batch path below (still correct, just slower).
-            if lhs_layout.is_contiguous() && rhs_t_layout.is_contiguous() {
+            // GEMV dispatch instead of one per-head alloc/copy/dispatch. The guard
+            // requires a batch of contiguous (n, k) blocks (see
+            // `batched_gemv_inner_contiguous`); the batch stride may be non-compact
+            // (a `narrow`ed grown cache) since the shader reads it as a push-constant.
+            // Any genuinely intra-block-strided view falls back to the per-batch
+            // path below (still correct, just slower).
+            if lhs_layout.is_contiguous() && Self::batched_gemv_inner_contiguous(&rhs_t_layout) {
                 let dst = lhs.run_batched_gemv_f32(rhs_t, &lhs_layout, &rhs_t_layout, b, m, n, k)?;
                 drop(lhs_contiguous);
                 return Ok(dst);

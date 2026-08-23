@@ -1582,6 +1582,56 @@ fn test_matmul(tracker: &mut SuiteTracker, gpu_backends: &[(String, Device)]) {
                 a.matmul(&b_nk.transpose(1, 2)?)
             },
         );
+        // StrIDED-batch m == 1 batched GEMV (grown/narrowed KV-cache view): the RHS
+        // V is the natural-layout (batch, kv, head_dim) prefix of a backing buffer
+        // with capacity > live length, so its BATCH stride (capacity*head_dim) is
+        // NON-compact while each within-batch (kv, head_dim) block stays contiguous.
+        // This is exactly the shape the expanded-KV cache hands the Vulkan
+        // `batched_gemv_f32`/`ctx_gemv_f32` kernels; the batch stride is read from the
+        // layout, not hardcoded as kv*head_dim. Exercises the score-style transpose of
+        // a strided B (q @ k^T) against CPU.
+        run_case(
+            tracker,
+            "matmul_batched",
+            dtype,
+            "batched_mm_m1_strided_batch",
+            &[2, 1, 64],
+            gpu_backends,
+            |device| {
+                let live = 64usize;
+                let cap = live + 41; // grown capacity > live prefix -> strided batch
+                // Storage (batch, cap, head_head_dim); narrow to the live kv prefix.
+                let b_src = Tensor::from_vec(gen_f32(&[2, cap, 100], 137), (2, cap, 100), device)?
+                    .to_dtype(dtype)?;
+                let b = b_src.narrow(1, 0, live)?; // (2, live, 100) strided batch
+                let a = Tensor::from_vec(gen_f32(&[2, 1, 100], 42), (2, 1, 100), device)?
+                    .to_dtype(dtype)?;
+                // a @ b^T: reduce over the inner 100, output over the strided live dim.
+                a.matmul(&b.transpose(1, 2)?)
+            },
+        );
+        // Natural-layout CONTEXT GEMV with a strided (grown) V: probs @ v where v is
+        // the (batch, kv, head_dim) prefix of a capacity > live backing buffer, so
+        // v's batch stride is non-compact and the kernel reads it from the layout.
+        // Directly exercises `ctx_gemv_f32`'s stride-aware batch read (no transpose).
+        run_case(
+            tracker,
+            "matmul_batched",
+            dtype,
+            "batched_mm_ctx_natural_strided",
+            &[2, 1, 128],
+            gpu_backends,
+            |device| {
+                let live = 130usize;
+                let cap = live + 47; // grown capacity > live prefix -> strided batch
+                let a = Tensor::from_vec(gen_f32(&[2, 1, live], 42), (2, 1, live), device)?
+                    .to_dtype(dtype)?;
+                let v_src = Tensor::from_vec(gen_f32(&[2, cap, 128], 137), (2, cap, 128), device)?
+                    .to_dtype(dtype)?;
+                let v = v_src.narrow(1, 0, live)?; // (2, live, 128) strided on batch
+                a.matmul(&v)
+            },
+        );
     }
 }
 

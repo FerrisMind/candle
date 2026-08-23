@@ -182,6 +182,51 @@ impl AttentionKvCache {
     }
 }
 
+/// Device-gated EXPANDED (num_heads-wide) KV cache used on Vulkan to avoid the
+/// O(N^2) whole-cache re-expansion of GQA every decode step.
+///
+/// The model stores an 8-head (num_kv_heads) cache and `repeat_kv`s it to the
+/// 16-head (num_heads) width inside every forward so the score/ctx matmuls can
+/// broadcast each KV head to its group of query heads. That re-expansion re-reads
+/// and re-writes the ENTIRE cache every token (~2.8 GB/token at 4096 ctx), which is
+/// the dominant pp4096 residual. This cache keeps the EXPANDED 16-head K/V buffers
+/// persistently and only `repeat_kv`s the NEW tail (the tokens being appended this
+/// step) before an in-place `GrowableKvCache` append, so the incremental per-token
+/// cost is O(seq_len_this_step) instead of O(total_len).
+///
+/// The expansion is a pure data duplication with the same head ordering as the CPU
+/// path's `repeat_kv`, so the attention math (scores, softmax, ctx) is bit-identical
+/// to the existing `repeat_kv` + matmul path — only the materialization is avoided.
+#[derive(Debug, Clone)]
+struct ExpandedKvCache {
+    inner: GrowableKvCache,
+    num_kv_groups: usize,
+}
+
+impl ExpandedKvCache {
+    fn new(num_kv_groups: usize) -> Self {
+        Self {
+            inner: GrowableKvCache::new(2),
+            num_kv_groups,
+        }
+    }
+
+    /// Expand the just-arrived `(k, v)` (num_kv_heads wide) to num_heads and append
+    /// in-place, returning the full (num_heads-wide) live-prefix views (`narrow`ed to
+    /// the used length, strided by the backing-buffer capacity). The returned views
+    /// alias the cache and are only valid until the next grow, matching the
+    /// `GrowableKvCache` contract (consumed within the same forward).
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        let k = repeat_kv(k.clone(), self.num_kv_groups)?.contiguous()?;
+        let v = repeat_kv(v.clone(), self.num_kv_groups)?.contiguous()?;
+        self.inner.append(&k, &v)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AttentionWeights {
     q_proj: QMatMul,
@@ -197,6 +242,7 @@ struct AttentionWeights {
     hidden_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
     kv_cache: Option<AttentionKvCache>,
+    expanded_cache: Option<ExpandedKvCache>,
     interleaved_cache: Option<InterleavedKvCache>,
     raw_cache: Option<RawInterleavedKvCache>,
     span_attn: tracing::Span,
@@ -226,16 +272,23 @@ impl AttentionWeights {
         let k_norm = gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), rms_norm_eps)?;
 
         // CPU: use interleaved + raw caches for flash attention
-        // GPU: standard KV-cache path. Vulkan/WGPU use the in-place growable cache
-        // (the O(N²) re-copy in ConcatKvCache dominates prefill); CPU/CUDA/Metal keep
-        // the original ConcatKvCache untouched.
+        // GPU: standard KV-cache path. Vulkan uses the in-place GROWABLE EXPANDED
+        // (num_heads-wide) cache so the O(N^2) whole-cache GQA re-expansion on every
+        // decode step is replaced by an O(1)-per-token tail append; wgpu keeps the
+        // in-place 8-head growable cache + repeat_kv (B15 owns wgpu), and CUDA/Metal
+        // keep the original ConcatKvCache + repeat_kv path byte-for-byte.
         let on_cpu = device.is_cpu();
-        let kv_cache = if on_cpu {
-            None
-        } else if device.is_vulkan() || device.is_wgpu() {
-            Some(AttentionKvCache::Growable(GrowableKvCache::new(2)))
+        let (kv_cache, expanded_cache) = if on_cpu {
+            (None, None)
+        } else if device.is_vulkan() {
+            (None, Some(ExpandedKvCache::new(num_kv_groups)))
+        } else if device.is_wgpu() {
+            (
+                Some(AttentionKvCache::Growable(GrowableKvCache::new(2))),
+                None,
+            )
         } else {
-            Some(AttentionKvCache::Concat(ConcatKvCache::new(2)))
+            (Some(AttentionKvCache::Concat(ConcatKvCache::new(2))), None)
         };
         let interleaved_cache = if on_cpu {
             Some(InterleavedKvCache::new(head_dim))
@@ -264,6 +317,7 @@ impl AttentionWeights {
             hidden_size,
             rotary_emb,
             kv_cache,
+            expanded_cache,
             interleaved_cache,
             raw_cache,
             span_attn,
@@ -389,11 +443,18 @@ impl AttentionWeights {
                 ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
             }
         } else {
-            // Standard matmul attention (no flash)
-            let (k, v) = self.kv_cache.as_mut().unwrap().append(&k, &v)?;
-
-            let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-            let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+            // Standard matmul attention (no flash). On Vulkan the expanded cache
+            // returns the num_heads-wide (16-head) K/V live-prefix views already, so
+            // the whole-cache `repeat_kv` materialization is skipped (the pp4096
+            // residual); CUDA/Metal/wgpu keep the existing `repeat_kv` path.
+            let (k, v) = if let Some(ec) = &mut self.expanded_cache {
+                ec.append(&k, &v)?
+            } else {
+                let (k, v) = self.kv_cache.as_mut().unwrap().append(&k, &v)?;
+                let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
+                let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+                (k, v)
+            };
 
             let scale = 1.0 / (self.head_dim as f64).sqrt();
             let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
@@ -415,6 +476,9 @@ impl AttentionWeights {
 
     fn clear_kv_cache(&mut self) {
         if let Some(c) = &mut self.kv_cache {
+            c.reset();
+        }
+        if let Some(c) = &mut self.expanded_cache {
             c.reset();
         }
         if let Some(c) = &mut self.interleaved_cache {
@@ -1291,6 +1355,74 @@ mod tests {
         let l1_out_vk = (&l1_post_attn_vk + &l1_mlp_vk)?;
         assert_tensor_close_with_nmse("layer1_out", &l1_out_vk, &l1_out_cpu, 5e-2, 5e-3)?;
         assert_no_gpu_fallbacks("qwen3_local_vulkan_layer1_topology_parity", &vk)?;
+        Ok(())
+    }
+
+    /// Validates the device-gated expanded (num_heads-wide) KV cache against the
+    /// reference `repeat_kv` expansion used by the CPU/CUDA/Metal path. The expansion
+    /// is a pure data duplication with the SAME head ordering, so the attention values
+    /// must be identical; this guards the pp4096 optimization (w-b14) against any
+    /// subtle ordering divergence. Runs on CPU (no GPU needed) — the cache logic is
+    /// backend-agnostic.
+    #[test]
+    fn expanded_kv_cache_matches_repeat_kv_reference() -> Result<()> {
+        let device = Device::Cpu;
+        let num_kv_heads = 2usize;
+        let num_kv_groups = 2usize;
+        let head_dim = 4usize;
+        let mut ec = ExpandedKvCache::new(num_kv_groups);
+
+        // Chunk 1: 2 tokens, 8-head.
+        let k1 = Tensor::from_vec(
+            (0..num_kv_heads * 2 * head_dim).map(|i| i as f32 + 0.5).collect(),
+            (1, num_kv_heads, 2, head_dim),
+            &device,
+        )?;
+        let v1 = Tensor::from_vec(
+            (0..num_kv_heads * 2 * head_dim).map(|i| 100.0 + i as f32).collect(),
+            (1, num_kv_heads, 2, head_dim),
+            &device,
+        )?;
+        let (kf, vf) = ec.append(&k1, &v1)?;
+        let k_ref = repeat_kv(k1.clone(), num_kv_groups)?.contiguous()?;
+        let v_ref = repeat_kv(v1.clone(), num_kv_groups)?.contiguous()?;
+        assert_eq!(
+            kf.flatten_all()?.to_vec1::<f32>()?,
+            k_ref.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_eq!(
+            vf.flatten_all()?.to_vec1::<f32>()?,
+            v_ref.flatten_all()?.to_vec1::<f32>()?
+        );
+
+        // Chunk 2: append another 2 tokens. The live cache must equal
+        // repeat_kv(cat(k1, k2)) expanded — the same as expanding the whole cache.
+        let k2 = Tensor::from_vec(
+            (1000..1000 + num_kv_heads * 2 * head_dim)
+                .map(|i| i as f32 + 0.25)
+                .collect(),
+            (1, num_kv_heads, 2, head_dim),
+            &device,
+        )?;
+        let v2 = Tensor::from_vec(
+            (2000..2000 + num_kv_heads * 2 * head_dim)
+                .map(|i| i as f32 + 0.75)
+                .collect(),
+            (1, num_kv_heads, 2, head_dim),
+            &device,
+        )?;
+        let (kf, vf) = ec.append(&k2, &v2)?;
+        let kcat = Tensor::cat(&[&k1, &k2], 2)?;
+        let vcat = Tensor::cat(&[&v1, &v2], 2)?;
+        assert_eq!(kcat.dims4()?.2, 4);
+        let kcat_ref = repeat_kv(kcat.clone(), num_kv_groups)?.contiguous()?;
+        let vcat_ref = repeat_kv(vcat.clone(), num_kv_groups)?.contiguous()?;
+        let kf_c = kf.contiguous()?;
+        let vf_c = vf.contiguous()?;
+        assert_eq!(kf_c.dims(), kcat_ref.dims());
+        assert_eq!(vf_c.dims(), vcat_ref.dims());
+        assert_eq!(kf_c.flatten_all()?.to_vec1::<f32>()?, kcat_ref.flatten_all()?.to_vec1::<f32>()?);
+        assert_eq!(vf_c.flatten_all()?.to_vec1::<f32>()?, vcat_ref.flatten_all()?.to_vec1::<f32>()?);
         Ok(())
     }
 }
