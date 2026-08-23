@@ -318,6 +318,20 @@ struct WgpuRopeParams {
 }
 
 #[repr(C)]
+struct WgpuRopeCsParams {
+    offset_src: u32,
+    offset_dst: u32,
+    offset_cos: u32,
+    offset_sin: u32,
+    n_threads: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
+    ne3: u32,
+    cs_batched: u32,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct RmsNormMulParams {
     offset_rn_src: u32,
@@ -8568,6 +8582,79 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             &bindings,
             ((count / 2) as u32).div_ceil(WG_SIZE),
             "candle-wgpu-rope",
+        )?;
+        Ok(dst)
+    }
+
+    pub fn cos_sin_rope(
+        &self,
+        layout: &Layout,
+        cos: &Self,
+        cos_layout: &Layout,
+        sin: &Self,
+        sin_layout: &Layout,
+    ) -> Result<Self> {
+        if self.dtype != cos.dtype || self.dtype != sin.dtype {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu rope cos/sin").bt());
+        }
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu rope cos/sin").bt());
+        }
+        if !layout.is_contiguous() {
+            return Err(Error::Msg("wgpu rope cos/sin requires contiguous src".into()).bt());
+        }
+        if !cos_layout.is_contiguous() || !sin_layout.is_contiguous() {
+            return Err(Error::Msg("wgpu rope cos/sin requires contiguous cos/sin".into()).bt());
+        }
+        let (b, h, t, d) = layout.shape().dims4()?;
+        let cs_len = cos_layout.shape().dims().len();
+        if cs_len != 2 && cs_len != 3 {
+            return Err(Error::Msg("wgpu rope cos/sin requires 2D or 3D cos/sin".into()).bt());
+        }
+        if sin_layout.shape() != cos_layout.shape() {
+            return Err(Error::Msg("wgpu rope cos/sin cos/sin shape mismatch".into()).bt());
+        }
+        let half = d / 2;
+        let n_threads = b * h * t * half;
+        let cs_batched: u32 = if cs_len == 3 { 1 } else { 0 };
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        let params = WgpuRopeCsParams {
+            offset_src: layout.start_offset().try_into()?,
+            offset_dst: 0,
+            offset_cos: cos_layout.start_offset().try_into()?,
+            offset_sin: sin_layout.start_offset().try_into()?,
+            n_threads: n_threads.try_into()?,
+            ne0: d.try_into()?,
+            ne1: t.try_into()?,
+            ne2: h.try_into()?,
+            ne3: b.try_into()?,
+            cs_batched,
+        };
+        const _: () = assert!(size_of::<WgpuRopeCsParams>() <= 256);
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            storage_entry(3, false),
+            uniform_entry(4),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &cos.buffer),
+            buffer_binding(2, &sin.buffer),
+            buffer_binding(3, &dst.buffer),
+            buffer_binding(4, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::rope_cs_shader(wgpu_kernel_dtype(self.dtype)?, WG_SIZE)
+            .ok_or_else(|| Error::Msg("wgpu shader rope_cs.wgsl not embedded".into()).bt())?;
+        let total_wg = (n_threads as u32).div_ceil(WG_SIZE);
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            total_wg,
+            "candle-wgpu-rope-cs",
         )?;
         Ok(dst)
     }

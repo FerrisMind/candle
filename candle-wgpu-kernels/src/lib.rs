@@ -263,6 +263,25 @@ pub fn rope_shader(dtype: DType, workgroup_size: u32) -> Option<String> {
     Some(preprocess(source, &defines, &replacements, dtype))
 }
 
+/// Fused RoPE with precomputed cos/sin tables (used by the wgpu device-gated rope
+/// path for F32/F16; mirrors `rope_shader` but reads two separate cos/sin buffers).
+pub fn rope_cs_shader(dtype: DType, workgroup_size: u32) -> Option<String> {
+    let source = get("rope_cs.wgsl")?.source();
+    let mut defines = vec!["WG_SIZE".to_string()];
+    let mut replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    match dtype {
+        DType::F32 => {
+            defines.push("TYPE_F32".to_string());
+            replacements.push(("DataType".to_string(), "f32".to_string()));
+        }
+        DType::F16 => {
+            defines.push("TYPE_F16".to_string());
+            replacements.push(("DataType".to_string(), "f16".to_string()));
+        }
+    }
+    Some(preprocess(source, &defines, &replacements, dtype))
+}
+
 fn argsort_shader_for_type(workgroup_size: u32, asc: bool, src_type: &str) -> Option<String> {
     let source = get("argsort.wgsl")?.source();
     let mut defines = vec!["WG_SIZE".to_string()];

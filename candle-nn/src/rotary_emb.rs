@@ -522,6 +522,20 @@ impl candle::CustomOp3 for RotaryEmb {
         Ok((dst, l1.shape().clone()))
     }
 
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        s1: &candle::WgpuStorage,
+        l1: &Layout,
+        s2: &candle::WgpuStorage,
+        l2: &Layout,
+        s3: &candle::WgpuStorage,
+        l3: &Layout,
+    ) -> Result<(candle::WgpuStorage, Shape)> {
+        let storage = s1.cos_sin_rope(l1, s2, l2, s3, l3)?;
+        Ok((storage, l1.shape().clone()))
+    }
+
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
@@ -611,8 +625,14 @@ pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     if !sin.is_contiguous() {
         candle::bail!("sin has to be contiguous in rope")
     }
-    // Avoid per-call CPU fallback on WGPU/Vulkan for the custom-op path.
-    // Use the explicit tensor decomposition so execution stays on the backend.
+    // WGPU: use the device-gated fused cos/sin rope for F32/F16 so execution stays
+    // on the backend with a single dispatch per (q/k) instead of the decomposed
+    // rope_slow (which adds 3 cats + 3 elementwise). CPU/CUDA/Metal keep the custom
+    // op below; Vulkan (and WGPU non-F32/F16) keep rope_slow for parity with prior
+    // behavior (cf08c4ef neutrality pattern).
+    if xs.device().is_wgpu() && matches!(xs.dtype(), candle::DType::F32 | candle::DType::F16) {
+        return xs.apply_op3_no_bwd(cos, sin, &RotaryEmb);
+    }
     if xs.device().is_wgpu() || xs.device().is_vulkan() {
         return rope_slow(xs, cos, sin);
     }
