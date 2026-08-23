@@ -362,6 +362,25 @@ struct VulkanMatVecParams {
     broadcast3: u32,
 }
 
+/// Push-constant layout for the m == 1 batched GEMV shader (`batched_gemv_f32`).
+///
+/// One dispatch covers all `batch` matrices: A is a shared (batch, k) vector set,
+/// B is a contiguous (batch, n, k) matrix, D is the (batch, n) result. Mirrors
+/// the GLSL `parameter` block in `batched_gemv_f32.comp` (9 u32s).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VulkanBatchedGemvParams {
+    k_dim: u32,
+    n_dim: u32,
+    batch: u32,
+    offset_a: u32,
+    offset_b: u32,
+    offset_d: u32,
+    batch_stride_a: u32,
+    batch_stride_b: u32,
+    batch_stride_d: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VulkanMatVecIdParams {
@@ -3679,6 +3698,63 @@ impl VulkanStorage {
         }
         Ok(dst)
     }
+
+    /// m == 1 batched GEMV in a SINGLE dispatch over all `batch` matrices.
+    ///
+    /// This is the shape of the attention score/ctx matmuls during autoregressive
+    /// prefill (and any generic batched A@B with m == 1): lhs is a (batch, k)
+    /// vector set, rhs_t is a contiguous (batch, n, k) matrix. Previously this
+    /// routed to `run_batched_matmul_f32_via_rank2_batches`, which allocated,
+    /// copied and dispatched one small matvec PER batch (16 heads x 2 matmuls x
+    /// num_layers) — dominating host overhead and re-reading B once per head.
+    ///
+    /// The kernel reads B exactly once per element, coalesced along K, and covers
+    /// all batches in one dispatch. Requires contiguous lhs (batch, m, k) and
+    /// contiguous rhs_t (batch, n, k); the dispatch guard enforces that and any
+    /// non-contiguous case falls back to the generic path below.
+    #[allow(clippy::too_many_arguments)]
+    fn run_batched_gemv_f32(
+        &self,
+        rhs_t: &Self,
+        lhs_layout: &Layout,
+        rhs_t_layout: &Layout,
+        b: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        debug_assert_eq!(m, 1);
+        let dst_shape = Shape::from(vec![b, 1, n]);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let params = VulkanBatchedGemvParams {
+            k_dim: k.try_into()?,
+            n_dim: n.try_into()?,
+            batch: b.try_into()?,
+            offset_a: lhs_layout.start_offset().try_into()?,
+            offset_b: rhs_t_layout.start_offset().try_into()?,
+            offset_d: 0,
+            batch_stride_a: (m * k).try_into()?,
+            batch_stride_b: (n * k).try_into()?,
+            batch_stride_d: n.try_into()?,
+        };
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&rhs_t.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("batched_gemv_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader batched_gemv_f32 not generated".into()).bt())?;
+        // 128 threads/group, 4 output groups (32 lanes each) computed per group.
+        let workgroups = (n.div_ceil(4).try_into()?, b.try_into()?, 1u32);
+        self.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            workgroups,
+        )?;
+        Ok(dst)
+    }
+
     fn materialize_to_f32(&self, layout: &Layout) -> Result<Self> {
         if self.dtype == DType::F32 {
             if layout.is_contiguous() && layout.start_offset() == 0 {
@@ -7507,9 +7583,19 @@ impl VulkanStorage {
         }
         if rank > 2
             && self.dtype == DType::F32
+            && m == 1
             && lhs_l.dims()[..rank - 2] == rhs_l.dims()[..rank - 2]
             && !vulkan_dense_gemm_prefers_tiled(m, n, k)
         {
+            // m == 1 batched (attention score/ctx shapes): run every batch in ONE
+            // GEMV dispatch instead of one per-head alloc/copy/dispatch. Keep the
+            // contiguous-only guard so any exotic strided view falls back to the
+            // per-batch path below (still correct, just slower).
+            if lhs_layout.is_contiguous() && rhs_t_layout.is_contiguous() {
+                let dst = lhs.run_batched_gemv_f32(rhs_t, &lhs_layout, &rhs_t_layout, b, m, n, k)?;
+                drop(lhs_contiguous);
+                return Ok(dst);
+            }
             let dst = lhs.run_batched_matmul_f32_via_rank2_batches(rhs_t, b, m, n, k)?;
             drop(lhs_contiguous);
             return Ok(dst);

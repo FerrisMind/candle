@@ -1519,6 +1519,29 @@ fn test_matmul(tracker: &mut SuiteTracker, gpu_backends: &[(String, Device)]) {
             },
         );
     }
+
+    // Batched m == 1 GEMV (the attention score/ctx shape, e.g. head_dim columns):
+    // exercises the Vulkan single-dispatch batched-GEMV kernel. Uses a k that is
+    // NOT a multiple of 32 to exercise the partial last K iteration, and a
+    // non-trivial batch so every head is covered in one dispatch.
+    #[allow(clippy::single_element_loop)]
+    for &dtype in &[DType::F32] {
+        run_case(
+            tracker,
+            "matmul_batched",
+            dtype,
+            "batched_mm_m1",
+            &[2, 1, 64],
+            gpu_backends,
+            |device| {
+                let a = Tensor::from_vec(gen_f32(&[2, 1, 100], 42), (2, 1, 100), device)?
+                    .to_dtype(dtype)?;
+                let b = Tensor::from_vec(gen_f32(&[2, 100, 64], 137), (2, 100, 64), device)?
+                    .to_dtype(dtype)?;
+                a.broadcast_matmul(&b)
+            },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
