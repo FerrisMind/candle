@@ -83,3 +83,5 @@ See [`portable-webgpu-capability-matrix.md`](./portable-webgpu-capability-matrix
 | Portable WebGPU | no universal % vs CUDA | GPU-only; profile vs native WebGPU on same HW |
 
 Deviations must be recorded with objective API/hardware evidence.
+
+> Measured end-to-end numbers (per-wave results vs CUDA, e.g. the 2026-08-23 perf wave: Vulkan 184–207% CUDA, WGPU host-bound ≈7.7–8.0%) are tracked in [`cuda-vulkan-wgpu-parity-review-2026-08-21.md`](./cuda-vulkan-wgpu-parity-review-2026-08-21.md), §12–§16 — this table stays a target spec, not a place to duplicate numbers.

@@ -1732,7 +1732,7 @@ fn smoke_q8_1_quantized_native_only(device: &Device) -> Result<()> {
 /// a systematic LHS-quantization error (~5e-4 relative). Mirror of the Vulkan
 /// `67e07ec5` fix tolerance: relative `expected.abs() * 1e-5` with a 1e-6
 /// absolute floor (see parity review §14 follow-up #9 / commit 67e07ec5).
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(feature = "wgpu")]
 fn assert_q8_1_reference_close(actual: &Tensor, expected: &Tensor, case: &str) -> Result<()> {
     assert_eq!(actual.dims(), expected.dims(), "{case} shape mismatch");
     let actual_vals = actual.flatten_all()?.to_vec1::<f32>()?;
@@ -1756,7 +1756,7 @@ fn assert_q8_1_reference_close(actual: &Tensor, expected: &Tensor, case: &str) -
     Ok(())
 }
 
-#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+#[cfg(feature = "wgpu")]
 fn smoke_q8_1_activation_reference(device: &Device) -> Result<()> {
     let cpu = Device::Cpu;
     let dtype = GgmlDType::Q8_1;

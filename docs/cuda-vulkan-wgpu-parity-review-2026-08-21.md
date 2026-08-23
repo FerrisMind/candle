@@ -345,5 +345,60 @@ Byte-parity тесты (сравнение GPU-байт с CPU-байтами, �
 
 *Прогоны волны #4 — HEAD `67e07ec5`, RTX 3060, release, `--test-threads=1`, 2026-08-22.*
 
+## 16. ФИНАЛЬНАЯ ВОЛНА ПЕРФ 2026-08-23 (agent-swarm): Vulkan 184–207% CUDA (все SLO PASS), честный вердикт wgpu host-bound, OOM-фикс подтверждён
+
+**Цели волны.** Довести decode/prefill до (и выше) целевых SLO на Qwen3-0.6B GGUF Q4_K_M против свежего CUDA-базлайна; закрыть wgpu OOM; подтвердить отсутствие утечек; обеспечить CPU/CUDA/Metal-нейтральность всех общих правок. Полная матрица замеров — `.swarm/results/w-c1-final-matrix.md` («measurement of record» C1).
+
+**Коммиты волны** (HEAD `eaab92cc`, 13 коммитов):
+
+| Хэш | Коммит |
+|---|---|
+| `57eabb35` | fix(bench): clear KV cache между warmup/measure в candle-bench |
+| `c179065c` | fix(wgpu): OOM — recycle pending storage buffers + MemoryUsage hints |
+| `67b415f6` | perf(vulkan): амортизация per-alloc cleanup submission для decode |
+| `d603c698` | perf(vulkan): повышение batch-капов dispatch/copy |
+| `b9c4870b` | perf(wgpu): батчинг copy в активный submission |
+| `cf08c4ef` | perf(kv): device-gated GrowableKvCache (vulkan/wgpu) |
+| `f479d117` | perf(kv): exact-ish рост GrowableKvCache |
+| `2db05b73` | fix(wgpu): q8_1 matmul/matvec честный A-side-контракт (зеркало `67e07ec5`) |
+| `abfcb4af` | perf(wgpu): fused cos/sin RoPE (вдвое меньше dispatch) |
+| `b5ee20dc` | perf(vulkan): single-dispatch m=1 batched GEMV |
+| `979f5f26` | perf(wgpu): single-dispatch m=1 batched GEMV (порт b5ee20dc) |
+| `5f4ef036` | perf(vulkan): ctx-GEMV читает V в natural layout (без per-step transpose) |
+| `eaab92cc` | perf(vulkan): stride-aware attention GEMVs + device-gated expanded-KV cache |
+
+**ОOM-фикс (wgpu, `c179065c`).** Root cause — НЕ нехватка VRAM (device-OOM срабатывал при 456 MiB из ~1 GiB использованных). `storage_buffer_pool` раздулся до **22 253 буферов (~11 GiB)** из-за того, что модем-циклы никогда не вызывали `synchronize`, KV-cat-аллокации исчерпывали блоки gpu-allocator. Фикс: opportunistic re-engagement пула (+64 pending → non-blocking Poll + flush), MemoryUsage `PreferDevice`→`PreferPerformance`, байт-кап free-пула 1 GiB + bucket-кап 8. До фикса pp=512 OOM'd, после — полный цикл без OOM. Подтверждено финально: C1-прогон wgpu (REDUCED-матрица) — VRAM-плато **6199 MiB (~50% из 12GB), ноль OOM, exit 0**.
+
+**Финальная таблица требований** (%CUDA; CUDA-базлайн = свежий прогон той же сессии, decode tg128=58.43/tg256=56.05, prefill pp512=56.54/pp1024=57.11/pp2048=54.45/pp4096=43.39):
+
+| Бекенд | Фаза | Ячейка | tok/s | %CUDA | Min | Normal | Goal | P/F |
+|---|---|---|---|---|---|---|---|---|
+| Vulkan | decode | tg128 | 116.35 | 199.1% | 75% | 90% | 90%+ | PASS×3 |
+| Vulkan | decode | tg256 | 116.28 | 207.4% | 75% | 90% | 90%+ | PASS×3 |
+| Vulkan | prefill | pp512 | 114.49 | 202.5% | 85% | 95% | 95%+ | PASS×3 |
+| Vulkan | prefill | pp1024 | 105.08 | 184.0% | 85% | 95% | 95%+ | PASS×3 |
+| Vulkan | prefill | pp2048 | 100.27 | 184.2% | 85% | 95% | 95%+ | PASS×3 |
+| Vulkan | prefill | pp4096 | 89.24 | 205.7% | 85% | 95% | 95%+ | PASS×3 |
+| WGPU | decode | tg128 | 4.48 | 7.7% | 75% | 95% | 95%+ | FAIL |
+| WGPU | decode | tg256 | 4.50 | 8.0% | 75% | 95% | 95%+ | FAIL |
+| WGPU | prefill | pp512 | 4.32 | 7.6% | 75% | 85% | 85%+ | FAIL |
+| WGPU | prefill | pp1024 | 4.49 | 7.9% | 75% | 85% | 85%+ | FAIL |
+
+Vulkan: decode mean 203.3%, prefill mean 194.1% — **все ячейки все тиры PASS**. WGPU: mean 7.7–8.0% — **FAIL на каждой ячейке против Min 75%**, но стабильно и без OOM (S1 PASS). CUDA-дрифт этой сессии +3.5…+8.8% относительно 08-22 (равномерный сдвиг вверх — окружение: драйвер 596.49/клоки, не код; prefill stddev ≤1.4%).
+
+**Честный вердикт wgpu — host-bound платформенный предел (не трогается кодом).** Пакет доказательств:
+
+- **W-B11** (`.swarm/results/w-b11-wgpu-serialization.md`): per-dispatch валидация wgpu-core ~**27 µs** × **674 dispatches/token** + per-op подготовка модели/quantized-matrix ~**65 ms/token** на хосте (~31 ms `run_compute_xyz_ex`, ~18 ms submit). Полная стена ~150 ms/token не покрывается инструментовкой wgpu_backend.
+- **W-B12** (`.swarm/results/w-b12-wgpu-kernels.md`): kernel-работа исчерпана — GPU-фаза не является узким местом; дальнейшая оптимизация шейдеров не поможет host-bound бюджету.
+- **W-B15** (`.swarm/results/w-b15-wgpu-bindgroup.md`): механизм bind-group thrash подтверждён (cap 256→2048 даёт hit-rate 0.045%→3.73%), НО фикс опровергнут по эффекту: ~266 miss/token остаются (96.4% созданий), выигрыш <0.5% (≈1.15 ms/token), рост cap = риск leak-slope и рост LRU-eviction O(cap·log cap) на доминирующем miss-пути.
+
+**Опровергнутые рычаги (эмпирически, чисто негативно):** submit-batching ≥15× collapse = **+15% только** (W-B1/W-B6); halving dispatch count = **0%** (W-B12); bind-group cache-fix = **<1%** (W-B15). Класс ограничения: per-dispatch host overhead wgpu 29 (gfx-rs) на RTX 3060 — ~4.5 tok/s потолок подтверждён финальным прогоном C1 (7.6–8.0% CUDA). Это **platform limit**, не дефект форка; будущее — wgpu upstream / новые coop-шейдеры (`enable wgpu_cooperative_matrix`), см. future-work.
+
+**CUDA/CPU/Metal-нейтральность (общие правки device-gated).** В `candle-transformers/src/models/quantized_qwen3.rs:281-292` выбор кэша строго по устройству: `on_cpu` → `(None, None)`; `is_vulkan` → `ExpandedKvCache` (новый путь `eaab92cc`); `is_wgpu` → `GrowableKvCache` (`cf08c4ef`); **всё остальное (CUDA/Metal) — оригинальный `ConcatKvCache` byte-for-byte**. Ровно то же для fuse-path (`is_wgpu`/`is_vulkan` в том же файле, стр. 699-701) и для RoPE (`abfcb4af`, device-gated). CUDA-код этой волной не изменён вообще.
+
+**Гейты закрытия (HEAD `eaab92cc`, RTX 3060, `--test-threads=1`):** clippy `-D warnings` 0/0: candle-core vulkan-tests, wgpu-tests, candle-vulkan-kernels, candle-wgpu-kernels, candle-nn --tests, candle-transformers --lib (после гигиены cfg в `backend_smoke_tests.rs` — сужение `cfg(any(wgpu,vulkan))` → `cfg(wgpu)` для wgpu-only q8_1 A-side-хелперов). Тесты: vulkan lib **50/0**, wgpu lib **138/0**, parity_diff **9/0/1** оба, smoke wgpu **44/0**, CPU-нейтральность: candle-core lib **18/0**, candle-nn **6/0**, candle-transformers lib **17/0**. Leak-audit (`perf_memory_audit`, release): vulkan slopes **0.004%/0.004%**, wgpu slopes **0.083%/0.058%** — все <<1%.
+
+**SLO-статус.** Vulkan: **все 3 тира PASS на всех 6 ячейках** (184–207% CUDA vs Min 75–85%). WGPU: **FAIL против SLO требований** (Min 75% недостижим на 7.7–8.0% при host-bound потолке ~4.5 tok/s); функциональный паритет и стабильность памяти (без OOM) подтверждены. `docs/backend-parity.md` SLO-таблица остаётся спецификацией целей (≤15%/≤30% vs CUDA) и НЕ хранит end-to-end чисел — см. этот §16 как точку отсчёта фактов по 2026-08-23.
+
 ---
 *Все утверждения о коде проверены на HEAD 1596684b; тестовые прогоны — RTX 3060, release, 2026-08-21, однопоточные (`--test-threads=1`). Фиксы финальной волны: wgpu_backend.rs (powf/elu F16, reduce I16, to_dtype U8→I32, F8E4M3-хабы, uniform ring), 7 argsort-шейдеров candle-vulkan-kernels, vulkan scatter_add F8E4M3, backend_parity_diff (harness-сравнение по dtype результата). См. также §10–11 документа 2026-08-19.*
