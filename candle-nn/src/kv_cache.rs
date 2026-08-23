@@ -827,9 +827,6 @@ pub struct GrowableKvCache {
 }
 
 impl GrowableKvCache {
-    /// Initial buffer capacity (in sequence positions) used before the first grow.
-    const INITIAL_CAPACITY: usize = 64;
-
     /// Create a new empty, growable, in-place KV cache.
     ///
     /// `dim` is the concatenation dimension, matching `ConcatKvCache::new`:
@@ -880,10 +877,19 @@ impl GrowableKvCache {
         if needed <= self.capacity {
             return Ok(());
         }
-        let mut new_capacity = self.capacity.max(Self::INITIAL_CAPACITY);
-        while new_capacity < needed {
-            new_capacity = new_capacity.saturating_mul(2).max(needed);
-        }
+        // Exact-ish growth: instead of doubling to a power of two (which grows the
+        // backing buffer to up to ~2x the longest live prefix and leaves a large
+        // pad every step after a warmup reset keeps the old capacity), grow to the
+        // live length plus a small slack. This keeps the backing buffer within
+        // ~12.5% (min 256 positions) of the live prefix so the `narrow` views
+        // derived from it stay much closer to the used range. The pad cannot be
+        // exactly zero without re-allocating every append (which would reintroduce
+        // the O(seq^2) re-copy), so a small slack is the best compromise. The slack
+        // grows with the sequence so the amortized number of grow-copies stays O(1)
+        // per appended token (a grow copies the live prefix; the slack bounds how
+        // many grows happen for a given sequence length).
+        let slack = (needed / 8).max(256);
+        let new_capacity = needed + slack;
         let new_k = self.alloc_like(k, new_capacity)?;
         let new_v = self.alloc_like(v, new_capacity)?;
         if self.len > 0 {
@@ -1112,6 +1118,46 @@ mod tests {
 
         assert_eq!(k.dims(), &[1, 5, 8, 64]); // Concatenated on dim 1
         assert_eq!(cache.current_seq_len(), 5);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_growable_kv_cache_exact_growth() -> Result<()> {
+        // Exhaustive single-token append across multiple exact-ish grows (the
+        // grow slack is max(256, len/8), so a run of ~600 tokens triggers several
+        // grow-copies). Verify the appended value is visible at its position and
+        // that seq len tracks correctly.
+        let device = Device::Cpu;
+        let mut cache = GrowableKvCache::new(2);
+        let total = 600usize;
+        for i in 0..total {
+            let k = Tensor::new(&[[[[i as f32]]]], &device)?.broadcast_as((1, 2, 1, 4))?;
+            let v = Tensor::new(&[[[[i as f32]]]], &device)?.broadcast_as((1, 2, 1, 4))?;
+            let (kv, vv) = cache.append(&k, &v)?;
+            assert_eq!(kv.dims(), &[1, 2, i + 1, 4]);
+            assert_eq!(vv.dims(), &[1, 2, i + 1, 4]);
+            assert_eq!(cache.current_seq_len(), i + 1);
+            // The token appended at position `i` holds value `i` (all heads, all
+            // head_dim slots).
+            let last_k = kv.narrow(2, i, 1)?.flatten_all()?.to_vec1::<f32>()?;
+            let last_v = vv.narrow(2, i, 1)?.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(last_k.len(), 8);
+            assert_eq!(last_v.len(), 8);
+            assert!(last_k.iter().all(|x| *x == i as f32));
+            assert!(last_v.iter().all(|x| *x == i as f32));
+        }
+        assert_eq!(cache.current_seq_len(), total);
+
+        // reset() must keep the (already-grown) capacity, so re-appending from 0
+        // does not re-grow and the live prefix is still correct.
+        cache.reset();
+        assert_eq!(cache.current_seq_len(), 0);
+        let k = Tensor::new(&[[[[99.0f32]]]], &device)?.broadcast_as((1, 2, 1, 4))?;
+        let v = Tensor::new(&[[[[99.0f32]]]], &device)?.broadcast_as((1, 2, 1, 4))?;
+        let (kv, _vv) = cache.append(&k, &v)?;
+        assert_eq!(kv.dims(), &[1, 2, 1, 4]);
+        assert_eq!(cache.current_seq_len(), 1);
 
         Ok(())
     }
