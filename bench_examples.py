@@ -42,15 +42,20 @@ PREFILL_SIZES = (512, 1024, 2048, 4096)
 DECODE_SIZES = (128, 256)
 DECODE_PROMPT_TOKENS = 16
 
-# % of CUDA — Candle Vulkan/wgpu targets (RTX 3090/4090 class vs CUDA reference).
+# % of CUDA throughput (tok/s) — grades: below < min ≤ normal ≤ goal.
+# When normal == goal, hitting the threshold counts as goal (N%+).
 PERF_TARGETS: Dict[str, Dict[str, Dict[str, float]]] = {
     "vulkan": {
-        "prefill": {"ok": 75.0, "good": 85.0, "excellent": 90.0},
-        "decode": {"ok": 85.0, "good": 95.0, "excellent": 100.0},
+        # decode: min 75%, normal 90%, goal 90%+
+        # prefill: min 85%, normal 95%, goal 95%+
+        "prefill": {"min": 85.0, "normal": 95.0, "goal": 95.0},
+        "decode": {"min": 75.0, "normal": 90.0, "goal": 90.0},
     },
     "wgpu": {
-        "prefill": {"ok": 60.0, "good": 75.0, "excellent": 85.0},
-        "decode": {"ok": 80.0, "good": 90.0, "excellent": 100.0},
+        # decode: min 75%, normal 95%, goal 95%+
+        # prefill: min 75%, normal 85%, goal 85%+
+        "prefill": {"min": 75.0, "normal": 85.0, "goal": 85.0},
+        "decode": {"min": 75.0, "normal": 95.0, "goal": 95.0},
     },
 }
 
@@ -154,17 +159,18 @@ def primary_tps(avg: Dict[str, Any], phase: Optional[str]) -> Optional[float]:
 
 
 def grade_perf(backend: str, phase: Optional[str], pct: Optional[float]) -> str:
+    """Grade vs CUDA: below | min | normal | goal."""
     if pct is None or phase not in ("prefill", "decode"):
         return "-"
     targets = PERF_TARGETS.get(backend, {}).get(phase)
     if not targets:
         return "-"
-    if pct >= targets["excellent"]:
-        return "excellent"
-    if pct >= targets["good"]:
-        return "good"
-    if pct >= targets["ok"]:
-        return "ok"
+    if pct >= targets["goal"]:
+        return "goal"
+    if pct >= targets["normal"]:
+        return "normal"
+    if pct >= targets["min"]:
+        return "min"
     return "below"
 
 
