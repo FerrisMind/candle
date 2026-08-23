@@ -757,6 +757,17 @@ pub fn matmul_coop_64_shader() -> Option<&'static str> {
     get("mul_mat_coop_64.wgsl").map(|m| m.source())
 }
 
+/// Batched m == 1 GEMV (attention score/ctx shapes): C[b,i] = sum_k A[b,k]*B[b,i,k].
+/// Single dispatch over all batches; port of the Vulkan `batched_gemv_f32.comp`.
+pub fn batched_gemv_f32_shader() -> Option<&'static str> {
+    get("batched_gemv_f32.wgsl").map(|m| m.source())
+}
+
+/// Workgroup size of the batched m == 1 GEMV shader (128 = 4 warps × 32 lanes).
+pub const BATCHED_GEMV_F32_WG_SIZE: u32 = 128;
+/// Number of output columns computed per workgroup (4 warps, one column each).
+pub const BATCHED_GEMV_F32_OUTPUTS_PER_WG: u32 = 4;
+
 pub fn matmul_fast_shader(dtype: DType, vectorized: bool) -> Option<String> {
     let source = get("mul_mat_reg_tile.wgsl")?
         .source()
@@ -1051,6 +1062,11 @@ pub fn quantized_matvec_shader(dtype: QuantizedDType, rhs_dtype: DType) -> Optio
     let outputs_per_wg = quantized_matvec_outputs_per_wg(dtype);
     let mut defines = vec![
         "SCALAR".to_string(),
+        // Naga (wgpu 29) does not implement `enable subgroups;`, and the
+        // `enable -extension` validation rejects any shader declaring it, so the
+        // subgroup-reduction branch (USE_SUBGROUP_REDUCTION) below cannot be used
+        // on this backend. Use the portable 8-barrier workgroup tree instead (the
+        // llama.cpp / wgpu-llm subgroup option is unavailable here).
         "USE_WORKGROUP_REDUCTION".to_string(),
         "BYTE_HELPERS".to_string(),
         "U32_DEQUANT_HELPERS".to_string(),

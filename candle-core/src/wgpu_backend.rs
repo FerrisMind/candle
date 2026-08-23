@@ -520,6 +520,30 @@ struct MulMatParams {
     _pad1: u32,
 }
 
+/// Batched m == 1 GEMV (attention score/ctx shapes): C[b,i] = sum_k A[b,k]*B[b,i,k].
+/// Layout is contiguous (batch,k) A, contiguous (batch,n,k) B, contiguous (batch,n) D.
+/// Mirrors the Vulkan `BatchedGemvParams` (9 u32), padded to 16 u32 (64 B, 16-aligned).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BatchedGemvParams {
+    k_dim: u32,
+    n_dim: u32,
+    batch: u32,
+    offset_a: u32,
+    offset_b: u32,
+    offset_d: u32,
+    batch_stride_a: u32,
+    batch_stride_b: u32,
+    batch_stride_d: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+    _pad4: u32,
+    _pad5: u32,
+    _pad6: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Conv2dParams {
@@ -9447,6 +9471,90 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(())
     }
 
+    /// m == 1 batched GEMV in a SINGLE dispatch over all `batch` matrices.
+    ///
+    /// This is the shape of the attention score/ctx matmuls during autoregressive
+    /// decode (and any generic batched A@B with m == 1): lhs is a (batch, k) vector
+    /// set, B is a contiguous (batch, n, k) matrix. Previously this routed to the
+    /// generic GEMM dispatch, which is catastrophic for m == 1 (one workgroup per
+    /// output element). The kernel reads B once per element, coalesced along K, and
+    /// covers all batches in one dispatch. Requires contiguous lhs (batch, 1, k) and
+    /// a contiguous (batch, n, k) B; the routing guard enforces that and any
+    /// non-contiguous case falls back to the generic path.
+    ///
+    /// `rhs_t` is the already-transposed RHS: for a math RHS of (batch, k, n) this is
+    /// the contiguous (batch, n, k) view/V such that B[b, i, k] = rhs_t[b, i, k].
+    /// `lhs` (self) is (batch, m, k) with m == 1, so A[b, k] = self[b, 0, k].
+    #[allow(clippy::too_many_arguments)]
+    fn run_batched_gemv_f32(
+        &self,
+        rhs_t: &Self,
+        lhs_layout: &Layout,
+        rhs_t_layout: &Layout,
+        b: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        debug_assert_eq!(m, 1);
+        let dst_shape = Shape::from(vec![b, 1, n]);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let params = BatchedGemvParams {
+            k_dim: k.try_into()?,
+            n_dim: n.try_into()?,
+            batch: b.try_into()?,
+            offset_a: lhs_layout.start_offset().try_into()?,
+            offset_b: rhs_t_layout.start_offset().try_into()?,
+            offset_d: 0,
+            batch_stride_a: (m * k).try_into()?,
+            batch_stride_b: (n * k).try_into()?,
+            batch_stride_d: n.try_into()?,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+            _pad4: 0,
+            _pad5: 0,
+            _pad6: 0,
+        };
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &rhs_t.buffer),
+            buffer_binding(2, &dst.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::batched_gemv_f32_shader().ok_or_else(|| {
+            Error::Msg("wgpu shader batched_gemv_f32.wgsl not embedded".into()).bt()
+        })?;
+        // grid.x = ceil(n / 4) output-column tiles, grid.y = batch, 128 threads/group.
+        let wg_x = n.div_ceil(candle_wgpu_kernels::BATCHED_GEMV_F32_OUTPUTS_PER_WG as usize);
+        let (wg_x, wg_y) = compute_2d_workgroups(
+            (wg_x as u32)
+                .checked_mul(b.try_into()?)
+                .ok_or_else(|| {
+                    Error::Msg("wgpu backend op batched gemv workgroup overflow".into()).bt()
+                })?,
+            wgpu_dispatch_wg_cap(&self.device),
+        );
+        self.device.run_compute_xyz(
+            shader,
+            &entries,
+            &bindings,
+            (wg_x, wg_y, 1),
+            &[],
+            None,
+            "candle-wgpu-gemv",
+        )?;
+        Ok(dst)
+    }
+
     fn run_matmul_f32(
         &self,
         rhs: &Self,
@@ -9527,6 +9635,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
             let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
             return out_f32.to_dtype(&out_l, self.dtype);
+        }
+
+        // m == 1 batched (attention score shapes: q @ k^T, RHS is a transposed view
+        // whose transpose-complement is a contiguous (batch, n, k) matrix): run every
+        // batch in ONE GEMV dispatch instead of the generic GEMM (pathological for
+        // m == 1). A GEMV reads B once, coalesced over K. Only fires when the
+        // contiguous B view is available with no per-batch copy; any non-contiguous
+        // or strided shape falls back to the generic dispatches below (still correct).
+        // This is the wgpu mirror of the Vulkan `run_batched_gemv_f32` guard (B10).
+        if rank > 2
+            && self.dtype == DType::F32
+            && m == 1
+            && lhs_l.dims()[..rank - 2] == rhs_l.dims()[..rank - 2]
+        {
+            let rhs_t_src = rhs_l.transpose(rank - 2, rank - 1)?;
+            if lhs_l.is_contiguous() && rhs_t_src.is_contiguous() {
+                let dst = self.run_batched_gemv_f32(
+                    rhs,
+                    lhs_l,
+                    &rhs_t_src,
+                    b,
+                    m,
+                    n,
+                    k,
+                )?;
+                return Ok(dst);
+            }
         }
 
         let mut lhs_contiguous = None;
