@@ -3755,6 +3755,63 @@ impl VulkanStorage {
         Ok(dst)
     }
 
+    /// Context-attention GEMV for the m == 1 case, reading V in its NATURAL
+    /// (batch, k, n) layout and reducing over the outer `k`, outputting over the
+    /// inner `n` (head_dim). This is the `out = scores @ v` shape where v is the
+    /// KV-cache column (kv, 128) — see `ctx_gemv_f32.comp`.
+    ///
+    /// `batched_gemv_f32` reduces over the CONTIGUOUS inner dim of B, so for this
+    /// shape it needs B materialized as the transposed (batch, n, k) V^T copy.
+    /// That copy is a full-V read+write every token (the dominant pp4096 residual).
+    /// Reading V in its native layout entirely skips the transpose materialization.
+    ///
+    /// Push-constant layout is the same 9-u32 `VulkanBatchedGemvParams`, but here
+    /// `k_dim` = reduction length (kv), `n_dim` = output length (head_dim), and
+    /// `batch_stride_b` = k*n (V is (batch, k, n)). Mirrors cmp block.
+    #[allow(clippy::too_many_arguments)]
+    fn run_ctx_gemv_f32(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        b: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        debug_assert_eq!(m, 1);
+        let dst_shape = Shape::from(vec![b, 1, n]);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let params = VulkanBatchedGemvParams {
+            k_dim: k.try_into()?,
+            n_dim: n.try_into()?,
+            batch: b.try_into()?,
+            offset_a: lhs_layout.start_offset().try_into()?,
+            offset_b: rhs_layout.start_offset().try_into()?,
+            offset_d: 0,
+            batch_stride_a: (m * k).try_into()?,
+            batch_stride_b: (k * n).try_into()?,
+            batch_stride_d: n.try_into()?,
+        };
+        // A (lhs/scores) on binding 0, V (rhs, natural layout) on binding 1.
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&rhs.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("ctx_gemv_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader ctx_gemv_f32 not generated".into()).bt())?;
+        // 256 threads/group = 8 l-slice warps x 32 head_dim lanes; grid.x tiles head_dim.
+        let workgroups = (n.div_ceil(32).try_into()?, b.try_into()?, 1u32);
+        self.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            workgroups,
+        )?;
+        Ok(dst)
+    }
+
     fn materialize_to_f32(&self, layout: &Layout) -> Result<Self> {
         if self.dtype == DType::F32 {
             if layout.is_contiguous() && layout.start_offset() == 0 {
@@ -7471,6 +7528,28 @@ impl VulkanStorage {
                 Layout::contiguous(lhs_l.shape().clone()),
             )
         };
+
+        // B13: m==1 batched attention CONTEXT matmul with V in its NATURAL
+        // (batch, k, n) layout — reduce over the outer k (kv), output over the
+        // inner n (head_dim). Reading V natively skips the generic per-step
+        // (batch, n, k) V-transpose materialization below (the pp4096 residual).
+        // Only fires when the RHS is already contiguous in natural layout: the
+        // SCORE matmul's key^T view is strided and never matches (so the score
+        // path and every non-natural shape keep their existing dispatch).
+        if rank > 2
+            && self.dtype == DType::F32
+            && m == 1
+            && !vulkan_dense_gemm_prefers_tiled(m, n, k)
+            && lhs_l.dims()[..rank - 2] == rhs_l.dims()[..rank - 2]
+            && lhs_layout.is_contiguous()
+            && lhs_layout.start_offset() == 0
+            && rhs_l.is_contiguous()
+            && rhs_l.start_offset() == 0
+        {
+            let dst = lhs.run_ctx_gemv_f32(rhs, &lhs_layout, rhs_l, b, m, n, k)?;
+            drop(lhs_contiguous);
+            return Ok(dst);
+        }
 
         // Virtual B^T: bind contiguous physical (K,N) as A without materializing
         // a full n×k transpose. Big win on tall/wide (avoids 4096² copies); on

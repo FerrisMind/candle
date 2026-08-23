@@ -1541,6 +1541,47 @@ fn test_matmul(tracker: &mut SuiteTracker, gpu_backends: &[(String, Device)]) {
                 a.broadcast_matmul(&b)
             },
         );
+        // Natural-layout CONTEXT GEMV (probs @ v): the m==1 rank>2 runtime dispatches
+        // to the `ctx_gemv_f32` kernel when the RHS V is contiguous (batch, k, n),
+        // reducing over k and outputting over head_dim n. This case gives a
+        // head_dim-width output (n=128 -> grid.x = 4 head_dim tiles) and a k that is
+        // NOT a multiple of 32 (exercises the partial l-slice in the K_SPLIT
+        // partition). batch=2 covers every head in one dispatch.
+        run_case(
+            tracker,
+            "matmul_batched",
+            dtype,
+            "batched_mm_ctx_natural",
+            &[2, 1, 128],
+            gpu_backends,
+            |device| {
+                let a = Tensor::from_vec(gen_f32(&[2, 1, 130], 42), (2, 1, 130), device)?
+                    .to_dtype(dtype)?;
+                let b = Tensor::from_vec(gen_f32(&[2, 130, 128], 137), (2, 130, 128), device)?
+                    .to_dtype(dtype)?;
+                a.broadcast_matmul(&b)
+            },
+        );
+        // wgpu m == 1 batched GEMV (score-style q @ k^T): the RHS is a transposed
+        // view of a contiguous (batch, n, k) matrix, so the single-dispatch
+        // batched-GEMV kernel fires (its transpose-complement is contiguous). Uses a
+        // k that is NOT a multiple of 32 (partial last K iteration) and an n that is
+        // a multiple of the 4-column output tile. Correct on every backend.
+        run_case(
+            tracker,
+            "matmul_batched",
+            dtype,
+            "batched_mm_m1_wgpu",
+            &[2, 1, 64],
+            gpu_backends,
+            |device| {
+                let a = Tensor::from_vec(gen_f32(&[2, 1, 100], 42), (2, 1, 100), device)?
+                    .to_dtype(dtype)?;
+                let b_nk = Tensor::from_vec(gen_f32(&[2, 64, 100], 137), (2, 64, 100), device)?
+                    .to_dtype(dtype)?;
+                a.matmul(&b_nk.transpose(1, 2)?)
+            },
+        );
     }
 }
 
