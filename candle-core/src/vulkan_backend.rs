@@ -1549,8 +1549,8 @@ fn hash_spirv_words(words: &[u32]) -> u64 {
 impl VulkanDevice {
     const SUBMISSION_DESCRIPTOR_CAPACITY: u32 = 64;
     const MAX_REUSABLE_SUBMISSIONS_PER_QUEUE: usize = 64;
-    const MAX_BATCH_DISPATCHES: u32 = 32;
-    const MAX_BATCH_COPIES: u32 = 64;
+    const MAX_BATCH_DISPATCHES: u32 = 64;
+    const MAX_BATCH_COPIES: u32 = 128;
     const DESCRIPTOR_SET_ALLOC_CHUNK: u32 = 8;
     const MAX_BATCH_DESCRIPTOR_SETS: u32 = Self::MAX_BATCH_DISPATCHES;
     const MAX_ALLOCATED_DESCRIPTOR_SETS_PER_BATCH: u32 =
