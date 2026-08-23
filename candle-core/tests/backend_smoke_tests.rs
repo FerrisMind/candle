@@ -1725,6 +1725,96 @@ fn smoke_q8_1_quantized_native_only(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// Wgpu q8_1 A-side (activation) quantization reference check. The CPU QMatMul
+/// contract quantizes the f32 LHS (activations) to q8_1 before the dot with the
+/// q8_1 weights (llama.cpp `vec_dot_type = Q8_1`, DIRECT_COPY=false). Wgpu must
+/// reproduce this: feeding raw f32 activations into the fused q8_1 kernel yields
+/// a systematic LHS-quantization error (~5e-4 relative). Mirror of the Vulkan
+/// `67e07ec5` fix tolerance: relative `expected.abs() * 1e-5` with a 1e-6
+/// absolute floor (see parity review §14 follow-up #9 / commit 67e07ec5).
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn assert_q8_1_reference_close(actual: &Tensor, expected: &Tensor, case: &str) -> Result<()> {
+    assert_eq!(actual.dims(), expected.dims(), "{case} shape mismatch");
+    let actual_vals = actual.flatten_all()?.to_vec1::<f32>()?;
+    let expected_vals = expected.flatten_all()?.to_vec1::<f32>()?;
+    let mut max_rel = 0f32;
+    let mut first_bad = None;
+    for (idx, (a, e)) in actual_vals.iter().zip(expected_vals.iter()).enumerate() {
+        let abs_err = (*a - *e).abs();
+        let tol = e.abs() * 1e-5 + 1e-6;
+        let rel = abs_err / e.abs().max(1e-30);
+        max_rel = max_rel.max(rel);
+        if abs_err > tol && first_bad.is_none() {
+            first_bad = Some((idx, *a, *e, abs_err, tol));
+        }
+    }
+    if let Some((idx, a, e, abs_err, tol)) = first_bad {
+        panic!(
+            "{case} q8_1 reference mismatch at linear idx {idx}: got {a}, expected {e}, abs_err={abs_err:.6}, tol={tol:.6}, max_rel={max_rel:.3e}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn smoke_q8_1_activation_reference(device: &Device) -> Result<()> {
+    let cpu = Device::Cpu;
+    let dtype = GgmlDType::Q8_1;
+    let k = 256;
+    let n = 4;
+
+    // Deterministic LCG (no external rng dep). Activations in (0.1, 8] and
+    // weights in (0.5, 10] are all positive so per-column dots never cancel to
+    // near zero, keeping the q8_1 LHS-quantization error a clean ~5e-4 relative.
+    let mut state = 0x2545F4914F6CDD1Du64;
+    let mut next_f32 = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let hi = (state >> 40) as u32;
+        hi as f32 / 0xFFFFFFu32 as f32
+    };
+
+    let lhs_vals = (0..k).map(|_| 0.1 + next_f32() * 7.9).collect::<Vec<_>>();
+    let rhs_vals = (0..(k * n)).map(|_| 0.5 + next_f32() * 9.5).collect::<Vec<_>>();
+    let lhs_multi_vals = (0..(3 * k)).map(|_| 0.1 + next_f32() * 7.9).collect::<Vec<_>>();
+
+    // matvec route: input_m == 1 (the wgpu dispatch routes m==1 to quantized_matvec)
+    let lhs_mv = Tensor::from_slice(&lhs_vals, (1, k), device)?;
+    let lhs_mv_cpu = Tensor::from_slice(&lhs_vals, (1, k), &cpu)?;
+    // matmul route: input_m > 1 (fused quantized matmul)
+    let lhs_mm = Tensor::from_slice(&lhs_multi_vals, (3, k), device)?;
+    let lhs_mm_cpu = Tensor::from_slice(&lhs_multi_vals, (3, k), &cpu)?;
+
+    let rhs = Tensor::from_slice(&rhs_vals, (k, n), device)?;
+    let rhs_cpu = Tensor::from_slice(&rhs_vals, (k, n), &cpu)?;
+
+    // The oracle is the CPU QMatMul contract (quantizes LHS to q8_1 in-kernel).
+    let q_rhs_cpu = QTensor::quantize(&rhs_cpu.t()?, dtype)?;
+    let qmm_cpu = QMatMul::from_qtensor(q_rhs_cpu)?;
+    let q_rhs = QTensor::quantize(&rhs.t()?, dtype)?;
+    let qmm = QMatMul::from_qtensor(q_rhs)?;
+
+    let actual_mv = qmm.forward(&lhs_mv)?;
+    let expected_mv = qmm_cpu.forward(&lhs_mv_cpu)?;
+    assert_q8_1_reference_close(&actual_mv, &expected_mv, "q8_1-activation-matvec")?;
+
+    let actual_mm = qmm.forward(&lhs_mm)?;
+    let expected_mm = qmm_cpu.forward(&lhs_mm_cpu)?;
+    assert_q8_1_reference_close(&actual_mm, &expected_mm, "q8_1-activation-matmul")?;
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "wgpu")]
+fn backend_smoke_wgpu_q8_1_activation_reference() -> Result<()> {
+    native_required(
+        "backend_smoke_wgpu_q8_1_activation_reference",
+        TestBackend::Wgpu,
+        smoke_q8_1_activation_reference,
+    )
+}
+
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_q8k_quantized_native_only(device: &Device) -> Result<()> {
     let k = 256;

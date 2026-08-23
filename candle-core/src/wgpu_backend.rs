@@ -11057,6 +11057,77 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
+    /// Reproduce the CPU QMatMul A-side (LHS/activation) quantization contract
+    /// for Q8_1 weights: quantize the f32/f16 activation to q8_1 and dequantize
+    /// back to f32 in a single pass. The reconstructed f32 (rounded to q8_1
+    /// precision) is what the CPU `vec_dot_q8_1_q8_1` would use for the LHS, so
+    /// feeding it to the fused q8_1 kernel yields
+    /// `sum(qs_lhs[i]*qs_rhs[i]) * d_lhs * d_rhs` — i.e. the same result as the
+    /// CPU `QMatMul` contract (which quantizes the activation before the dot).
+    /// The round-trip is applied only when `qdtype == Q8_1`; all other quant
+    /// dtypes feed the raw activation as before.
+    pub(crate) fn quantize_q8_1_lhs_roundtrip(&self, elem_count: usize) -> Result<WgpuStorage> {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+            return Err(Error::UnsupportedDTypeForOp(
+                self.dtype,
+                "wgpu quantize_q8_1_lhs_roundtrip",
+            )
+            .bt());
+        }
+        let src_is_f16 = if self.dtype == DType::F16 { 1u32 } else { 0u32 };
+        let num_blocks = elem_count.div_ceil(32);
+        let dst = unsafe {
+            self.device
+                .alloc_uninit(&Shape::from(elem_count), DType::F32)?
+        };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct QuantizeParams {
+            ne: u32,
+            num_blocks: u32,
+            src_is_f16: u32,
+            _pad0: u32,
+        }
+        const _: () = assert!(size_of::<QuantizeParams>() <= 256);
+
+        let params = QuantizeParams {
+            ne: elem_count as u32,
+            num_blocks: num_blocks as u32,
+            src_is_f16,
+            _pad0: 0,
+        };
+
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
+
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &dst.buffer),
+            buffer_binding(2, &param_buffer),
+        ];
+
+        let shader_source = candle_wgpu_kernels::quantize_q8_1_roundtrip_shader()
+            .ok_or_else(|| Error::Msg("wgpu quantize_q8_1_roundtrip shader not found".into()).bt())?;
+
+        let num_wgs = (num_blocks as u32).div_ceil(64);
+        self.device.run_compute_xyz(
+            &shader_source,
+            &entries,
+            &bindings,
+            (num_wgs, 1, 1),
+            &[],
+            None,
+            "candle-wgpu-quantize-q8-1-roundtrip",
+        )?;
+
+        Ok(dst)
+    }
+
     pub fn quantize_f32_to_q8_0(&self, elem_count: usize) -> Result<WgpuStorage> {
         if self.dtype != DType::F32 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu quantize_q8_0").bt());
@@ -11517,6 +11588,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             )
         };
 
+        // Q8_1 A-side (activation) quantization: the CPU QMatMul contract
+        // quantizes the f32 LHS to q8_1 before the dot. Reproduce it by
+        // quantizing the activation to q8_1 and dequantizing back to f32; the
+        // fused q8_1 kernel then multiplies the q8_1-rounded LHS by the
+        // dequantized Q8_1 weights, matching `sum(qs_lhs[i]*qs_rhs[i])*d_lhs*d_rhs`.
+        // Feeding raw f32/f16 activations here silently drops the LHS
+        // quantization (systematic ~1e-4 relative error) — mirror of the Vulkan
+        // 67e07ec5 fix.
+        let q8_1_owned: Option<WgpuStorage> = if qdtype == GgmlDType::Q8_1 {
+            Some(src.quantize_q8_1_lhs_roundtrip(src_layout.shape().elem_count())?)
+        } else {
+            None
+        };
+        let (src, src_layout) = match &q8_1_owned {
+            Some(rc) => (rc, Layout::contiguous(src_layout.shape().clone())),
+            None => (src, src_layout),
+        };
+
         let src_stride = src_layout.stride();
         let batch_inner = if rank >= 3 {
             src_layout.dims()[rank - 3]
@@ -11649,6 +11738,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 src_contiguous.as_ref().unwrap(),
                 Layout::contiguous(layout.shape().clone()),
             )
+        };
+
+        // Q8_1 A-side (activation) quantization: the CPU QMatMul contract
+        // quantizes the f32 LHS to q8_1 before the dot. Reproduce it by
+        // quantizing the activation to q8_1 and dequantizing back to f32; the
+        // fused q8_1 kernel then multiplies the q8_1-rounded LHS by the
+        // dequantized Q8_1 weights, matching `sum(qs_lhs[i]*qs_rhs[i])*d_lhs*d_rhs`.
+        // Feeding raw f32/f16 activations here silently drops the LHS
+        // quantization (systematic ~1e-4 relative error) — mirror of the Vulkan
+        // 67e07ec5 fix.
+        let q8_1_owned: Option<WgpuStorage> = if qdtype == GgmlDType::Q8_1 {
+            Some(src.quantize_q8_1_lhs_roundtrip(src_layout.shape().elem_count())?)
+        } else {
+            None
+        };
+        let (src, src_layout) = match &q8_1_owned {
+            Some(rc) => (rc, Layout::contiguous(src_layout.shape().clone())),
+            None => (src, src_layout),
         };
 
         let src_stride = src_layout.stride();

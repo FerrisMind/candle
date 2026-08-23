@@ -1075,6 +1075,13 @@ pub fn quantized_matmul_fast_shader(dtype: QuantizedDType, rhs_dtype: DType) -> 
         quantized_mul_mat_id_init_define(dtype).to_string(),
         "INIT_SRC1_SHMEM_FLOAT".to_string(),
     ];
+    if matches!(dtype, QuantizedDType::Q8_1) {
+        // q8_1 needs full-precision f32 workgroup cache: the contract quantizes
+        // the A-side to q8_1 and dequantizes at f32 precision, so demoting the
+        // RHS (and LHS) to f16 shmem would drop ~5e-5 relative vs the CPU
+        // reference (mirror of the Vulkan 67e07ec5 fix path).
+        defines.push("FLOAT_ACC_SHMEM".to_string());
+    }
     let src1_type = match rhs_dtype {
         DType::F32 => "f32",
         DType::F16 => "f16",
@@ -1382,6 +1389,10 @@ pub fn fill_inplace_shader(dtype: DType, workgroup_size: u32) -> String {
 
 pub fn quantize_q8_1_shader() -> Option<String> {
     Some(get("quantize_q8_1.wgsl")?.source().to_string())
+}
+
+pub fn quantize_q8_1_roundtrip_shader() -> Option<String> {
+    Some(get("quantize_q8_1_roundtrip.wgsl")?.source().to_string())
 }
 
 pub fn quantize_q8_0_shader() -> Option<String> {
