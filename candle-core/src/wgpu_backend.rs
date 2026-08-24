@@ -11810,19 +11810,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             )
         };
 
-        // Q8_1 A-side (activation) quantization: the CPU QMatMul contract
-        // quantizes the f32 LHS to q8_1 before the dot. Reproduce it by
-        // quantizing the activation to q8_1 and dequantizing back to f32; the
-        // fused q8_1 kernel then multiplies the q8_1-rounded LHS by the
-        // dequantized Q8_1 weights, matching `sum(qs_lhs[i]*qs_rhs[i])*d_lhs*d_rhs`.
-        // Feeding raw f32/f16 activations here silently drops the LHS
-        // quantization (systematic ~1e-4 relative error) — mirror of the Vulkan
-        // 67e07ec5 fix.
-        let q8_1_owned: Option<WgpuStorage> = if qdtype == GgmlDType::Q8_1 {
-            Some(src.quantize_q8_1_lhs_roundtrip(src_layout.shape().elem_count())?)
-        } else {
-            None
-        };
+        // A-side (activation) quantization: the CPU QMatMul contract quantizes
+        // the f32 LHS to q8_1 before the dot for EVERY quantized dtype
+        // (`VecDotType = BlockQ8K` for Q4_K etc.), and the cuda fast-mmq kernels
+        // do the same. Reproduce it by quantizing the activation to q8_1 and
+        // dequantizing back to f32; the kernel then multiplies the q8_1-rounded
+        // LHS by the dequantized weights, matching the reference activation
+        // contract. Feeding raw f32/f16 activations here silently drops the LHS
+        // quantization — a deterministic, weight/activation-fixed error that
+        // compounds through the residual stream — mirror of the Vulkan
+        // 67e07ec5 fix. Previously gated to Q8_1 dtype; extended to all
+        // quantized dtypes to match the CPU/cuda mmq activation contract.
+        let q8_1_owned: Option<WgpuStorage> = Some(src.quantize_q8_1_lhs_roundtrip(
+            src_layout.shape().elem_count(),
+        )?);
         let (src, src_layout) = match &q8_1_owned {
             Some(rc) => (rc, Layout::contiguous(src_layout.shape().clone())),
             None => (src, src_layout),
