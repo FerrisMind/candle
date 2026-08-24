@@ -642,7 +642,12 @@ struct WgpuInner {
     coop_matmul_enabled: bool,
     seed_value: RwLock<u64>,
     pipeline_cache: Mutex<HashMap<WgpuPipelineCacheKey, Arc<WgpuCachedPipeline>>>,
-    buffer_registry: Mutex<HashMap<usize, Weak<wgpu::Buffer>>>,
+    buffer_registry: Mutex<HashMap<usize, (Weak<wgpu::Buffer>, u64)>>,
+    /// Monotonic per-buffer object id. Survives pool reuse (same live Arc keeps
+    /// its id) but changes when an Arc dies and a DIFFERENT wgpu buffer is
+    /// allocated at the same address — so address-reuse can never alias a stale
+    /// bind-group cache entry to a new object.
+    buffer_oid_next: std::sync::atomic::AtomicU64,
     /// Free storage buffers by size (wgpu_copy_size key). Only populated after
     /// GPU drain (`synchronize` / pending cleanup) so recycled buffers are never
     /// still referenced by in-flight dispatches.
@@ -703,7 +708,7 @@ impl WgpuHotRing {
 struct WgpuElemBgKey {
     shader_hash: u64,
     shader_len: usize,
-    /// All storage buffer identities (excludes trailing uniform).
+    /// All storage buffer object ids (excludes trailing uniform).
     storage_ptrs: Vec<usize>,
 }
 
@@ -1127,7 +1132,7 @@ impl WgpuDevice {
 
     fn prune_buffer_registry(&self) {
         if let Ok(mut registry) = self.inner.buffer_registry.lock() {
-            registry.retain(|_, weak| weak.strong_count() > 0);
+            registry.retain(|_, (weak, _)| weak.strong_count() > 0);
         }
     }
 
@@ -1553,16 +1558,51 @@ impl WgpuDevice {
 
     fn register_buffer_arc(&self, arc: Arc<wgpu::Buffer>) -> Arc<wgpu::Buffer> {
         let key = wgpu_buffer_key(arc.as_ref());
-        if let Ok(mut registry) = self.inner.buffer_registry.lock() {
-            registry.insert(key, Arc::downgrade(&arc));
-        }
+        let oid = match self.inner.buffer_registry.lock() {
+            Ok(mut registry) => {
+                // Reuse the id while the SAME object is still alive at this
+                // address (pool reuse / re-registration). Dead or absent →
+                // fresh id so a new object can never alias old cache entries.
+                let oid = registry
+                    .get(&key)
+                    .filter(|(weak, _)| weak.strong_count() > 0)
+                    .map(|(_, oid)| *oid)
+                    .unwrap_or_else(|| {
+                        self.inner
+                            .buffer_oid_next
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    });
+                registry.insert(key, (Arc::downgrade(&arc), oid));
+                oid
+            }
+            Err(_) => self
+                .inner
+                .buffer_oid_next
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+        let _ = oid;
         arc
+    }
+
+    /// Stable per-buffer object id for bind-group caching. Unregistered/dead
+    /// bindings (e.g. permanent uniform ring buffers, which are excluded from
+    /// cache keys anyway) map to a sentinel that never collides with a real id.
+    fn buffer_oid(&self, buffer: &wgpu::Buffer) -> u64 {
+        let key = wgpu_buffer_key(buffer);
+        match self.inner.buffer_registry.lock() {
+            Ok(registry) => registry
+                .get(&key)
+                .filter(|(weak, _)| weak.strong_count() > 0)
+                .map(|(_, oid)| *oid)
+                .unwrap_or(u64::MAX),
+            Err(_) => u64::MAX,
+        }
     }
 
     fn upgrade_registered_buffer(&self, buffer: &wgpu::Buffer) -> Option<Arc<wgpu::Buffer>> {
         let key = wgpu_buffer_key(buffer);
         let registry = self.inner.buffer_registry.lock().ok()?;
-        registry.get(&key).and_then(|weak| weak.upgrade())
+        registry.get(&key).and_then(|(weak, _)| weak.upgrade())
     }
 
     fn retain_from_bindings(
@@ -2049,15 +2089,20 @@ impl WgpuDevice {
                     cached
                 }
             };
-        // Elementwise path: cache bind groups by (shader, storage ptrs).
+        // Elementwise path: cache bind groups by (shader, storage OIDs).
         // Dyn-uniform: storage + trailing uniform. Immediates: storage only.
+        // Storage buffers are keyed by STABLE object ids, NOT addresses: a
+        // freed candle Arc slot can be reused by a DIFFERENT wgpu buffer, and
+        // an address-keyed stale cache hit would make the dispatch read/write
+        // the WRONG buffer (observed wrong argmax/argmin indices in the wgpu
+        // smoke suite under allocation churn).
         let cacheable = use_immediates || (!dynamic_offsets.is_empty() && bindings.len() >= 3);
         let bind_group = if cacheable {
             let ptrs: Vec<usize> = bindings
                 .iter()
                 .filter_map(|e| match &e.resource {
                     wgpu::BindingResource::Buffer(bb) => {
-                        Some(std::ptr::from_ref(bb.buffer) as usize)
+                        Some(self.buffer_oid(bb.buffer) as usize)
                     }
                     other => {
                         let _ = other;
@@ -14538,6 +14583,7 @@ impl BackendDevice for WgpuDevice {
                 seed_value: RwLock::new(299_792_458),
                 pipeline_cache: Mutex::new(HashMap::new()),
                 buffer_registry: Mutex::new(HashMap::new()),
+                buffer_oid_next: std::sync::atomic::AtomicU64::new(1),
                 storage_buffer_pool: Mutex::new(HashMap::new()),
                 storage_pool_pending: Mutex::new(Vec::new()),
                 pending_submissions: Mutex::new(Vec::new()),
