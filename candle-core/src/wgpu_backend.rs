@@ -655,6 +655,11 @@ struct WgpuInner {
     /// Ring of reusable uniform buffers (avoids per-dispatch create_buffer).
     /// Used by non-dynamic uniform bindings (`as_entire_binding`).
     uniform_ring: Mutex<(Vec<wgpu::Buffer>, usize)>,
+    /// Content-addressed uniform params cache. Decode calls `mul_mat_vec` etc.
+    /// with byte-identical param structs every token; writing the same bytes
+    /// through the ring each time wastes a `queue.write_buffer` + ring lock.
+    /// Key is the full params hash; bytes are stored for collision check.
+    uniform_params_cache: Mutex<Vec<(u64, Vec<u8>, wgpu::Buffer)>>,
     /// Single large uniform buffer for dynamic-offset slots (elementwise host path).
     /// Slot size is `uniform_dyn_slot` (aligned to min_uniform_buffer_offset_alignment).
     /// Cursor is atomic so reserve_uniform_slot avoids a Mutex on the hot path.
@@ -1367,6 +1372,41 @@ impl WgpuDevice {
         // before GPU completion reclaims a slot's contents.
         const RING: usize = 128;
         const SLOT: u64 = 256;
+        // Content cache: decode/refill dispatches feed byte-identical param
+        // structs token after token. Reusing the buffer avoids a per-dispatch
+        // `queue.write_buffer` + ring lock (measured ~5µs/op for 452 ops).
+        // Bounded LRU-by-recent: evict overalloc only (≤ 1024 entries).
+        {
+            let mut cache = self
+                .inner
+                .uniform_params_cache
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            if bytes.len() as u64 <= SLOT {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut hasher);
+                let key = hasher.finish();
+                for entry in cache.iter().rev() {
+                    if entry.0 == key && entry.1.as_slice() == bytes {
+                        let buf = entry.2.clone();
+                        return Ok(buf);
+                    }
+                }
+                if cache.len() >= 1024 {
+                    cache.clear();
+                }
+                let buf = self.inner.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("candle-wgpu-uniform-cache"),
+                    size: SLOT,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.inner.queue.write_buffer(&buf, 0, bytes);
+                cache.push((key, bytes.to_vec(), buf.clone()));
+                return Ok(buf);
+            }
+        }
         if bytes.len() as u64 > SLOT {
             // Oversized uniforms: allocate once (rare).
             let buf = self.inner.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1797,9 +1837,13 @@ impl WgpuDevice {
 
     fn read_buffer(&self, buffer: &wgpu::Buffer, size: usize) -> Result<Vec<u8>> {
         let copy_size = wgpu_copy_size(size);
-        // ponytail: sync + drop cached pipelines before staging alloc; one retry on map failure
-        self.synchronize()?;
-        let _ = self.trim_pipeline_cache();
+        // Submit any pending compute first. The single queue is FIFO, so the
+        // readback copy below (submitted after this batch) observes it, and
+        // waiting only for the copy submission implies every earlier dispatch
+        // has completed — no full device drain needed on the hot path.
+        // Pipeline cache is kept warm (re-creating ~11 pipelines per token
+        // cost ~8.3ms; the retry path below re-trims on the rare map failure).
+        self.flush_active_batch("readback")?;
         let try_read = || -> Result<Vec<u8>> {
             let staging = self.inner.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("candle-wgpu-readback"),
@@ -1814,16 +1858,22 @@ impl WgpuDevice {
                         label: Some("candle-wgpu-readback"),
                     });
             encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, copy_size as u64);
-            // synchronize() already flushed; keep for call paths that skip it.
-            let _ = self.flush_before_standalone_submit();
-            self.inner.queue.submit([encoder.finish()]);
+            let sub_idx = self.inner.queue.submit([encoder.finish()]);
 
             let slice = staging.slice(..);
             let (tx, rx) = std::sync::mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |result| {
                 let _ = tx.send(result);
             });
-            self.synchronize()?;
+            // Wait only for this (last) submission; all earlier queue work is
+            // already complete by FIFO. Map callbacks fire on completion.
+            self.inner
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(sub_idx),
+                    timeout: None,
+                })
+                .map_err(Error::wrap)?;
             rx.recv()
                 .map_err(Error::wrap)?
                 .map_err(Error::wrap)
@@ -1836,7 +1886,16 @@ impl WgpuDevice {
             Ok(data)
         };
         match try_read() {
-            Ok(data) => Ok(data),
+            Ok(data) => {
+                // GPU is drained (readback submission was last). Run the
+                // recycling steps `synchronize()` would have done without
+                // another blocking poll.
+                self.cleanup_pending_submissions(false)?;
+                self.reset_hot_rings_if_idle();
+                self.flush_storage_pool_pending();
+                self.prune_buffer_registry();
+                Ok(data)
+            }
             Err(_) => {
                 self.synchronize()?;
                 let _ = self.trim_pipeline_cache();
@@ -14484,6 +14543,7 @@ impl BackendDevice for WgpuDevice {
                 pending_submissions: Mutex::new(Vec::new()),
                 active_batch: Mutex::new(None),
                 uniform_ring: Mutex::new((Vec::new(), 0)),
+                uniform_params_cache: Mutex::new(Vec::new()),
                 uniform_dyn: Mutex::new(None),
                 uniform_dyn_cursor: AtomicUsize::new(0),
                 uniform_dyn_slot,
