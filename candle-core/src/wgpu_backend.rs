@@ -778,25 +778,18 @@ struct WgpuPipelineCacheKey {
 
 fn wgpu_shader_cache_key(shader: &str) -> (u64, usize) {
     use std::hash::{Hash, Hasher};
-    // Avoid full multi-KB DefaultHasher on every dispatch (coopmat WGSL), but
-    // never key only on (ptr,len): heap-allocated template strings can reuse
-    // the same address with different content after free (observed as wrong
-    // pipelines on int binary / unary tests). Content-sample head+mid+tail.
+    // Hash the FULL shader content. The previous implementation hashed only a
+    // head/mid/tail sample of shaders longer than 512 bytes, so two DIFFERENT
+    // shaders of the same length with identical sampled regions collided on the
+    // same cache key and a dispatch could reuse a pipeline compiled for a
+    // DIFFERENT shader — silently corrupting results (a wgpu-only divergence
+    // that looked history-dependent: whichever shader got cached first won the
+    // slot). Hashing the whole WGSL string is ~µs, negligible next to pipeline
+    // creation, and correctness wins over the sampling shortcut.
     let len = shader.len();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     len.hash(&mut hasher);
-    if len <= 512 {
-        shader.hash(&mut hasher);
-    } else {
-        let head = 128.min(len);
-        let tail = 128.min(len);
-        let mid = len / 2;
-        let mid0 = mid.saturating_sub(64);
-        let mid1 = (mid + 64).min(len);
-        shader[..head].hash(&mut hasher);
-        shader[mid0..mid1].hash(&mut hasher);
-        shader[len - tail..].hash(&mut hasher);
-    }
+    shader.hash(&mut hasher);
     (hasher.finish(), len)
 }
 
@@ -14356,7 +14349,7 @@ impl BackendDevice for WgpuDevice {
 
 #[cfg(test)]
 mod compute_2d_self_check {
-    use super::{compute_2d_workgroups, WGPU_DISPATCH_WG_CAP};
+    use super::{compute_2d_workgroups, wgpu_shader_cache_key, WGPU_DISPATCH_WG_CAP};
 
     #[test]
     fn both_axes_within_limit() {
@@ -14378,6 +14371,34 @@ mod compute_2d_self_check {
                 "total={total} reported_max={reported_max} -> ({x},{y})"
             );
         }
+    }
+
+    /// Shaders that DIFFER only in their interior must not collide on the
+    /// pipeline-cache key. The previous implementation hashed only a 128-byte
+    /// head/mid/tail sample for shaders > 512 bytes, so two length-identical
+    /// shaders with identical samples shared one key and a dispatch could reuse
+    /// a pipeline compiled for a DIFFERENT shader (mis-compiled quantized
+    /// matmuls on wgpu — the whole-model divergence fixed by full-content hash).
+    #[test]
+    fn shader_cache_key_full_content() {
+        let n = 4096usize; // same length, same sampled regions by construction
+        let a: String = format!(
+            "{:064}\nconst distinct = 0u; // {}\n{:>04096}",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        let b: String = format!(
+            "{:064}\nconst distinct = 1u; // {}\n{:>04096}",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(a.len(), b.len());
+        let (ha, la) = wgpu_shader_cache_key(&a);
+        let (hb, lb) = wgpu_shader_cache_key(&b);
+        assert_eq!(la, lb);
+        assert_ne!(ha, hb, "distinct shader contents must not collide on cache key");
     }
 }
 
