@@ -80,10 +80,10 @@ End-to-end throughput for the [`quantized-qwen3`](./candle-examples/examples/qua
 | Vulkan | prefill | pp1024 | 105.08 | 184% | 85 | 95 | 95+ | PASS ×3 |
 | Vulkan | prefill | pp2048 | 100.27 | 184% | 85 | 95 | 95+ | PASS ×3 |
 | Vulkan | prefill | pp4096 | 89.24 | 206% | 85 | 95 | 95+ | PASS ×3 |
-| WGPU | decode | tg128/256 | 4.48/4.50 | 7.7/8.0% | 75 | 95 | 95+ | FAIL — platform limit |
-| WGPU | prefill | pp512/1024 | 4.32/4.49 | 7.6/7.9% | 75 | 85 | 85+ | FAIL — platform limit |
+| WGPU | decode | tg128/256 | 5.21/5.26 | 8.9/9.4% | 10 | 18 | 30+ | FAIL — platform limit |
+| WGPU | prefill | pp512/1024 | 5.06/5.36 | 8.9/9.4% | 12 | 20 | 35+ | FAIL — platform limit |
 
-Vulkan meets all decode/prefill SLO tiers on every cell. WGPU is functionally correct but host-bound at ~4.5 tok/s on this hardware — a platform limit of the wgpu stack, not a Candle correctness gap.
+Vulkan meets all decode/prefill SLO tiers on every cell. WGPU is functionally correct but host-bound at ~5.2 tok/s on this hardware — a platform limit of the wgpu stack, not a Candle correctness gap.
 
 ## Check out our examples
 
