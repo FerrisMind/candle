@@ -74,16 +74,22 @@ End-to-end throughput for the [`quantized-qwen3`](./candle-examples/examples/qua
 
 | Backend | Phase | Cell | tok/s | %CUDA | Min | Normal | Goal | Verdict |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Vulkan | decode | tg128 | 116.35 | 199% | 75 | 90 | 90+ | PASS ×3 |
-| Vulkan | decode | tg256 | 116.28 | 207% | 75 | 90 | 90+ | PASS ×3 |
-| Vulkan | prefill | pp512 | 114.49 | 203% | 85 | 95 | 95+ | PASS ×3 |
-| Vulkan | prefill | pp1024 | 105.08 | 184% | 85 | 95 | 95+ | PASS ×3 |
-| Vulkan | prefill | pp2048 | 100.27 | 184% | 85 | 95 | 95+ | PASS ×3 |
-| Vulkan | prefill | pp4096 | 89.24 | 206% | 85 | 95 | 95+ | PASS ×3 |
-| WGPU | decode | tg128/256 | 5.21/5.26 | 8.9/9.4% | 10 | 18 | 30+ | FAIL — platform limit |
-| WGPU | prefill | pp512/1024 | 5.06/5.36 | 8.9/9.4% | 12 | 20 | 35+ | FAIL — platform limit |
+| Vulkan | decode | tg128 | 121.51 | 202% | 75 | 90 | 90+ | PASS ×3 |
+| Vulkan | decode | tg256 | 121.26 | 203% | 75 | 90 | 90+ | PASS ×3 |
+| Vulkan | prefill | pp512 | 120.72 | 205% | 85 | 95 | 95+ | PASS ×3 |
+| Vulkan | prefill | pp1024 | 117.55 | 207% | 85 | 95 | 95+ | PASS ×3 |
+| Vulkan | prefill | pp2048 | 112.03 | 190% | 85 | 95 | 95+ | PASS ×3 |
+| Vulkan | prefill | pp4096 | 96.46 | 220% | 85 | 95 | 95+ | PASS ×3 |
+| WGPU | decode | tg128 | 53.85 | 90% | 10 | 18 | 30+ | PASS ×3 |
+| WGPU | decode | tg256 | 52.99 | 89% | 10 | 18 | 30+ | PASS ×3 |
+| WGPU | prefill | pp512 | 52.87 | 90% | 12 | 20 | 35+ | PASS ×3 |
+| WGPU | prefill | pp1024 | 45.18 | 80% | 12 | 20 | 35+ | PASS ×3 |
+| WGPU | prefill | pp2048 | 33.50 | 57% | 12 | 20 | 35+ | PASS ×3 |
+| WGPU | prefill | pp4096 | 22.01 | 50% | 12 | 22 | 38+ | PASS ×3 |
 
-Vulkan meets all decode/prefill SLO tiers on every cell. WGPU is functionally correct but host-bound at ~5.2 tok/s on this hardware — a platform limit of the wgpu stack, not a Candle correctness gap.
+CUDA baseline (same session): tg128 60.09, tg256 59.57, pp512 58.79, pp1024 56.74, pp2048 58.78, pp4096 43.91 tok/s.
+
+Vulkan meets all decode/prefill SLO tiers on every cell. WGPU meets all portability-class SLO tiers on every cell (decode 89–90%, prefill 50–90% of CUDA): the earlier ~5 tok/s host-bound ceiling was traced to per-dispatch WGSL regeneration (~800 µs/op) plus a double full-device drain per readback and an address-keyed bind-group cache race — all fixed in the backend layer. Logs: `bench_logs/qwen3-q4km_{cuda,vulkan,wgpu}_final.log`.
 
 ## Check out our examples
 
