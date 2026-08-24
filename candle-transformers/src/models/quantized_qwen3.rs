@@ -443,6 +443,26 @@ impl AttentionWeights {
                 ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
             }
         } else {
+            // Fused decode attention on wgpu (device-gated additive, P1): ONE
+            // dispatch per layer replaces the standard repeat_kv x2 + score GEMV +
+            // softmax + ctx matmul chain for the single-token decode step
+            // (l == 1). q/k/v are the post-rope F32 tensors; the cache views are
+            // `narrow`ed prefixes of the growable backing (strided by capacity),
+            // read via strides by the kernel — no V^T materialization. Non-decode
+            // (l > 1, batched prefill) keeps the standard matmul path below.
+            if std::env::var_os("CANDLE_DISABLE_FUSED_ATTN").is_none()
+                && x.device().is_wgpu()
+                && b == 1
+                && l == 1
+                && q.dtype() == DType::F32
+            {
+                let (k, v) = self.kv_cache.as_mut().unwrap().append(&k, &v)?;
+                let scale = 1.0 / (self.head_dim as f64).sqrt();
+                let q = q.contiguous()?;
+                let ctx = self.fused_decode_attn_wgpu(&q, &k, &v, scale)?;
+                let reshaped_ctx = ctx.transpose(1, 2)?.reshape((b, l, self.hidden_size))?;
+                return self.o_proj.forward(&reshaped_ctx);
+            }
             // Standard matmul attention (no flash). On Vulkan the expanded cache
             // returns the num_heads-wide (16-head) K/V live-prefix views already, so
             // the whole-cache `repeat_kv` materialization is skipped (the pp4096
@@ -472,6 +492,29 @@ impl AttentionWeights {
             let reshaped_ctx = ctx.transpose(1, 2)?.reshape((b, l, self.hidden_size))?;
             self.o_proj.forward(&reshaped_ctx)
         }
+    }
+
+    /// Fused decode attention on wgpu: q @ k^T -> online softmax -> P @ V in ONE
+    /// dispatch (see `WgpuStorage::run_fused_decode_attn_f32`). `k`/`v` are the
+    /// live narrowed cache views (growable backing, strided by capacity) and `q`
+    /// is the post-rope (1, num_heads, 1, head_dim) tensor. Returns a tensor of
+    /// that same shape holding the per-head context vectors.
+    fn fused_decode_attn_wgpu(&self, q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+        let (q_g, q_l) = q.storage_and_layout();
+        let (k_g, k_l) = k.storage_and_layout();
+        let (v_g, v_l) = v.storage_and_layout();
+        let out = match (&*q_g, &*k_g, &*v_g) {
+            (Storage::Wgpu(qs), Storage::Wgpu(ks), Storage::Wgpu(vs)) => {
+                qs.run_fused_decode_attn_f32(ks, vs, q_l, k_l, v_l, scale as f32)?
+            }
+            _ => candle::bail!("Fused decode attention expects wgpu storage"),
+        };
+        Ok(Tensor::from_storage(
+            Storage::Wgpu(out),
+            (1, self.num_heads, 1, self.head_dim),
+            candle::op::BackpropOp::none(),
+            false,
+        ))
     }
 
     fn clear_kv_cache(&mut self) {

@@ -8037,6 +8037,148 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
+    /// Fused DECODE attention for a single query token per head (l == 1):
+    ///   out[h, d] = softmax(scale * q @ k^T)_p · V[kv_h, p, d]
+    /// One dispatch replaces repeat_kv × 2, the score GEMV, the softmax, and the
+    /// ctx matmul (6-7 model ops -> 1). GQA is handled in-kernel
+    /// (kv_head = h / (n_q_heads / n_kv_heads)); K/V are read via STRIDES from the
+    /// layouts, so a `narrow`ed prefix of a grown KV-cache backing (capacity >
+    /// live length) routes here without materializing V^T (see `ctx_gemv_f32`).
+    ///
+    /// q/k/v must be F32. `q` layout is (1, n_q_heads, 1, head_dim) (decode token),
+    /// k/v layouts are (1, n_kv_heads, kv_len, head_dim) — the live cache views.
+    /// Returns a storage of (n_q_heads, head_dim) contiguous.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_fused_decode_attn_f32(
+        &self,
+        k: &Self,
+        v: &Self,
+        q_layout: &Layout,
+        k_layout: &Layout,
+        v_layout: &Layout,
+        scale: f32,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 || k.dtype != DType::F32 || v.dtype != DType::F32 {
+            return Err(Error::Msg("fused_decode_attn requires F32 q/k/v".into()).bt());
+        }
+        let q_dims = q_layout.dims();
+        let k_dims = k_layout.dims();
+        let v_dims = v_layout.dims();
+        if q_dims.len() != 4 || k_dims.len() != 4 || v_dims.len() != 4 {
+            return Err(Error::Msg("fused_decode_attn expects 4D q/k/v".into()).bt());
+        }
+        if q_dims[0] != 1 || q_dims[2] != 1 {
+            return Err(Error::Msg(
+                "fused_decode_attn expects batch 1 and seq_len 1 (decode)".into(),
+            )
+            .bt());
+        }
+        let n_q_heads = q_dims[1];
+        let n_kv_heads = k_dims[1];
+        let head_dim = q_dims[3];
+        if k_dims[0] != 1 || k_dims[3] != head_dim || v_dims != k_dims {
+            return Err(Error::Msg("fused_decode_attn q/k/v shape mismatch".into()).bt());
+        }
+        let kv_len = k_dims[2];
+        if head_dim > candle_wgpu_kernels::FUSED_DECODE_ATTN_WG_SIZE as usize {
+            return Err(Error::Msg(
+                "fused_decode_attn head_dim exceeds 128-thread workgroup".into(),
+            )
+            .bt());
+        }
+        let q_stride = q_layout.stride();
+        let k_stride = k_layout.stride();
+        let v_stride = v_layout.stride();
+        if q_stride[3] != 1 || k_stride[3] != 1 || v_stride[3] != 1 {
+            return Err(Error::Msg("fused_decode_attn requires unit d-stride".into()).bt());
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FusedDecodeAttnParams {
+            kv_len: u32,
+            n_q_heads: u32,
+            n_kv_heads: u32,
+            head_dim: u32,
+            scale: f32,
+            offset_q: u32,
+            offset_k: u32,
+            offset_v: u32,
+            offset_o: u32,
+            q_head_stride: u32,
+            q_d_stride: u32,
+            k_head_stride: u32,
+            k_pos_stride: u32,
+            k_d_stride: u32,
+            v_head_stride: u32,
+            v_pos_stride: u32,
+            v_d_stride: u32,
+            o_head_stride: u32,
+            o_d_stride: u32,
+            _pad0: u32,
+        }
+
+        let dst_shape = Shape::from(vec![n_q_heads, head_dim]);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let params = FusedDecodeAttnParams {
+            kv_len: kv_len.try_into()?,
+            n_q_heads: n_q_heads.try_into()?,
+            n_kv_heads: n_kv_heads.try_into()?,
+            head_dim: head_dim.try_into()?,
+            scale,
+            offset_q: q_layout.start_offset().try_into()?,
+            offset_k: k_layout.start_offset().try_into()?,
+            offset_v: v_layout.start_offset().try_into()?,
+            offset_o: 0,
+            q_head_stride: q_stride[1].try_into()?,
+            q_d_stride: q_stride[3].try_into()?,
+            k_head_stride: k_stride[1].try_into()?,
+            k_pos_stride: k_stride[2].try_into()?,
+            k_d_stride: k_stride[3].try_into()?,
+            v_head_stride: v_stride[1].try_into()?,
+            v_pos_stride: v_stride[2].try_into()?,
+            v_d_stride: v_stride[3].try_into()?,
+            o_head_stride: head_dim.try_into()?,
+            o_d_stride: 1,
+            _pad0: 0,
+        };
+        if size_of::<FusedDecodeAttnParams>() != 80 {
+            return Err(Error::Msg("fused_decode_attn params size mismatch".into()).bt());
+        }
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, false),
+            uniform_entry(4),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &k.buffer),
+            buffer_binding(2, &v.buffer),
+            buffer_binding(3, &dst.buffer),
+            buffer_binding(4, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::fused_decode_attn_f32_shader().ok_or_else(|| {
+            Error::Msg("wgpu shader fused_decode_attn_f32.wgsl not embedded".into()).bt()
+        })?;
+        // ONE workgroup per query head; grid.x == n_q_heads (16 for qwen3).
+        let wg_x = n_q_heads.try_into()?;
+        let (wg_x, wg_y) =
+            compute_2d_workgroups(wg_x, wgpu_dispatch_wg_cap(&self.device));
+        self.device.run_compute_xyz(
+            shader,
+            &entries,
+            &bindings,
+            (wg_x, wg_y, 1),
+            &[],
+            None,
+            "candle-wgpu-fused-decode-attn",
+        )?;
+        Ok(dst)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn flash_attn_varlen(
         &self,
@@ -9464,6 +9606,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(())
     }
 
+    /// True when a rank >= 3 layout can be treated as a SINGLE flat batch dimension
+    /// of arbitrary (possibly non-compact) `batch_stride` for the m == 1 batched
+    /// GEMV kernels (`batched_gemv_f32` / `ctx_gemv_f32`). Exact port of the
+    /// Vulkan helper (eaab92cc).
+    ///
+    /// Two requirements:
+    ///   * every batch dim before the innermost one (`dims[..rank-3]`) is size 1, so
+    ///     flattening `batch = product(dims[..rank-2])` has a UNIFORM stride
+    ///     (`stride[rank-3]`) — one batch index maps linearly to one row of matrices;
+    ///   * the trailing two dims `(rows, cols)` (the per-batch block the kernel
+    ///     reduces/maps over) are contiguous (`stride[rank-2] == cols` and
+    ///     `stride[rank-1] == 1`), so the kernel's `row*cols + col` addressing holds.
+    ///
+    /// This is exactly the shape produced by a `narrow`ed prefix of a grown KV-cache
+    /// backing buffer (capacity > live length): the batch stride is the capacity
+    /// stride instead of the compact `rows*cols`. A fully contiguous layout also
+    /// passes; a genuinely strided-within-batch view fails and falls back to the
+    /// generic per-batch path (correct, slower).
+    fn batched_gemv_inner_contiguous(l: &Layout) -> bool {
+        let rank = l.dims().len();
+        if rank < 3 || l.dims()[..rank - 3].iter().any(|&d| d != 1) {
+            return false;
+        }
+        l.stride()[rank - 2] == l.dims()[rank - 1] && l.stride()[rank - 1] == 1
+    }
+
     /// m == 1 batched GEMV in a SINGLE dispatch over all `batch` matrices.
     ///
     /// This is the shape of the attention score/ctx matmuls during autoregressive
@@ -9492,6 +9660,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         debug_assert_eq!(m, 1);
         let dst_shape = Shape::from(vec![b, 1, n]);
         let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        // Batch strides come from the layouts so a `narrow`ed prefix of a grown
+        // KV-cache backing buffer (capacity > live length, batch stride == capacity
+        // stride) routes correctly; a compact batch preserves stride == n*k/m*k.
+        let rank = rhs_t_layout.dims().len();
+        let batch_stride_a = if lhs_layout.dims().len() >= 3 {
+            lhs_layout.stride()[lhs_layout.dims().len() - 3]
+        } else {
+            m * k
+        };
+        let batch_stride_b = if rank >= 3 {
+            rhs_t_layout.stride()[rank - 3]
+        } else {
+            n * k
+        };
         let params = BatchedGemvParams {
             k_dim: k.try_into()?,
             n_dim: n.try_into()?,
@@ -9499,8 +9681,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             offset_a: lhs_layout.start_offset().try_into()?,
             offset_b: rhs_t_layout.start_offset().try_into()?,
             offset_d: 0,
-            batch_stride_a: (m * k).try_into()?,
-            batch_stride_b: (n * k).try_into()?,
+            batch_stride_a: batch_stride_a.try_into()?,
+            batch_stride_b: batch_stride_b.try_into()?,
             batch_stride_d: n.try_into()?,
             _pad0: 0,
             _pad1: 0,
@@ -9544,6 +9726,99 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             &[],
             None,
             "candle-wgpu-gemv",
+        )?;
+        Ok(dst)
+    }
+
+    /// m == 1 batched CONTEXT GEMV reading V in its NATURAL layout:
+    ///   out[b, i] = sum_l A[b, l] * V[b, l, i]
+    /// where V is the (batch, l, head_dim) cache (head_dim contiguous inner).
+    /// Port of the Vulkan `ctx_gemv_f32.comp` (eaab92cc); the score matmul uses
+    /// `run_batched_gemv_f32`, the CONTEXT matmul reduces over the strided kv length
+    /// instead, so this reads V natively — no per-step V^T materialization.
+    ///
+    /// `rhs` is the natural-layout V. `lhs` (self) is (batch, m, k) with m == 1, so
+    /// A[b, l] = self[b, 0, l]. Both batches use stride-aware `batch_stride`
+    /// params (a `narrow`ed grown-cache prefix with capacity stride routes here).
+    #[allow(clippy::too_many_arguments)]
+    fn run_ctx_gemv_f32(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        b: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        debug_assert_eq!(m, 1);
+        let dst_shape = Shape::from(vec![b, 1, n]);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        // Stride-aware (see `run_batched_gemv_f32`): read V's actual batch stride so a
+        // `narrow`ed grown expanded-KV-cache view (capacity > live length) routes here.
+        let rhs_rank = rhs_layout.dims().len();
+        let batch_stride_a = if lhs_layout.dims().len() >= 3 {
+            lhs_layout.stride()[lhs_layout.dims().len() - 3]
+        } else {
+            m * k
+        };
+        let batch_stride_b = if rhs_rank >= 3 {
+            rhs_layout.stride()[rhs_rank - 3]
+        } else {
+            k * n
+        };
+        let params = BatchedGemvParams {
+            k_dim: k.try_into()?,
+            n_dim: n.try_into()?,
+            batch: b.try_into()?,
+            offset_a: lhs_layout.start_offset().try_into()?,
+            offset_b: rhs_layout.start_offset().try_into()?,
+            offset_d: 0,
+            batch_stride_a: batch_stride_a.try_into()?,
+            batch_stride_b: batch_stride_b.try_into()?,
+            batch_stride_d: n.try_into()?,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+            _pad4: 0,
+            _pad5: 0,
+            _pad6: 0,
+        };
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &rhs.buffer),
+            buffer_binding(2, &dst.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::ctx_gemv_f32_shader().ok_or_else(|| {
+            Error::Msg("wgpu shader ctx_gemv_f32.wgsl not embedded".into()).bt()
+        })?;
+        // grid.x = ceil(n / 32) head_dim tiles (32 columns/warp), grid.y = batch.
+        let wg_x = n.div_ceil(candle_wgpu_kernels::CTX_GEMV_F32_I_GROUP as usize);
+        let (wg_x, wg_y) = compute_2d_workgroups(
+            (wg_x as u32)
+                .checked_mul(b.try_into()?)
+                .ok_or_else(|| {
+                    Error::Msg("wgpu backend op ctx gemv workgroup overflow".into()).bt()
+                })?,
+            wgpu_dispatch_wg_cap(&self.device),
+        );
+        self.device.run_compute_xyz(
+            shader,
+            &entries,
+            &bindings,
+            (wg_x, wg_y, 1),
+            &[],
+            None,
+            "candle-wgpu-ctx-gemv",
         )?;
         Ok(dst)
     }
@@ -9636,25 +9911,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // m == 1). A GEMV reads B once, coalesced over K. Only fires when the
         // contiguous B view is available with no per-batch copy; any non-contiguous
         // or strided shape falls back to the generic dispatches below (still correct).
-        // This is the wgpu mirror of the Vulkan `run_batched_gemv_f32` guard (B10).
+        // This is the wgpu mirror of the Vulkan `run_batched_gemv_f32` guard (B10),
+        // relaxed to `batched_gemv_inner_contiguous` (eaab92cc) so a `narrow`ed
+        // prefix of a grown KV-cache backing (batch stride == capacity stride)
+        // routes to the single-dispatch GEMV without materializing B^T.
+        if rank > 2 && self.dtype == DType::F32 && m == 1 {
+            let rhs_t_src = rhs_l.transpose(rank - 2, rank - 1)?;
+            if lhs_l.dims()[..rank - 2] == rhs_l.dims()[..rank - 2]
+                && lhs_l.is_contiguous()
+                && Self::batched_gemv_inner_contiguous(&rhs_t_src)
+            {
+                let dst =
+                    self.run_batched_gemv_f32(rhs, lhs_l, &rhs_t_src, b, m, n, k)?;
+                return Ok(dst);
+            }
+        }
+        // m == 1 batched CONTEXT shape (probs @ V): V is the NATURAL-layout
+        // (batch, kv, head_dim) cache with head_dim contiguous inner and a possibly
+        // non-compact batch stride (a `narrow`ed grown-cache prefix). Reading V
+        // natively skips the per-token V^T materialization (the pp4096 residual on
+        // Vulkan). The score path's k^T view has a strided inner dim and never
+        // matches `batched_gemv_inner_contiguous`, so it keeps its own dispatch.
         if rank > 2
             && self.dtype == DType::F32
             && m == 1
             && lhs_l.dims()[..rank - 2] == rhs_l.dims()[..rank - 2]
+            && lhs_l.is_contiguous()
+            && lhs_l.start_offset() == 0
+            && Self::batched_gemv_inner_contiguous(rhs_l)
         {
-            let rhs_t_src = rhs_l.transpose(rank - 2, rank - 1)?;
-            if lhs_l.is_contiguous() && rhs_t_src.is_contiguous() {
-                let dst = self.run_batched_gemv_f32(
-                    rhs,
-                    lhs_l,
-                    &rhs_t_src,
-                    b,
-                    m,
-                    n,
-                    k,
-                )?;
-                return Ok(dst);
-            }
+            let dst = self.run_ctx_gemv_f32(rhs, lhs_l, rhs_l, b, m, n, k)?;
+            return Ok(dst);
         }
 
         let mut lhs_contiguous = None;
@@ -14381,7 +14668,8 @@ mod compute_2d_self_check {
     /// matmuls on wgpu — the whole-model divergence fixed by full-content hash).
     #[test]
     fn shader_cache_key_full_content() {
-        let n = 4096usize; // same length, same sampled regions by construction
+        // Same length, same sampled regions by construction: only the marker byte
+        // in shader B differs from shader A (see below).
         let a: String = format!(
             "{:064}\nconst distinct = 0u; // {}\n{:>04096}",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

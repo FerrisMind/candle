@@ -763,6 +763,31 @@ pub fn batched_gemv_f32_shader() -> Option<&'static str> {
     get("batched_gemv_f32.wgsl").map(|m| m.source())
 }
 
+/// Natural-layout m == 1 CONTEXT GEMV: out[b,i] = sum_l A[b,l]*V[b,l,i], reading V
+/// in its native (batch, l, head_dim) layout (no V^T materialization). Port of the
+/// Vulkan `ctx_gemv_f32.comp`.
+pub fn ctx_gemv_f32_shader() -> Option<&'static str> {
+    get("ctx_gemv_f32.wgsl").map(|m| m.source())
+}
+
+/// Workgroup size of the context GEMV shader (256 = 8 l-slice warps x 32 lanes).
+pub const CTX_GEMV_F32_WG_SIZE: u32 = 256;
+/// Output columns (head_dim positions) handled per warp (coalesced read width).
+pub const CTX_GEMV_F32_I_GROUP: u32 = 32;
+
+/// Fused DECODE attention (single query token per head), GQA in-kernel, online
+/// (flash) softmax over 64-position tiles. Replaces repeat_kv x2 + score GEMV +
+/// softmax + ctx matmul with ONE dispatch. Reads K/V via strides taken from the
+/// layouts so a `narrow`ed prefix of a grown KV-cache backing routes here.
+pub fn fused_decode_attn_f32_shader() -> Option<&'static str> {
+    get("fused_decode_attn_f32.wgsl").map(|m| m.source())
+}
+
+/// Workgroup size of the fused decode attention shader (one 128-thread group per
+/// query head) and the positions-per-tile (online-softmax tile width).
+pub const FUSED_DECODE_ATTN_WG_SIZE: u32 = 128;
+pub const FUSED_DECODE_ATTN_BC: u32 = 64;
+
 /// Workgroup size of the batched m == 1 GEMV shader (128 = 4 warps × 32 lanes).
 pub const BATCHED_GEMV_F32_WG_SIZE: u32 = 128;
 /// Number of output columns computed per workgroup (4 warps, one column each).

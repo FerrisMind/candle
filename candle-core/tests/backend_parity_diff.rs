@@ -27,7 +27,7 @@ mod support;
 use candle_core::test_utils::{
     compare_f32_slices, compare_f64_slices, compare_int_slices, diff_tolerance, is_integer_dtype,
 };
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Storage, Tensor};
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
@@ -2179,6 +2179,304 @@ fn test_strided_views(tracker: &mut SuiteTracker, gpu_backends: &[(String, Devic
 // Test entry points
 // ---------------------------------------------------------------------------
 
+/// Fused decode attention (wgpu-only, P1): one dispatch replaces repeat_kv x2 +
+/// score GEMV + softmax + ctx matmul for the single-token decode step. This case
+/// runs the fused kernel on wgpu and compares the (16, head_dim) O against the
+/// standard CPU chain q@k^T -> scale -> softmax_last_dim -> @v computed on the
+/// same (strided, capacity-backed) K/V views within the F32 tolerance.
+#[cfg(feature = "wgpu")]
+fn test_fused_decode_attn(tracker: &mut SuiteTracker, gpu_backends: &[(String, Device)]) {
+    let Some((_, wgpu_dev)) = gpu_backends.iter().find(|(name, _)| name == "wgpu") else {
+        return;
+    };
+    let cpu_dev = &Device::Cpu;
+    // Qwen3 decode shapes: 16 q-heads, 8 kv-heads, head_dim 128, ~a page of KV.
+    let (num_heads, num_kv_heads, head_dim, kv_len) = (16usize, 8usize, 128usize, 293usize);
+    let kv_head_stride_cap = 384usize; // grown backing capacity > live kv_len
+
+    let q_shape = vec![1, num_heads, 1, head_dim];
+    let kv_shape = vec![1, num_kv_heads, kv_head_stride_cap, head_dim];
+
+    let q_cpu = Tensor::from_vec(gen_f32(&q_shape, 42), q_shape.clone(), cpu_dev).unwrap();
+    let q_wgpu = Tensor::from_vec(gen_f32(&q_shape, 42), q_shape, wgpu_dev).unwrap();
+    let k_cpu = Tensor::from_vec(gen_f32(&kv_shape, 137), kv_shape.clone(), cpu_dev).unwrap();
+    let k_wgpu = Tensor::from_vec(gen_f32(&kv_shape, 137), kv_shape.clone(), wgpu_dev).unwrap();
+    let v_cpu = Tensor::from_vec(gen_f32(&kv_shape, 777), kv_shape.clone(), cpu_dev).unwrap();
+    let v_wgpu = Tensor::from_vec(gen_f32(&kv_shape, 777), kv_shape, wgpu_dev).unwrap();
+    // Live prefixes of the capacity backing -> strided (non-compact) batch views.
+    let k_cpu = k_cpu.narrow(2, 0, kv_len).unwrap();
+    let k_wgpu = k_wgpu.narrow(2, 0, kv_len).unwrap();
+    let v_cpu = v_cpu.narrow(2, 0, kv_len).unwrap();
+    let v_wgpu = v_wgpu.narrow(2, 0, kv_len).unwrap();
+    let scale = 1.0 / (head_dim as f64).sqrt();
+
+    // GPU: fused kernel via the public WgpuStorage method.
+    let (q_g, q_l) = q_wgpu.storage_and_layout();
+    let (k_g, k_l) = k_wgpu.storage_and_layout();
+    let (v_g, v_l) = v_wgpu.storage_and_layout();
+    let out = match (&*q_g, &*k_g, &*v_g) {
+        (Storage::Wgpu(qs), Storage::Wgpu(ks), Storage::Wgpu(vs)) => {
+            qs.run_fused_decode_attn_f32(ks, vs, q_l, k_l, v_l, scale as f32)
+        }
+        _ => Err(candle_core::Error::Msg("expected wgpu storage".into())),
+    };
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            tracker.record(CaseResult {
+                op: "fused_decode_attn".to_string(),
+                dtype: "F32".to_string(),
+                shape: format!("[{num_heads},{head_dim}]"),
+                backend: "wgpu".to_string(),
+                outcome: CaseOutcome::Fail(format!("fused decode attn op failed: {e}")),
+                expected_note: None,
+                max_abs_vs_cpu: 1e30,
+                max_rel_vs_cpu: 1e30,
+                max_ulp_vs_cpu: u64::MAX / 4,
+                max_abs_cross_gpu: 0.0,
+            });
+            return;
+        }
+    };
+    let fused = Tensor::from_storage(
+        Storage::Wgpu(out),
+        vec![1, num_heads, 1, head_dim],
+        candle_core::op::BackpropOp::none(),
+        false,
+    );
+
+    // CPU reference: repeat_kv -> scores -> scale -> softmax -> context matmul.
+    let repeat_kv = |x: &Tensor| -> candle_core::Result<Tensor> {
+        // Candle's `repeat_kv` (quantized_qwen3): cat the same kv tensor n_rep
+        // times along the seq dim (2) then reshape so head j reads kv head j/n_rep
+        // — the exact GQA ordering the fused kernel implements in-kernel.
+        let copies: Vec<Tensor> = (0..(num_heads / num_kv_heads))
+            .map(|_| x.clone())
+            .collect();
+        let stacked = Tensor::cat(&copies, 2)?;
+        stacked.reshape((1, num_heads, kv_len, head_dim))
+    };
+    let let_result = (|| -> candle_core::Result<Tensor> {
+        let k_heads = repeat_kv(&k_cpu)?;
+        let v_heads = repeat_kv(&v_cpu)?;
+        let scores = (q_cpu.matmul(&k_heads.transpose(2, 3)?)? * scale)?;
+        let probs = manual_softmax(&scores)?;
+        let ctx = probs.matmul(&v_heads)?;
+        Ok(ctx)
+    })();
+    let ctx_cpu = match let_result {
+        Ok(o) => o,
+        Err(e) => {
+            tracker.record(CaseResult {
+                op: "fused_decode_attn".to_string(),
+                dtype: "F32".to_string(),
+                shape: format!("[{num_heads},{head_dim}]"),
+                backend: "wgpu".to_string(),
+                outcome: CaseOutcome::Skip(format!("CPU reference failed: {e}")),
+                expected_note: None,
+                max_abs_vs_cpu: 0.0,
+                max_rel_vs_cpu: 0.0,
+                max_ulp_vs_cpu: 0,
+                max_abs_cross_gpu: 0.0,
+            });
+            return;
+        }
+    };
+
+    match compare_tensors(&fused, &ctx_cpu) {
+        Ok((max_abs, max_rel, max_ulp)) => {
+            let (atol, rtol) = diff_tolerance(DType::F32);
+            // Fail only if BOTH abs and rel are exceeded (matches the harness
+            // `check_vs_cpu` tolerance semantics for float comparisons).
+            if max_abs <= atol || max_rel <= rtol {
+                tracker.record(CaseResult {
+                    op: "fused_decode_attn".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: format!("[{num_heads},{head_dim}]"),
+                    backend: "wgpu".to_string(),
+                    outcome: CaseOutcome::Pass,
+                    expected_note: None,
+                    max_abs_vs_cpu: max_abs,
+                    max_rel_vs_cpu: max_rel,
+                    max_ulp_vs_cpu: max_ulp,
+                    max_abs_cross_gpu: 0.0,
+                });
+            } else {
+                tracker.record(CaseResult {
+                    op: "fused_decode_attn".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: format!("[{num_heads},{head_dim}]"),
+                    backend: "wgpu".to_string(),
+                    outcome: CaseOutcome::Fail(format!(
+                        "max_abs {max_abs:.3e} > atol {atol:.1e} or max_rel {max_rel:.3e} > rtol {rtol:.1e}"
+                    )),
+                    expected_note: None,
+                    max_abs_vs_cpu: max_abs,
+                    max_rel_vs_cpu: max_rel,
+                    max_ulp_vs_cpu: max_ulp,
+                    max_abs_cross_gpu: 0.0,
+                });
+            }
+        }
+        Err(e) => {
+            tracker.record(CaseResult {
+                op: "fused_decode_attn".to_string(),
+                dtype: "F32".to_string(),
+                shape: format!("[{num_heads},{head_dim}]"),
+                backend: "wgpu".to_string(),
+                outcome: CaseOutcome::Fail(format!("tensor compare failed: {e}")),
+                expected_note: None,
+                max_abs_vs_cpu: 1e30,
+                max_rel_vs_cpu: 1e30,
+                max_ulp_vs_cpu: u64::MAX / 4,
+                max_abs_cross_gpu: 0.0,
+            });
+        }
+    }
+}
+
+/// Context GEMV reading V in its NATURAL layout (wgpu-only, P1b): the m == 1
+/// `probs @ v` whose V is a `narrow`ed live prefix of a grown KV-cache backing
+/// (batch stride == capacity stride, head_dim inner contiguous). Exercises
+/// `run_ctx_gemv_f32`/`ctx_gemv_f32.wgsl` through the public matmul op and checks
+/// the result against the identical matmul on a compact (capacity == kv_len) CPU
+/// input within the F32 tolerance.
+#[cfg(feature = "wgpu")]
+fn test_ctx_gemv_natural(tracker: &mut SuiteTracker, gpu_backends: &[(String, Device)]) {
+    let Some((_, wgpu_dev)) = gpu_backends.iter().find(|(name, _)| name == "wgpu") else {
+        return;
+    };
+    let cpu_dev = &Device::Cpu;
+    // Qwen3 ctx-shape: 16 q-heads, head_dim 128, kv far shorter than backing cap.
+    let (heads, head_dim, kv_len, kv_cap) = (16usize, 128usize, 97usize, 256usize);
+
+    let probs_shape = vec![1, heads, 1, kv_len];
+    let v_shape = vec![1, heads, kv_cap, head_dim];
+
+    let probs_cpu = Tensor::from_vec(gen_f32(&probs_shape, 91), probs_shape.clone(), cpu_dev)
+        .unwrap();
+    let probs_wgpu = Tensor::from_vec(gen_f32(&probs_shape, 91), probs_shape, wgpu_dev).unwrap();
+    let v_cpu = Tensor::from_vec(gen_f32(&v_shape, 515), v_shape.clone(), cpu_dev).unwrap();
+    let v_wgpu = Tensor::from_vec(gen_f32(&v_shape, 515), v_shape.clone(), wgpu_dev).unwrap();
+    // Live prefix: strided (non-compact batch stride) natural-layout V on both.
+    let v_cpu = v_cpu.narrow(2, 0, kv_len).unwrap();
+    let v_wgpu = v_wgpu.narrow(2, 0, kv_len).unwrap();
+
+    let gpu = match probs_wgpu.matmul(&v_wgpu) {
+        Ok(o) => o,
+        Err(e) => {
+            tracker.record(CaseResult {
+                op: "ctx_gemv_natural".to_string(),
+                dtype: "F32".to_string(),
+                shape: format!("[{heads},1,{kv_len}]x[{kv_len},{head_dim}]"),
+                backend: "wgpu".to_string(),
+                outcome: CaseOutcome::Fail(format!("ctx gemv op failed: {e}")),
+                expected_note: None,
+                max_abs_vs_cpu: 1e30,
+                max_rel_vs_cpu: 1e30,
+                max_ulp_vs_cpu: u64::MAX / 4,
+                max_abs_cross_gpu: 0.0,
+            });
+            return;
+        }
+    };
+    let cpu = match probs_cpu.matmul(&v_cpu) {
+        Ok(o) => o,
+        Err(e) => {
+            tracker.record(CaseResult {
+                op: "ctx_gemv_natural".to_string(),
+                dtype: "F32".to_string(),
+                shape: format!("[{heads},1,{kv_len}]x[{kv_len},{head_dim}]"),
+                backend: "wgpu".to_string(),
+                outcome: CaseOutcome::Skip(format!("CPU reference failed: {e}")),
+                expected_note: None,
+                max_abs_vs_cpu: 0.0,
+                max_rel_vs_cpu: 0.0,
+                max_ulp_vs_cpu: 0,
+                max_abs_cross_gpu: 0.0,
+            });
+            return;
+        }
+    };
+
+    match compare_tensors(&gpu, &cpu) {
+        Ok((max_abs, max_rel, max_ulp)) => {
+            let (atol, rtol) = diff_tolerance(DType::F32);
+            if max_abs <= atol || max_rel <= rtol {
+                tracker.record(CaseResult {
+                    op: "ctx_gemv_natural".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: format!("[{heads},1,{kv_len}]x[{kv_len},{head_dim}]"),
+                    backend: "wgpu".to_string(),
+                    outcome: CaseOutcome::Pass,
+                    expected_note: None,
+                    max_abs_vs_cpu: max_abs,
+                    max_rel_vs_cpu: max_rel,
+                    max_ulp_vs_cpu: max_ulp,
+                    max_abs_cross_gpu: 0.0,
+                });
+            } else {
+                tracker.record(CaseResult {
+                    op: "ctx_gemv_natural".to_string(),
+                    dtype: "F32".to_string(),
+                    shape: format!("[{heads},1,{kv_len}]x[{kv_len},{head_dim}]"),
+                    backend: "wgpu".to_string(),
+                    outcome: CaseOutcome::Fail(format!(
+                        "max_abs {max_abs:.3e} > atol {atol:.1e} or max_rel {max_rel:.3e} > rtol {rtol:.1e}"
+                    )),
+                    expected_note: None,
+                    max_abs_vs_cpu: max_abs,
+                    max_rel_vs_cpu: max_rel,
+                    max_ulp_vs_cpu: max_ulp,
+                    max_abs_cross_gpu: 0.0,
+                });
+            }
+        }
+        Err(e) => {
+            tracker.record(CaseResult {
+                op: "ctx_gemv_natural".to_string(),
+                dtype: "F32".to_string(),
+                shape: format!("[{heads},1,{kv_len}]x[{kv_len},{head_dim}]"),
+                backend: "wgpu".to_string(),
+                outcome: CaseOutcome::Fail(format!("tensor compare failed: {e}")),
+                expected_note: None,
+                max_abs_vs_cpu: 1e30,
+                max_rel_vs_cpu: 1e30,
+                max_ulp_vs_cpu: u64::MAX / 4,
+                max_abs_cross_gpu: 0.0,
+            });
+        }
+    }
+}
+
+/// Fallback row-softmax (exp-normalize over the last dim) for a 4D scores tensor,
+/// used when the wgpu/vulkan softmax op isn't reachable from a CPU reference.
+#[cfg(feature = "wgpu")]
+fn manual_softmax(scores: &Tensor) -> candle_core::Result<Tensor> {
+    let s = scores.to_dtype(DType::F32)?;
+    let rank = s.rank();
+    let max = s.max(rank - 1)?.unsqueeze(rank - 1)?;
+    let expd = s.broadcast_sub(&max)?.exp()?;
+    let sum = expd.sum(rank - 1)?.unsqueeze(rank - 1)?;
+    expd.broadcast_div(&sum)?.to_dtype(scores.dtype())
+}
+
+/// Compare two tensors elementwise in F32, returning (max_abs, max_rel, max_ulp).
+#[cfg(feature = "wgpu")]
+fn compare_tensors(a: &Tensor, b: &Tensor) -> candle_core::Result<(f64, f64, u64)> {
+    if a.dims() != b.dims() {
+        return Err(candle_core::Error::Msg(format!(
+            "shape mismatch: {:?} vs {:?}",
+            a.dims(),
+            b.dims()
+        )));
+    }
+    let a = a.flatten_all()?.to_vec1::<f32>()?;
+    let b = b.flatten_all()?.to_vec1::<f32>()?;
+    let (max_abs, max_rel, max_ulp, _) = compare_f32_slices(&a, &b);
+    Ok((max_abs, max_rel, max_ulp))
+}
+
 #[test]
 fn diff_unary() -> Result<()> {
     let backends = probe_backends();
@@ -2364,6 +2662,10 @@ fn diff_misc() -> Result<()> {
     test_cumsum(&mut tracker, &backends.devices);
     test_affine_powf_elu(&mut tracker, &backends.devices);
     test_strided_views(&mut tracker, &backends.devices);
+    #[cfg(feature = "wgpu")]
+    test_fused_decode_attn(&mut tracker, &backends.devices);
+    #[cfg(feature = "wgpu")]
+    test_ctx_gemv_natural(&mut tracker, &backends.devices);
     eprintln!("{}", tracker.summary());
     let failures = tracker.failures_report();
     if !failures.is_empty() {
