@@ -1,0 +1,83 @@
+#version 450
+
+// Batched matrix-vector product for the m == 1 case: C[b, i] = sum_k A[b, k] * B[b, i, k]
+// (one batch-vector A per batch, one full (n x k) matrix B per batch).
+//
+// Motivation (see w-b10 results): the attention score/ctx matmuls are m == 1 over
+// batch == num_heads. The previous dispatch ran the generic DMMV kernel once per
+// head with per-head alloc + copy + dispatch (16 head x 2 matmuls x num_layers).
+// This kernel processes ALL batches in one dispatch and reads B once, coalesced.
+//
+// Layout assumptions (contiguous, guaranteed by the dispatch guard):
+//   A : (batch, k)      -> data_a[batch_stride_a * b + kk]
+//   B : (batch, n, k)   -> data_b[batch_stride_b * b + out_idx*k_dim + kk]
+//   D : (batch, n)      -> data_d[batch_stride_d * b + out_idx]
+//
+// Workgroup = 128 threads = 4 "output groups" (one warp/32 lanes per output column).
+// Within an output group the K reduction is split across the 32 lanes (coalesced
+// B reads), then the 32 partials are reduced through shared memory. This gives a
+// deterministic accumulation order and high occupancy even when n is small
+// (e.g. ctx matmul n == head_dim == 128) but k is large (k == seq_len).
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform parameter {
+    uint k_dim; // reduction length K
+    uint n_dim; // output length N
+    uint batch; // number of batches (heads)
+    uint offset_a; // start offset (elements) of A
+    uint offset_b; // start offset (elements) of B
+    uint offset_d; // start offset (elements) of D
+    uint batch_stride_a; // A batch stride (m * k, m == 1 => k)
+    uint batch_stride_b; // B batch stride (n * k)
+    uint batch_stride_d; // D batch stride (n)
+} p;
+
+// Number of output groups (warps) per workgroup == 128 / 32.
+const uint OUT_GROUPS = 4u;
+// Group size used for the coalesced K split.
+const uint K_GROUP = 32u;
+
+shared float sh_part[OUT_GROUPS][K_GROUP];
+
+layout(binding = 0) readonly buffer SrcA {
+    float data_a[];
+};
+layout(binding = 1) readonly buffer SrcB {
+    float data_b[];
+};
+layout(binding = 2) writeonly buffer Dst {
+    float data_d[];
+};
+
+void main() {
+    const uint batch_idx = gl_WorkGroupID.y;
+    const uint group = gl_LocalInvocationID.x / K_GROUP; // which output column (0..OUT_GROUPS-1)
+    const uint lane = gl_LocalInvocationID.x % K_GROUP; // which K slice
+
+    const uint out_idx = gl_WorkGroupID.x * OUT_GROUPS + group;
+    const bool valid = out_idx < p.n_dim;
+
+    const uint a_base = p.offset_a + batch_idx * p.batch_stride_a;
+    const uint b_base = p.offset_b + batch_idx * p.batch_stride_b;
+    const uint d_base = p.offset_d + batch_idx * p.batch_stride_d;
+
+    float acc = 0.0f;
+    for (uint kk = lane; kk < p.k_dim; kk += K_GROUP) {
+        // Guard the B read so a partial output tile never touches out-of-range rows.
+        const float bv = valid ? data_b[b_base + out_idx * p.k_dim + kk] : 0.0f;
+        acc = fma(data_a[a_base + kk], bv, acc);
+    }
+
+    sh_part[group][lane] = acc;
+    barrier();
+
+    if (lane == 0u) {
+        float sum = sh_part[group][0];
+        for (uint t = 1u; t < K_GROUP; ++t) {
+            sum += sh_part[group][t];
+        }
+        if (valid) {
+            data_d[d_base + out_idx] = sum;
+        }
+    }
+}

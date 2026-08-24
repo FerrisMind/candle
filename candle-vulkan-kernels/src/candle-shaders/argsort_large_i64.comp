@@ -34,7 +34,19 @@ layout(push_constant) uniform parameter {
 bool should_swap(const SortPair a, const SortPair b, const bool needs_bounds_check) {
     const bool a_oob = needs_bounds_check ? a.idx >= p.ncols : false;
     const bool b_oob = needs_bounds_check ? b.idx >= p.ncols : false;
-    return a_oob || (!b_oob && a.val > b.val);
+    if (a_oob) {
+        return true;
+    }
+    if (b_oob) {
+        return false;
+    }
+    // Stable total order: (key, original index). Equal keys resolve by
+    // ascending original index in BOTH directions, matching CPU sort_by
+    // stability. DESC inverts the key comparison only.
+    if (a.val == b.val) {
+        return a.idx > b.idx;
+    }
+    return (p.order == ASC) ? (a.val > b.val) : (a.val < b.val);
 }
 
 void argsort(bool needs_bounds_check, const uint row) {
@@ -92,11 +104,7 @@ void argsort(bool needs_bounds_check, const uint row) {
         [[unroll]] for (int u = 0; u < WG_UNROLL_FACTOR; ++u) {
             uint c = uint(u * BLOCK_SIZE + col);
             if (c < p.ncols) {
-                if (p.order == ASC) {
-                    data_d[row_offset + c] = tmp_idx[idx_offset + c].idx;
-                } else {
-                    data_d[row_offset + p.ncols - c - 1] = tmp_idx[idx_offset + c].idx;
-                }
+                data_d[row_offset + c] = tmp_idx[idx_offset + c].idx;
             }
         }
     }

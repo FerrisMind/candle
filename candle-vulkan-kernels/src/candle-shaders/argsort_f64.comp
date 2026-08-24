@@ -52,7 +52,19 @@ bool f64_gt(const SortPair a, const SortPair b) {
 bool should_swap(const SortPair a, const SortPair b, const bool needs_bounds_check) {
     const bool a_oob = needs_bounds_check ? a.idx >= p.ncols : false;
     const bool b_oob = needs_bounds_check ? b.idx >= p.ncols : false;
-    return a_oob || (!b_oob && f64_gt(a, b));
+    if (a_oob) {
+        return true;
+    }
+    if (b_oob) {
+        return false;
+    }
+    // Stable total order: (key, original index). Equal keys resolve by
+    // ascending original index in BOTH directions, matching CPU sort_by
+    // stability. DESC inverts the key comparison only.
+    if (a.lo == b.lo && a.hi == b.hi) {
+        return a.idx > b.idx;
+    }
+    return (p.order == ASC) ? f64_gt(a, b) : f64_lt(a, b);
 }
 
 void argsort(bool needs_bounds_check, const uint row) {
@@ -92,11 +104,7 @@ void argsort(bool needs_bounds_check, const uint row) {
     }
 
     if (col < p.ncols) {
-        if (p.order == ASC) {
-            data_d[row_offset + uint(col)] = dst_row[col].idx;
-        } else {
-            data_d[row_offset + p.ncols - uint(col) - 1] = dst_row[col].idx;
-        }
+        data_d[row_offset + uint(col)] = dst_row[col].idx;
     }
 }
 

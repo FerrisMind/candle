@@ -263,6 +263,25 @@ pub fn rope_shader(dtype: DType, workgroup_size: u32) -> Option<String> {
     Some(preprocess(source, &defines, &replacements, dtype))
 }
 
+/// Fused RoPE with precomputed cos/sin tables (used by the wgpu device-gated rope
+/// path for F32/F16; mirrors `rope_shader` but reads two separate cos/sin buffers).
+pub fn rope_cs_shader(dtype: DType, workgroup_size: u32) -> Option<String> {
+    let source = get("rope_cs.wgsl")?.source();
+    let mut defines = vec!["WG_SIZE".to_string()];
+    let mut replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    match dtype {
+        DType::F32 => {
+            defines.push("TYPE_F32".to_string());
+            replacements.push(("DataType".to_string(), "f32".to_string()));
+        }
+        DType::F16 => {
+            defines.push("TYPE_F16".to_string());
+            replacements.push(("DataType".to_string(), "f16".to_string()));
+        }
+    }
+    Some(preprocess(source, &defines, &replacements, dtype))
+}
+
 fn argsort_shader_for_type(workgroup_size: u32, asc: bool, src_type: &str) -> Option<String> {
     let source = get("argsort.wgsl")?.source();
     let mut defines = vec!["WG_SIZE".to_string()];
@@ -285,19 +304,100 @@ fn argsort_shader_for_type(workgroup_size: u32, asc: bool, src_type: &str) -> Op
     Some(preprocess(source, &defines, &replacements, DType::F32))
 }
 
+/// F32 argsort (intra-tile). Uses the orderable-key transform (sign flip):
+/// the raw bitcast orders negative floats above all positives under
+/// unsigned comparison, which produced wrong order for any data with
+/// negatives.
 pub fn argsort_shader(workgroup_size: u32, asc: bool) -> Option<String> {
-    argsort_shader_for_type(workgroup_size, asc, "f32")
+    argsort_keyed_shader(
+        workgroup_size,
+        asc,
+        "f32",
+        "(bitcast<u32>(src[i]) ^ select(0x80000000u, 0xFFFFFFFFu, (bitcast<u32>(src[i]) & 0x80000000u) != 0u))",
+    )
 }
 
 pub fn argsort_u32_shader(workgroup_size: u32, asc: bool) -> Option<String> {
     argsort_shader_for_type(workgroup_size, asc, "u32")
 }
 
-fn argsort_merge_shader_for_type(workgroup_size: u32, asc: bool, src_type: &str) -> Option<String> {
+/// Extended-dtype argsort: values are read as their storage type and mapped to
+/// orderable u32 keys inside the shader (CUDA sort.cu key trick).
+pub fn argsort_keyed_shader(
+    workgroup_size: u32,
+    asc: bool,
+    src_type: &str,
+    sort_key: &str,
+) -> Option<String> {
+    let source = get("argsort.wgsl")?.source();
+    let mut defines = vec![
+        "WG_SIZE".to_string(),
+        "KEY_ORDERABLE".to_string(),
+        "KEY_FN".to_string(),
+    ];
+    if asc {
+        defines.push("ORDER == 0".to_string());
+    }
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        (
+            "ORDER".to_string(),
+            if asc {
+                "0".to_string()
+            } else {
+                "1".to_string()
+            },
+        ),
+        ("SRC_TYPE".to_string(), src_type.to_string()),
+        ("KEY_BODY".to_string(), sort_key.to_string()),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
+pub fn argsort_i32_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    argsort_keyed_shader(workgroup_size, asc, "i32", "orderable_from_i32(src[i])")
+}
+
+pub fn argsort_i16_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    // i16 stored as u32 words (2 per word) is not the layout here: the host
+    // uploads a materialized i16 buffer reinterpreted as i32 lanes.
+    argsort_keyed_shader(workgroup_size, asc, "i32", "orderable_from_i16(src[i])")
+}
+
+pub fn argsort_u8_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    argsort_keyed_shader(workgroup_size, asc, "u32", "orderable_from_u8(src[i])")
+}
+
+pub fn argsort_f16_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    argsort_keyed_shader(workgroup_size, asc, "f32", "orderable_from_f32(src[i])")
+}
+
+pub fn argsort_bf16_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    argsort_keyed_shader(workgroup_size, asc, "f32", "orderable_from_f32(src[i])")
+}
+
+pub fn argsort_f8e4m3_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    argsort_keyed_shader(
+        workgroup_size,
+        asc,
+        "u32",
+        "orderable_from_f8e4m3_bits(src[i])",
+    )
+}
+
+fn argsort_merge_shader_for_type(
+    workgroup_size: u32,
+    asc: bool,
+    src_type: &str,
+    key_body: Option<&str>,
+) -> Option<String> {
     let source = get("argsort_merge.wgsl")?.source();
     let mut defines = vec!["WG_SIZE".to_string()];
     if asc {
         defines.push("ORDER == 0".to_string());
+    }
+    if key_body.is_some() {
+        defines.push("KEY_FN".to_string());
     }
     let replacements = vec![
         ("WG_SIZE".to_string(), workgroup_size.to_string()),
@@ -312,15 +412,90 @@ fn argsort_merge_shader_for_type(workgroup_size: u32, asc: bool, src_type: &str)
     ];
     let mut replacements = replacements;
     replacements.push(("SRC_TYPE".to_string(), src_type.to_string()));
+    if let Some(body) = key_body {
+        replacements.push(("KEY_BODY".to_string(), body.to_string()));
+    }
     Some(preprocess(source, &defines, &replacements, DType::F32))
 }
 
+/// F32 merge pass. The key MUST be the orderable transform (sign flip), not
+/// the raw bitcast: raw unsigned comparison orders negative floats above all
+/// positives, which produced unsorted multi-tile output.
 pub fn argsort_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
-    argsort_merge_shader_for_type(workgroup_size, asc, "f32")
+    argsort_merge_shader_for_type(
+        workgroup_size,
+        asc,
+        "f32",
+        Some("(bitcast<u32>(src[i]) ^ select(0x80000000u, 0xFFFFFFFFu, (bitcast<u32>(src[i]) & 0x80000000u) != 0u))"),
+    )
 }
 
+/// U32 merge pass (also serves U8 keys widened to u32 words: identity order).
 pub fn argsort_u32_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
-    argsort_merge_shader_for_type(workgroup_size, asc, "u32")
+    argsort_merge_shader_for_type(workgroup_size, asc, "u32", None)
+}
+
+/// F8E4M3 merge pass: storage is one f8 byte per u32 word; the key decodes
+/// the byte and applies the orderable transform (see KEY_F8E4M3 helpers in
+/// argsort_merge.wgsl).
+pub fn argsort_f8e4m3_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    let source = get("argsort_merge.wgsl")?.source();
+    let mut defines = vec![
+        "WG_SIZE".to_string(),
+        "KEY_FN".to_string(),
+        "KEY_F8E4M3".to_string(),
+    ];
+    if asc {
+        defines.push("ORDER == 0".to_string());
+    }
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        (
+            "ORDER".to_string(),
+            if asc {
+                "0".to_string()
+            } else {
+                "1".to_string()
+            },
+        ),
+        ("SRC_TYPE".to_string(), "u32".to_string()),
+        (
+            "KEY_BODY".to_string(),
+            "orderable_from_f32(decode_f8e4m3(src[i]))".to_string(),
+        ),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
+/// Orderable-key merge pass for widened integer keys (i32 words with sign
+/// flip) — mirrors argsort_keyed_shader's key construction.
+pub fn argsort_i32_merge_shader(workgroup_size: u32, asc: bool) -> Option<String> {
+    let source = get("argsort_merge.wgsl")?.source();
+    let mut defines = vec![
+        "WG_SIZE".to_string(),
+        "KEY_ORDERABLE".to_string(),
+        "KEY_FN".to_string(),
+    ];
+    if asc {
+        defines.push("ORDER == 0".to_string());
+    }
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        (
+            "ORDER".to_string(),
+            if asc {
+                "0".to_string()
+            } else {
+                "1".to_string()
+            },
+        ),
+        ("SRC_TYPE".to_string(), "i32".to_string()),
+        (
+            "KEY_BODY".to_string(),
+            "(bitcast<u32>(src[i]) ^ 0x80000000u)".to_string(),
+        ),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
 }
 
 pub fn cumsum_shader(workgroup_size: u32) -> Option<String> {
@@ -455,6 +630,57 @@ pub fn set_rows_add_f16_shader(workgroup_size: u32) -> Option<String> {
     Some(preprocess(source, &defines, &replacements, DType::F16))
 }
 
+/// u32 scatter-add via native atomicAdd.
+pub fn set_rows_add_u32_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("set_rows.wgsl")?.source();
+    let defines = vec!["ADD".to_string(), "ADD_U32".to_string()];
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        ("SRC_TYPE".to_string(), "u32".to_string()),
+        ("DST_INNER_TYPE".to_string(), "u32".to_string()),
+        ("DST_TYPE".to_string(), "u32".to_string()),
+        ("VEC_SIZE".to_string(), "1".to_string()),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
+/// u8 scatter-add: src is u8 elements (read as u32 words, lane extracted),
+/// dst updated with byte-lane CAS on the containing u32 word.
+pub fn set_rows_add_u8_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("set_rows.wgsl")?.source();
+    let defines = vec![
+        "ADD".to_string(),
+        "ADD_U32".to_string(),
+        "ADD_U8_MODE".to_string(),
+    ];
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        ("SRC_TYPE".to_string(), "u32".to_string()),
+        ("DST_INNER_TYPE".to_string(), "u32".to_string()),
+        ("DST_TYPE".to_string(), "u32".to_string()),
+        ("VEC_SIZE".to_string(), "1".to_string()),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
+/// i64 scatter-add: two u32 words per element, integer carry CAS pair.
+pub fn set_rows_add_i64_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("set_rows.wgsl")?.source();
+    let defines = vec![
+        "ADD".to_string(),
+        "ADD_U32".to_string(),
+        "ADD_I64_MODE".to_string(),
+    ];
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        ("SRC_TYPE".to_string(), "vec2<u32>".to_string()),
+        ("DST_INNER_TYPE".to_string(), "u32".to_string()),
+        ("DST_TYPE".to_string(), "u32".to_string()),
+        ("VEC_SIZE".to_string(), "1".to_string()),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
 pub fn matmul_f32_shader() -> Option<String> {
     let source = get("mul_mat.wgsl")?.source().replace(
         "#include \"common_decls.tmpl\"",
@@ -530,6 +756,42 @@ pub fn matmul_coop_shader() -> Option<&'static str> {
 pub fn matmul_coop_64_shader() -> Option<&'static str> {
     get("mul_mat_coop_64.wgsl").map(|m| m.source())
 }
+
+/// Batched m == 1 GEMV (attention score/ctx shapes): C[b,i] = sum_k A[b,k]*B[b,i,k].
+/// Single dispatch over all batches; port of the Vulkan `batched_gemv_f32.comp`.
+pub fn batched_gemv_f32_shader() -> Option<&'static str> {
+    get("batched_gemv_f32.wgsl").map(|m| m.source())
+}
+
+/// Natural-layout m == 1 CONTEXT GEMV: out[b,i] = sum_l A[b,l]*V[b,l,i], reading V
+/// in its native (batch, l, head_dim) layout (no V^T materialization). Port of the
+/// Vulkan `ctx_gemv_f32.comp`.
+pub fn ctx_gemv_f32_shader() -> Option<&'static str> {
+    get("ctx_gemv_f32.wgsl").map(|m| m.source())
+}
+
+/// Workgroup size of the context GEMV shader (256 = 8 l-slice warps x 32 lanes).
+pub const CTX_GEMV_F32_WG_SIZE: u32 = 256;
+/// Output columns (head_dim positions) handled per warp (coalesced read width).
+pub const CTX_GEMV_F32_I_GROUP: u32 = 32;
+
+/// Fused DECODE attention (single query token per head), GQA in-kernel, online
+/// (flash) softmax over 64-position tiles. Replaces repeat_kv x2 + score GEMV +
+/// softmax + ctx matmul with ONE dispatch. Reads K/V via strides taken from the
+/// layouts so a `narrow`ed prefix of a grown KV-cache backing routes here.
+pub fn fused_decode_attn_f32_shader() -> Option<&'static str> {
+    get("fused_decode_attn_f32.wgsl").map(|m| m.source())
+}
+
+/// Workgroup size of the fused decode attention shader (one 128-thread group per
+/// query head) and the positions-per-tile (online-softmax tile width).
+pub const FUSED_DECODE_ATTN_WG_SIZE: u32 = 128;
+pub const FUSED_DECODE_ATTN_BC: u32 = 64;
+
+/// Workgroup size of the batched m == 1 GEMV shader (128 = 4 warps × 32 lanes).
+pub const BATCHED_GEMV_F32_WG_SIZE: u32 = 128;
+/// Number of output columns computed per workgroup (4 warps, one column each).
+pub const BATCHED_GEMV_F32_OUTPUTS_PER_WG: u32 = 4;
 
 pub fn matmul_fast_shader(dtype: DType, vectorized: bool) -> Option<String> {
     let source = get("mul_mat_reg_tile.wgsl")?
@@ -825,6 +1087,11 @@ pub fn quantized_matvec_shader(dtype: QuantizedDType, rhs_dtype: DType) -> Optio
     let outputs_per_wg = quantized_matvec_outputs_per_wg(dtype);
     let mut defines = vec![
         "SCALAR".to_string(),
+        // Naga (wgpu 29) does not implement `enable subgroups;`, and the
+        // `enable -extension` validation rejects any shader declaring it, so the
+        // subgroup-reduction branch (USE_SUBGROUP_REDUCTION) below cannot be used
+        // on this backend. Use the portable 8-barrier workgroup tree instead (the
+        // llama.cpp / wgpu-llm subgroup option is unavailable here).
         "USE_WORKGROUP_REDUCTION".to_string(),
         "BYTE_HELPERS".to_string(),
         "U32_DEQUANT_HELPERS".to_string(),
@@ -867,6 +1134,14 @@ pub fn quantized_matmul_fast_shader(dtype: QuantizedDType, rhs_dtype: DType) -> 
         quantized_mul_acc_define(dtype).to_string(),
         quantized_mul_mat_id_init_define(dtype).to_string(),
         "INIT_SRC1_SHMEM_FLOAT".to_string(),
+        // Full-precision f32 workgroup cache for the dequantized weights. The
+        // CPU/CUDA/llama.cpp reference dequantizes K-quants at f32 precision
+        // (int nibble * f32 d, endpoint-scaled per 64-wide group); demoting the
+        // dequantized weights to f16 shmem rounds `d * sc` per element, which is
+        // a FIXED (weight-only) perturbation that compounds through the residual
+        // stream across layers. Q8_1 already used FLOAT_ACC_SHMEM (67e07ec5
+        // mirror); extend the same path to every quantized dtype.
+        "FLOAT_ACC_SHMEM".to_string(),
     ];
     let src1_type = match rhs_dtype {
         DType::F32 => "f32",
@@ -952,15 +1227,20 @@ pub fn quantized_mul_mat_id_shader(dtype: QuantizedDType, rhs_dtype: DType) -> O
             "#include \"mul_mat_decls.tmpl\"",
             get("mul_mat_decls.tmpl")?.source(),
         );
-    let defines = vec![
-        "MUL_MAT_ID".to_string(),
-        "SCALAR".to_string(),
-        "BYTE_HELPERS".to_string(),
-        "DECLARE_BYTE_LOADERS_SRC0".to_string(),
-        "INIT_SRC1_SHMEM_FLOAT".to_string(),
-        "U32_DEQUANT_HELPERS".to_string(),
-        quantized_mul_mat_id_init_define(dtype).to_string(),
-    ];
+    let (mut defines, _, _) = quantized_shader_config(dtype);
+    defines.push("MUL_MAT_ID".to_string());
+    defines.push("SCALAR".to_string());
+    defines.push("BYTE_HELPERS".to_string());
+    defines.push("DECLARE_BYTE_LOADERS_SRC0".to_string());
+    defines.push("INIT_SRC1_SHMEM_FLOAT".to_string());
+    defines.push("U32_DEQUANT_HELPERS".to_string());
+    defines.push(quantized_mul_mat_id_init_define(dtype).to_string());
+    defines.push("TILE_M".to_string());
+    defines.push("TILE_N".to_string());
+    defines.push("WORKGROUP_SIZE_M".to_string());
+    defines.push("WORKGROUP_SIZE_N".to_string());
+    defines.push("TILE_K".to_string());
+
     let src1_type = match rhs_dtype {
         DType::F32 => "f32",
         DType::F16 => "f16",
@@ -968,6 +1248,9 @@ pub fn quantized_mul_mat_id_shader(dtype: QuantizedDType, rhs_dtype: DType) -> O
     let replacements = vec![
         ("SRC0_TYPE".to_string(), "u32".to_string()),
         ("SRC1_TYPE".to_string(), src1_type.to_string()),
+        ("SRC0_INNER_TYPE".to_string(), "u32".to_string()),
+        ("SRC1_INNER_TYPE".to_string(), src1_type.to_string()),
+        ("DST_TYPE".to_string(), "f32".to_string()),
         ("TILE_M".to_string(), "4u".to_string()),
         ("TILE_N".to_string(), "4u".to_string()),
         ("TILE_K".to_string(), "32u".to_string()),
@@ -991,6 +1274,39 @@ pub fn conv2d_f32_shader(workgroup_size: u32) -> Option<String> {
     Some(preprocess(&source, &defines, &replacements, DType::F32))
 }
 
+/// Native F16 conv2d/conv1d (CUDA parity: f16 in, f32 accumulate, f16 out).
+pub fn conv2d_f16_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("conv2d.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let defines = vec![
+        "WEIGHT_F16".to_string(),
+        "INPUT_F16".to_string(),
+        "OUTPUT_F16".to_string(),
+    ];
+    let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    Some(preprocess(&source, &defines, &replacements, DType::F16))
+}
+
+/// Native BF16 conv2d/conv1d (CUDA parity: bf16 in, f32 accumulate, bf16 out;
+/// packed two-per-u32-word storage with atomic output word merge).
+pub fn conv2d_bf16_shader(workgroup_size: u32) -> Option<String> {
+    let source = get("conv2d.wgsl")?.source().replace(
+        "#include \"common_decls.tmpl\"",
+        get("common_decls.tmpl")?.source(),
+    );
+    let defines = vec![
+        "WEIGHT_BF16".to_string(),
+        "INPUT_BF16".to_string(),
+        "OUTPUT_BF16".to_string(),
+    ];
+    let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    // BF16 uses only u32 bit-twiddling, no f16 scalar types: strip the f16
+    // enable so the shader also compiles on adapters without SHADER_F16.
+    Some(preprocess(&source, &defines, &replacements, DType::F32))
+}
+
 pub fn im2col_f32_shader(workgroup_size: u32) -> Option<String> {
     let source = get("im2col.wgsl")?.source().replace(
         "#include \"common_decls.tmpl\"",
@@ -999,6 +1315,117 @@ pub fn im2col_f32_shader(workgroup_size: u32) -> Option<String> {
     let defines = vec!["INPUT_F32".to_string(), "OUTPUT_F32".to_string()];
     let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
     Some(preprocess(&source, &defines, &replacements, DType::F32))
+}
+
+fn pool_shader(workgroup_size: u32, avg: bool, dtype: DType) -> Option<String> {
+    let source = get("pool.wgsl")?.source();
+    let mut defines = vec![
+        "WG_SIZE".to_string(),
+        if avg { "POOL_AVG" } else { "POOL_MAX" }.to_string(),
+    ];
+    let mut replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+    match dtype {
+        DType::F32 => {
+            defines.push("SRC_F32".to_string());
+            defines.push("DST_F32".to_string());
+            replacements.push(("SRC_TYPE".to_string(), "f32".to_string()));
+            replacements.push(("DST_TYPE".to_string(), "f32".to_string()));
+        }
+        DType::F16 => {
+            defines.push("SRC_F16".to_string());
+            defines.push("DST_F16".to_string());
+            replacements.push(("SRC_TYPE".to_string(), "f16".to_string()));
+            replacements.push(("DST_TYPE".to_string(), "f16".to_string()));
+        }
+    }
+    Some(preprocess(source, &defines, &replacements, dtype))
+}
+
+/// BF16 2D pool: tensors are u32 words with two BF16 halves per word; the
+/// shader decodes to f32, reduces there, and CAS-writes the halves back.
+fn pool_bf16_shader(workgroup_size: u32, avg: bool) -> Option<String> {
+    let source = get("pool.wgsl")?.source();
+    let defines = vec![
+        "WG_SIZE".to_string(),
+        if avg { "POOL_AVG" } else { "POOL_MAX" }.to_string(),
+        "SRC_BF16".to_string(),
+        "DST_BF16".to_string(),
+    ];
+    let replacements = vec![
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+        ("SRC_TYPE".to_string(), "u32".to_string()),
+        ("DST_TYPE".to_string(), "u32".to_string()),
+    ];
+    Some(preprocess(source, &defines, &replacements, DType::F32))
+}
+
+pub fn pool_max_f32_shader(workgroup_size: u32) -> Option<String> {
+    pool_shader(workgroup_size, false, DType::F32)
+}
+
+pub fn pool_max_f16_shader(workgroup_size: u32) -> Option<String> {
+    pool_shader(workgroup_size, false, DType::F16)
+}
+
+pub fn pool_max_bf16_shader(workgroup_size: u32) -> Option<String> {
+    pool_bf16_shader(workgroup_size, false)
+}
+
+pub fn pool_avg_f32_shader(workgroup_size: u32) -> Option<String> {
+    pool_shader(workgroup_size, true, DType::F32)
+}
+
+pub fn pool_avg_f16_shader(workgroup_size: u32) -> Option<String> {
+    pool_shader(workgroup_size, true, DType::F16)
+}
+
+pub fn pool_avg_bf16_shader(workgroup_size: u32) -> Option<String> {
+    pool_bf16_shader(workgroup_size, true)
+}
+
+/// Shared native-dtype upsample variant: `mode` is one of NEAREST1D/NEAREST2D/
+/// BILINEAR2D, `src_type` is the WGSL storage element type ("f32"/"f16"/"u32"
+/// for bf16). `SRC_TYPE` is replaced token-wise and the matching SRC_F32/
+/// SRC_F16/SRC_BF16 `#ifdef` is enabled so the shader's load/store helpers
+/// (and `enable f16` for the F16 variant) are selected consistently.
+fn upsample_shader(mode: &str, src_type: &str, workgroup_size: u32) -> Option<String> {
+    let source = get("upsample.wgsl")?.source();
+    let dtype_def = match src_type {
+        "f32" => "SRC_F32",
+        "f16" => "SRC_F16",
+        _ => "SRC_BF16",
+    };
+    let defines = vec![
+        mode.to_string(),
+        dtype_def.to_string(),
+        "WG_SIZE".to_string(),
+    ];
+    let replacements = vec![
+        ("SRC_TYPE".to_string(), src_type.to_string()),
+        ("WG_SIZE".to_string(), workgroup_size.to_string()),
+    ];
+    let pre_dtype = if src_type == "f16" {
+        DType::F16
+    } else {
+        DType::F32
+    };
+    Some(preprocess(source, &defines, &replacements, pre_dtype))
+}
+
+/// Native nearest1d upsample. `src_type` = "f32" | "f16" | "u32" (bf16 halves).
+pub fn upsample_nearest1d_shader(workgroup_size: u32, src_type: &str) -> Option<String> {
+    upsample_shader("NEAREST1D", src_type, workgroup_size)
+}
+
+/// Native nearest2d upsample. `src_type` = "f32" | "f16" | "u32" (bf16 halves).
+pub fn upsample_nearest2d_shader(workgroup_size: u32, src_type: &str) -> Option<String> {
+    upsample_shader("NEAREST2D", src_type, workgroup_size)
+}
+
+/// Native bilinear2d upsample (per-axis host weights, interpolation in f32).
+/// `src_type` = "f32" | "f16" | "u32" (bf16 halves).
+pub fn upsample_bilinear2d_shader(workgroup_size: u32, src_type: &str) -> Option<String> {
+    upsample_shader("BILINEAR2D", src_type, workgroup_size)
 }
 
 pub fn fill_inplace_shader(dtype: DType, workgroup_size: u32) -> String {
@@ -1019,6 +1446,42 @@ pub fn fill_inplace_shader(dtype: DType, workgroup_size: u32) -> String {
         }
     }
     preprocess(UNARY_WGSL.source(), &defines, &replacements, dtype)
+}
+
+pub fn quantize_q8_1_shader() -> Option<String> {
+    Some(get("quantize_q8_1.wgsl")?.source().to_string())
+}
+
+pub fn quantize_q8_1_roundtrip_shader() -> Option<String> {
+    Some(get("quantize_q8_1_roundtrip.wgsl")?.source().to_string())
+}
+
+pub fn quantize_q8_0_shader() -> Option<String> {
+    Some(get("quantize_q8_0.wgsl")?.source().to_string())
+}
+
+pub fn quantize_q4_0_shader() -> Option<String> {
+    Some(get("quantize_q4_0.wgsl")?.source().to_string())
+}
+
+pub fn quantize_q4_1_shader() -> Option<String> {
+    Some(get("quantize_q4_1.wgsl")?.source().to_string())
+}
+
+pub fn quantize_q5_0_shader() -> Option<String> {
+    Some(get("quantize_q5_0.wgsl")?.source().to_string())
+}
+
+pub fn quantize_q5_1_shader() -> Option<String> {
+    Some(get("quantize_q5_1.wgsl")?.source().to_string())
+}
+
+pub fn dequant_nvfp4_shader() -> Option<String> {
+    Some(get("dequant_nvfp4.wgsl")?.source().to_string())
+}
+
+pub fn dequant_mxfp4_shader() -> Option<String> {
+    Some(get("dequant_mxfp4.wgsl")?.source().to_string())
 }
 
 #[derive(Clone, Copy)]
@@ -1176,6 +1639,7 @@ fn replace_token(line: &str, name: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{shader, BinaryOp, DType, ShaderOp, UnaryOp};
+    type PoolShaderFn = fn(u32) -> Option<String>;
 
     #[test]
     fn preprocesses_rand_uniform_wgsl() {
@@ -1244,5 +1708,141 @@ mod tests {
         assert!(source.contains("enable f16;"));
         assert!(source.contains("atomic_add_f16"));
         assert!(!source.contains("atomic_add_f32"));
+    }
+
+    #[test]
+    fn test_quantized_mul_mat_id_shader() {
+        use super::QuantizedDType::*;
+        for dt in [
+            Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K,
+        ] {
+            let s = super::quantized_mul_mat_id_shader(dt, DType::F32).expect("moe shader");
+            assert!(
+                s.contains("fn init_shmem_src0"),
+                "Shader for {dt:?} missing init_shmem_src0"
+            );
+        }
+    }
+
+    #[test]
+    fn pool_f32_shader_resolves_types() {
+        let shaders: &[(PoolShaderFn, &str)] = &[
+            (super::pool_max_f32_shader, "POOL_MAX"),
+            (super::pool_avg_f32_shader, "POOL_AVG"),
+        ];
+        for &(getter, op) in shaders {
+            let s = getter(256).expect("pool f32");
+            assert!(s.contains("@compute @workgroup_size(256)"));
+            assert!(s.contains("array<f32>"), "f32 {op} must use f32 arrays");
+            assert!(
+                !s.contains("#ifdef"),
+                "preprocessor must be resolved for {op}"
+            );
+            assert!(
+                !s.contains("#endif"),
+                "preprocessor must be resolved for {op}"
+            );
+            assert!(
+                !s.contains("enable f16"),
+                "f32 {op} must not keep enable f16"
+            );
+        }
+    }
+
+    #[test]
+    fn pool_f16_shader_keeps_f16_extension() {
+        let shaders: &[(PoolShaderFn, &str)] = &[
+            (super::pool_max_f16_shader, "POOL_MAX"),
+            (super::pool_avg_f16_shader, "POOL_AVG"),
+        ];
+        for &(getter, op) in shaders {
+            let s = getter(256).expect("pool f16");
+            assert!(s.contains("enable f16;"), "f16 {op} must keep enable f16");
+            assert!(s.contains("array<f16>"), "f16 {op} must use f16 arrays");
+            assert!(
+                !s.contains("#ifdef"),
+                "preprocessor must be resolved for {op}"
+            );
+        }
+    }
+
+    #[test]
+    fn pool_bf16_shader_uses_word_helpers() {
+        let shaders: &[(PoolShaderFn, &str)] = &[
+            (super::pool_max_bf16_shader, "POOL_MAX"),
+            (super::pool_avg_bf16_shader, "POOL_AVG"),
+        ];
+        for &(getter, op) in shaders {
+            let s = getter(256).expect("pool bf16");
+            assert!(s.contains("bf16_to_f32"), "{op} bf16 must decode halves");
+            assert!(
+                s.contains("atomicCompareExchangeWeak"),
+                "{op} bf16 store must be a CAS"
+            );
+            assert!(s.contains("array<u32>"), "{op} bf16 must use u32 words");
+            assert!(
+                !s.contains("enable f16"),
+                "bf16 {op} must not carry enable f16"
+            );
+            assert!(
+                !s.contains("#ifdef"),
+                "preprocessor must be resolved for {op}"
+            );
+        }
+    }
+    #[test]
+    fn upsample_shaders_preprocess_modes_and_types() {
+        // Distinguish the actual `enable f16;` directive from the header comment
+        // mentioning it (comments are not stripped by preprocess).
+        let bare_enable_f16 = |s: &str| s.lines().any(|l| l.trim() == "enable f16;");
+        let any_directive = |s: &str| s.lines().any(|l| l.trim_start().starts_with('#'));
+        for (mode, accessor) in [
+            (
+                "NEAREST1D",
+                super::upsample_nearest1d_shader as fn(u32, &str) -> Option<String>,
+            ),
+            ("NEAREST2D", super::upsample_nearest2d_shader),
+            ("BILINEAR2D", super::upsample_bilinear2d_shader),
+        ] {
+            let f32s = accessor(256, "f32").expect("upsample f32");
+            assert!(f32s.contains("array<f32>"), "{mode} f32 array");
+            assert!(
+                !bare_enable_f16(&f32s),
+                "{mode} f32 must not keep enable f16"
+            );
+            assert!(
+                !any_directive(&f32s),
+                "{mode} f32 must strip all directives"
+            );
+            assert!(
+                !f32s.contains("SRC_TYPE"),
+                "{mode} f32 must replace SRC_TYPE"
+            );
+            assert!(f32s.contains("fn main"), "{mode} f32 entry point");
+            assert!(f32s.contains("store_dst("), "{mode} f32 body");
+
+            let f16s = accessor(256, "f16").expect("upsample f16");
+            assert!(bare_enable_f16(&f16s), "{mode} f16 must keep enable f16");
+            assert!(f16s.contains("array<f16>"), "{mode} f16 array");
+            assert!(
+                !f16s.contains("SRC_TYPE"),
+                "{mode} f16 must replace SRC_TYPE"
+            );
+
+            let bf16s = accessor(256, "u32").expect("upsample bf16");
+            assert!(bf16s.contains("array<u32>"), "{mode} bf16 array");
+            assert!(
+                !bare_enable_f16(&bf16s),
+                "{mode} bf16 must not keep enable f16"
+            );
+            assert!(
+                bf16s.contains("atomicCompareExchangeWeak"),
+                "{mode} bf16 CAS store"
+            );
+            assert!(
+                !bf16s.contains("SRC_TYPE"),
+                "{mode} bf16 must replace SRC_TYPE"
+            );
+        }
     }
 }

@@ -6,10 +6,12 @@ use ash::vk;
 use gpu_allocator::vulkan::{
     Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc,
 };
+use gpu_allocator::AllocationSizes;
 use gpu_allocator::MemoryLocation;
+use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
-use std::collections::HashMap;
 use std::ffi::{CStr, CString};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::trace_span;
 
@@ -360,6 +362,25 @@ struct VulkanMatVecParams {
     broadcast3: u32,
 }
 
+/// Push-constant layout for the m == 1 batched GEMV shader (`batched_gemv_f32`).
+///
+/// One dispatch covers all `batch` matrices: A is a shared (batch, k) vector set,
+/// B is a contiguous (batch, n, k) matrix, D is the (batch, n) result. Mirrors
+/// the GLSL `parameter` block in `batched_gemv_f32.comp` (9 u32s).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VulkanBatchedGemvParams {
+    k_dim: u32,
+    n_dim: u32,
+    batch: u32,
+    offset_a: u32,
+    offset_b: u32,
+    offset_d: u32,
+    batch_stride_a: u32,
+    batch_stride_b: u32,
+    batch_stride_d: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VulkanMatVecIdParams {
@@ -382,6 +403,20 @@ struct VulkanMatVecIdParams {
 struct VulkanQuantizeQ8_1Params {
     ne: u32,
     num_blocks: u32,
+    scale_bits: u32,
+}
+
+/// Push constants for the Q4_1/Q5_0/Q5_1 quantize kernels. `scale_bits` is the
+/// f32 bit pattern of the block scale divisor, passed as runtime data so the
+/// SPIR-V optimizer cannot constant-fold the division chain (glslc rewrites
+/// `x/15.0` and `1.0/(x/15.0)` into 1-ulp-different forms, breaking exact
+/// byte parity with the CPU path).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VulkanQuantizeScaleParams {
+    ne: u32,
+    num_blocks: u32,
+    scale_bits: u32,
 }
 
 #[repr(C)]
@@ -493,6 +528,8 @@ struct VulkanInner {
     physical_device: vk::PhysicalDevice,
     vendor_id: u32,
     integer_dot_product: bool,
+    /// shaderFloat64 feature enabled; required for native F64 compute.
+    shader_float64: bool,
     /// VK_KHR_cooperative_matrix enabled (tensor-core style GEMM shaders).
     cooperative_matrix: bool,
     subgroup_arithmetic: bool,
@@ -523,6 +560,16 @@ struct VulkanInner {
     reusable_compute_submissions: Mutex<Vec<VulkanSubmissionResources>>,
     reusable_transfer_submissions: Mutex<Vec<VulkanSubmissionResources>>,
     deferred_buffer_frees: Mutex<Vec<VulkanDeferredBuffer>>,
+    /// Hot-path counter tracking ops since the last amortized submission cleanup.
+    /// See `cleanup_pending_submissions_amortized` / `CLEANUP_DEBT_THRESHOLD`.
+    alloc_cleanup_debt: AtomicU32,
+    /// Pool of reusable upload staging buffers, keyed by size class (power-of-two).
+    upload_staging_pool: Mutex<HashMap<usize, Vec<Arc<VulkanBuffer>>>>,
+    /// Pool of reusable readback staging buffers, keyed by size class (power-of-two).
+    readback_staging_pool: Mutex<HashMap<usize, Vec<Arc<VulkanBuffer>>>>,
+    /// Staging buffers whose GPU references have been released and are pending
+    /// return to the pool (drained during cleanup).
+    staging_pending_return: Mutex<Vec<Arc<VulkanBuffer>>>,
 }
 
 impl VulkanDevice {
@@ -536,6 +583,11 @@ impl VulkanDevice {
 
     pub fn integer_dot_product_supported(&self) -> bool {
         self.inner.integer_dot_product
+    }
+
+    /// Returns true when the physical device exposes `shaderFloat64`.
+    pub fn shader_float64_supported(&self) -> bool {
+        self.inner.shader_float64
     }
 
     pub fn subgroup_arithmetic_supported(&self) -> bool {
@@ -807,12 +859,21 @@ impl std::fmt::Debug for VulkanInner {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingKind {
+    None,
+    Upload,
+    Readback,
+}
+
 #[derive(Debug)]
 struct VulkanBuffer {
     device: VulkanDevice,
     buffer: vk::Buffer,
     allocation: Mutex<Option<Allocation>>,
     size: usize,
+    is_staging: bool,
+    staging_kind: StagingKind,
 }
 
 #[derive(Debug, Clone)]
@@ -1095,8 +1156,15 @@ fn vulkan_q8_1_rhs_matvec_shader_name(
     n: usize,
     k: usize,
     indexed: bool,
+    // q8_1 weights (repacked to q8_0 on device) must quantize the activation
+    // (A-side) to q8_1 to reproduce the CPU QMatMul contract. The mmvq
+    // heuristic can otherwise steer small single-row matvecs onto the raw-f32
+    // activation path, which silently drops the companion A-side quantization.
+    force_q8_1_rhs: bool,
 ) -> Result<Option<(String, VulkanDmmvWorkgroup)>> {
-    if !vulkan_supports_q8_1_rhs(qdtype) || !vulkan_should_use_mmvq(device, qdtype, n, k) {
+    if !vulkan_supports_q8_1_rhs(qdtype)
+        || (!force_q8_1_rhs && !vulkan_should_use_mmvq(device, qdtype, n, k))
+    {
         return Ok(None);
     }
     // Q5_1 multi-column MMVQ (q8_1 rhs) is numerically incorrect on current
@@ -1142,6 +1210,7 @@ fn quantize_f32_storage_to_q8_1_x4(
     let params = VulkanQuantizeQ8_1Params {
         ne: elem_count.try_into()?,
         num_blocks,
+        scale_bits: 127f32.to_bits(),
     };
     let workgroups_x = num_blocks.min(device.inner.max_workgroup_count_x.max(1));
     device.run_compute_specialized(
@@ -1190,6 +1259,173 @@ fn repack_q8_1_storage_to_q8_0(
         ],
         Some(any_as_bytes(&params)),
         workgroups_x,
+    )?;
+    Ok(out)
+}
+
+/// GPU-native block quantize for Q8_0/Q4_0: packs CPU-layout blocks
+/// (34/18 bytes) directly on device, avoiding the CPU F32 round-trip.
+pub(crate) fn quantize_f32_storage_to_q8_0(
+    device: &VulkanDevice,
+    src: &VulkanStorage,
+    elem_count: usize,
+) -> Result<VulkanStorage> {
+    if src.dtype != DType::F32 {
+        return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan quantize_q8_0").bt());
+    }
+    let num_blocks: u32 = (elem_count / 32).try_into()?;
+    let out_count = (num_blocks as usize) * GgmlDType::Q8_0.type_size();
+    let out = unsafe { device.alloc_uninit(&Shape::from(out_count), DType::U8)? };
+    let spirv = candle_vulkan_kernels::spirv("quantize_q8_0")
+        .ok_or_else(|| Error::Msg("vulkan shader quantize_q8_0 not generated".into()).bt())?;
+    let params = VulkanQuantizeScaleParams {
+        ne: elem_count.try_into()?,
+        num_blocks,
+        scale_bits: 127f32.to_bits(),
+    };
+    let block_groups = num_blocks.div_ceil(4);
+    let workgroups_x = block_groups.min(device.inner.max_workgroup_count_x.max(1));
+    device.run_compute_specialized(
+        spirv,
+        &[
+            VulkanBinding::Storage(&src.buffer),
+            VulkanBinding::Storage(&out.buffer),
+        ],
+        Some(any_as_bytes(&params)),
+        (workgroups_x, 1, 1),
+        Some(&[(0, 32)]),
+    )?;
+    Ok(out)
+}
+
+pub(crate) fn quantize_f32_storage_to_q4_0(
+    device: &VulkanDevice,
+    src: &VulkanStorage,
+    elem_count: usize,
+) -> Result<VulkanStorage> {
+    if src.dtype != DType::F32 {
+        return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan quantize_q4_0").bt());
+    }
+    let num_blocks: u32 = (elem_count / 32).try_into()?;
+    let out_count = (num_blocks as usize) * GgmlDType::Q4_0.type_size();
+    let out = unsafe { device.alloc_uninit(&Shape::from(out_count), DType::U8)? };
+    let spirv = candle_vulkan_kernels::spirv("quantize_q4_0")
+        .ok_or_else(|| Error::Msg("vulkan shader quantize_q4_0 not generated".into()).bt())?;
+    let params = VulkanQuantizeScaleParams {
+        ne: elem_count.try_into()?,
+        num_blocks,
+        scale_bits: (-8f32).to_bits(),
+    };
+    let block_groups = num_blocks.div_ceil(4);
+    let workgroups_x = block_groups.min(device.inner.max_workgroup_count_x.max(1));
+    device.run_compute_specialized(
+        spirv,
+        &[
+            VulkanBinding::Storage(&src.buffer),
+            VulkanBinding::Storage(&out.buffer),
+        ],
+        Some(any_as_bytes(&params)),
+        (workgroups_x, 1, 1),
+        Some(&[(0, 32)]),
+    )?;
+    Ok(out)
+}
+
+pub(crate) fn quantize_f32_storage_to_q4_1(
+    device: &VulkanDevice,
+    src: &VulkanStorage,
+    elem_count: usize,
+) -> Result<VulkanStorage> {
+    if src.dtype != DType::F32 {
+        return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan quantize_q4_1").bt());
+    }
+    let num_blocks: u32 = (elem_count / 32).try_into()?;
+    let out_count = (num_blocks as usize) * GgmlDType::Q4_1.type_size();
+    let out = unsafe { device.alloc_uninit(&Shape::from(out_count), DType::U8)? };
+    let spirv = candle_vulkan_kernels::spirv("quantize_q4_1")
+        .ok_or_else(|| Error::Msg("vulkan shader quantize_q4_1 not generated".into()).bt())?;
+    let params = VulkanQuantizeScaleParams {
+        ne: elem_count.try_into()?,
+        num_blocks,
+        scale_bits: 15f32.to_bits(),
+    };
+    let block_groups = num_blocks.div_ceil(4);
+    let workgroups_x = block_groups.min(device.inner.max_workgroup_count_x.max(1));
+    device.run_compute_specialized(
+        spirv,
+        &[
+            VulkanBinding::Storage(&src.buffer),
+            VulkanBinding::Storage(&out.buffer),
+        ],
+        Some(any_as_bytes(&params)),
+        (workgroups_x, 1, 1),
+        Some(&[(0, 32)]),
+    )?;
+    Ok(out)
+}
+
+pub(crate) fn quantize_f32_storage_to_q5_0(
+    device: &VulkanDevice,
+    src: &VulkanStorage,
+    elem_count: usize,
+) -> Result<VulkanStorage> {
+    if src.dtype != DType::F32 {
+        return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan quantize_q5_0").bt());
+    }
+    let num_blocks: u32 = (elem_count / 32).try_into()?;
+    let out_count = (num_blocks as usize) * GgmlDType::Q5_0.type_size();
+    let out = unsafe { device.alloc_uninit(&Shape::from(out_count), DType::U8)? };
+    let spirv = candle_vulkan_kernels::spirv("quantize_q5_0")
+        .ok_or_else(|| Error::Msg("vulkan shader quantize_q5_0 not generated".into()).bt())?;
+    let params = VulkanQuantizeScaleParams {
+        ne: elem_count.try_into()?,
+        num_blocks,
+        scale_bits: (-16f32).to_bits(),
+    };
+    let block_groups = num_blocks.div_ceil(4);
+    let workgroups_x = block_groups.min(device.inner.max_workgroup_count_x.max(1));
+    device.run_compute_specialized(
+        spirv,
+        &[
+            VulkanBinding::Storage(&src.buffer),
+            VulkanBinding::Storage(&out.buffer),
+        ],
+        Some(any_as_bytes(&params)),
+        (workgroups_x, 1, 1),
+        Some(&[(0, 32)]),
+    )?;
+    Ok(out)
+}
+
+pub(crate) fn quantize_f32_storage_to_q5_1(
+    device: &VulkanDevice,
+    src: &VulkanStorage,
+    elem_count: usize,
+) -> Result<VulkanStorage> {
+    if src.dtype != DType::F32 {
+        return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan quantize_q5_1").bt());
+    }
+    let num_blocks: u32 = (elem_count / 32).try_into()?;
+    let out_count = (num_blocks as usize) * GgmlDType::Q5_1.type_size();
+    let out = unsafe { device.alloc_uninit(&Shape::from(out_count), DType::U8)? };
+    let spirv = candle_vulkan_kernels::spirv("quantize_q5_1")
+        .ok_or_else(|| Error::Msg("vulkan shader quantize_q5_1 not generated".into()).bt())?;
+    let params = VulkanQuantizeScaleParams {
+        ne: elem_count.try_into()?,
+        num_blocks,
+        scale_bits: 31f32.to_bits(),
+    };
+    let block_groups = num_blocks.div_ceil(4);
+    let workgroups_x = block_groups.min(device.inner.max_workgroup_count_x.max(1));
+    device.run_compute_specialized(
+        spirv,
+        &[
+            VulkanBinding::Storage(&src.buffer),
+            VulkanBinding::Storage(&out.buffer),
+        ],
+        Some(any_as_bytes(&params)),
+        (workgroups_x, 1, 1),
+        Some(&[(0, 32)]),
     )?;
     Ok(out)
 }
@@ -1332,8 +1568,8 @@ fn hash_spirv_words(words: &[u32]) -> u64 {
 impl VulkanDevice {
     const SUBMISSION_DESCRIPTOR_CAPACITY: u32 = 64;
     const MAX_REUSABLE_SUBMISSIONS_PER_QUEUE: usize = 64;
-    const MAX_BATCH_DISPATCHES: u32 = 32;
-    const MAX_BATCH_COPIES: u32 = 64;
+    const MAX_BATCH_DISPATCHES: u32 = 64;
+    const MAX_BATCH_COPIES: u32 = 128;
     const DESCRIPTOR_SET_ALLOC_CHUNK: u32 = 8;
     const MAX_BATCH_DESCRIPTOR_SETS: u32 = Self::MAX_BATCH_DISPATCHES;
     const MAX_ALLOCATED_DESCRIPTOR_SETS_PER_BATCH: u32 =
@@ -1344,6 +1580,15 @@ impl VulkanDevice {
         Self::MAX_ALLOCATED_DESCRIPTOR_SETS_PER_BATCH * Self::SUBMISSION_DESCRIPTOR_CAPACITY;
     const MAX_BATCH_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
     const MAX_BATCH_COMPUTE_BYTES: usize = 512 * 1024 * 1024;
+    /// Maximum number of deferred buffer frees before forcing a drain.
+    const MAX_DEFERRED_BUFFER_FREES: usize = 512;
+    /// Amortize the per-op `cleanup_pending_submissions(false)` fence-poll + multi-lock
+    /// cascade over this many hot-path ops (alloc/copy/dispatch). Kept small so fences
+    /// still get polled and deferred buffers/caps still get drained promptly, but large
+    /// enough to remove ~all of the per-op host overhead from the decode loop.
+    const CLEANUP_DEBT_THRESHOLD: u32 = 32;
+    /// Maximum number of staging buffers per size class in the pool.
+    const MAX_STAGING_PER_SIZE_CLASS: usize = 32;
 
     fn copy_queue_and_family(
         &self,
@@ -1538,7 +1783,7 @@ impl VulkanDevice {
             transfer_bytes: 0,
             compute_bytes: 0,
             retained_buffers: Vec::new(),
-            cached_descriptor_sets: HashMap::new(),
+            cached_descriptor_sets: HashMap::default(),
         })
     }
 
@@ -1758,8 +2003,10 @@ impl VulkanDevice {
         name: &'static str,
         usage: vk::BufferUsageFlags,
         location: MemoryLocation,
+        is_staging: bool,
+        staging_kind: StagingKind,
     ) -> Result<Arc<VulkanBuffer>> {
-        self.cleanup_pending_submissions(false)?;
+        self.cleanup_pending_submissions_amortized()?;
         let mut info = vk::BufferCreateInfo::default()
             .size(size as u64)
             .usage(usage);
@@ -1829,6 +2076,8 @@ impl VulkanDevice {
             buffer,
             allocation: Mutex::new(Some(allocation)),
             size,
+            is_staging,
+            staging_kind,
         }))
     }
 
@@ -1841,24 +2090,143 @@ impl VulkanDevice {
                 | vk::BufferUsageFlags::TRANSFER_SRC
                 | vk::BufferUsageFlags::TRANSFER_DST,
             MemoryLocation::GpuOnly,
+            false,
+            StagingKind::None,
         )
     }
 
+    /// Power-of-two size class for staging buffer pooling.
+    fn staging_size_class(size: usize) -> usize {
+        if size == 0 {
+            return 0;
+        }
+        size.next_power_of_two()
+    }
+
+    /// Try to get a staging buffer from the pool, or create a new one.
+    fn acquire_staging_buffer(
+        &self,
+        size: usize,
+        name: &'static str,
+        usage: vk::BufferUsageFlags,
+        location: MemoryLocation,
+        staging_kind: StagingKind,
+    ) -> Result<Arc<VulkanBuffer>> {
+        let size_class = Self::staging_size_class(size);
+        let pool = match staging_kind {
+            StagingKind::Upload => &self.inner.upload_staging_pool,
+            StagingKind::Readback => &self.inner.readback_staging_pool,
+            StagingKind::None => {
+                return self.create_buffer_with_location(
+                    size,
+                    name,
+                    usage,
+                    location,
+                    false,
+                    StagingKind::None,
+                );
+            }
+        };
+        // Try to pop from pool. The pool is keyed by power-of-two size class,
+        // so an entry may be SMALLER than the current request (e.g. a 1280B
+        // buffer stored under the 2048 class). Reusing it would either bail
+        // in map_write ("write larger than buffer") or silently truncate the
+        // upload, so only accept buffers at least as large as requested.
+        {
+            let mut pool = pool.lock().map_err(|e| Error::wrap(e.to_string()))?;
+            if let Some(entry) = pool.get_mut(&size_class) {
+                let mut skipped = Vec::new();
+                let mut accepted = None;
+                while let Some(buf) = entry.pop() {
+                    if buf.size >= size {
+                        accepted = Some(buf);
+                        break;
+                    }
+                    skipped.push(buf);
+                }
+                entry.extend(skipped);
+                if let Some(buf) = accepted {
+                    return Ok(buf);
+                }
+            }
+        }
+        // Pool miss: create a new buffer with the requested size (not size_class)
+        // to avoid allocating more than needed.
+        self.create_buffer_with_location(size, name, usage, location, true, staging_kind)
+    }
+
+    /// Drain the staging pending return list into the free pools.
+    fn drain_staging_pending(&self) -> Result<()> {
+        let pending = {
+            let mut pending = self
+                .inner
+                .staging_pending_return
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            std::mem::take(&mut *pending)
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        for buf in pending {
+            let size_class = Self::staging_size_class(buf.size);
+            let pool = match buf.staging_kind {
+                StagingKind::Upload => &self.inner.upload_staging_pool,
+                StagingKind::Readback => &self.inner.readback_staging_pool,
+                StagingKind::None => {
+                    // Not a staging buffer, defer free
+                    if let Ok(mut alloc) = buf.allocation.lock() {
+                        if let Some(allocation) = alloc.take() {
+                            if let Ok(mut deferred) = self.inner.deferred_buffer_frees.lock() {
+                                deferred.push(VulkanDeferredBuffer {
+                                    buffer: buf.buffer,
+                                    allocation,
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+            let mut pool = pool.lock().map_err(|e| Error::wrap(e.to_string()))?;
+            let entry = pool.entry(size_class).or_default();
+            if entry.len() < Self::MAX_STAGING_PER_SIZE_CLASS {
+                entry.push(buf);
+            } else {
+                // Pool full: defer free instead
+                drop(pool);
+                if let Ok(mut alloc) = buf.allocation.lock() {
+                    if let Some(allocation) = alloc.take() {
+                        if let Ok(mut deferred) = self.inner.deferred_buffer_frees.lock() {
+                            deferred.push(VulkanDeferredBuffer {
+                                buffer: buf.buffer,
+                                allocation,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn create_upload_staging_buffer(&self, size: usize) -> Result<Arc<VulkanBuffer>> {
-        self.create_buffer_with_location(
+        self.acquire_staging_buffer(
             size,
             "candle-vulkan-upload-staging",
             vk::BufferUsageFlags::TRANSFER_SRC,
             MemoryLocation::CpuToGpu,
+            StagingKind::Upload,
         )
     }
 
     fn create_readback_staging_buffer(&self, size: usize) -> Result<Arc<VulkanBuffer>> {
-        self.create_buffer_with_location(
+        self.acquire_staging_buffer(
             size,
             "candle-vulkan-readback-staging",
             vk::BufferUsageFlags::TRANSFER_DST,
             MemoryLocation::GpuToCpu,
+            StagingKind::Readback,
         )
     }
 
@@ -1901,6 +2269,47 @@ impl VulkanDevice {
 
     fn cleanup_pending_submissions(&self, wait: bool) -> Result<()> {
         self.cleanup_pending_submissions_impl(wait, None)
+    }
+
+    /// Hot-path variant of `cleanup_pending_submissions(false)` that amortizes the
+    /// expensive fence-poll + multi-lock cascade over `CLEANUP_DEBT_THRESHOLD` ops
+    /// instead of running it on every alloc/copy/dispatch. Called from the per-op
+    /// fast path (each buffer creation, copy submission and compute dispatch).
+    ///
+    /// Correctness is preserved because the force-drain safety boundary is still
+    /// guarded: `deferred_buffer_frees` is capped before overflow (a single cheap
+    /// lock check triggers a real cleanup when it nears `MAX_DEFERRED_BUFFER_FREES`),
+    /// and the deferred cap overflow still forces a full pipe drain inside
+    /// `cleanup_pending_submissions_impl`. Fences are still polled and staging
+    /// pending still retired on every amortized cleanup.
+    fn cleanup_pending_submissions_amortized(&self) -> Result<()> {
+        // Cheap guard: if the deferred free list is already near its cap, don't
+        // skip — run the real cleanup so the force-drain boundary honors the cap.
+        let deferred_near_cap = {
+            let deferred = self
+                .inner
+                .deferred_buffer_frees
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            deferred.len() + (Self::CLEANUP_DEBT_THRESHOLD as usize)
+                > Self::MAX_DEFERRED_BUFFER_FREES
+        };
+        if deferred_near_cap {
+            return self.cleanup_pending_submissions(false);
+        }
+        let debt = self
+            .inner
+            .alloc_cleanup_debt
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        if debt >= Self::CLEANUP_DEBT_THRESHOLD {
+            // Preserve the overflow (not the whole count) so we don't lose ops.
+            self.inner
+                .alloc_cleanup_debt
+                .fetch_sub(Self::CLEANUP_DEBT_THRESHOLD, Ordering::Relaxed);
+            return self.cleanup_pending_submissions(false);
+        }
+        Ok(())
     }
 
     fn cleanup_pending_submissions_impl(
@@ -1984,7 +2393,66 @@ impl VulkanDevice {
                 .map_err(|e| Error::wrap(e.to_string()))?
                 .is_none();
         if pending_empty && active_batches_empty {
+            self.drain_staging_pending()?;
             self.destroy_deferred_buffers()?;
+        } else {
+            // Always drain staging pending when we can
+            self.drain_staging_pending()?;
+            // Cap check: if deferred list is too large, force drain
+            let deferred_exceeded = {
+                self.inner
+                    .deferred_buffer_frees
+                    .lock()
+                    .map_err(|e| Error::wrap(e.to_string()))?
+                    .len()
+                    > Self::MAX_DEFERRED_BUFFER_FREES
+            };
+            if deferred_exceeded {
+                // Force-wait: drain all remaining pending submissions
+                if !wait {
+                    let mut pending = self
+                        .inner
+                        .pending_submissions
+                        .lock()
+                        .map_err(|e| Error::wrap(e.to_string()))?;
+                    let remaining: Vec<_> = pending.drain(..).collect();
+                    drop(pending);
+                    for submission in remaining {
+                        unsafe {
+                            self.inner
+                                .device
+                                .wait_for_fences(
+                                    std::slice::from_ref(&submission.resources.fence),
+                                    true,
+                                    u64::MAX,
+                                )
+                                .map_err(Error::wrap)?;
+                        }
+                        drop(submission.retained_buffers);
+                        self.recycle_submission_resources(
+                            submission.queue_kind,
+                            submission.resources,
+                        )?;
+                    }
+                }
+                // Now drain staging pending and destroy deferred
+                self.drain_staging_pending()?;
+                self.destroy_deferred_buffers()?;
+                // Verify cap is now satisfied
+                let still_exceeded = self
+                    .inner
+                    .deferred_buffer_frees
+                    .lock()
+                    .map_err(|e| Error::wrap(e.to_string()))?
+                    .len()
+                    > Self::MAX_DEFERRED_BUFFER_FREES;
+                if still_exceeded {
+                    return Err(Error::Msg(
+                        "vulkan: deferred buffer cap still exceeded after force drain".to_string(),
+                    )
+                    .bt());
+                }
+            }
         }
         Ok(())
     }
@@ -2103,7 +2571,7 @@ impl VulkanDevice {
         if regions.is_empty() {
             return Ok(());
         }
-        self.cleanup_pending_submissions(false)?;
+        self.cleanup_pending_submissions_amortized()?;
         let (queue, queue_family_index, queue_kind) = self.copy_queue_and_family(prefer_transfer);
         if queue_kind == SubmissionQueueKind::Compute {
             self.wait_for_transfer_dependencies()?;
@@ -2211,7 +2679,13 @@ impl VulkanDevice {
             "read_buffer_after_copy_record",
         )?;
         self.cleanup_pending_submissions(true)?;
-        self.map_read_host_buffer(staging.as_ref())
+        let mut bytes = self.map_read_host_buffer(staging.as_ref())?;
+        // The GPU copy above wrote exactly `buffer.size` bytes into the staging
+        // buffer, which may be a recycled pooled buffer whose capacity exceeds
+        // `buffer.size`. Truncate the readback to the bytes actually written so a
+        // larger pooled buffer cannot leak stale tail bytes to the caller.
+        bytes.truncate(buffer.size);
+        Ok(bytes)
     }
 
     fn run_compute(
@@ -2315,7 +2789,7 @@ impl VulkanDevice {
         )
         .entered();
         self.wait_for_transfer_dependencies()?;
-        self.cleanup_pending_submissions(false)?;
+        self.cleanup_pending_submissions_amortized()?;
         let binding_signature = bindings
             .iter()
             .map(|binding| binding.descriptor_type().as_raw() as u32)
@@ -2851,9 +3325,39 @@ fn binary_int_opcode(op: &str) -> Result<i32> {
     }
 }
 
+/// Map a `UnaryOpT::NAME` to the opcode used by `unary_f64.comp`.
+fn f64_unary_opcode(op: &str) -> Result<f32> {
+    match op {
+        "exp" => Ok(0.0),
+        "log" => Ok(1.0),
+        "sin" => Ok(2.0),
+        "cos" => Ok(3.0),
+        "abs" => Ok(4.0),
+        "neg" => Ok(5.0),
+        "recip" => Ok(6.0),
+        "sqr" => Ok(7.0),
+        "sqrt" => Ok(8.0),
+        "gelu" => Ok(9.0),
+        "gelu_erf" => Ok(10.0),
+        "erf" => Ok(11.0),
+        "relu" => Ok(12.0),
+        "silu" => Ok(13.0),
+        "tanh" => Ok(14.0),
+        "floor" => Ok(15.0),
+        "ceil" => Ok(16.0),
+        "round" => Ok(17.0),
+        "sign" => Ok(18.0),
+        _ => Err(unsupported("f64 unary")),
+    }
+}
+
 fn copy_spirv(src: DType, dst: DType) -> Result<&'static [u32]> {
     let name = match (src, dst) {
         (DType::F32, DType::F32) => "cpy_f32_f32",
+        (DType::F8E4M3, DType::F32) => "convert_f8e4m3_f32",
+        (DType::F32, DType::F8E4M3) => "convert_f32_f8e4m3",
+        (DType::F8E4M3, DType::F16) => "convert_f8e4m3_f16",
+        (DType::F16, DType::F8E4M3) => "convert_f16_f8e4m3",
         (DType::F32, DType::I32) => "cpy_f32_i32",
         (DType::I32, DType::F32) => "cpy_i32_f32",
         (DType::U32, DType::F32) => "cpy_u32_f32",
@@ -2970,6 +3474,11 @@ fn cmp_opcode(op: CmpOp) -> i32 {
 }
 
 impl VulkanStorage {
+    /// Number of elements stored in this buffer (elements, not bytes).
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
     pub(crate) fn quantized_dequantize_f32(
         &self,
         qdtype: GgmlDType,
@@ -3189,6 +3698,172 @@ impl VulkanStorage {
         }
         Ok(dst)
     }
+
+    /// True when a rank >= 3 layout can be treated as a SINGLE flat batch dimension
+    /// of arbitrary (possibly non-compact) `batch_stride` for the m == 1 batched GEMV
+    /// kernels (`batched_gemv_f32` / `ctx_gemv_f32`).
+    ///
+    /// Two requirements:
+    ///   * every batch dim before the innermost one (`dims[..rank-3]`) is size 1, so
+    ///     flattening `batch = product(dims[..rank-2])` has a UNIFORM stride
+    ///     (`stride[rank-3]`) — one batch index maps linearly to one row of matrices;
+    ///   * the trailing two dims `(rows, cols)` (the per-batch block the kernel
+    ///     reduces/maps over) are contiguous (`stride[rank-2] == cols` and
+    ///     `stride[rank-1] == 1`), so the kernel's `row*cols + col` addressing holds.
+    ///
+    /// This is exactly the shape produced by a `narrow`ed prefix of a grown KV-cache
+    /// backing buffer (capacity > live length): the batch stride is the capacity
+    /// stride instead of the compact `rows*cols`. A fully contiguous layout also
+    /// passes; a genuinely strided-within-batch view fails and falls back to the
+    /// generic per-batch path (correct, slower).
+    fn batched_gemv_inner_contiguous(l: &Layout) -> bool {
+        let rank = l.dims().len();
+        if rank < 3 || l.dims()[..rank - 3].iter().any(|&d| d != 1) {
+            return false;
+        }
+        l.stride()[rank - 2] == l.dims()[rank - 1] && l.stride()[rank - 1] == 1
+    }
+
+    /// m == 1 batched GEMV in a SINGLE dispatch over all `batch` matrices.
+    ///
+    /// This is the shape of the attention score/ctx matmuls during autoregressive
+    /// prefill (and any generic batched A@B with m == 1): lhs is a (batch, k)
+    /// vector set, rhs_t is a contiguous (batch, n, k) matrix. Previously this
+    /// routed to `run_batched_matmul_f32_via_rank2_batches`, which allocated,
+    /// copied and dispatched one small matvec PER batch (16 heads x 2 matmuls x
+    /// num_layers) — dominating host overhead and re-reading B once per head.
+    ///
+    /// The kernel reads B exactly once per element, coalesced along K, and covers
+    /// all batches in one dispatch. Requires contiguous lhs (batch, m, k) and
+    /// contiguous rhs_t (batch, n, k); the dispatch guard enforces that and any
+    /// non-contiguous case falls back to the generic path below.
+    #[allow(clippy::too_many_arguments)]
+    fn run_batched_gemv_f32(
+        &self,
+        rhs_t: &Self,
+        lhs_layout: &Layout,
+        rhs_t_layout: &Layout,
+        b: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        debug_assert_eq!(m, 1);
+        let dst_shape = Shape::from(vec![b, 1, n]);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        // Batch strides come from the layouts so a `narrow`ed prefix of a grown
+        // KV-cache backing buffer (capacity > live length, batch stride == capacity
+        // stride) routes correctly; a compact batch preserves stride == n*k/m*k.
+        let rank = rhs_t_layout.dims().len();
+        let batch_stride_a = if lhs_layout.dims().len() >= 3 {
+            lhs_layout.stride()[lhs_layout.dims().len() - 3]
+        } else {
+            m * k
+        };
+        let batch_stride_b = if rank >= 3 {
+            rhs_t_layout.stride()[rank - 3]
+        } else {
+            n * k
+        };
+        let params = VulkanBatchedGemvParams {
+            k_dim: k.try_into()?,
+            n_dim: n.try_into()?,
+            batch: b.try_into()?,
+            offset_a: lhs_layout.start_offset().try_into()?,
+            offset_b: rhs_t_layout.start_offset().try_into()?,
+            offset_d: 0,
+            batch_stride_a: batch_stride_a.try_into()?,
+            batch_stride_b: batch_stride_b.try_into()?,
+            batch_stride_d: n.try_into()?,
+        };
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&rhs_t.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("batched_gemv_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader batched_gemv_f32 not generated".into()).bt())?;
+        // 128 threads/group, 4 output groups (32 lanes each) computed per group.
+        let workgroups = (n.div_ceil(4).try_into()?, b.try_into()?, 1u32);
+        self.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            workgroups,
+        )?;
+        Ok(dst)
+    }
+
+    /// Context-attention GEMV for the m == 1 case, reading V in its NATURAL
+    /// (batch, k, n) layout and reducing over the outer `k`, outputting over the
+    /// inner `n` (head_dim). This is the `out = scores @ v` shape where v is the
+    /// KV-cache column (kv, 128) — see `ctx_gemv_f32.comp`.
+    ///
+    /// `batched_gemv_f32` reduces over the CONTIGUOUS inner dim of B, so for this
+    /// shape it needs B materialized as the transposed (batch, n, k) V^T copy.
+    /// That copy is a full-V read+write every token (the dominant pp4096 residual).
+    /// Reading V in its native layout entirely skips the transpose materialization.
+    ///
+    /// Push-constant layout is the same 9-u32 `VulkanBatchedGemvParams`, but here
+    /// `k_dim` = reduction length (kv), `n_dim` = output length (head_dim), and
+    /// `batch_stride_b` = k*n (V is (batch, k, n)). Mirrors cmp block.
+    #[allow(clippy::too_many_arguments)]
+    fn run_ctx_gemv_f32(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        b: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        debug_assert_eq!(m, 1);
+        let dst_shape = Shape::from(vec![b, 1, n]);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        // Stride-aware (see `run_batched_gemv_f32`): read V's actual batch stride so a
+        // `narrow`ed grown expanded-KV-cache view (capacity > live length) routes here.
+        let rhs_rank = rhs_layout.dims().len();
+        let batch_stride_a = if lhs_layout.dims().len() >= 3 {
+            lhs_layout.stride()[lhs_layout.dims().len() - 3]
+        } else {
+            m * k
+        };
+        let batch_stride_b = if rhs_rank >= 3 {
+            rhs_layout.stride()[rhs_rank - 3]
+        } else {
+            k * n
+        };
+        let params = VulkanBatchedGemvParams {
+            k_dim: k.try_into()?,
+            n_dim: n.try_into()?,
+            batch: b.try_into()?,
+            offset_a: lhs_layout.start_offset().try_into()?,
+            offset_b: rhs_layout.start_offset().try_into()?,
+            offset_d: 0,
+            batch_stride_a: batch_stride_a.try_into()?,
+            batch_stride_b: batch_stride_b.try_into()?,
+            batch_stride_d: n.try_into()?,
+        };
+        // A (lhs/scores) on binding 0, V (rhs, natural layout) on binding 1.
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&rhs.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("ctx_gemv_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader ctx_gemv_f32 not generated".into()).bt())?;
+        // 256 threads/group = 8 l-slice warps x 32 head_dim lanes; grid.x tiles head_dim.
+        let workgroups = (n.div_ceil(32).try_into()?, b.try_into()?, 1u32);
+        self.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            workgroups,
+        )?;
+        Ok(dst)
+    }
+
     fn materialize_to_f32(&self, layout: &Layout) -> Result<Self> {
         if self.dtype == DType::F32 {
             if layout.is_contiguous() && layout.start_offset() == 0 {
@@ -3349,15 +4024,32 @@ impl VulkanStorage {
         out_f32.to_dtype(&lhs_contiguous, DType::BF16)
     }
 
-    fn bf16_cmp_via_f32(
+    /// F8E4M3 unary compute via decode -> f32 op -> encode (all GPU-resident;
+    /// mirrors the CUDA fp8 compute path which computes in float).
+    fn f8e4m3_unary_via_f32(
+        &self,
+        layout: &Layout,
+        f: impl FnOnce(&Self, &Layout) -> Result<Self>,
+    ) -> Result<Self> {
+        let f32_storage = self.to_dtype(layout, DType::F32)?;
+        let contiguous = if layout.dims().len() > 4 {
+            Layout::contiguous(Self::compact_rank_gt4_shape(layout))
+        } else {
+            Layout::contiguous(layout.shape())
+        };
+        let out_f32 = f(&f32_storage, &contiguous)?;
+        out_f32.to_dtype(&contiguous, DType::F8E4M3)
+    }
+
+    fn f8e4m3_binary_via_f32(
         &self,
         rhs: &Self,
         lhs_layout: &Layout,
         rhs_layout: &Layout,
-        op: CmpOp,
+        f: impl FnOnce(&Self, &Self, &Layout, &Layout) -> Result<Self>,
     ) -> Result<Self> {
-        if rhs.dtype != DType::BF16 {
-            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan bf16 cmp").bt());
+        if rhs.dtype != DType::F8E4M3 {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan f8e4m3 binary").bt());
         }
         self.device
             .same_device(&rhs.device)
@@ -3366,12 +4058,12 @@ impl VulkanStorage {
                 Error::DeviceMismatchBinaryOp {
                     lhs: self.device.location(),
                     rhs: rhs.device.location(),
-                    op: "bf16 cmp",
+                    op: "f8e4m3 binary",
                 }
                 .bt()
             })?;
-        let lhs_f32 = self.materialize_to_f32(lhs_layout)?;
-        let rhs_f32 = rhs.materialize_to_f32(rhs_layout)?;
+        let lhs_f32 = self.to_dtype(lhs_layout, DType::F32)?;
+        let rhs_f32 = rhs.to_dtype(rhs_layout, DType::F32)?;
         let lhs_contiguous = if lhs_layout.dims().len() > 4 {
             Layout::contiguous(Self::compact_rank_gt4_shape(lhs_layout))
         } else {
@@ -3382,7 +4074,8 @@ impl VulkanStorage {
         } else {
             Layout::contiguous(rhs_layout.shape())
         };
-        lhs_f32.run_cmp_u8(&rhs_f32, &lhs_contiguous, &rhs_contiguous, op)
+        let out_f32 = f(&lhs_f32, &rhs_f32, &lhs_contiguous, &rhs_contiguous)?;
+        out_f32.to_dtype(&lhs_contiguous, DType::F8E4M3)
     }
 
     fn bf16_where_via_f32(
@@ -3546,7 +4239,20 @@ impl VulkanStorage {
             );
         }
         let count = layout.shape().elem_count();
-        let dst = unsafe { self.device.alloc_uninit(layout.shape(), dst_dtype)? };
+        // F8E4M3 destination packs 4 bytes per u32 word in conversion kernels;
+        // round the element count up so the last partial word fits.
+        let dst_shape = if dst_dtype == DType::F8E4M3 {
+            crate::Shape::from(count.div_ceil(4) * 4)
+        } else {
+            layout.shape().clone()
+        };
+        let mut dst = unsafe { self.device.alloc_uninit(&dst_shape, dst_dtype)? };
+        if dst_dtype == DType::F8E4M3 {
+            // Encode kernels pack bytes with atomicOr into u32 words; the
+            // destination must start zeroed. fill_raw supports fp8.
+            let zero = crate::scalar::Scalar::F8E4M3(float8::F8E4M3::from_bits(0));
+            dst.const_set(zero, &Layout::contiguous(layout.shape().clone()))?;
+        }
         let (src_dims, src_strides) = dims4_ggml(layout)?;
         let dst_dims = src_dims;
         let dst_strides = contiguous_strides_ggml(dst_dims);
@@ -3597,6 +4303,9 @@ impl VulkanStorage {
         let workgroups = ggml_linear_workgroups(count)?;
         self.device
             .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+        if dst_dtype == DType::F8E4M3 && dst.count != count {
+            dst.count = count;
+        }
         Ok(dst)
     }
 
@@ -3613,7 +4322,7 @@ impl VulkanStorage {
     ) -> Result<Self> {
         if !matches!(
             self.dtype,
-            DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64
+            DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64 | DType::BF16
         ) {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan cmp").bt());
         }
@@ -3714,10 +4423,118 @@ impl VulkanStorage {
             DType::U8 => "cmp_u8",
             DType::U32 => "cmp_u32",
             DType::I64 => "cmp_i64",
+            DType::BF16 => "cmp_bf16",
             _ => return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan cmp").bt()),
         };
         let spirv = candle_vulkan_kernels::spirv(spirv_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
+        let workgroups = ggml_linear_workgroups(count)?;
+        self.device
+            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+        Ok(dst)
+    }
+
+    /// F64 comparison dispatch using `cmp_f64.comp`.
+    fn run_cmp_f64(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        op: CmpOp,
+    ) -> Result<Self> {
+        if rhs.dtype != DType::F64 {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan f64 cmp").bt());
+        }
+        self.device
+            .same_device(&rhs.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: rhs.device.location(),
+                    op: "cmp",
+                }
+                .bt()
+            })?;
+        if lhs_layout.dims().len() > 4 || rhs_layout.dims().len() > 4 {
+            let (lhs, lhs_layout) = if lhs_layout.dims().len() > 4 {
+                self.materialize_rank_gt4_compact(lhs_layout)?
+            } else if lhs_layout.start_offset() == 0 {
+                (self.try_clone(lhs_layout)?, lhs_layout.clone())
+            } else {
+                let mut tmp = unsafe { self.device.alloc_uninit(lhs_layout.shape(), DType::F64)? };
+                <Self as BackendStorage>::copy_strided_src(self, &mut tmp, 0, lhs_layout)?;
+                (tmp, Layout::contiguous(lhs_layout.shape().clone()))
+            };
+            let (rhs, rhs_layout) = if rhs_layout.dims().len() > 4 {
+                rhs.materialize_rank_gt4_compact(rhs_layout)?
+            } else if rhs_layout.start_offset() == 0 {
+                (rhs.try_clone(rhs_layout)?, rhs_layout.clone())
+            } else {
+                let mut tmp = unsafe { rhs.device.alloc_uninit(rhs_layout.shape(), DType::F64)? };
+                <Self as BackendStorage>::copy_strided_src(rhs, &mut tmp, 0, rhs_layout)?;
+                (tmp, Layout::contiguous(rhs_layout.shape().clone()))
+            };
+            return lhs.run_cmp_f64(&rhs, &lhs_layout, &rhs_layout, op);
+        }
+        let (lhs_tmp, lhs_layout) = if lhs_layout.start_offset() == 0 {
+            (None, lhs_layout.clone())
+        } else {
+            let mut tmp = unsafe { self.device.alloc_uninit(lhs_layout.shape(), DType::F64)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut tmp, 0, lhs_layout)?;
+            (Some(tmp), Layout::contiguous(lhs_layout.shape().clone()))
+        };
+        let lhs = lhs_tmp.as_ref().unwrap_or(self);
+        let (rhs_tmp, rhs_layout) = if rhs_layout.start_offset() == 0 {
+            (None, rhs_layout.clone())
+        } else {
+            let mut tmp = unsafe { rhs.device.alloc_uninit(rhs_layout.shape(), DType::F64)? };
+            <Self as BackendStorage>::copy_strided_src(rhs, &mut tmp, 0, rhs_layout)?;
+            (Some(tmp), Layout::contiguous(rhs_layout.shape().clone()))
+        };
+        let rhs = rhs_tmp.as_ref().unwrap_or(rhs);
+        let (lhs_dims, lhs_strides) = dims4_ggml(&lhs_layout)?;
+        let (rhs_dims, rhs_strides) = dims4_ggml(&rhs_layout)?;
+        let count = lhs_layout.shape().elem_count();
+        let dst = unsafe { self.device.alloc_uninit(lhs_layout.shape(), DType::U8)? };
+        let params = GgmlBinaryParams {
+            ne: count.try_into()?,
+            ne00: lhs_dims[0],
+            ne01: lhs_dims[1],
+            ne02: lhs_dims[2],
+            ne03: lhs_dims[3],
+            nb00: lhs_strides[0],
+            nb01: lhs_strides[1],
+            nb02: lhs_strides[2],
+            nb03: lhs_strides[3],
+            ne10: rhs_dims[0],
+            ne11: rhs_dims[1],
+            ne12: rhs_dims[2],
+            ne13: rhs_dims[3],
+            nb10: rhs_strides[0],
+            nb11: rhs_strides[1],
+            nb12: rhs_strides[2],
+            nb13: rhs_strides[3],
+            ne20: lhs_dims[0],
+            ne21: lhs_dims[1],
+            ne22: lhs_dims[2],
+            ne23: lhs_dims[3],
+            nb20: 1,
+            nb21: lhs_dims[0],
+            nb22: lhs_dims[0] * lhs_dims[1],
+            nb23: lhs_dims[0] * lhs_dims[1] * lhs_dims[2],
+            misalign_offsets: 0,
+            param1: 0.0,
+            param2: 0.0,
+            param3: cmp_opcode(op),
+        };
+        let bindings = [
+            VulkanBinding::Storage(&lhs.buffer),
+            VulkanBinding::Storage(&rhs.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("cmp_f64")
+            .ok_or_else(|| Error::Msg("vulkan shader cmp_f64 not generated".into()).bt())?;
         let workgroups = ggml_linear_workgroups(count)?;
         self.device
             .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
@@ -3915,6 +4732,89 @@ impl VulkanStorage {
             VulkanBinding::Storage(&dst.buffer),
         ];
         let spirv = binary_spirv(op, self.dtype)?;
+        let workgroups = ggml_linear_workgroups(count)?;
+        self.device
+            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
+        Ok(dst)
+    }
+
+    /// F64 binary dispatch using `binary_f64.comp` (opcode-switched).
+    fn run_binary_f64(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        op: &'static str,
+    ) -> Result<Self> {
+        if rhs.dtype != DType::F64 {
+            return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan f64 binary").bt());
+        }
+        self.device
+            .same_device(&rhs.device)
+            .then_some(())
+            .ok_or_else(|| {
+                Error::DeviceMismatchBinaryOp {
+                    lhs: self.device.location(),
+                    rhs: rhs.device.location(),
+                    op,
+                }
+                .bt()
+            })?;
+        if lhs_layout.start_offset() != 0
+            || rhs_layout.start_offset() != 0
+            || !lhs_layout.is_contiguous()
+            || !rhs_layout.is_contiguous()
+        {
+            let mut lhs_mat = unsafe { self.device.alloc_uninit(lhs_layout.shape(), DType::F64)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut lhs_mat, 0, lhs_layout)?;
+            let mut rhs_mat = unsafe { rhs.device.alloc_uninit(rhs_layout.shape(), DType::F64)? };
+            <Self as BackendStorage>::copy_strided_src(rhs, &mut rhs_mat, 0, rhs_layout)?;
+            let flat_l = Layout::contiguous(lhs_layout.shape());
+            let flat_r = Layout::contiguous(rhs_layout.shape());
+            return lhs_mat.run_binary_f64(&rhs_mat, &flat_l, &flat_r, op);
+        }
+        let (lhs_dims, lhs_strides) = dims4_ggml(lhs_layout)?;
+        let (rhs_dims, rhs_strides) = dims4_ggml(rhs_layout)?;
+        let count = lhs_layout.shape().elem_count();
+        let dst = unsafe { self.device.alloc_uninit(lhs_layout.shape(), DType::F64)? };
+        let params = GgmlBinaryParams {
+            ne: count.try_into()?,
+            ne00: lhs_dims[0],
+            ne01: lhs_dims[1],
+            ne02: lhs_dims[2],
+            ne03: lhs_dims[3],
+            nb00: lhs_strides[0],
+            nb01: lhs_strides[1],
+            nb02: lhs_strides[2],
+            nb03: lhs_strides[3],
+            ne10: rhs_dims[0],
+            ne11: rhs_dims[1],
+            ne12: rhs_dims[2],
+            ne13: rhs_dims[3],
+            nb10: rhs_strides[0],
+            nb11: rhs_strides[1],
+            nb12: rhs_strides[2],
+            nb13: rhs_strides[3],
+            ne20: lhs_dims[0],
+            ne21: lhs_dims[1],
+            ne22: lhs_dims[2],
+            ne23: lhs_dims[3],
+            nb20: 1,
+            nb21: lhs_dims[0],
+            nb22: lhs_dims[0] * lhs_dims[1],
+            nb23: lhs_dims[0] * lhs_dims[1] * lhs_dims[2],
+            misalign_offsets: 0,
+            param1: 0.0,
+            param2: 0.0,
+            param3: binary_int_opcode(op)?,
+        };
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&rhs.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("binary_f64")
+            .ok_or_else(|| Error::Msg("vulkan shader binary_f64 not generated".into()).bt())?;
         let workgroups = ggml_linear_workgroups(count)?;
         self.device
             .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
@@ -4389,6 +5289,197 @@ impl VulkanStorage {
         };
         let spirv = candle_vulkan_kernels::spirv(name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {name} not generated")).bt())?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (rows.try_into()?, 1, 1),
+            Some(&[(0, self.device.inner.subgroup_size)]),
+        )?;
+        Ok(dst)
+    }
+
+    /// F64 last-dim reduction dispatch.
+    fn run_f64_reduce(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
+        let rank = layout.dims().len();
+        if rank == 0 {
+            return self.try_clone(layout);
+        }
+        if reduce_dims.len() > 1 {
+            let mut current_layout = layout.clone();
+            let mut current_shape = layout.dims().to_vec();
+            let mut current: Option<Self> = None;
+            for &dim in reduce_dims {
+                let src = current.as_ref().unwrap_or(self);
+                let reduced = src.run_f64_reduce(op, &current_layout, &[dim])?;
+                current_shape[dim] = 1;
+                current_layout = Layout::contiguous(Shape::from(current_shape.clone()));
+                current = Some(reduced);
+            }
+            return match current {
+                Some(v) => Ok(v),
+                None => self.try_clone(layout),
+            };
+        }
+        let dim = reduce_dims[0];
+        if dim != rank - 1 {
+            // Permute the reduced dim to the last position, materialize
+            // contiguously on the GPU, then reduce the last dim.
+            let perm = (0..rank)
+                .filter(|&i| i != dim)
+                .chain(std::iter::once(dim))
+                .collect::<Vec<_>>();
+            let perm_shape = perm.iter().map(|&i| layout.dims()[i]).collect::<Vec<_>>();
+            let perm_stride = perm.iter().map(|&i| layout.stride()[i]).collect::<Vec<_>>();
+            let perm_layout = Layout::new(
+                Shape::from(perm_shape.clone()),
+                perm_stride,
+                layout.start_offset(),
+            );
+            let mut permuted = unsafe {
+                self.device
+                    .alloc_uninit(&Shape::from(perm_shape.clone()), DType::F64)?
+            };
+            <Self as BackendStorage>::copy_strided_src(self, &mut permuted, 0, &perm_layout)?;
+            let permuted_layout = Layout::contiguous(Shape::from(perm_shape));
+            return permuted.run_f64_reduce(op, &permuted_layout, &[rank - 1]);
+        }
+        // Last-dim reduction. Materialize contiguously if needed.
+        let mut materialized_storage;
+        let src;
+        let src_layout;
+        let contiguous_layout;
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            src = self;
+            src_layout = layout;
+        } else {
+            materialized_storage = unsafe { self.device.alloc_uninit(layout.shape(), DType::F64)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized_storage, 0, layout)?;
+            contiguous_layout = Layout::contiguous(layout.shape());
+            src = &materialized_storage;
+            src_layout = &contiguous_layout;
+        }
+        match op {
+            ReduceOp::Sum => src.run_f64_sum_rows(src_layout),
+            ReduceOp::Max => src.run_f64_extrema_last_dim(src_layout, 0),
+            ReduceOp::Min => src.run_f64_extrema_last_dim(src_layout, 1),
+            ReduceOp::ArgMax => src.run_f64_argextrema_last_dim(src_layout, 0),
+            ReduceOp::ArgMin => src.run_f64_argextrema_last_dim(src_layout, 1),
+        }
+    }
+
+    /// F64 last-dim sum reduction using `sum_rows_f64.comp`.
+    fn run_f64_sum_rows(&self, layout: &Layout) -> Result<Self> {
+        if layout.start_offset() > u16::MAX as usize {
+            return self.run_f64_sum_rows(&Layout::contiguous(layout.shape()));
+        }
+        let rank = layout.dims().len();
+        let (src_dims, src_strides) = dims4_ggml(layout)?;
+        let mut dst_dims_candle = layout.dims().to_vec();
+        dst_dims_candle[rank - 1] = 1;
+        let dst_shape = Shape::from(dst_dims_candle);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F64)? };
+
+        let mut dst_dims = src_dims;
+        dst_dims[0] = 1;
+        let dst_strides = contiguous_strides_ggml(dst_dims);
+        let rows = src_dims[1] * src_dims[2] * src_dims[3];
+        let (ne0_12mp, ne0_12l) = fastdiv_values(src_dims[1] * src_dims[2]);
+        let (ne0_1mp, ne0_1l) = fastdiv_values(src_dims[1]);
+        let params = IntSumRowsParams {
+            n_cols: src_dims[0],
+            ne01: src_dims[1],
+            ne02: src_dims[2],
+            nb01: src_strides[1],
+            nb02: src_strides[2],
+            nb03: src_strides[3],
+            nb11: dst_strides[1],
+            nb12: dst_strides[2],
+            nb13: dst_strides[3],
+            misalign_offsets: (layout.start_offset() as u32) << 16,
+            ne0_12mp,
+            ne0_12l,
+            ne0_1mp,
+            ne0_1l,
+        };
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("sum_rows_f64")
+            .ok_or_else(|| Error::Msg("vulkan shader sum_rows_f64 not generated".into()).bt())?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (rows, 1, 1),
+            Some(&[(0, self.device.inner.subgroup_size)]),
+        )?;
+        Ok(dst)
+    }
+
+    /// F64 last-dim extrema reduction using `reduce_extrema_f64.comp`.
+    fn run_f64_extrema_last_dim(&self, layout: &Layout, mode: u32) -> Result<Self> {
+        let rank = layout.dims().len();
+        if rank == 0 {
+            return self.try_clone(layout);
+        }
+        let kx = *layout.dims().last().unwrap_or(&1);
+        let mut dst_dims = layout.dims().to_vec();
+        dst_dims[rank - 1] = 1;
+        let dst_shape = Shape::from(dst_dims);
+        let rows = dst_shape.elem_count();
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F64)? };
+        let params = IntExtremaParams {
+            kx: kx.try_into()?,
+            ky: rows.try_into()?,
+            mode,
+            pad: 0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("reduce_extrema_f64").ok_or_else(|| {
+            Error::Msg("vulkan shader reduce_extrema_f64 not generated".into()).bt()
+        })?;
+        self.device.run_compute_specialized(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (rows.try_into()?, 1, 1),
+            Some(&[(0, self.device.inner.subgroup_size)]),
+        )?;
+        Ok(dst)
+    }
+
+    /// F64 last-dim arg-extrema reduction using `argextrema_f64.comp`.
+    fn run_f64_argextrema_last_dim(&self, layout: &Layout, mode: u32) -> Result<Self> {
+        let rank = layout.dims().len();
+        if rank == 0 {
+            return Ok(unsafe {
+                self.device
+                    .alloc_uninit(&Shape::from(&[] as &[usize]), DType::U32)?
+            });
+        }
+        let kx = *layout.dims().last().unwrap_or(&1);
+        let mut dst_dims = layout.dims().to_vec();
+        dst_dims[rank - 1] = 1;
+        let dst_shape = Shape::from(dst_dims);
+        let rows = dst_shape.elem_count();
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::U32)? };
+        let params = IntExtremaParams {
+            kx: kx.try_into()?,
+            ky: rows.try_into()?,
+            mode,
+            pad: 0,
+        };
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("argextrema_f64")
+            .ok_or_else(|| Error::Msg("vulkan shader argextrema_f64 not generated".into()).bt())?;
         self.device.run_compute_specialized(
             spirv,
             &bindings,
@@ -5315,6 +6406,26 @@ impl VulkanStorage {
         scale: f32,
         causal: bool,
     ) -> Result<VulkanStorage> {
+        Self::flash_attn_ext(
+            q, q_layout, k, k_layout, v, v_layout, None, None, None, None, scale, causal,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_ext(
+        q: &VulkanStorage,
+        q_layout: &Layout,
+        k: &VulkanStorage,
+        k_layout: &Layout,
+        v: &VulkanStorage,
+        v_layout: &Layout,
+        alibi_slopes: Option<&VulkanStorage>,
+        window_size_left: Option<usize>,
+        window_size_right: Option<usize>,
+        softcap: Option<f32>,
+        scale: f32,
+        causal: bool,
+    ) -> Result<VulkanStorage> {
         use crate::DType;
 
         // Decide compute dtype: F16 when inputs are BF16/F16 (halves VRAM,
@@ -5357,6 +6468,18 @@ impl VulkanStorage {
         let out_shape = Shape::from_dims(&[b, h, seq_q, head_dim_v]);
         let dst = unsafe { q_buf.device.alloc_uninit(&out_shape, DType::F32)? };
 
+        let alibi_storage = if let Some(alibi) = alibi_slopes {
+            if alibi.dtype != DType::F32 {
+                Some(alibi.to_dtype(&Layout::contiguous(alibi.count), DType::F32)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let alibi_ref = alibi_storage.as_ref().or(alibi_slopes).unwrap_or(&dst);
+        let has_alibi = alibi_slopes.is_some();
+
         #[repr(C)]
         #[derive(Clone, Copy)]
         struct FlashAttnParams {
@@ -5369,6 +6492,10 @@ impl VulkanStorage {
             batch_size: u32,
             scale: f32,
             causal: u32,
+            window_size_left: u32,
+            window_size_right: u32,
+            softcap: f32,
+            has_alibi: u32,
         }
 
         let params = FlashAttnParams {
@@ -5381,6 +6508,10 @@ impl VulkanStorage {
             batch_size: b as u32,
             scale,
             causal: if causal { 1 } else { 0 },
+            window_size_left: window_size_left.unwrap_or(0) as u32,
+            window_size_right: window_size_right.unwrap_or(0) as u32,
+            softcap: softcap.unwrap_or(0.0),
+            has_alibi: if has_alibi { 1 } else { 0 },
         };
 
         let bindings = [
@@ -5388,6 +6519,7 @@ impl VulkanStorage {
             VulkanBinding::Storage(&k_buf.buffer),
             VulkanBinding::Storage(&v_buf.buffer),
             VulkanBinding::Storage(&dst.buffer),
+            VulkanBinding::Storage(&alibi_ref.buffer),
         ];
 
         let shader_name = if use_f16 {
@@ -5407,6 +6539,435 @@ impl VulkanStorage {
             &bindings,
             Some(any_as_bytes(&params)),
             (num_workgroups, 1, 1),
+        )?;
+
+        Ok(dst)
+    }
+
+    /// Fused flash attention with variable-length sequences (non-paged K/V).
+    ///
+    /// This is the Vulkan counterpart of `candle-flash-attn`'s CUDA
+    /// `flash_attn_varlen` (dense k/v, no block table) and matches its
+    /// semantics: `O = softmax(Q @ K^T * softmax_scale + causal_mask) @ V`,
+    /// computed per sequence via online softmax over the owning KV range.
+    ///
+    /// Shapes:
+    /// - `q`: `(total_q, h_q, d)` (the receiver, contiguous).
+    /// - `k`/`v`: `(total_kv, h_kv, ...)`; the last dim must be contiguous.
+    /// - `gqa`: `h_q % h_kv == 0`; q head `n` attends to kv head `n * h_kv / h_q`.
+    /// - `cu_seqlens_q`/`cu_seqlens_k`: `I32`, `batch + 1` elements, contiguous,
+    ///   cumulative sequence offsets `[0, l1, l1 + l2, ...]`.
+    /// - `causal`: within a sequence only keys whose local index `<=` the
+    ///   query's local index participate.
+    ///
+    /// `max_seqlen_q`/`max_seqlen_k` are accepted for signature parity with the
+    /// CUDA kernel; correctness only depends on the actual `cu_seqlens` ranges.
+    ///
+    /// The output has shape `(total_q, h_q, d_v)` and the dtype of `q`
+    /// (`F32`/`F16`/`BF16`), matching the CUDA reference.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_varlen(
+        &self,
+        layout: &Layout, // q: (total_q, h_q, d), contiguous
+        k: &Self,
+        k_l: &Layout, // (total_kv, h_kv, d)
+        v: &Self,
+        v_l: &Layout,        // (total_kv, h_kv, d_v)
+        cu_seqlens_q: &Self, // I32, batch+1, contiguous
+        cu_seqlens_k: &Self, // I32, batch+1, contiguous
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        softmax_scale: f32,
+        causal: bool,
+    ) -> Result<Self> {
+        use crate::DType;
+
+        if !matches!(self.dtype, DType::F32 | DType::F16 | DType::BF16) {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan flash_attn_varlen").bt());
+        }
+        if k.dtype != self.dtype || v.dtype != self.dtype {
+            return Err(Error::Msg(
+                "flash_attn_varlen requires k and v to share the dtype of q".into(),
+            )
+            .bt());
+        }
+
+        let (q, q_l) = self.materialize_contiguous(layout)?;
+        let (k, k_l) = k.materialize_contiguous(k_l)?;
+        let (v, v_l) = v.materialize_contiguous(v_l)?;
+
+        let dims_q = q_l.dims();
+        let dims_k = k_l.dims();
+        let dims_v = v_l.dims();
+        if dims_q.len() != 3 || dims_k.len() != 3 || dims_v.len() != 3 {
+            return Err(Error::Msg(
+                "flash_attn_varlen expects 3D tensors q/k/v [rows, heads, head_dim]".into(),
+            )
+            .bt());
+        }
+        let (total_q, h_q, head_dim) = (dims_q[0], dims_q[1], dims_q[2]);
+        let (total_kv, h_kv, head_dim_k) = (dims_k[0], dims_k[1], dims_k[2]);
+        let (total_kv_v, h_kv_v, head_dim_v) = (dims_v[0], dims_v[1], dims_v[2]);
+        if head_dim_k != head_dim {
+            return Err(Error::Msg(format!(
+                "flash_attn_varlen head dim mismatch q ({head_dim}) vs k ({head_dim_k})"
+            ))
+            .bt());
+        }
+        if total_kv_v != total_kv || h_kv_v != h_kv {
+            return Err(Error::Msg(format!(
+                "flash_attn_varlen shape mismatch k ({total_kv}, {h_kv}) vs v ({total_kv_v}, {h_kv_v})"
+            ))
+            .bt());
+        }
+        if h_q % h_kv != 0 {
+            return Err(Error::Msg(format!(
+                "flash_attn_varlen requires h_q ({h_q}) to be a multiple of h_kv ({h_kv})"
+            ))
+            .bt());
+        }
+
+        if cu_seqlens_q.dtype != DType::I32 || cu_seqlens_k.dtype != DType::I32 {
+            return Err(
+                Error::Msg("flash_attn_varlen requires cu_seqlens_q/k to be I32".into()).bt(),
+            );
+        }
+        let num_seqs_q = cu_seqlens_q.count.checked_sub(1);
+        let num_seqs_k = cu_seqlens_k.count.checked_sub(1);
+        let (Some(batch_q), Some(batch_k)) = (num_seqs_q, num_seqs_k) else {
+            return Err(Error::Msg(
+                "flash_attn_varlen requires at least 2 cu_seqlens elements".into(),
+            )
+            .bt());
+        };
+        if batch_q != batch_k {
+            return Err(Error::Msg(format!(
+                "flash_attn_varlen cu_seqlens_q ({batch_q} seqs) and cu_seqlens_k ({batch_k} seqs) mismatch"
+            ))
+            .bt());
+        }
+        let batch = batch_q;
+
+        // F16/BF16 route through the F32 hub (GPU-resident conversion, exact
+        // for f16/bf16 inputs): compute in f32 like the CUDA kernel's f32
+        // accumulation, convert the result back to the input dtype.
+        if self.dtype != DType::F32 {
+            let q_f32 = q.to_dtype(&q_l, DType::F32)?;
+            let k_f32 = k.to_dtype(&k_l, DType::F32)?;
+            let v_f32 = v.to_dtype(&v_l, DType::F32)?;
+            let out = q_f32.flash_attn_varlen(
+                &q_l,
+                &k_f32,
+                &k_l,
+                &v_f32,
+                &v_l,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale,
+                causal,
+            )?;
+
+            let out_l = Layout::contiguous(Shape::from_dims(&[total_q, h_q, head_dim_v]));
+            return out.to_dtype(&out_l, self.dtype);
+        }
+
+        let cu_q_shape = Shape::from_dims(&[cu_seqlens_q.count]);
+        let cu_k_shape = Shape::from_dims(&[cu_seqlens_k.count]);
+        let (cu_q, _) = cu_seqlens_q.materialize_contiguous(&Layout::contiguous(cu_q_shape))?;
+        let (cu_k, _) = cu_seqlens_k.materialize_contiguous(&Layout::contiguous(cu_k_shape))?;
+
+        let out_shape = Shape::from_dims(&[total_q, h_q, head_dim_v]);
+        let dst = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
+        if total_q == 0 || h_q == 0 {
+            return Ok(dst);
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FlashAttnVarLenParams {
+            total_q: u32,
+            h_q: u32,
+            h_kv: u32,
+            head_dim: u32,
+            head_dim_v: u32,
+            num_seqs: u32,
+            scale: f32,
+            causal: u32,
+            max_seqlen_q: u32,
+            max_seqlen_k: u32,
+        }
+
+        let params = FlashAttnVarLenParams {
+            total_q: total_q as u32,
+            h_q: h_q as u32,
+            h_kv: h_kv as u32,
+            head_dim: head_dim as u32,
+            head_dim_v: head_dim_v as u32,
+            num_seqs: batch as u32,
+            scale: softmax_scale,
+            causal: if causal { 1 } else { 0 },
+            max_seqlen_q: max_seqlen_q as u32,
+            max_seqlen_k: max_seqlen_k as u32,
+        };
+
+        let bindings = [
+            VulkanBinding::Storage(&q.buffer),
+            VulkanBinding::Storage(&k.buffer),
+            VulkanBinding::Storage(&v.buffer),
+            VulkanBinding::Storage(&cu_q.buffer),
+            VulkanBinding::Storage(&cu_k.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+
+        let shader_name = match self.dtype {
+            DType::F32 => "flash_attn_varlen",
+            DType::F16 => "flash_attn_varlen_f16",
+            DType::BF16 => "flash_attn_varlen_bf16",
+            _ => unreachable!("dtype checked above"),
+        };
+        let spirv = candle_vulkan_kernels::spirv(shader_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {shader_name} not generated")).bt())?;
+
+        // One thread per (q_row, q_head): x -> q_row, y -> q_head.
+        let workgroup_size = 256u32;
+        let num_workgroups_x = (total_q as u32).div_ceil(workgroup_size);
+        q.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (num_workgroups_x, h_q as u32, 1),
+        )?;
+
+        Ok(dst)
+    }
+
+    /// Paged flash attention with variable-length sequences, the Vulkan
+    /// counterpart of candle-flash-attn::flash_attn_with_kvcache (CUDA,
+    /// paged mode with a block_table).
+    ///
+    /// k/v are rank-4 page caches:
+    ///   (num_blocks, page_block_size, h_kv, head_dim(_v))
+    /// and rows are scattered through physical pages: for local kv row
+    /// `k_idx` of sequence b,
+    ///   page_idx = k_idx / page_block_size,
+    ///   page_row = k_idx % page_block_size,
+    ///   block = block_table[b * max_blocks_per_seq + page_idx],
+    ///   j_flat = block * page_block_size + page_row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_paged(
+        &self,
+        layout: &Layout, // q: (total_q, h_q, d), contiguous
+        k: &Self,
+        k_l: &Layout, // (num_blocks, page_block_size, h_kv, d)
+        v: &Self,
+        v_l: &Layout,        // (num_blocks, page_block_size, h_kv, d_v)
+        cu_seqlens_q: &Self, // I32, batch+1, contiguous
+        cu_seqlens_k: &Self, // I32, batch+1, contiguous
+        block_table: &Self,
+        block_table_l: &Layout, // I32, (batch, max_blocks_per_seq), last dim contiguous
+        page_block_size: usize,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        softmax_scale: f32,
+        causal: bool,
+    ) -> Result<Self> {
+        use crate::DType;
+
+        if !matches!(self.dtype, DType::F32 | DType::F16 | DType::BF16) {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan flash_attn_paged").bt());
+        }
+        if k.dtype != self.dtype || v.dtype != self.dtype {
+            return Err(Error::Msg(
+                "flash_attn_paged requires k and v to share the dtype of q".into(),
+            )
+            .bt());
+        }
+
+        let (q, q_l) = self.materialize_contiguous(layout)?;
+        let (k, k_l) = k.materialize_contiguous(k_l)?;
+        let (v, v_l) = v.materialize_contiguous(v_l)?;
+
+        let dims_q = q_l.dims();
+        let dims_k = k_l.dims();
+        let dims_v = v_l.dims();
+        if dims_q.len() != 3 || dims_k.len() != 4 || dims_v.len() != 4 {
+            return Err(Error::Msg(
+                "flash_attn_paged expects 3D q [rows, heads, head_dim] and 4D k/v [num_blocks, page_block_size, heads, head_dim]"
+                    .into(),
+            )
+            .bt());
+        }
+        let (total_q, h_q, head_dim) = (dims_q[0], dims_q[1], dims_q[2]);
+        let (num_blocks, k_pbs, h_kv, head_dim_k) = (dims_k[0], dims_k[1], dims_k[2], dims_k[3]);
+        let (num_blocks_v, k_pbs_v, h_kv_v, head_dim_v) =
+            (dims_v[0], dims_v[1], dims_v[2], dims_v[3]);
+        if !page_block_size.is_multiple_of(32) {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged requires page_block_size to be a multiple of 32 (got {page_block_size})"
+            ))
+            .bt());
+        }
+        if k_pbs != page_block_size || k_pbs_v != page_block_size {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged page_block_size ({page_block_size}) does not match k/v shape ({k_pbs}, {k_pbs_v})"
+            ))
+            .bt());
+        }
+        if head_dim_k != head_dim {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged head dim mismatch q ({head_dim}) vs k ({head_dim_k})"
+            ))
+            .bt());
+        }
+        if num_blocks_v != num_blocks || k_pbs_v != k_pbs || h_kv_v != h_kv {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged shape mismatch k ({num_blocks}, {k_pbs}, {h_kv}) vs v ({num_blocks_v}, {k_pbs_v}, {h_kv_v})"
+            ))
+            .bt());
+        }
+        if h_q % h_kv != 0 {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged requires h_q ({h_q}) to be a multiple of h_kv ({h_kv})"
+            ))
+            .bt());
+        }
+        if head_dim > 512 || head_dim_v > 512 {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged supports head dims up to 512 (got q/k {head_dim}, v {head_dim_v})"
+            ))
+            .bt());
+        }
+
+        if cu_seqlens_q.dtype != DType::I32 || cu_seqlens_k.dtype != DType::I32 {
+            return Err(
+                Error::Msg("flash_attn_paged requires cu_seqlens_q/k to be I32".into()).bt(),
+            );
+        }
+        let num_seqs_q = cu_seqlens_q.count.checked_sub(1);
+        let num_seqs_k = cu_seqlens_k.count.checked_sub(1);
+        let (Some(batch_q), Some(batch_k)) = (num_seqs_q, num_seqs_k) else {
+            return Err(Error::Msg(
+                "flash_attn_paged requires at least 2 cu_seqlens elements".into(),
+            )
+            .bt());
+        };
+        if batch_q != batch_k {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged cu_seqlens_q ({batch_q} seqs) and cu_seqlens_k ({batch_k} seqs) mismatch"
+            ))
+            .bt());
+        }
+        let batch = batch_q;
+
+        let bt_dims = block_table_l.dims();
+        if block_table.dtype != DType::I32
+            || bt_dims.len() != 2
+            || bt_dims[0] != batch
+            || block_table_l.stride().last().copied() != Some(1)
+        {
+            return Err(Error::Msg(format!(
+                "flash_attn_paged requires block_table to be contiguous I32 (batch={batch}, max_blocks_per_seq), got shape {bt_dims:?}"
+            ))
+            .bt());
+        }
+        let max_blocks_per_seq = bt_dims[1];
+
+        // F16/BF16 route through the F32 hub (GPU-resident conversion, exact
+        // for f16/bf16 inputs): compute in f32 like the CUDA kernel's f32
+        // accumulation, convert the result back to the input dtype.
+        if self.dtype != DType::F32 {
+            let q_f32 = q.to_dtype(&q_l, DType::F32)?;
+            let k_f32 = k.to_dtype(&k_l, DType::F32)?;
+            let v_f32 = v.to_dtype(&v_l, DType::F32)?;
+            let out = q_f32.flash_attn_paged(
+                &q_l,
+                &k_f32,
+                &k_l,
+                &v_f32,
+                &v_l,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                block_table,
+                block_table_l,
+                page_block_size,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale,
+                causal,
+            )?;
+
+            let out_l = Layout::contiguous(Shape::from_dims(&[total_q, h_q, head_dim_v]));
+            return out.to_dtype(&out_l, self.dtype);
+        }
+
+        let cu_q_shape = Shape::from_dims(&[cu_seqlens_q.count]);
+        let cu_k_shape = Shape::from_dims(&[cu_seqlens_k.count]);
+        let (cu_q, _) = cu_seqlens_q.materialize_contiguous(&Layout::contiguous(cu_q_shape))?;
+        let (cu_k, _) = cu_seqlens_k.materialize_contiguous(&Layout::contiguous(cu_k_shape))?;
+        let (block_table, _) = block_table.materialize_contiguous(block_table_l)?;
+
+        let out_shape = Shape::from_dims(&[total_q, h_q, head_dim_v]);
+        let dst = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
+        if total_q == 0 || h_q == 0 {
+            return Ok(dst);
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FlashAttnPagedParams {
+            total_q: u32,
+            h_q: u32,
+            h_kv: u32,
+            head_dim: u32,
+            head_dim_v: u32,
+            num_seqs: u32,
+            scale: f32,
+            causal: u32,
+            max_seqlen_q: u32,
+            max_seqlen_k: u32,
+            page_block_size: u32,
+            max_blocks_per_seq: u32,
+        }
+
+        let params = FlashAttnPagedParams {
+            total_q: total_q as u32,
+            h_q: h_q as u32,
+            h_kv: h_kv as u32,
+            head_dim: head_dim as u32,
+            head_dim_v: head_dim_v as u32,
+            num_seqs: batch as u32,
+            scale: softmax_scale,
+            causal: if causal { 1 } else { 0 },
+            max_seqlen_q: max_seqlen_q as u32,
+            max_seqlen_k: max_seqlen_k as u32,
+            page_block_size: page_block_size as u32,
+            max_blocks_per_seq: max_blocks_per_seq as u32,
+        };
+
+        let bindings = [
+            VulkanBinding::Storage(&q.buffer),
+            VulkanBinding::Storage(&k.buffer),
+            VulkanBinding::Storage(&v.buffer),
+            VulkanBinding::Storage(&cu_q.buffer),
+            VulkanBinding::Storage(&cu_k.buffer),
+            VulkanBinding::Storage(&block_table.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+
+        let shader_name = "flash_attn_paged";
+        let spirv = candle_vulkan_kernels::spirv(shader_name)
+            .ok_or_else(|| Error::Msg(format!("vulkan shader {shader_name} not generated")).bt())?;
+
+        // One thread per (q_row, q_head): x -> q_row, y -> q_head.
+        let workgroup_size = 256u32;
+        let num_workgroups_x = (total_q as u32).div_ceil(workgroup_size);
+        q.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (num_workgroups_x, h_q as u32, 1),
         )?;
 
         Ok(dst)
@@ -5790,8 +7351,47 @@ impl VulkanStorage {
             compact.copy_strided_src(self, dst_l.start_offset(), dst_l)?;
             return Ok(());
         }
-        // Native F32 and F16 only (F16 uses packed-half CAS in set_rows_add_f16_i32).
-        if self.dtype != src.dtype || !matches!(self.dtype, DType::F32 | DType::F16) {
+        // Native: F32 (atomicAdd), F16 (packed-half CAS), U32/U8/I64/F64 via
+        // the set_rows_add_ext family (word CAS), F64 via F32 hub is NOT used —
+        // the ext kernel accumulates through the FLOAT_TYPE path.
+        if self.dtype != src.dtype
+            || !matches!(
+                self.dtype,
+                DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I64 | DType::F64
+            )
+        {
+            if self.dtype == DType::BF16 && src.dtype == DType::BF16 {
+                // GPUEmulated: decode both sides to f32, scatter_add, encode back.
+                let mut dst_f32 = self.to_dtype(dst_l, DType::F32)?;
+                let src_f32 = src.to_dtype(&src_l, DType::F32)?;
+                let contig_dst = Layout::contiguous(dst_l.shape());
+                let contig_src = Layout::contiguous(src_l.shape());
+                dst_f32.run_scatter_add_last_dim_f32(
+                    &contig_dst,
+                    &ids,
+                    &ids_l,
+                    &src_f32,
+                    &contig_src,
+                )?;
+                let encoded = dst_f32.to_dtype(&contig_dst, DType::BF16)?;
+                return encoded.copy_strided_src(self, dst_l.start_offset(), &contig_dst);
+            }
+            if self.dtype == DType::F8E4M3 && src.dtype == DType::F8E4M3 {
+                // GPUEmulated: decode both sides to f32, scatter_add, encode back.
+                let mut dst_f32 = self.to_dtype(dst_l, DType::F32)?;
+                let src_f32 = src.to_dtype(&src_l, DType::F32)?;
+                let contig_dst = Layout::contiguous(dst_l.shape());
+                let contig_src = Layout::contiguous(src_l.shape());
+                dst_f32.run_scatter_add_last_dim_f32(
+                    &contig_dst,
+                    &ids,
+                    &ids_l,
+                    &src_f32,
+                    &contig_src,
+                )?;
+                let encoded = dst_f32.to_dtype(&contig_dst, DType::F8E4M3)?;
+                return encoded.copy_strided_src(self, dst_l.start_offset(), &contig_dst);
+            }
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan scatter_add").bt());
         }
         let rank = dst_l.dims().len();
@@ -5865,6 +7465,10 @@ impl VulkanStorage {
         ];
         let spirv_name = match self.dtype {
             DType::F16 => "set_rows_add_f16_i32",
+            DType::U8 => "set_rows_add_u8_i32",
+            DType::U32 => "set_rows_add_u32_i32",
+            DType::I64 => "set_rows_add_i64_i32",
+            DType::F64 => "set_rows_add_f64_i32",
             _ => "set_rows_add_f32_i32",
         };
         let spirv = candle_vulkan_kernels::spirv(spirv_name)
@@ -5977,6 +7581,29 @@ impl VulkanStorage {
             )
         };
 
+        // B13: m==1 batched attention CONTEXT matmul with V in its NATURAL
+        // (batch, k, n) layout — reduce over the outer k (kv), output over the
+        // inner n (head_dim). Reading V natively skips the generic per-step
+        // (batch, n, k) V-transpose materialization below (the pp4096 residual).
+        // Only fires when the RHS is a batch of contiguous (k, n) blocks (native
+        // layout, including a `narrow`ed grown cache whose batch stride is the
+        // capacity stride): the SCORE matmul's key^T view has a strided inner dim
+        // and never matches batched_gemv_inner_contiguous (so it keeps its own
+        // dispatch below), as do every non-natural shape.
+        if rank > 2
+            && self.dtype == DType::F32
+            && m == 1
+            && !vulkan_dense_gemm_prefers_tiled(m, n, k)
+            && lhs_l.dims()[..rank - 2] == rhs_l.dims()[..rank - 2]
+            && lhs_layout.is_contiguous()
+            && lhs_layout.start_offset() == 0
+            && Self::batched_gemv_inner_contiguous(rhs_l)
+        {
+            let dst = lhs.run_ctx_gemv_f32(rhs, &lhs_layout, rhs_l, b, m, n, k)?;
+            drop(lhs_contiguous);
+            return Ok(dst);
+        }
+
         // Virtual B^T: bind contiguous physical (K,N) as A without materializing
         // a full n×k transpose. Big win on tall/wide (avoids 4096² copies); on
         // large squares the aligned K-contiguous path still wins after a cheap
@@ -5998,7 +7625,24 @@ impl VulkanStorage {
                 || vulkan_spirv_exists("matmul_f32_f32_virtual_fp32"));
 
         let rhs_t_src_layout = rhs_l.transpose(rank - 2, rank - 1)?;
+        // m == 1 batched-GEMV SCORE path (dispatched below for rank > 2): when the
+        // RHS is a batch of contiguous (n, k) blocks but the batch stride is
+        // non-compact (a `narrow`ed grown KV-cache backing buffer), keep the strided
+        // transpose view instead of materializing a full B^T copy — the single-
+        // dispatch GEMV reads it directly via the `batch_stride` push-constant. A
+        // fully-contiguous view takes the `other` branch; any genuinely intra-block
+        // strided view fails and falls back to the generic materialize (correct,
+        // slower).
+        let m1_batched_inner_contig = rank > 2
+            && self.dtype == DType::F32
+            && m == 1
+            && !vulkan_dense_gemm_prefers_tiled(m, n, k)
+            && Self::batched_gemv_inner_contiguous(&rhs_t_src_layout)
+            && lhs_l.dims()[..rank - 2] == rhs_l.dims()[..rank - 2]
+            && lhs_layout.is_contiguous()
+            && lhs_layout.start_offset() == 0;
         let rhs_t_contiguous = if rhs_virtual_bt
+            || m1_batched_inner_contig
             || (rhs_t_src_layout.is_contiguous() && rhs_t_src_layout.start_offset() == 0)
         {
             None
@@ -6088,9 +7732,22 @@ impl VulkanStorage {
         }
         if rank > 2
             && self.dtype == DType::F32
+            && m == 1
             && lhs_l.dims()[..rank - 2] == rhs_l.dims()[..rank - 2]
             && !vulkan_dense_gemm_prefers_tiled(m, n, k)
         {
+            // m == 1 batched (attention score/ctx shapes): run every batch in ONE
+            // GEMV dispatch instead of one per-head alloc/copy/dispatch. The guard
+            // requires a batch of contiguous (n, k) blocks (see
+            // `batched_gemv_inner_contiguous`); the batch stride may be non-compact
+            // (a `narrow`ed grown cache) since the shader reads it as a push-constant.
+            // Any genuinely intra-block-strided view falls back to the per-batch
+            // path below (still correct, just slower).
+            if lhs_layout.is_contiguous() && Self::batched_gemv_inner_contiguous(&rhs_t_layout) {
+                let dst = lhs.run_batched_gemv_f32(rhs_t, &lhs_layout, &rhs_t_layout, b, m, n, k)?;
+                drop(lhs_contiguous);
+                return Ok(dst);
+            }
             let dst = lhs.run_batched_matmul_f32_via_rank2_batches(rhs_t, b, m, n, k)?;
             drop(lhs_contiguous);
             return Ok(dst);
@@ -7025,6 +8682,17 @@ impl VulkanStorage {
         storage: &Self,
         layout: &Layout,
     ) -> Result<(Self, Shape)> {
+        self.quantized_matmul_impl(qdtype, qshape, storage, layout, false)
+    }
+
+    fn quantized_matmul_impl(
+        &self,
+        qdtype: GgmlDType,
+        qshape: &Shape,
+        storage: &Self,
+        layout: &Layout,
+        force_q8_1_rhs: bool,
+    ) -> Result<(Self, Shape)> {
         if storage.dtype != DType::F32 && storage.dtype != DType::F16 {
             return Err(
                 Error::UnsupportedDTypeForOp(storage.dtype, "vulkan quantized matmul").bt(),
@@ -7042,7 +8710,10 @@ impl VulkanStorage {
         }
         if qdtype == GgmlDType::Q8_1 {
             let repacked = repack_q8_1_storage_to_q8_0(&self.device, self, qshape.elem_count())?;
-            return repacked.quantized_matmul(GgmlDType::Q8_0, qshape, storage, layout);
+            // q8_1 weights must quantize the A-side (activations) to q8_1 as well
+            // to reproduce the CPU QMatMul contract. The repacked q8_0 path forces
+            // the fused q8_1-rhs kernels so the LHS quantization step is not lost.
+            return repacked.quantized_matmul_impl(GgmlDType::Q8_0, qshape, storage, layout, true);
         }
         let mut dst_dims = layout.dims().to_vec();
         dst_dims.pop();
@@ -7064,7 +8735,8 @@ impl VulkanStorage {
             };
             let flat_m = layout.shape().elem_count() / k;
             let flat_layout = Layout::contiguous(Shape::from((flat_m, k)));
-            let (dst, _) = self.quantized_matmul(qdtype, qshape, src, &flat_layout)?;
+            let (dst, _) =
+                self.quantized_matmul_impl(qdtype, qshape, src, &flat_layout, force_q8_1_rhs)?;
             drop(src_contiguous);
             return Ok((dst, dst_shape));
         }
@@ -7072,7 +8744,7 @@ impl VulkanStorage {
             && rank == 2
             && vulkan_supports_quantized_matvec_weight(qdtype)
         {
-            return self.quantized_matvec(qdtype, qshape, storage, layout);
+            return self.quantized_matvec(qdtype, qshape, storage, layout, force_q8_1_rhs);
         }
 
         let mut src_contiguous = None;
@@ -7252,6 +8924,7 @@ impl VulkanStorage {
         qshape: &Shape,
         storage: &Self,
         layout: &Layout,
+        force_q8_1_rhs: bool,
     ) -> Result<(Self, Shape)> {
         let rank = layout.dims().len();
         let (n, k) = qshape.dims2()?;
@@ -7306,7 +8979,14 @@ impl VulkanStorage {
             && self.device.inner.integer_dot_product
             && src_elem_count % 4 == 0
         {
-            vulkan_q8_1_rhs_matvec_shader_name(&self.device, qdtype, input_m, k, false)?
+            vulkan_q8_1_rhs_matvec_shader_name(
+                &self.device,
+                qdtype,
+                input_m,
+                k,
+                false,
+                force_q8_1_rhs,
+            )?
         } else {
             None
         };
@@ -7501,7 +9181,7 @@ impl VulkanStorage {
             && self.device.inner.integer_dot_product
             && src_elem_count.is_multiple_of(4)
         {
-            vulkan_q8_1_rhs_matvec_shader_name(&self.device, qdtype, batch, k, true)?
+            vulkan_q8_1_rhs_matvec_shader_name(&self.device, qdtype, batch, k, true, false)?
         } else {
             None
         };
@@ -7604,6 +9284,30 @@ impl Drop for VulkanBuffer {
     fn drop(&mut self) {
         if let Ok(mut allocation) = self.allocation.lock() {
             if let Some(allocation) = allocation.take() {
+                if self.is_staging {
+                    // Return to staging pending list instead of deferred free
+                    if let Ok(mut pending) = self.device.inner.staging_pending_return.lock() {
+                        let buf = Arc::new(VulkanBuffer {
+                            device: self.device.clone(),
+                            buffer: self.buffer,
+                            allocation: Mutex::new(Some(allocation)),
+                            size: self.size,
+                            is_staging: true,
+                            staging_kind: self.staging_kind,
+                        });
+                        pending.push(buf);
+                        return;
+                    }
+                }
+                // Non-staging buffers always route through the device-level
+                // deferred-free list: the actual `allocator.free` runs in
+                // `destroy_deferred_buffers` under the allocator lock (never
+                // here — VulkanBuffer::drop can run while that lock is held).
+                // Without this, allocator sub-blocks are only reclaimed when a
+                // submission cycle happens to observe the buffer; test-suite
+                // devices that never run another op leak their first blocks
+                // for the process lifetime (compounding across the smoke
+                // suite's ~44 leaked devices).
                 if let Ok(mut deferred) = self.device.inner.deferred_buffer_frees.lock() {
                     deferred.push(VulkanDeferredBuffer {
                         buffer: self.buffer,
@@ -7711,6 +9415,35 @@ impl Drop for VulkanInner {
                     }
                 }
             }
+            // Drain staging pools: destroy all pooled staging buffers
+            if let Ok(mut allocator) = self.allocator.lock() {
+                if let Some(allocator) = allocator.as_mut() {
+                    if let Ok(mut pending) = self.staging_pending_return.lock() {
+                        for buf in pending.drain(..) {
+                            if let Ok(mut alloc) = buf.allocation.lock() {
+                                if let Some(allocation) = alloc.take() {
+                                    self.device.destroy_buffer(buf.buffer, None);
+                                    let _ = allocator.free(allocation);
+                                }
+                            }
+                        }
+                    }
+                    for pool in [&self.upload_staging_pool, &self.readback_staging_pool] {
+                        if let Ok(mut pool) = pool.lock() {
+                            for (_, bufs) in pool.drain() {
+                                for buf in bufs {
+                                    if let Ok(mut alloc) = buf.allocation.lock() {
+                                        if let Some(allocation) = alloc.take() {
+                                            self.device.destroy_buffer(buf.buffer, None);
+                                            let _ = allocator.free(allocation);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if let Ok(mut allocator) = self.allocator.lock() {
                 let _ = allocator.take();
             }
@@ -7765,6 +9498,9 @@ impl BackendStorage for VulkanStorage {
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
         let gpu = || -> Result<Self> {
+            if self.dtype == DType::F8E4M3 {
+                return self.f8e4m3_unary_via_f32(layout, |src, src_l| src.affine(src_l, mul, add));
+            }
             if self.dtype == DType::BF16 {
                 return self.bf16_unary_via_f32(layout, |src, src_l| src.affine(src_l, mul, add));
             }
@@ -7791,6 +9527,9 @@ impl BackendStorage for VulkanStorage {
     }
     fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
         let gpu = || -> Result<Self> {
+            if self.dtype == DType::F8E4M3 {
+                return self.f8e4m3_unary_via_f32(layout, |src, src_l| src.powf(src_l, e));
+            }
             if self.dtype == DType::BF16 {
                 return self.bf16_unary_via_f32(layout, |src, src_l| src.powf(src_l, e));
             }
@@ -7815,6 +9554,9 @@ impl BackendStorage for VulkanStorage {
     }
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
         if alpha == 1.0 {
+            if self.dtype == DType::F8E4M3 {
+                return self.f8e4m3_unary_via_f32(layout, |src, src_l| src.elu(src_l, alpha));
+            }
             if self.dtype == DType::BF16 {
                 return self.bf16_unary_via_f32(layout, |src, src_l| src.elu(src_l, alpha));
             }
@@ -7855,11 +9597,29 @@ impl BackendStorage for VulkanStorage {
         cond.where_cond(&zero_l, self, layout, &elu_neg, layout)
     }
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
+        if self.dtype == DType::F8E4M3 {
+            // Decode -> reduce in f32 -> (for Min/Max/Sum) re-encode to fp8.
+            // ArgMin/ArgMax return u32 indices regardless of source dtype.
+            let f32_storage = self.to_dtype(layout, DType::F32)?;
+            let contiguous = Layout::contiguous(layout.shape().clone());
+            let reduced = f32_storage.reduce_op(op, &contiguous, reduce_dims)?;
+            if matches!(op, ReduceOp::ArgMin | ReduceOp::ArgMax) {
+                return Ok(reduced);
+            }
+            // Reduced dims become 1; encode back to fp8.
+            let mut out_dims = layout.dims().to_vec();
+            for &dim in reduce_dims {
+                out_dims[dim] = 1;
+            }
+            let out_layout = Layout::contiguous(crate::Shape::from(out_dims));
+            return reduced.to_dtype(&out_layout, DType::F8E4M3);
+        }
         let int_dtype = matches!(self.dtype, DType::U8 | DType::U32 | DType::I32 | DType::I64);
         if self.dtype != DType::F32
             && self.dtype != DType::F16
             && self.dtype != DType::BF16
             && !int_dtype
+            && self.dtype != DType::F64
         {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan reduce").bt());
         }
@@ -7874,6 +9634,15 @@ impl BackendStorage for VulkanStorage {
             if dim >= rank {
                 crate::bail!("vulkan backend op reduce got out-of-range dim {dim} for rank {rank}")
             }
+        }
+        if self.dtype == DType::F64 {
+            if !self.device.shader_float64_supported() {
+                return Err(Error::Msg(
+                    "vulkan F64 reduce requires shaderFloat64 device feature".into(),
+                )
+                .bt());
+            }
+            return self.run_f64_reduce(op, layout, reduce_dims);
         }
         if int_dtype {
             return self.run_int_reduce(op, layout, reduce_dims);
@@ -7961,12 +9730,45 @@ impl BackendStorage for VulkanStorage {
         gpu()
     }
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
-        if self.dtype == DType::BF16 {
-            return self.bf16_cmp_via_f32(rhs, lhs_l, rhs_l, op);
+        if self.dtype == DType::F8E4M3 {
+            if rhs.dtype != DType::F8E4M3 {
+                return Err(Error::UnsupportedDTypeForOp(rhs.dtype, "vulkan f8e4m3 cmp").bt());
+            }
+            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
+            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
+            let l = if lhs_l.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(lhs_l))
+            } else {
+                Layout::contiguous(lhs_l.shape())
+            };
+            let r = if rhs_l.dims().len() > 4 {
+                Layout::contiguous(Self::compact_rank_gt4_shape(rhs_l))
+            } else {
+                Layout::contiguous(rhs_l.shape())
+            };
+            return lhs_f32.cmp(op, &rhs_f32, &l, &r);
+        }
+        // BF16 falls through to native cmp via run_cmp_u8 (packed-u16 shader).
+        if self.dtype == DType::F64 {
+            if !self.device.shader_float64_supported() {
+                return Err(Error::Msg(
+                    "vulkan F64 cmp requires shaderFloat64 device feature".into(),
+                )
+                .bt());
+            }
+            return self.run_cmp_f64(rhs, lhs_l, rhs_l, op);
         }
         self.run_cmp_u8(rhs, lhs_l, rhs_l, op)
     }
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+        if self.dtype == DType::F8E4M3 && !matches!(dtype, DType::F32 | DType::F16 | DType::F8E4M3)
+        {
+            // Decode to f32 then convert onward (GPU-resident; matches the
+            // CUDA cast matrix which routes fp8 through float internally).
+            let f32_storage = self.to_dtype(layout, DType::F32)?;
+            let contiguous = Layout::contiguous(layout.shape().clone());
+            return f32_storage.to_dtype(&contiguous, dtype);
+        }
         if self.dtype == DType::BF16 && !matches!(dtype, DType::F16 | DType::F32 | DType::BF16) {
             // No direct bf16 -> integer kernel exists; decompose into the
             // native bf16 -> f32 path followed by the native f32 -> dst cast,
@@ -7993,14 +9795,23 @@ impl BackendStorage for VulkanStorage {
         self.run_unary_generic_with_params_dtype(layout, spirv, 0.0, 0.0, dtype)
     }
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+        if self.dtype == DType::F8E4M3 {
+            return self.f8e4m3_unary_via_f32(layout, |src, src_l| src.unary_impl::<B>(src_l));
+        }
         if self.dtype == DType::BF16 {
             return self.bf16_unary_via_f32(layout, |src, src_l| src.unary_impl::<B>(src_l));
         }
         if self.dtype == DType::F64 {
-            let src_l = Layout::contiguous(layout.shape());
-            let src_f32 = self.to_dtype(layout, DType::F32)?;
-            let out_f32 = src_f32.unary_impl::<B>(&src_l)?;
-            return out_f32.to_dtype(&src_l, DType::F64);
+            if !self.device.shader_float64_supported() {
+                return Err(Error::Msg(
+                    "vulkan F64 unary requires shaderFloat64 device feature".into(),
+                )
+                .bt());
+            }
+            let opcode = f64_unary_opcode(B::NAME)?;
+            let spirv = candle_vulkan_kernels::spirv("unary_f64")
+                .ok_or_else(|| Error::Msg("vulkan shader unary_f64 not generated".into()).bt())?;
+            return self.run_unary_generic_with_params(layout, spirv, opcode, 0.0);
         }
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan unary").bt());
@@ -8036,6 +9847,14 @@ impl BackendStorage for VulkanStorage {
         lhs_layout: &Layout,
         rhs_layout: &Layout,
     ) -> Result<Self> {
+        if self.dtype == DType::F8E4M3 {
+            return self.f8e4m3_binary_via_f32(
+                rhs,
+                lhs_layout,
+                rhs_layout,
+                |lhs, rhs, lhs_l, rhs_l| lhs.binary_impl::<B>(rhs, lhs_l, rhs_l),
+            );
+        }
         if self.dtype == DType::BF16 {
             return self.bf16_binary_via_f32(
                 rhs,
@@ -8045,12 +9864,13 @@ impl BackendStorage for VulkanStorage {
             );
         }
         if self.dtype == DType::F64 {
-            let lhs_l = Layout::contiguous(lhs_layout.shape());
-            let rhs_l = Layout::contiguous(rhs_layout.shape());
-            let lhs_f32 = self.to_dtype(lhs_layout, DType::F32)?;
-            let rhs_f32 = rhs.to_dtype(rhs_layout, DType::F32)?;
-            let out_f32 = lhs_f32.binary_impl::<B>(&rhs_f32, &lhs_l, &rhs_l)?;
-            return out_f32.to_dtype(&lhs_l, DType::F64);
+            if !self.device.shader_float64_supported() {
+                return Err(Error::Msg(
+                    "vulkan F64 binary requires shaderFloat64 device feature".into(),
+                )
+                .bt());
+            }
+            return self.run_binary_f64(rhs, lhs_layout, rhs_layout, B::NAME);
         }
         if lhs_layout.dims().len() > 4 || rhs_layout.dims().len() > 4 {
             let (lhs, lhs_l) = if lhs_layout.dims().len() > 4 {
@@ -8892,51 +10712,80 @@ impl BackendDevice for VulkanDevice {
             physical_device,
             debug_settings: Default::default(),
             buffer_device_address: false,
-            allocation_sizes: Default::default(),
+            // Default 256MB initial blocks (measured: a 16MB cap — even with
+            // growth to 256MB — regressed batched large-matmul ~3x from
+            // allocator block cycling). The smoke-test-suite OOM those caps
+            // fixed is instead handled by the per-device block ceiling below.
+            allocation_sizes: AllocationSizes::new(256 * 1024 * 1024, 64 * 1024 * 1024),
         })
         .map_err(Error::wrap)?;
         init_guard.disarm();
-        Ok(Self {
-            inner: Arc::new(VulkanInner {
-                ordinal,
-                physical_device_name,
-                physical_device_type,
-                _entry: entry,
-                instance,
-                physical_device,
-                vendor_id,
-                integer_dot_product,
-                cooperative_matrix,
-                subgroup_arithmetic,
-                subgroup_size,
-                subgroup_size_control,
-                compute_full_subgroups,
-                subgroup_min_size,
-                subgroup_max_size,
-                max_workgroup_size_log2,
-                max_workgroup_count_x,
-                max_workgroup_count_y,
-                max_push_constants_size,
-                robust_buffer_access,
-                vulkan_memory_model,
-                non_coherent_atom_size,
-                device,
-                driver_pipeline_cache,
-                queue_family_index,
-                queue,
-                transfer_queue_family_index,
-                transfer_queue,
-                allocator: Mutex::new(Some(allocator)),
-                seed_value: RwLock::new(299_792_458),
-                pipeline_cache: Mutex::new(HashMap::new()),
-                pending_submissions: Mutex::new(Vec::new()),
-                active_compute_batch: Mutex::new(None),
-                active_transfer_batch: Mutex::new(None),
-                reusable_compute_submissions: Mutex::new(Vec::new()),
-                reusable_transfer_submissions: Mutex::new(Vec::new()),
-                deferred_buffer_frees: Mutex::new(Vec::new()),
-            }),
-        })
+        let inner = Arc::new(VulkanInner {
+            ordinal,
+            physical_device_name,
+            physical_device_type,
+            _entry: entry,
+            instance,
+            physical_device,
+            vendor_id,
+            integer_dot_product,
+            shader_float64,
+            cooperative_matrix,
+            subgroup_arithmetic,
+            subgroup_size,
+            subgroup_size_control,
+            compute_full_subgroups,
+            subgroup_min_size,
+            subgroup_max_size,
+            max_workgroup_size_log2,
+            max_workgroup_count_x,
+            max_workgroup_count_y,
+            max_push_constants_size,
+            robust_buffer_access,
+            vulkan_memory_model,
+            non_coherent_atom_size,
+            device,
+            driver_pipeline_cache,
+            queue_family_index,
+            queue,
+            transfer_queue_family_index,
+            transfer_queue,
+            allocator: Mutex::new(Some(allocator)),
+            seed_value: RwLock::new(299_792_458),
+            pipeline_cache: Mutex::new(HashMap::default()),
+            pending_submissions: Mutex::new(Vec::new()),
+            active_compute_batch: Mutex::new(None),
+            active_transfer_batch: Mutex::new(None),
+            reusable_compute_submissions: Mutex::new(Vec::new()),
+            reusable_transfer_submissions: Mutex::new(Vec::new()),
+            deferred_buffer_frees: Mutex::new(Vec::new()),
+            alloc_cleanup_debt: AtomicU32::new(0),
+            upload_staging_pool: Mutex::new(HashMap::default()),
+            readback_staging_pool: Mutex::new(HashMap::default()),
+            staging_pending_return: Mutex::new(Vec::new()),
+        });
+        // Device cache: `Device::new_vulkan(ordinal)` is called per test /
+        // per component in the wild, but VulkanInner holds GPU resources that
+        // are never reclaimed while any VulkanBuffer exists (the buffer ->
+        // Arc<VulkanInner> -> pool -> Arc<VulkanBuffer> cycle keeps the device
+        // alive), so repeated construction leaks ~a device's full allocator
+        // footprint each time (the smoke suite exhausted 12GB after ~24
+        // devices). Dedup by ordinal: the first construction wins and later
+        // calls share it. `same_device` is Arc::ptr_eq, so sharing is
+        // semantically indistinguishable from re-construction.
+        static DEVICE_CACHE: std::sync::OnceLock<Mutex<Vec<Arc<VulkanInner>>>> =
+            std::sync::OnceLock::new();
+        let cache = DEVICE_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+        if let Ok(mut devices) = cache.lock() {
+            if let Some(existing) = devices.iter().find(|d| d.ordinal == ordinal) {
+                drop(inner);
+                return Ok(Self {
+                    inner: existing.clone(),
+                });
+            }
+            devices.push(inner.clone());
+        }
+        Ok(Self { inner })
     }
 
     fn location(&self) -> crate::DeviceLocation {
@@ -9046,6 +10895,7 @@ impl BackendDevice for VulkanDevice {
 mod tests {
     use super::*;
     use crate::Module;
+    use float8::F8E4M3 as f8e4m3;
 
     fn exact_q8_1_x4_bytes(xs: &[f32]) -> Vec<u8> {
         assert_eq!(xs.len() % 128, 0);
@@ -9598,6 +11448,252 @@ mod tests {
         Ok(())
     }
 
+    fn quant_test_lcg(n: usize, seed: u64) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let x = (i as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(seed);
+                let u = ((x >> 33) as i32 as f32) / 1.0e9;
+                u * 3.0 - 1.5
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_q8_0_matches_cpu_bytes() -> Result<()> {
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let cpu = crate::Device::Cpu;
+        let n = 3 * 32; // non-power-of-2, whole blocks only
+        let xs = quant_test_lcg(n, 0xfeed_beef);
+        let t_vk = crate::Tensor::from_vec(xs.clone(), n, &vk)?;
+        let t_cpu = crate::Tensor::from_vec(xs, n, &cpu)?;
+        let q_vk = crate::quantized::QTensor::quantize(&t_vk, GgmlDType::Q8_0)?;
+        let q_cpu = crate::quantized::QTensor::quantize(&t_cpu, GgmlDType::Q8_0)?;
+        // Documented: Q8_0 GPU quantize is byte-identical to the CPU path.
+        assert_eq!(q_vk.data()?.as_ref(), q_cpu.data()?.as_ref());
+        let deq_vk = q_vk.dequantize(&vk)?.to_vec1::<f32>()?;
+        let deq_cpu = q_cpu.dequantize(&cpu)?.to_vec1::<f32>()?;
+        for (i, (a, b)) in deq_vk.iter().zip(deq_cpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1.0e-2,
+                "dequant mismatch at {i}: gpu {a} vs cpu {b}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_q4_0_matches_cpu_bytes() -> Result<()> {
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let cpu = crate::Device::Cpu;
+        let n = 5 * 32; // non-power-of-2, whole blocks only
+        let xs = quant_test_lcg(n, 0x0ddba11);
+        let t_vk = crate::Tensor::from_vec(xs.clone(), n, &vk)?;
+        let t_cpu = crate::Tensor::from_vec(xs, n, &cpu)?;
+        let q_vk = crate::quantized::QTensor::quantize(&t_vk, GgmlDType::Q4_0)?;
+        let q_cpu = crate::quantized::QTensor::quantize(&t_cpu, GgmlDType::Q4_0)?;
+        // Documented: Q4_0 GPU quantize is byte-identical to the CPU path.
+        assert_eq!(q_vk.data()?.as_ref(), q_cpu.data()?.as_ref());
+        let deq_vk = q_vk.dequantize(&vk)?.to_vec1::<f32>()?;
+        let deq_cpu = q_cpu.dequantize(&cpu)?.to_vec1::<f32>()?;
+        for (i, (a, b)) in deq_vk.iter().zip(deq_cpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1.0e-2,
+                "dequant mismatch at {i}: gpu {a} vs cpu {b}"
+            );
+        }
+        Ok(())
+    }
+
+    /// 128 elements = 4 blocks of 32. Sewn blocks carry byte-parity worst cases:
+    /// exact duplicates, +-0.0 min/max ties (minNum keeps -0.0, maxNum keeps
+    /// +0.0) and first-occurrence absmax ties (Q5_0 selects the *first* element
+    /// of a tied |x|). Each block is padded to 32 with a band that never
+    /// overrides the block's intended extrema.
+    fn quant_tie_fixture(dtype: GgmlDType) -> Vec<f32> {
+        fn fill(xs: &mut Vec<f32>, lo: f32, span: f32) {
+            while !xs.len().is_multiple_of(32) {
+                let i = xs.len();
+                xs.push(lo + (i % 7) as f32 * span / 6.0);
+            }
+        }
+        let mut xs = Vec::with_capacity(128);
+        // Block 0: straight-line values, distinct.
+        for i in 0..32 {
+            xs.push((i as f32) * 0.19 - 2.0);
+        }
+        // Block 1: max tie between +0.0 and -0.0 (maxNum keeps +0.0),
+        // min -2.5. Fill stays strictly negative, above the min.
+        xs.extend_from_slice(&[0.0, -0.0, -2.5, -1.25]);
+        fill(&mut xs, -2.25, 1.75);
+        // Block 2: min tie between +0.0 and -0.0 so m must be f16(-0.0) =
+        // 0x8000. Fill stays strictly positive.
+        xs.extend_from_slice(&[1.0, -0.0, 0.0, 2.0]);
+        fill(&mut xs, 0.25, 2.0);
+        // Block 3: format-specific tie cases.
+        match dtype {
+            GgmlDType::Q5_0 => {
+                xs.extend_from_slice(&[3.0, -3.0, 1.0, -1.0, 2.5, -0.0, 0.0, -0.25]);
+            }
+            _ => {
+                xs.extend_from_slice(&[3.0, 3.0, -3.0, -3.0, 0.5, 0.5, -0.0, 0.0]);
+            }
+        }
+        fill(&mut xs, 0.25, 2.0);
+        assert_eq!(xs.len(), 128);
+        xs
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_q4_1_matches_cpu_bytes() -> Result<()> {
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let cpu = crate::Device::Cpu;
+        let n = 3 * 32; // non-power-of-2, whole blocks only
+        let xs = quant_test_lcg(n, 0xfeed_4e11);
+        let t_vk = crate::Tensor::from_vec(xs.clone(), n, &vk)?;
+        let t_cpu = crate::Tensor::from_vec(xs, n, &cpu)?;
+        let q_vk = crate::quantized::QTensor::quantize(&t_vk, GgmlDType::Q4_1)?;
+        let q_cpu = crate::quantized::QTensor::quantize(&t_cpu, GgmlDType::Q4_1)?;
+        // Documented: Q4_1 GPU quantize is byte-identical to the CPU path.
+        assert_eq!(q_vk.data()?.as_ref(), q_cpu.data()?.as_ref());
+        let deq_vk = q_vk.dequantize(&vk)?.to_vec1::<f32>()?;
+        let deq_cpu = q_cpu.dequantize(&cpu)?.to_vec1::<f32>()?;
+        for (i, (a, b)) in deq_vk.iter().zip(deq_cpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1.0e-2,
+                "dequant mismatch at {i}: gpu {a} vs cpu {b}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_q5_0_matches_cpu_bytes() -> Result<()> {
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let cpu = crate::Device::Cpu;
+        let n = 5 * 32; // non-power-of-2, whole blocks only
+        let xs = quant_test_lcg(n, 0xfeed_5e0d);
+        let t_vk = crate::Tensor::from_vec(xs.clone(), n, &vk)?;
+        let t_cpu = crate::Tensor::from_vec(xs, n, &cpu)?;
+        let q_vk = crate::quantized::QTensor::quantize(&t_vk, GgmlDType::Q5_0)?;
+        let q_cpu = crate::quantized::QTensor::quantize(&t_cpu, GgmlDType::Q5_0)?;
+        // Documented: Q5_0 GPU quantize is byte-identical to the CPU path.
+        assert_eq!(q_vk.data()?.as_ref(), q_cpu.data()?.as_ref());
+        let deq_vk = q_vk.dequantize(&vk)?.to_vec1::<f32>()?;
+        let deq_cpu = q_cpu.dequantize(&cpu)?.to_vec1::<f32>()?;
+        for (i, (a, b)) in deq_vk.iter().zip(deq_cpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1.0e-2,
+                "dequant mismatch at {i}: gpu {a} vs cpu {b}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_q5_1_matches_cpu_bytes() -> Result<()> {
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let cpu = crate::Device::Cpu;
+        let n = 3 * 32; // non-power-of-2, whole blocks only
+        let xs = quant_test_lcg(n, 0xfeed_5e11);
+        let t_vk = crate::Tensor::from_vec(xs.clone(), n, &vk)?;
+        let t_cpu = crate::Tensor::from_vec(xs, n, &cpu)?;
+        let q_vk = crate::quantized::QTensor::quantize(&t_vk, GgmlDType::Q5_1)?;
+        let q_cpu = crate::quantized::QTensor::quantize(&t_cpu, GgmlDType::Q5_1)?;
+        // Documented: Q5_1 GPU quantize is byte-identical to the CPU path.
+        assert_eq!(q_vk.data()?.as_ref(), q_cpu.data()?.as_ref());
+        let deq_vk = q_vk.dequantize(&vk)?.to_vec1::<f32>()?;
+        let deq_cpu = q_cpu.dequantize(&cpu)?.to_vec1::<f32>()?;
+        for (i, (a, b)) in deq_vk.iter().zip(deq_cpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1.0e-2,
+                "dequant mismatch at {i}: gpu {a} vs cpu {b}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_dm_large_multi_workgroup_matches_cpu() -> Result<()> {
+        // 4608 = 144 blocks -> 36 workgroups of 4 blocks, each striding over
+        // the workgroup loop several times. Single-workgroup fixtures hide
+        // block-indexing bugs (see the c91c7daf wgpu fix) so this stays.
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let cpu = crate::Device::Cpu;
+        for (dtype, seed) in [
+            (GgmlDType::Q4_1, 0x0de0_4111),
+            (GgmlDType::Q5_0, 0x0de0_5000),
+            (GgmlDType::Q5_1, 0x0de0_5111),
+        ] {
+            let n = 4608;
+            let xs = quant_test_lcg(n, seed);
+            let t_vk = crate::Tensor::from_vec(xs.clone(), n, &vk)?;
+            let t_cpu = crate::Tensor::from_vec(xs, n, &cpu)?;
+            let q_vk = crate::quantized::QTensor::quantize(&t_vk, dtype)?;
+            let q_cpu = crate::quantized::QTensor::quantize(&t_cpu, dtype)?;
+            assert_eq!(
+                q_vk.data()?.as_ref(),
+                q_cpu.data()?.as_ref(),
+                "{dtype:?} GPU quantize bytes differ from CPU at n={n}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_ties_and_zero_bytes_match_cpu() -> Result<()> {
+        // Byte-level min/max and absmax tie semantics (incl. +-0.0) must be
+        // identical on device for Q4_1/Q5_0/Q5_1.
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let cpu = crate::Device::Cpu;
+        for dtype in [GgmlDType::Q4_1, GgmlDType::Q5_0, GgmlDType::Q5_1] {
+            let xs = quant_tie_fixture(dtype);
+            let n = xs.len();
+            let t_vk = crate::Tensor::from_vec(xs.clone(), n, &vk)?;
+            let t_cpu = crate::Tensor::from_vec(xs, n, &cpu)?;
+            let q_vk = crate::quantized::QTensor::quantize(&t_vk, dtype)?;
+            let q_cpu = crate::quantized::QTensor::quantize(&t_cpu, dtype)?;
+            assert_eq!(
+                q_vk.data()?.as_ref(),
+                q_cpu.data()?.as_ref(),
+                "{dtype:?} GPU quantize bytes differ from CPU for tie/zero fixture",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_non_multiple_takes_cpu_behavior() -> Result<()> {
+        // Not a whole number of blocks: the GPU fast-path guard does not apply
+        // and the documented CPU path governs, so both devices must surface
+        // identical behavior (same error via QTensor::quantize).
+        let vk = crate::Device::Vulkan(VulkanDevice::new(0)?);
+        let cpu = crate::Device::Cpu;
+        let n = 3 * 32 + 4; // not a multiple of any quantized block size
+        for dtype in [GgmlDType::Q4_1, GgmlDType::Q5_0, GgmlDType::Q5_1] {
+            let xs = quant_test_lcg(n, 0xcafe_70dd);
+            let t_vk = crate::Tensor::from_vec(xs.clone(), n, &vk)?;
+            let t_cpu = crate::Tensor::from_vec(xs, n, &cpu)?;
+            let err_vk = crate::quantized::QTensor::quantize(&t_vk, dtype).unwrap_err();
+            let err_cpu = crate::quantized::QTensor::quantize(&t_cpu, dtype).unwrap_err();
+            assert_eq!(
+                err_vk.to_string(),
+                err_cpu.to_string(),
+                "{dtype:?} non-multiple input diverged from the documented CPU path",
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore]
     fn vulkan_quantize_q8_1_x4_matches_cpu_pack() -> Result<()> {
@@ -9670,9 +11766,16 @@ mod tests {
             for (col_idx, (actual, expected)) in
                 direct_row.iter().zip(expected_row.iter()).enumerate()
             {
+                // The fused q8_1 matvec computes the per-32-block i32 dot then
+                // applies the f16 scales in a single f32 multiply, while the CPU
+                // reference accumulates 32 f32 products sequentially. At magnitude
+                // ~4742 these differ by exactly one f32 ulp (2^-11), which is the
+                // physical f32 floor; use a relative tolerance with an absolute
+                // floor instead of demanding bit-identical f32.
+                let rel_err = (actual - expected).abs() / expected.abs().max(1e-6);
                 assert!(
-                    (actual - expected).abs() <= 1e-6,
-                    "direct q8_1 vulkan_fwd mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}"
+                    (actual - expected).abs() <= expected.abs() * 1e-5 + 1e-6,
+                    "direct q8_1 vulkan_fwd mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}, rel_err {rel_err:.2e}"
                 );
             }
         }
@@ -9684,9 +11787,12 @@ mod tests {
             for (col_idx, (actual, expected)) in
                 actual_row.iter().zip(expected_row.iter()).enumerate()
             {
+                // See the direct-path comment above: 1e-6 absolute at ~4742 is
+                // below one f32 ulp; compare relative with an absolute floor.
+                let rel_err = (actual - expected).abs() / expected.abs().max(1e-6);
                 assert!(
-                    (actual - expected).abs() <= 1e-6,
-                    "q8_1 qmatmul mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}"
+                    (actual - expected).abs() <= expected.abs() * 1e-5 + 1e-6,
+                    "q8_1 qmatmul mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}, rel_err {rel_err:.2e}"
                 );
             }
         }
@@ -9729,9 +11835,11 @@ mod tests {
             for (col_idx, (actual, expected)) in
                 actual_row.iter().zip(expected_row.iter()).enumerate()
             {
+                // 1e-6 absolute at ~4742 is below one f32 ulp; compare relative.
+                let rel_err = (actual - expected).abs() / expected.abs().max(1e-6);
                 assert!(
-                    (actual - expected).abs() <= 1e-6,
-                    "q8_1 qmatmul no-warmup mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}"
+                    (actual - expected).abs() <= expected.abs() * 1e-5 + 1e-6,
+                    "q8_1 qmatmul no-warmup mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}, rel_err {rel_err:.2e}"
                 );
             }
         }
@@ -9845,6 +11953,1391 @@ mod tests {
                     "q8_1 from_data mismatch at ({row_idx}, {col_idx}): got {actual}, expected {expected}"
                 );
             }
+        }
+        Ok(())
+    }
+
+    // ---- F64 native dispatch tests (requires shaderFloat64) ----
+
+    /// Helper: compare two f64 slices with relative tolerance 1e-12.
+    fn assert_f64_close(got: &[f64], expected: &[f64], tol: f64) {
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "length mismatch: got {}, expected {}",
+            got.len(),
+            expected.len()
+        );
+        for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            let abs_diff = (g - e).abs();
+            let rel = if e.abs() > 1e-300 {
+                abs_diff / e.abs().max(1e-300)
+            } else {
+                abs_diff
+            };
+            assert!(
+                rel <= tol,
+                "f64 mismatch at [{i}]: got {g:e}, expected {e:e}, rel_err {rel:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn vulkan_scatter_add_u32() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let dst: Vec<u32> = vec![10, 20, 30, 40, 50, 60];
+        let ids: Vec<u32> = vec![2, 2, 0];
+        let src: Vec<u32> = vec![1, 7, 100];
+        let d = device.storage_from_cpu_storage(&CpuStorage::U32(dst.clone()))?;
+        let i = device.storage_from_cpu_storage(&CpuStorage::U32(ids.clone()))?;
+        let sv = device.storage_from_cpu_storage(&CpuStorage::U32(src.clone()))?;
+        let l = Layout::contiguous((6usize,));
+        let il = Layout::contiguous((3usize,));
+        let mut out = d.try_clone(&l)?;
+        out.scatter_add_set(&l, &i, &il, &sv, &il, 0)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::U32(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        // CPU reference with duplicate index 2.
+        let mut want = dst.clone();
+        want[2] += 1;
+        want[2] += 7;
+        want[0] += 100;
+        assert_eq!(got, want);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_scatter_add_f8e4m3() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        // 3x8 dst / 3x4 ids & src with duplicate indices per row (accumulation)
+        // and negative f8 values on both sides.
+        let dst: Vec<f8e4m3> = (0..24u32)
+            .map(|i| f8e4m3::from_f32(i as f32 * 0.5 - 3.0))
+            .collect();
+        let ids: Vec<u32> = vec![2, 2, 0, 7, 5, 5, 5, 1, 3, 3, 3, 3];
+        let src: Vec<f8e4m3> = (0..12u32)
+            .map(|i| f8e4m3::from_f32(i as f32 * 0.75 - 4.5))
+            .collect();
+        let d = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(dst.clone()))?;
+        let i = device.storage_from_cpu_storage(&CpuStorage::U32(ids.clone()))?;
+        let s = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(src.clone()))?;
+        let dl = Layout::contiguous((3usize, 8));
+        let sl = Layout::contiguous((3usize, 4));
+        let mut out = d.try_clone(&dl)?;
+        out.scatter_add_set(&dl, &i, &sl, &s, &sl, 1)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F8E4M3(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        // CPU reference in f32, single re-quantization (mirrors the f32-hub path).
+        let dst_f32: Vec<f32> = dst.iter().map(|f| f.to_f32()).collect();
+        let src_f32: Vec<f32> = src.iter().map(|f| f.to_f32()).collect();
+        let mut want = dst_f32.clone();
+        for (r, row_ids) in ids.chunks_exact(4).enumerate() {
+            for (j, &idx) in row_ids.iter().enumerate() {
+                want[r * 8 + idx as usize] += src_f32[r * 4 + j];
+            }
+        }
+        // fp8 re-quantization tolerance, as in vulkan_f8e4m3_reduce_sum.
+        for (idx, (g, e)) in got.iter().zip(want.iter()).enumerate() {
+            let gv = g.to_f32();
+            let eq = f8e4m3::from_f32(*e).to_f32();
+            assert!(
+                (gv - eq).abs() <= eq.abs() * 0.15 + 1e-3,
+                "scatter_add f8e4m3 mismatch at {idx}: got {gv}, want {eq}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_argsort_f32_duplicates_stable() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        // duplicates: 5 at 0/2, 3 at 1/4
+        let vals: Vec<f32> = vec![5.0, 3.0, 5.0, 1.0, 3.0, 9.0];
+        let s = device.storage_from_cpu_storage(&CpuStorage::F32(vals))?;
+        let layout = Layout::contiguous((6usize,));
+        let out = s.argsort_last_dim(&layout, true, 6)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::U32(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        // CPU sort_by stability: equal keys keep ascending original index.
+        let want: Vec<u32> = vec![3, 1, 4, 0, 2, 5];
+        assert_eq!(got, want);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f8e4m3_convert_roundtrip() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let bits: Vec<u8> = vec![0x38, 0xC0, 0x48, 0x00, 0x80, 0x7D, 0x01];
+        let vals: Vec<f8e4m3> = bits.iter().map(|&b| f8e4m3::from_bits(b)).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(vals))?;
+        let layout = Layout::contiguous((bits.len(),));
+        let f32s = src.to_dtype(&layout, DType::F32)?;
+        let back = f32s.to_dtype(&layout, DType::F8E4M3)?;
+        let got = match back.to_cpu_storage()? {
+            CpuStorage::F8E4M3(v) => v.into_iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_eq!(got, bits);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f8e4m3_unary_relu() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let bits: Vec<u8> = vec![0x38, 0xC0, 0x00, 0x80, 0x7D, 0xB0];
+        let vals: Vec<f8e4m3> = bits.iter().map(|&b| f8e4m3::from_bits(b)).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(vals))?;
+        let layout = Layout::contiguous((bits.len(),));
+        let out = src.unary_impl::<crate::op::Relu>(&layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F8E4M3(v) => v.into_iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        // CPU reference: relu in f32 then re-quantize to e4m3.
+        for (i, &b) in bits.iter().enumerate() {
+            let v: f32 = f8e4m3::from_bits(b).to_f32();
+            let r = if v > 0.0 { v } else { 0.0 };
+            let expect = f8e4m3::from_f32(r).to_bits();
+            assert_eq!(got[i], expect);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f8e4m3_binary_add() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let a_bits: Vec<u8> = vec![0x38, 0x40, 0x30];
+        let b_bits: Vec<u8> = vec![0x38, 0x38, 0x28];
+        let a: Vec<f8e4m3> = a_bits.iter().map(|&b| f8e4m3::from_bits(b)).collect();
+        let b: Vec<f8e4m3> = b_bits.iter().map(|&b| f8e4m3::from_bits(b)).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(b))?;
+        let layout = Layout::contiguous((3usize,));
+        let out = lhs.binary_impl::<crate::op::Add>(&rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F8E4M3(v) => v.into_iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        for i in 0..3 {
+            let av: f32 = f8e4m3::from_bits(a_bits[i]).to_f32();
+            let bv: f32 = f8e4m3::from_bits(b_bits[i]).to_f32();
+            let expect = f8e4m3::from_f32(av + bv).to_bits();
+            assert_eq!(got[i], expect);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f8e4m3_reduce_sum() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        let bits: Vec<u8> = vec![0x38, 0x40, 0x30, 0x48];
+        let vals: Vec<f8e4m3> = bits.iter().map(|&b| f8e4m3::from_bits(b)).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(vals))?;
+        let layout = Layout::contiguous((4usize,));
+        let out = src.reduce_op(ReduceOp::Sum, &layout, &[0])?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F8E4M3(v) => v[0].to_f32(),
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        let expect: f32 = bits.iter().map(|&b| f8e4m3::from_bits(b).to_f32()).sum();
+        // fp8 re-quantization tolerance
+        let expect_q = f8e4m3::from_f32(expect).to_f32();
+        assert!((got - expect_q).abs() <= expect_q.abs() * 0.15 + 1e-3);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f8e4m3_cmp_lt() -> Result<()> {
+        use crate::op::CmpOp;
+        let device = VulkanDevice::new(0)?;
+        let a_bits: Vec<u8> = vec![0x30, 0x50, 0x10];
+        let b_bits: Vec<u8> = vec![0x38, 0x48, 0x18];
+        let a: Vec<f8e4m3> = a_bits.iter().map(|&b| f8e4m3::from_bits(b)).collect();
+        let b: Vec<f8e4m3> = b_bits.iter().map(|&b| f8e4m3::from_bits(b)).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F8E4M3(b))?;
+        let layout = Layout::contiguous((3usize,));
+        let out = lhs.cmp(CmpOp::Lt, &rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::U8(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        for i in 0..3 {
+            let av: f32 = f8e4m3::from_bits(a_bits[i]).to_f32();
+            let bv: f32 = f8e4m3::from_bits(b_bits[i]).to_f32();
+            assert_eq!(got[i], u8::from(av < bv));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_bf16_cmp_native_matches_reference() -> Result<()> {
+        use crate::op::CmpOp;
+        let device = VulkanDevice::new(0)?;
+        // Non-power-of-two length; covers negatives, +/- zero and NaNs.
+        let a_f32 = [
+            1.0f32,
+            -1.0,
+            0.0,
+            3.5,
+            -0.0,
+            f32::NAN,
+            100.0,
+            -100.0,
+            0.5,
+            -2.25,
+            1.0,
+            4.0,
+            8.0,
+            2.0,
+            6.0,
+            7.0,
+            0.125,
+            -0.5,
+            3.0,
+            2.0,
+            -7.0,
+            5.0,
+            11.0,
+        ];
+        let b_f32 = [
+            1.0f32,
+            -2.0,
+            0.0,
+            3.5,
+            0.0,
+            f32::NAN,
+            -100.0,
+            100.0,
+            0.25,
+            -2.0,
+            1.5,
+            4.0,
+            2.0,
+            8.0,
+            6.0,
+            7.0,
+            -0.125,
+            0.5,
+            3.0,
+            3.0,
+            7.0,
+            -5.0,
+            11.0,
+        ];
+        assert_eq!(a_f32.len(), b_f32.len());
+        let len = a_f32.len();
+        let a: Vec<half::bf16> = a_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let b: Vec<half::bf16> = b_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::BF16(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::BF16(b))?;
+        let layout = Layout::contiguous((len,));
+        let ops = [
+            CmpOp::Eq,
+            CmpOp::Ne,
+            CmpOp::Lt,
+            CmpOp::Le,
+            CmpOp::Gt,
+            CmpOp::Ge,
+        ];
+        for op in ops {
+            let out = lhs.cmp(op, &rhs, &layout, &layout)?;
+            let got = match out.to_cpu_storage()? {
+                CpuStorage::U8(v) => v,
+                other => crate::bail!("unexpected dtype: {other:?}"),
+            };
+            for i in 0..len {
+                // bf16 -> f32 is exact, so decoded comparisons match candle's
+                // CPU bf16 cmp (which compares through f32), incl. NaN != NaN.
+                let x = half::bf16::from_f32(a_f32[i]).to_f32();
+                let y = half::bf16::from_f32(b_f32[i]).to_f32();
+                let expected = match op {
+                    CmpOp::Eq => u8::from(x == y),
+                    CmpOp::Ne => u8::from(x != y),
+                    CmpOp::Lt => u8::from(x < y),
+                    CmpOp::Le => u8::from(x <= y),
+                    CmpOp::Gt => u8::from(x > y),
+                    CmpOp::Ge => u8::from(x >= y),
+                };
+                let op_name = match op {
+                    CmpOp::Eq => "Eq",
+                    CmpOp::Ne => "Ne",
+                    CmpOp::Lt => "Lt",
+                    CmpOp::Le => "Le",
+                    CmpOp::Gt => "Gt",
+                    CmpOp::Ge => "Ge",
+                };
+                assert_eq!(got[i], expected, "op {op_name} idx {i}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_unary_exp() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![0.0, 1.0, -1.0, 2.0, -2.0, 0.5, -0.5, 10.0, -10.0];
+        let expected: Vec<f64> = x.iter().map(|v| v.exp()).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((9,));
+        let out = src.unary_impl::<crate::op::Exp>(&layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_unary_log() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![0.5, 1.0, 2.0, 10.0, 0.1, 3.0, 7.0];
+        let expected: Vec<f64> = x.iter().map(|v| v.ln()).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((7,));
+        let out = src.unary_impl::<crate::op::Log>(&layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_unary_sqrt() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![0.0, 1.0, 2.0, 4.0, 16.0, 0.25, 100.0];
+        let expected: Vec<f64> = x.iter().map(|v| v.sqrt()).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((7,));
+        let out = src.unary_impl::<crate::op::Sqrt>(&layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_unary_sqr() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![0.0, 1.0, -2.0, 3.0, -4.0, 0.5, 10.0];
+        let expected: Vec<f64> = x.iter().map(|v| v * v).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((7,));
+        let out = src.unary_impl::<crate::op::Sqr>(&layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_unary_neg() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![0.0, 1.0, -2.0, 3.5, -0.0_f64];
+        let expected: Vec<f64> = x.iter().map(|v| -v).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((5,));
+        let out = src.unary_impl::<crate::op::Neg>(&layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_unary_abs() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![0.0, 1.0, -2.0, 3.5, -0.5, -100.0];
+        let expected: Vec<f64> = x.iter().map(|v| v.abs()).collect();
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((6,));
+        let out = src.unary_impl::<crate::op::Abs>(&layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_binary_add() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0];
+        let b: Vec<f64> = vec![5.0, 6.0, 7.0, 8.0];
+        let expected: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.binary_impl::<crate::op::Add>(&rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_binary_mul() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0];
+        let b: Vec<f64> = vec![5.0, 6.0, 7.0, 8.0];
+        let expected: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x * y).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.binary_impl::<crate::op::Mul>(&rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_binary_div() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![10.0, 20.0, 30.0, 0.0];
+        let b: Vec<f64> = vec![2.0, 4.0, 5.0, 1.0];
+        let expected: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x / y).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.binary_impl::<crate::op::Div>(&rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_binary_max() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![1.0, 5.0, 3.0, 4.0];
+        let b: Vec<f64> = vec![2.0, 3.0, 7.0, 1.0];
+        let expected: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x.max(*y)).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.binary_impl::<crate::op::Maximum>(&rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_binary_min() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![1.0, 5.0, 3.0, 4.0];
+        let b: Vec<f64> = vec![2.0, 3.0, 7.0, 1.0];
+        let expected: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x.min(*y)).collect();
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.binary_impl::<crate::op::Minimum>(&rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_cmp_eq() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 3.0];
+        let b: Vec<f64> = vec![1.0, 0.0, 3.0, 4.0];
+        let expected: Vec<u8> = vec![1, 0, 1, 0];
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.cmp(CmpOp::Eq, &rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::U8(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_eq!(got, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_cmp_lt() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 5.0];
+        let b: Vec<f64> = vec![2.0, 2.0, 1.0, 10.0];
+        let expected: Vec<u8> = vec![1, 0, 0, 1];
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.cmp(CmpOp::Lt, &rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::U8(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_eq!(got, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_cmp_ge() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 5.0];
+        let b: Vec<f64> = vec![2.0, 2.0, 1.0, 10.0];
+        let expected: Vec<u8> = vec![0, 1, 1, 0];
+        let lhs = device.storage_from_cpu_storage(&CpuStorage::F64(a))?;
+        let rhs = device.storage_from_cpu_storage(&CpuStorage::F64(b))?;
+        let layout = Layout::contiguous((4,));
+        let out = lhs.cmp(CmpOp::Ge, &rhs, &layout, &layout)?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::U8(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_eq!(got, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_reduce_sum() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let expected: Vec<f64> = vec![21.0];
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((6,));
+        let out = src.reduce_op(ReduceOp::Sum, &layout, &[0])?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_reduce_sum_2d() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let expected: Vec<f64> = vec![5.0, 7.0, 9.0]; // sum over rows: [1+4, 2+5, 3+6]
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((2, 3));
+        let out = src.reduce_op(ReduceOp::Sum, &layout, &[0])?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_reduce_max() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0];
+        let expected: Vec<f64> = vec![6.0];
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((6,));
+        let out = src.reduce_op(ReduceOp::Max, &layout, &[0])?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_reduce_min() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![3.0, 1.0, 5.0, 2.0, 4.0, 0.5];
+        let expected: Vec<f64> = vec![0.5];
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((6,));
+        let out = src.reduce_op(ReduceOp::Min, &layout, &[0])?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::F64(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_f64_close(&got, &expected, 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_f64_reduce_argmax() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        if !device.shader_float64_supported() {
+            eprintln!("SKIP: shaderFloat64 not supported");
+            return Ok(());
+        }
+        let x: Vec<f64> = vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0];
+        let expected: Vec<u32> = vec![5];
+        let src = device.storage_from_cpu_storage(&CpuStorage::F64(x))?;
+        let layout = Layout::contiguous((6,));
+        let out = src.reduce_op(ReduceOp::ArgMax, &layout, &[0])?;
+        let got = match out.to_cpu_storage()? {
+            CpuStorage::U32(v) => v,
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        };
+        assert_eq!(got, expected);
+        Ok(())
+    }
+
+    /// Test that the deferred buffer cap prevents unbounded growth.
+    /// Allocates many small tensors without synchronizing, then verifies
+    /// the device is still healthy after the cleanup path drains.
+    #[test]
+    #[ignore]
+    fn vulkan_perf_deferred_cap() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        // Allocate and drop many small tensors without explicit synchronize.
+        // This exercises the deferred buffer free path and the cap logic.
+        let n = 1200usize;
+        for i in 0..n {
+            let vals = vec![i as f32; 64];
+            let storage = device.storage_from_cpu_storage(&CpuStorage::F32(vals))?;
+            // Drop storage immediately — buffer goes to deferred list
+            drop(storage);
+            // Periodically allow cleanup to drain some deferred buffers
+            if i % 200 == 0 {
+                device.synchronize_pending()?;
+            }
+        }
+        // Final synchronize: all deferred buffers should be drained
+        device.synchronize_pending()?;
+        // Verify device is still healthy: allocate and read back
+        let vals = vec![42.0f32; 64];
+        let storage = device.storage_from_cpu_storage(&CpuStorage::F32(vals))?;
+        let cpu = storage.to_cpu_storage()?;
+        match cpu {
+            CpuStorage::F32(v) => {
+                assert_eq!(v.len(), 64);
+                for &x in &v {
+                    assert!((x - 42.0f32).abs() < 1e-6);
+                }
+            }
+            other => crate::bail!("unexpected dtype: {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Test that the staging buffer pool correctly reuses buffers without
+    /// data corruption across many write/read cycles.
+    #[test]
+    #[ignore]
+    fn vulkan_perf_staging_pool() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        // Perform many write_buffer/read_buffer cycles with the same buffer.
+        let n_cycles = 200usize;
+        let buf_size = 4096usize;
+        let buffer = device.create_buffer(buf_size, "candle-vulkan-pool-test")?;
+        for i in 0..n_cycles {
+            let pattern = ((i as u8)..(i as u8).wrapping_add(buf_size as u8)).collect::<Vec<u8>>();
+            device.write_buffer(&buffer, &pattern)?;
+            let readback = device.read_buffer(&buffer)?;
+            assert_eq!(readback.len(), buf_size);
+            for (j, &byte) in readback.iter().enumerate() {
+                let expected = (i as u8).wrapping_add(j as u8);
+                assert_eq!(
+                    byte, expected,
+                    "staging pool corruption at cycle {}, byte {}: got {}, expected {}",
+                    i, j, byte, expected
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // ---- flash_attn_varlen (non-paged dense K/V) tests ----
+
+    /// CPU reference for variable-length attention, mirroring the CUDA
+    /// semantics: for each (row, query head) compute
+    /// `softmax(Q @ K^T * scale + causal_mask) @ V` over the owning
+    /// sequence's KV range, with the causal mask applied using local indices
+    /// and online softmax (computed in f64 for a high-precision baseline).
+    #[allow(clippy::too_many_arguments)]
+    fn varlen_attn_reference(
+        q: &[f32],
+        h_q: usize,
+        d_qk: usize,
+        d_v: usize,
+        k: &[f32],
+        h_kv: usize,
+        v: &[f32],
+        cu_q: &[i32],
+        cu_k: &[i32],
+        scale: f32,
+        causal: bool,
+    ) -> Vec<f32> {
+        let batch = cu_q.len() - 1;
+        let total_q = cu_q[batch] as usize;
+        let mut out = vec![0f32; total_q * h_q * d_v];
+        for i in 0..total_q {
+            let b = (0..batch)
+                .find(|&bb| {
+                    let s = cu_q[bb] as usize;
+                    let e = cu_q[bb + 1] as usize;
+                    s <= i && i < e
+                })
+                .expect("row must belong to a sequence");
+            let q_idx = i - cu_q[b] as usize;
+            let kv_start = cu_k[b] as usize;
+            let kv_end = cu_k[b + 1] as usize;
+            for h in 0..h_q {
+                let h_kv_use = h * h_kv / h_q;
+                let mut m = f64::NEG_INFINITY;
+                let mut l = 0f64;
+                let mut acc = vec![0f64; d_v];
+                for j in kv_start..kv_end {
+                    let k_idx = j - kv_start;
+                    if causal && k_idx > q_idx {
+                        continue;
+                    }
+                    let mut score = 0f64;
+                    for dd in 0..d_qk {
+                        score += q[(i * h_q + h) * d_qk + dd] as f64
+                            * k[(j * h_kv + h_kv_use) * d_qk + dd] as f64;
+                    }
+                    score *= scale as f64;
+                    let m_new = m.max(score);
+                    let w = (score - m_new).exp();
+                    let exp_diff = if m_new - m < 80.0 {
+                        (m - m_new).exp()
+                    } else {
+                        0.0
+                    };
+                    for dd in 0..d_v {
+                        acc[dd] =
+                            acc[dd] * exp_diff + w * v[(j * h_kv + h_kv_use) * d_v + dd] as f64;
+                    }
+                    l = l * exp_diff + w;
+                    m = m_new;
+                }
+                let inv_l = if l > 0.0 { 1.0 / l } else { 0.0 };
+                for dd in 0..d_v {
+                    out[(i * h_q + h) * d_v + dd] = (acc[dd] * inv_l) as f32;
+                }
+            }
+        }
+        out
+    }
+
+    fn max_relative_error(actual: &[f32], expected: &[f32]) -> f32 {
+        assert_eq!(actual.len(), expected.len());
+        let mut err = 0f32;
+        for (a, e) in actual.iter().zip(expected.iter()) {
+            let denom = e.abs().max(1e-6f32);
+            err = err.max((a - e).abs() / denom);
+        }
+        err
+    }
+
+    fn varlen_deterministic_f32(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let u = ((state >> 33) as u32) % 1000;
+                (u as f32 - 500.0) / 500.0
+            })
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn vulkan_flash_attn_varlen_f32_matches_reference() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        // (h_q, h_kv, cu_q, cu_k, causal, head_dim, rtol)
+        //
+        // rtol note: the reference is computed in f64 while the kernel is f32,
+        // so the observed error is the f32 accumulation noise floor (~1.5e-5
+        // for a 64-dim dot + online-softmax rescale, see the CUDA reference
+        // suite which effectively tolerates ~1e-4 by rounding to 4 decimals).
+        let cases: &[(usize, usize, Vec<i32>, Vec<i32>, bool, usize, f32)] = &[
+            // single ragged batch [3, 1, 7], single head, non-causal
+            (1, 1, vec![0, 3, 4, 11], vec![0, 3, 4, 11], false, 64, 2e-4),
+            // two sequences [5, 5], single head, non-causal
+            (1, 1, vec![0, 5, 10], vec![0, 5, 10], false, 64, 2e-4),
+            // q/k sequences with different lengths (q shorter than k)
+            (1, 1, vec![0, 2, 5], vec![0, 4, 7], false, 64, 2e-4),
+            // single head, head_dim 32
+            (1, 1, vec![0, 4, 9], vec![0, 4, 9], false, 32, 2e-4),
+        ];
+
+        for &(h_q, h_kv, ref cu_q, ref cu_k, _causal, d, rtol) in cases {
+            let batch = cu_q.len() - 1;
+            let total_q = cu_q[batch] as usize;
+            let total_kv = cu_k[batch] as usize;
+            let d_v = d;
+            let q = varlen_deterministic_f32(total_q * h_q * d, batch as u64 * 71 + 11);
+            let k = varlen_deterministic_f32(total_kv * h_kv * d, batch as u64 * 13 + 3);
+            let v = varlen_deterministic_f32(total_kv * h_kv * d_v, batch as u64 * 17 + 5);
+            let scale = 0.125f32;
+
+            let q_s = device.storage_from_cpu_storage(&CpuStorage::F32(q.clone()))?;
+            let k_s = device.storage_from_cpu_storage(&CpuStorage::F32(k.clone()))?;
+            let v_s = device.storage_from_cpu_storage(&CpuStorage::F32(v.clone()))?;
+            let q_l = Layout::contiguous((total_q, h_q, d));
+            let k_l = Layout::contiguous((total_kv, h_kv, d));
+            let v_l = Layout::contiguous((total_kv, h_kv, d_v));
+            let cu_q_s = device.storage_from_cpu_storage(&CpuStorage::I32(cu_q.clone()))?;
+            let cu_k_s = device.storage_from_cpu_storage(&CpuStorage::I32(cu_k.clone()))?;
+
+            // max_seqlen larger than the actual lengths to exercise the
+            // kernel's tolerance to over-estimated bounds.
+            let max_q = total_q + 4;
+            let max_k = total_kv + 7;
+
+            let out = q_s.flash_attn_varlen(
+                &q_l, &k_s, &k_l, &v_s, &v_l, &cu_q_s, &cu_k_s, max_q, max_k, scale, false,
+            )?;
+            let cpu = out.to_cpu_storage()?;
+            let got = match &cpu {
+                CpuStorage::F32(v) => v.clone(),
+                other => crate::bail!("unexpected output dtype {other:?}"),
+            };
+            let expected =
+                varlen_attn_reference(&q, h_q, d, d_v, &k, h_kv, &v, cu_q, cu_k, scale, false);
+            let err = max_relative_error(&got, &expected);
+            assert!(
+                err < rtol,
+                "f32 varlen mismatch: h_q={h_q} h_kv={h_kv} cu_q={cu_q:?} head_dim={d} err={err}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_upload_staging_pool_roundtrip_integrity() -> Result<()> {
+        // Regression for the staging-pool size bug: buffers are pooled by
+        // power-of-two size class, so a smaller buffer (e.g. 1280 bytes)
+        // could be handed out for a larger request (1792 bytes), truncating
+        // the upload. Alternate small/large uploads and verify every value
+        // survives the round trip, including tail elements.
+        let device = VulkanDevice::new(0)?;
+        let sizes = [
+            (320usize, 448usize), // q=1280B, k=1792B (the flash_attn varlen case)
+            (100, 260),
+            (5, 129),
+        ];
+        for &(small_len, big_len) in &sizes {
+            for _round in 0..4 {
+                let small_vals: Vec<f32> = (0..small_len).map(|i| i as f32 * 0.25).collect();
+                let big_vals: Vec<f32> = (0..big_len).map(|i| -(i as f32) * 0.5 - 1.0).collect();
+                let _small =
+                    device.storage_from_cpu_storage(&CpuStorage::F32(small_vals.clone()))?;
+                let big = device.storage_from_cpu_storage(&CpuStorage::F32(big_vals.clone()))?;
+                for (name, storage, vals) in
+                    [("small", &_small, &small_vals), ("big", &big, &big_vals)]
+                {
+                    let cpu = storage.to_cpu_storage()?;
+                    let CpuStorage::F32(got) = cpu else {
+                        crate::bail!("unexpected round-trip dtype");
+                    };
+                    assert_eq!(got.len(), vals.len(), "{name} length");
+                    for (i, (a, e)) in got.iter().zip(vals.iter()).enumerate() {
+                        assert_eq!(a, e, "{name} elem {i} (sizes {small_len}/{big_len})");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ---- flash_attn_paged (paged K/V cache with block_table) tests ----
+
+    /// CPU reference for paged flash attention. k/v are the physical page
+    /// buffers laid out as (num_blocks * page_block_size, h_kv, d); the local
+    /// kv row `k_idx` of sequence b is remapped to physical row
+    /// block_table[b * max_blocks_per_seq + k_idx / page_block_size]
+    ///   * page_block_size + k_idx % page_block_size.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_attn_reference(
+        q: &[f32],
+        h_q: usize,
+        d_qk: usize,
+        d_v: usize,
+        k: &[f32],
+        h_kv: usize,
+        v: &[f32],
+        cu_q: &[i32],
+        cu_k: &[i32],
+        block_table: &[i32],
+        max_blocks_per_seq: usize,
+        page_block_size: usize,
+        scale: f32,
+        causal: bool,
+    ) -> Vec<f32> {
+        let batch = cu_q.len() - 1;
+        let total_q = cu_q[batch] as usize;
+        let mut out = vec![0f32; total_q * h_q * d_v];
+        for i in 0..total_q {
+            let b = (0..batch)
+                .find(|&bb| {
+                    let s = cu_q[bb] as usize;
+                    let e = cu_q[bb + 1] as usize;
+                    s <= i && i < e
+                })
+                .expect("row must belong to a sequence");
+            let q_idx = i - cu_q[b] as usize;
+            let kv_start = cu_k[b] as usize;
+            let kv_end = cu_k[b + 1] as usize;
+            for h in 0..h_q {
+                let h_kv_use = h * h_kv / h_q;
+                let mut m = f64::NEG_INFINITY;
+                let mut l = 0f64;
+                let mut acc = vec![0f64; d_v];
+                for j in kv_start..kv_end {
+                    let k_idx = j - kv_start;
+                    if causal && k_idx > q_idx {
+                        continue;
+                    }
+                    let page_idx = k_idx / page_block_size;
+                    let page_row = k_idx % page_block_size;
+                    let block = block_table[b * max_blocks_per_seq + page_idx] as usize;
+                    let j_flat = block * page_block_size + page_row;
+                    let mut score = 0f64;
+                    for dd in 0..d_qk {
+                        score += q[(i * h_q + h) * d_qk + dd] as f64
+                            * k[(j_flat * h_kv + h_kv_use) * d_qk + dd] as f64;
+                    }
+                    score *= scale as f64;
+                    let m_new = m.max(score);
+                    let w = (score - m_new).exp();
+                    let exp_diff = if m_new - m < 80.0 {
+                        (m - m_new).exp()
+                    } else {
+                        0.0
+                    };
+                    for dd in 0..d_v {
+                        acc[dd] = acc[dd] * exp_diff
+                            + w * v[(j_flat * h_kv + h_kv_use) * d_v + dd] as f64;
+                    }
+                    l = l * exp_diff + w;
+                    m = m_new;
+                }
+                let inv_l = if l > 0.0 { 1.0 / l } else { 0.0 };
+                for dd in 0..d_v {
+                    out[(i * h_q + h) * d_v + dd] = (acc[dd] * inv_l) as f32;
+                }
+            }
+        }
+        out
+    }
+
+    /// Scatter dense per-sequence kv rows (total_kv, h_kv, d) into the
+    /// physical page buffer (num_blocks * page_block_size, h_kv, d) using the
+    /// same block_table mapping the kernel applies.
+    #[allow(clippy::too_many_arguments)]
+    fn scatter_paged_kv(
+        dense: &[f32], // (total_kv, h_kv, d)
+        h_kv: usize,
+        d: usize,
+        cu_k: &[i32],
+        block_table: &[i32],
+        max_blocks_per_seq: usize,
+        page_block_size: usize,
+        num_blocks: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0f32; num_blocks * page_block_size * h_kv * d];
+        let batch = cu_k.len() - 1;
+        for b in 0..batch {
+            let start = cu_k[b] as usize;
+            let end = cu_k[b + 1] as usize;
+            for k_idx in start..end {
+                let local = k_idx - start;
+                let page = local / page_block_size;
+                let row = local % page_block_size;
+                let block = block_table[b * max_blocks_per_seq + page] as usize;
+                let flat = block * page_block_size + row;
+                let src = k_idx * h_kv * d;
+                let dst = flat * h_kv * d;
+                out[dst..dst + h_kv * d].copy_from_slice(&dense[src..src + h_kv * d]);
+            }
+        }
+        out
+    }
+
+    /// Relative error with a configurable denominator floor: outputs with
+    /// magnitude below `floor` are treated as effectively zero (f32 round-off
+    /// dominates them), so near-zero elements are compared against the floor
+    /// instead of their own magnitude. Real indexing bugs produce O(1) errors
+    /// and are still caught.
+    fn max_relative_error_floor(actual: &[f32], expected: &[f32], floor: f32) -> f32 {
+        assert_eq!(actual.len(), expected.len());
+        let mut err = 0f32;
+        for (a, e) in actual.iter().zip(expected.iter()) {
+            let denom = e.abs().max(floor);
+            err = err.max((a - e).abs() / denom);
+        }
+        err
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn vulkan_flash_attn_paged_f32_matches_reference() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        // (h_q, h_kv, cu_q, cu_k, block_table, max_blocks_per_seq, page_block_size, causal, head_dim)
+        //
+        // Block tables intentionally use non-identity page ids and leave
+        // unused "hole" blocks so a kernel that ignores the indirection
+        // (or assumes pages are contiguous) fails loudly.
+        let cases: &[(
+            usize,
+            usize,
+            Vec<i32>,
+            Vec<i32>,
+            Vec<i32>,
+            usize,
+            usize,
+            bool,
+            usize,
+        )] = &[
+            // 2 seqs, non-causal, kv_len 34 > page 32 (2 pages, partial last
+            // page of 2 rows) and kv_len 16 (partial page); block 3 is a hole.
+            (
+                1,
+                1,
+                vec![0, 3, 5],
+                vec![0, 34, 50],
+                vec![0, 1, 2, 3],
+                2,
+                32,
+                false,
+                64,
+            ),
+            // causal, multi-page first sequence (33 rows), partial second.
+            (
+                1,
+                1,
+                vec![0, 4, 6],
+                vec![0, 33, 38],
+                vec![0, 1, 2, 3],
+                2,
+                32,
+                true,
+                64,
+            ),
+            // GQA h_q=2 h_kv=1, multi-page sequences with partial last pages
+            // (40 and 30 rows); third table column is unused padding.
+            (
+                2,
+                1,
+                vec![0, 5, 9],
+                vec![0, 40, 70],
+                vec![0, 1, 2, 2, 3, 1],
+                3,
+                32,
+                false,
+                64,
+            ),
+            // shuffled page ids [3, 1, 4, 0] with a hole (block 2 unused),
+            // head_dim 32.
+            (
+                1,
+                1,
+                vec![0, 2, 4],
+                vec![0, 40, 50],
+                vec![3, 1, 4, 0],
+                2,
+                32,
+                false,
+                32,
+            ),
+        ];
+
+        for &(h_q, h_kv, ref cu_q, ref cu_k, ref block_table, max_blocks, pbs, causal, d) in cases {
+            let batch = cu_q.len() - 1;
+            let total_q = cu_q[batch] as usize;
+            let total_kv = cu_k[batch] as usize;
+            let num_blocks = block_table.iter().copied().max().unwrap() as usize + 1;
+            let d_v = d;
+            let q = varlen_deterministic_f32(total_q * h_q * d, batch as u64 * 71 + 11);
+            let k_dense = varlen_deterministic_f32(total_kv * h_kv * d, batch as u64 * 13 + 3);
+            let v_dense = varlen_deterministic_f32(total_kv * h_kv * d_v, batch as u64 * 17 + 5);
+            let k = scatter_paged_kv(
+                &k_dense,
+                h_kv,
+                d,
+                cu_k,
+                block_table,
+                max_blocks,
+                pbs,
+                num_blocks,
+            );
+            let v = scatter_paged_kv(
+                &v_dense,
+                h_kv,
+                d_v,
+                cu_k,
+                block_table,
+                max_blocks,
+                pbs,
+                num_blocks,
+            );
+            let scale = 0.125f32;
+
+            let q_s = device.storage_from_cpu_storage(&CpuStorage::F32(q.clone()))?;
+            let k_s = device.storage_from_cpu_storage(&CpuStorage::F32(k.clone()))?;
+            let v_s = device.storage_from_cpu_storage(&CpuStorage::F32(v.clone()))?;
+            let q_l = Layout::contiguous((total_q, h_q, d));
+            let k_l = Layout::contiguous((num_blocks, pbs, h_kv, d));
+            let v_l = Layout::contiguous((num_blocks, pbs, h_kv, d_v));
+            let cu_q_s = device.storage_from_cpu_storage(&CpuStorage::I32(cu_q.clone()))?;
+            let cu_k_s = device.storage_from_cpu_storage(&CpuStorage::I32(cu_k.clone()))?;
+            let bt_s = device.storage_from_cpu_storage(&CpuStorage::I32(block_table.clone()))?;
+            let bt_l = Layout::contiguous((batch, max_blocks));
+
+            let out = q_s.flash_attn_paged(
+                &q_l,
+                &k_s,
+                &k_l,
+                &v_s,
+                &v_l,
+                &cu_q_s,
+                &cu_k_s,
+                &bt_s,
+                &bt_l,
+                pbs,
+                total_q + 4,
+                total_kv + 7,
+                scale,
+                causal,
+            )?;
+            let cpu = out.to_cpu_storage()?;
+            let got = match &cpu {
+                CpuStorage::F32(v) => v.clone(),
+                other => crate::bail!("unexpected output dtype {other:?}"),
+            };
+            let expected = paged_attn_reference(
+                &q,
+                h_q,
+                d,
+                d_v,
+                &k,
+                h_kv,
+                &v,
+                cu_q,
+                cu_k,
+                block_table,
+                max_blocks,
+                pbs,
+                scale,
+                causal,
+            );
+            let err = max_relative_error_floor(&got, &expected, 1e-4);
+            assert!(
+                err < 2e-4,
+                "paged mismatch: h_q={h_q} h_kv={h_kv} cu_q={cu_q:?} cu_k={cu_k:?} block_table={block_table:?} pbs={pbs} causal={causal} head_dim={d} err={err}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn vulkan_flash_attn_paged_f16_matches_reference() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        // F16 routes through the F32 hub (to_dtype -> f32 kernel -> to_dtype
+        // back), so this exercises the rank-4 dtype-conversion plumbing of
+        // flash_attn_paged; tolerance reflects f16 quantization (~5e-4).
+        let cases: &[(Vec<i32>, Vec<i32>, Vec<i32>, usize, bool)] = &[
+            // scattered page ids with a hole (block 2 unused), causal
+            (vec![0, 3, 5], vec![0, 34, 50], vec![3, 1, 0, 2], 2, true),
+            // multi-page sequences with partial last pages
+            (
+                vec![0, 5, 9],
+                vec![0, 40, 70],
+                vec![0, 1, 2, 2, 3, 1],
+                3,
+                false,
+            ),
+        ];
+        for &(ref cu_q, ref cu_k, ref block_table, max_blocks, causal) in cases {
+            let batch = cu_q.len() - 1;
+            let total_q = cu_q[batch] as usize;
+            let total_kv = cu_k[batch] as usize;
+            let (h_q, h_kv, d, pbs) = (1usize, 1usize, 64usize, 32usize);
+            let num_blocks = block_table.iter().copied().max().unwrap() as usize + 1;
+            let q = varlen_deterministic_f32(total_q * h_q * d, batch as u64 * 71 + 11);
+            let k_dense = varlen_deterministic_f32(total_kv * h_kv * d, batch as u64 * 13 + 3);
+            let v_dense = varlen_deterministic_f32(total_kv * h_kv * d, batch as u64 * 17 + 5);
+            let k = scatter_paged_kv(
+                &k_dense,
+                h_kv,
+                d,
+                cu_k,
+                block_table,
+                max_blocks,
+                pbs,
+                num_blocks,
+            );
+            let v = scatter_paged_kv(
+                &v_dense,
+                h_kv,
+                d,
+                cu_k,
+                block_table,
+                max_blocks,
+                pbs,
+                num_blocks,
+            );
+            let scale = 0.125f32;
+
+            let q_f16: Vec<half::f16> = q.iter().map(|&x| half::f16::from_f32(x)).collect();
+            let k_f16: Vec<half::f16> = k.iter().map(|&x| half::f16::from_f32(x)).collect();
+            let v_f16: Vec<half::f16> = v.iter().map(|&x| half::f16::from_f32(x)).collect();
+            // Reference over the exact f16-rounded inputs the kernel consumes,
+            // so the comparison isolates output f16 rounding + f32 accumulation
+            // instead of the (much larger) input quantization of f16.
+            let q_ref: Vec<f32> = q_f16.iter().map(|&x| x.to_f32()).collect();
+            let k_ref: Vec<f32> = k_f16.iter().map(|&x| x.to_f32()).collect();
+            let v_ref: Vec<f32> = v_f16.iter().map(|&x| x.to_f32()).collect();
+            let q_s = device.storage_from_cpu_storage(&CpuStorage::F16(q_f16))?;
+            let k_s = device.storage_from_cpu_storage(&CpuStorage::F16(k_f16))?;
+            let v_s = device.storage_from_cpu_storage(&CpuStorage::F16(v_f16))?;
+            let q_l = Layout::contiguous((total_q, h_q, d));
+            let k_l = Layout::contiguous((num_blocks, pbs, h_kv, d));
+            let v_l = Layout::contiguous((num_blocks, pbs, h_kv, d));
+            let cu_q_s = device.storage_from_cpu_storage(&CpuStorage::I32(cu_q.clone()))?;
+            let cu_k_s = device.storage_from_cpu_storage(&CpuStorage::I32(cu_k.clone()))?;
+            let bt_s = device.storage_from_cpu_storage(&CpuStorage::I32(block_table.clone()))?;
+            let bt_l = Layout::contiguous((batch, max_blocks));
+
+            let out = q_s.flash_attn_paged(
+                &q_l,
+                &k_s,
+                &k_l,
+                &v_s,
+                &v_l,
+                &cu_q_s,
+                &cu_k_s,
+                &bt_s,
+                &bt_l,
+                pbs,
+                total_q + 4,
+                total_kv + 7,
+                scale,
+                causal,
+            )?;
+            let cpu = out.to_cpu_storage()?;
+            let got = match &cpu {
+                CpuStorage::F16(v) => v.iter().map(|&x| x.to_f32()).collect::<Vec<f32>>(),
+                other => crate::bail!("unexpected output dtype {other:?}"),
+            };
+            let expected = paged_attn_reference(
+                &q_ref,
+                h_q,
+                d,
+                d,
+                &k_ref,
+                h_kv,
+                &v_ref,
+                cu_q,
+                cu_k,
+                block_table,
+                max_blocks,
+                pbs,
+                scale,
+                causal,
+            );
+            let err = max_relative_error_floor(&got, &expected, 1e-3);
+            assert!(
+                err < 2e-3,
+                "paged f16 mismatch: cu_q={cu_q:?} cu_k={cu_k:?} block_table={block_table:?} causal={causal} err={err}"
+            );
         }
         Ok(())
     }

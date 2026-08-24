@@ -55,6 +55,19 @@ impl WgpuStorage {
     ) -> Result<Self> {
         Err(Error::NotCompiledWithWgpuSupport)
     }
+
+    /// Fused decode attention stub (real implementation in `wgpu_backend.rs`).
+    pub fn run_fused_decode_attn_f32(
+        &self,
+        _: &Self,
+        _: &Self,
+        _: &Layout,
+        _: &Layout,
+        _: &Layout,
+        _: f32,
+    ) -> Result<Self> {
+        Err(Error::NotCompiledWithWgpuSupport)
+    }
 }
 
 #[derive(thiserror::Error, Debug)]

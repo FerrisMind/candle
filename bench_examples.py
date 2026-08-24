@@ -42,15 +42,26 @@ PREFILL_SIZES = (512, 1024, 2048, 4096)
 DECODE_SIZES = (128, 256)
 DECODE_PROMPT_TOKENS = 16
 
-# % of CUDA — Candle Vulkan/wgpu targets (RTX 3090/4090 class vs CUDA reference).
+# % of CUDA throughput (tok/s) — grades: below < min ≤ normal ≤ goal.
+# When normal == goal, hitting the threshold counts as goal (N%+).
+# Two SLO classes: native (direct driver path) vs portability (validation layer
+# over the same Vulkan/DX12 — wgpu pays per-dispatch CPU validation ~27µs and
+# has no bindless; its structural ceiling on batch-1 LLM decode is a fraction
+# of native. Do NOT compare wgpu and vulkan against the same thresholds.)
 PERF_TARGETS: Dict[str, Dict[str, Dict[str, float]]] = {
     "vulkan": {
-        "prefill": {"ok": 75.0, "good": 85.0, "excellent": 90.0},
-        "decode": {"ok": 85.0, "good": 95.0, "excellent": 100.0},
+        # class: native
+        # decode: min 75%, normal 90%, goal 90%+
+        # prefill: min 85%, normal 95%, goal 95%+
+        "prefill": {"min": 85.0, "normal": 95.0, "goal": 95.0},
+        "decode": {"min": 75.0, "normal": 90.0, "goal": 90.0},
     },
     "wgpu": {
-        "prefill": {"ok": 60.0, "good": 75.0, "excellent": 85.0},
-        "decode": {"ok": 80.0, "good": 90.0, "excellent": 100.0},
+        # class: portability — regression floor / realistic / ambitious
+        # decode: min 10%, normal 18%, goal 30% (tg128/tg256)
+        "decode": {"min": 10.0, "normal": 18.0, "goal": 30.0},
+        # prefill: min 12%, normal 20%, goal 35% (pp4096 stretch: normal 22%, goal 38%)
+        "prefill": {"min": 12.0, "normal": 20.0, "goal": 35.0},
     },
 }
 
@@ -154,17 +165,18 @@ def primary_tps(avg: Dict[str, Any], phase: Optional[str]) -> Optional[float]:
 
 
 def grade_perf(backend: str, phase: Optional[str], pct: Optional[float]) -> str:
+    """Grade vs CUDA: below | min | normal | goal."""
     if pct is None or phase not in ("prefill", "decode"):
         return "-"
     targets = PERF_TARGETS.get(backend, {}).get(phase)
     if not targets:
         return "-"
-    if pct >= targets["excellent"]:
-        return "excellent"
-    if pct >= targets["good"]:
-        return "good"
-    if pct >= targets["ok"]:
-        return "ok"
+    if pct >= targets["goal"]:
+        return "goal"
+    if pct >= targets["normal"]:
+        return "normal"
+    if pct >= targets["min"]:
+        return "min"
     return "below"
 
 

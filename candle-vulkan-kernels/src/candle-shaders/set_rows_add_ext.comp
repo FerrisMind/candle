@@ -1,0 +1,127 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#if defined(SRC_I64) || defined(SRC_F64)
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#endif
+#if defined(SRC_F64)
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+#endif
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+// Extended scatter-add: U8 (CAS on u32 word containing 4 u8s),
+// U32 (atomicAdd), I64 (CAS on u32 pair), F64 (CAS on u32 pair).
+
+#if defined(SRC_U8)
+void atomic_add_u8(uint dst_u8_idx, uint8_t value) {
+    const uint word_idx = dst_u8_idx >> 2u;
+    const uint shift = (dst_u8_idx & 3u) * 8u;
+    const uint mask = 0xFFu << shift;
+    uint expected = data_d[word_idx];
+    while (true) {
+        uint old_val = (expected >> shift) & 0xFFu;
+        uint new_val = old_val + uint(value);
+        if (new_val > 255u) { new_val = 255u; }
+        uint desired = (expected & ~mask) | (new_val << shift);
+        uint previous = atomicCompSwap(data_d[word_idx], expected, desired);
+        if (previous == expected) {
+            return;
+        }
+        expected = previous;
+    }
+}
+#endif
+
+#if defined(SRC_U32)
+void atomic_add_u32(uint dst_idx, uint value) {
+    atomicAdd(data_d[dst_idx], value);
+}
+#endif
+
+#if defined(SRC_I64)
+void atomic_add_i64(uint dst_elem_idx, int64_t value) {
+    const uint word_idx = dst_elem_idx * 2u;
+    uint expected_lo = data_d[word_idx];
+    uint expected_hi = data_d[word_idx + 1u];
+    while (true) {
+        uint64_t current_u = (uint64_t(expected_hi) << 32u) | uint64_t(expected_lo);
+        int64_t current = int64_t(current_u);
+        int64_t desired_val = current + value;
+        uint64_t desired_u = uint64_t(desired_val);
+        uint desired_lo = uint(desired_u & 0xFFFFFFFFu);
+        uint desired_hi = uint(desired_u >> 32u);
+        uint previous_lo = atomicCompSwap(data_d[word_idx], expected_lo, desired_lo);
+        if (previous_lo == expected_lo) {
+            uint previous_hi = atomicCompSwap(data_d[word_idx + 1u], expected_hi, desired_hi);
+            if (previous_hi == expected_hi) {
+                return;
+            }
+            expected_lo = previous_lo;
+            expected_hi = previous_hi;
+        } else {
+            expected_lo = previous_lo;
+            expected_hi = data_d[word_idx + 1u];
+        }
+    }
+}
+#endif
+
+#if defined(SRC_F64)
+void atomic_add_f64(uint dst_elem_idx, double value) {
+    const uint word_idx = dst_elem_idx * 2u;
+    uint expected_lo = data_d[word_idx];
+    uint expected_hi = data_d[word_idx + 1u];
+    while (true) {
+        uint64_t current_u = (uint64_t(expected_hi) << 32u) | uint64_t(expected_lo);
+        double current = uint64BitsToDouble(current_u);
+        double desired_val = current + value;
+        uint64_t desired_u = doubleBitsToUint64(desired_val);
+        uint desired_lo = uint(desired_u & 0xFFFFFFFFu);
+        uint desired_hi = uint(desired_u >> 32u);
+        uint previous_lo = atomicCompSwap(data_d[word_idx], expected_lo, desired_lo);
+        if (previous_lo == expected_lo) {
+            uint previous_hi = atomicCompSwap(data_d[word_idx + 1u], expected_hi, desired_hi);
+            if (previous_hi == expected_hi) {
+                return;
+            }
+            expected_lo = previous_lo;
+            expected_hi = previous_hi;
+        } else {
+            expected_lo = previous_lo;
+            expected_hi = data_d[word_idx + 1u];
+        }
+    }
+}
+#endif
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+
+    uint i00, i01, i02, i03;
+    get_indices(idx, i00, i01, i02, i03);
+
+    const uint i12 = fastmod(i03, p.ne12);
+    const uint i11 = fastmod(i02, p.ne11);
+    const uint i10 = i01;
+    const uint dst_row = data_b[src1_idx(i10, i11, i12, 0) + get_boffset()];
+
+    const uint src_idx = src0_idx(i00, i01, i02, i03) + get_aoffset();
+    const uint out_idx = dst_idx(i00, dst_row, i02, i03) + get_doffset();
+
+#if defined(SRC_U8)
+    atomic_add_u8(out_idx, data_a[src_idx]);
+#elif defined(SRC_U32)
+    atomic_add_u32(out_idx, data_a[src_idx]);
+#elif defined(SRC_I64)
+    atomic_add_i64(out_idx, int64_t(data_a[src_idx]));
+#elif defined(SRC_F64)
+    atomic_add_f64(out_idx, double(data_a[src_idx]));
+#endif
+}

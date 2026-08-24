@@ -1,0 +1,92 @@
+#version 450
+
+// Context GEMV for the m == 1 attention ctx matmul:
+//   out[b, i] = sum_l A[b, l] * V[b, l, i]
+// where V is the NATURAL KV-cache layout (batch, l, head_dim) with head_dim
+// contiguous inner (the model stores key/value caches as (heads, seq, 128)).
+//
+// Why a separate kernel from `batched_gemv_f32` (see w-b13 / w-b10):
+// the score matmul reduces over head_dim at fixed kv-position, so its reshaped
+// RHS (n=kv, k=head_dim) is already in the (n,k) layout that batched_gemv reads
+// coalesced. The CONTEXT matmul instead reduces over the kv length l, meaning the
+// RHS would have to be materialized as the transposed (head_dim, l) copy (the
+// per-step full-V transpose). Reading V in its native (l, head_dim) layout here
+// skips that transpose + the full-V copy entirely; the reduction runs over the
+// outer (strided) l dim while preserving coalesced head_dim reads.
+//
+// Thread mapping (deterministic, no subgroup intrinsics — portable):
+//   workgroup = K_SPLIT warps x 32 lanes.
+//   lane -> head_dim column within a 32-wide tile; wslice -> which l-slice.
+//   Grid.x tiles the head_dim output (32 columns per warp); Grid.y = batch(head).
+//   Each warp reads V[b, l, lane..lane+i_dim] coalesced (32 consecutive floats)
+//   and A[b, l] broadcast, then K_SPLIT partials are summed through shared memory
+//   in fixed index order (deterministic).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform parameter {
+    uint k_dim; // reduction length l (== the matmul's K == kv length)
+    uint n_dim; // output length i (== the matmul's N == head_dim)
+    uint batch; // number of batches (heads)
+    uint offset_a; // start offset (elements) of A (scores)
+    uint offset_b; // start offset (elements) of V (kv cache)
+    uint offset_d; // start offset (elements) of D
+    uint batch_stride_a; // A batch stride (m * k, m == 1 => k)
+    uint batch_stride_b; // V batch stride (k * n)
+    uint batch_stride_d; // D batch stride (n)
+} p;
+
+// Number of warps (l-slices) per workgroup. 8 -> 256 threads; good occupancy.
+const uint K_SPLIT = 8u;
+// Output columns handled per warp (== coalesced read width along head_dim).
+const uint I_GROUP = 32u;
+
+shared float sh_part[K_SPLIT][I_GROUP];
+
+layout(binding = 0) readonly buffer SrcA {
+    float data_a[];
+};
+layout(binding = 1) readonly buffer SrcB {
+    float data_b[];
+};
+layout(binding = 2) writeonly buffer Dst {
+    float data_d[];
+};
+
+void main() {
+    const uint batch_idx = gl_WorkGroupID.y;
+    const uint wslice = gl_LocalInvocationID.x / I_GROUP; // which l-slice (0..K_SPLIT-1)
+    const uint lane = gl_LocalInvocationID.x % I_GROUP; // head_dim column within tile
+    const uint out_idx = gl_WorkGroupID.x * I_GROUP + lane; // head_dim output column
+
+    const uint a_base = p.offset_a + batch_idx * p.batch_stride_a;
+    const uint b_base = p.offset_b + batch_idx * p.batch_stride_b;
+    const uint d_base = p.offset_d + batch_idx * p.batch_stride_d;
+
+    const bool valid = out_idx < p.n_dim;
+
+    // Contiguous l-range per warp: every worker owns a slice of the reduction.
+    const uint l_sz = p.k_dim / K_SPLIT;
+    const uint l_start = wslice * l_sz;
+    const uint l_end = (wslice == K_SPLIT - 1u) ? p.k_dim : (l_start + l_sz);
+
+    float acc = 0.0f;
+    if (valid) {
+        for (uint ll = l_start; ll < l_end; ++ll) {
+            // data_b[b_base + ll*i_dim + out_idx] : adjacent lanes -> adjacent i.
+            acc = fma(data_a[a_base + ll], data_b[b_base + ll * p.n_dim + out_idx], acc);
+        }
+    }
+
+    sh_part[wslice][lane] = acc;
+    barrier();
+
+    if (wslice == 0u) {
+        float sum = sh_part[0][lane];
+        for (uint t = 1u; t < K_SPLIT; ++t) {
+            sum += sh_part[t][lane];
+        }
+        if (valid) {
+            data_d[d_base + out_idx] = sum;
+        }
+    }
+}

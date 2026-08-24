@@ -40,8 +40,64 @@ var<workgroup> shmem_idx: array<u32, WG_SIZE>;
 #define SWAP_COMPARE_UP <
 #define SWAP_COMPARE_DOWN >
 #endif
+// Tie comparators do NOT flip with ORDER: equal keys always resolve so the
+// smaller original index ends first in the final output (CPU sort_by
+// stability in both directions).
+#define TIE_UP >
+#define TIE_DOWN <
+
+#ifdef KEY_FN
+// Orderable-key helpers (CUDA sort.cu trick): map values to u32 keys that
+// preserve source order under unsigned comparison.
+fn orderable_from_f32(v: f32) -> u32 {
+    let b = bitcast<u32>(v);
+    let mask = select(0xFFFFFFFFu, 0x80000000u, (b & 0x80000000u) == 0u);
+    return b ^ mask;
+}
+
+fn orderable_from_i32(v: i32) -> u32 {
+    return bitcast<u32>(v) ^ 0x80000000u;
+}
+
+fn orderable_from_u8(v: u32) -> u32 {
+    return v;
+}
+
+fn decode_f8e4m3(x: u32) -> f32 {
+    let b = x & 0xFFu;
+    let sign = select(1.0, -1.0, (b & 0x80u) != 0u);
+    let exp = (b >> 3u) & 0xFu;
+    let man = b & 0x7u;
+    if exp == 0u {
+        if man == 0u {
+            return sign * 0.0;
+        }
+        return sign * (f32(man) / 8.0) * 0.015625;
+    }
+    if exp == 0xFu && man == 0x7u {
+        return bitcast<f32>(0x7FC00000u);
+    }
+    return sign * (1.0 + f32(man) / 8.0) * exp2(f32(exp) - 7.0);
+}
+
+fn orderable_from_f8e4m3_bits(b: u32) -> u32 {
+    let v = decode_f8e4m3(b & 0xFFu);
+    return orderable_from_f32(v);
+}
+
+fn sort_key(i: u32) -> u32 {
+    return KEY_BODY;
+}
+#else
+fn sort_key(i: u32) -> u32 {
+    return bitcast<u32>(src[i]);
+}
+#endif
 
 fn should_swap_up(a_idx: u32, b_idx: u32, row_base: u32) -> bool {
+    // Up-box sorts in the FINAL direction. Total order (key, index): equal
+    // keys keep ascending original index (CPU sort_by stability in both
+    // directions), so the tie comparator flips with the key comparator.
     let a_oob = a_idx >= params.src_ne0;
     let b_oob = b_idx >= params.src_ne0;
     if (a_oob) {
@@ -50,7 +106,12 @@ fn should_swap_up(a_idx: u32, b_idx: u32, row_base: u32) -> bool {
     if (b_oob) {
         return false;
     }
-    return src[row_base + a_idx] SWAP_COMPARE_UP src[row_base + b_idx];
+    let ka = sort_key(row_base + a_idx);
+    let kb = sort_key(row_base + b_idx);
+    if (ka == kb) {
+        return a_idx TIE_UP b_idx;
+    }
+    return ka SWAP_COMPARE_UP kb;
 }
 
 fn should_swap_down(a_idx: u32, b_idx: u32, row_base: u32) -> bool {
@@ -62,7 +123,12 @@ fn should_swap_down(a_idx: u32, b_idx: u32, row_base: u32) -> bool {
     if (b_oob) {
         return true;
     }
-    return src[row_base + a_idx] SWAP_COMPARE_DOWN src[row_base + b_idx];
+    let ka = sort_key(row_base + a_idx);
+    let kb = sort_key(row_base + b_idx);
+    if (ka == kb) {
+        return a_idx TIE_DOWN b_idx;
+    }
+    return ka SWAP_COMPARE_DOWN kb;
 }
 
 @compute @workgroup_size(WG_SIZE)
@@ -124,3 +190,5 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         dst[row_dst + out_idx] = shmem_idx[lid.x];
     }
 }
+
+// cache-buster v2: full hash validation probe

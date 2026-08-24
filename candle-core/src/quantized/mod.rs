@@ -256,6 +256,47 @@ impl QWgpuStorage {
     }
 
     fn quantize(&mut self, src: &crate::WgpuStorage) -> Result<()> {
+        // GPU-path Q8_0/Q4_0 quantize: avoids a CPU round-trip of the source
+        // weights. Only for contiguous F32 sources sized to whole blocks;
+        // everything else keeps the documented CPU fallback.
+        #[cfg(feature = "wgpu")]
+        {
+            if src.dtype() == DType::F32 {
+                let elem_count = src.count();
+                let need =
+                    |bs: usize| self.dtype.block_size() == bs && elem_count.is_multiple_of(bs);
+                if self.dtype == GgmlDType::Q8_0 && need(32) {
+                    let quant = src.quantize_f32_to_q8_0(elem_count)?;
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ8_0>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+                if self.dtype == GgmlDType::Q4_0 && need(32) {
+                    let quant = src.quantize_f32_to_q4_0(elem_count)?;
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ4_0>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+                if self.dtype == GgmlDType::Q4_1 && need(32) {
+                    let quant = src.quantize_f32_to_q4_1(elem_count)?;
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ4_1>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+                if self.dtype == GgmlDType::Q5_0 && need(32) {
+                    let quant = src.quantize_f32_to_q5_0(elem_count)?;
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ5_0>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+                if self.dtype == GgmlDType::Q5_1 && need(32) {
+                    let quant = src.quantize_f32_to_q5_1(elem_count)?;
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ5_1>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+            }
+        }
         let src = src.to_cpu_storage()?;
         self.quantize_from_cpu(&src, None)
     }
@@ -404,6 +445,18 @@ impl QWgpuStorage {
             Err(err) => Err(err),
         }
     }
+
+    fn indexed_moe_forward_f32(
+        &self,
+        self_shape: &Shape,
+        input: &crate::WgpuStorage,
+        input_l: &crate::Layout,
+        ids: &crate::WgpuStorage,
+        ids_l: &crate::Layout,
+    ) -> Result<(crate::WgpuStorage, Shape)> {
+        self.storage
+            .quantized_indexed_moe_f32(self.dtype, self_shape, input, input_l, ids, ids_l)
+    }
 }
 
 pub struct QVulkanStorage {
@@ -481,6 +534,62 @@ impl QVulkanStorage {
     }
 
     fn quantize(&mut self, src: &crate::VulkanStorage) -> Result<()> {
+        // GPU-path Q8_0/Q4_0 quantize: avoids a CPU round-trip of the source
+        // weights. Only for contiguous F32 sources sized to whole blocks;
+        // everything else keeps the documented CPU fallback.
+        #[cfg(feature = "vulkan")]
+        {
+            if src.dtype() == DType::F32 {
+                let elem_count = src.count();
+                let need =
+                    |bs: usize| self.dtype.block_size() == bs && elem_count.is_multiple_of(bs);
+                if self.dtype == GgmlDType::Q8_0 && need(32) {
+                    let device = self.device();
+                    let quant = crate::vulkan_backend::quantize_f32_storage_to_q8_0(
+                        device, src, elem_count,
+                    )?;
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ8_0>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+                if self.dtype == GgmlDType::Q4_0 && need(32) {
+                    let device = self.device();
+                    let quant = crate::vulkan_backend::quantize_f32_storage_to_q4_0(
+                        device, src, elem_count,
+                    )?;
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ4_0>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+                if self.dtype == GgmlDType::Q4_1 && need(32) {
+                    let device = self.device();
+                    let quant = crate::vulkan_backend::quantize_f32_storage_to_q4_1(
+                        device, src, elem_count,
+                    )?;
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ4_1>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+                if self.dtype == GgmlDType::Q5_0 && need(32) {
+                    let device = self.device();
+                    let quant = crate::vulkan_backend::quantize_f32_storage_to_q5_0(
+                        device, src, elem_count,
+                    )?;
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ5_0>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+                if self.dtype == GgmlDType::Q5_1 && need(32) {
+                    let device = self.device();
+                    let quant = crate::vulkan_backend::quantize_f32_storage_to_q5_1(
+                        device, src, elem_count,
+                    )?;
+                    self.len_bytes = elem_count / 32 * std::mem::size_of::<k_quants::BlockQ5_1>();
+                    self.storage = quant;
+                    return Ok(());
+                }
+            }
+        }
         let src = src.to_cpu_storage()?;
         self.quantize_from_cpu(&src, None)
     }
@@ -1529,6 +1638,34 @@ impl QTensor {
                     return out.to_device(&output_device);
                 }
                 Err(err) if should_quantized_backend_fallback(&err, "vulkan") => {}
+                Err(err) => return Err(err),
+            }
+        }
+        if let (QStorage::Wgpu(storage), Storage::Wgpu(x_storage), Storage::Wgpu(ids_storage)) =
+            (&self.storage, &*x3_f32.storage(), &*ids.storage())
+        {
+            match storage.indexed_moe_forward_f32(
+                &self.shape,
+                x_storage,
+                x3_f32.layout(),
+                ids_storage,
+                ids.layout(),
+            ) {
+                Ok((storage, out_shape)) => {
+                    let out = crate::tensor::from_storage(
+                        Storage::Wgpu(storage),
+                        out_shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    );
+                    let out = if out.dtype() == output_dtype {
+                        out
+                    } else {
+                        out.to_dtype(output_dtype)?
+                    };
+                    return out.to_device(&output_device);
+                }
+                Err(err) if should_quantized_backend_fallback(&err, "wgpu") => {}
                 Err(err) => return Err(err),
             }
         }

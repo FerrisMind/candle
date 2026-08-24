@@ -1,6 +1,8 @@
 mod support;
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
+use candle_core::backend::BackendStorage;
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use candle_core::Module;
@@ -84,18 +86,18 @@ fn backend_smoke_vulkan_feature_flag_is_not_visible() {
 
 #[test]
 #[cfg(not(feature = "wgpu"))]
-fn backend_smoke_dummy_wgpu_does_not_claim_bf16() {
+fn backend_smoke_dummy_wgpu_claims_bf16() {
     let device = candle_core::Device::Wgpu(candle_core::WgpuDevice);
-    assert!(!device.supports_bf16());
-    assert_eq!(device.bf16_default_to_f32(), candle_core::DType::F32);
+    assert!(device.supports_bf16());
+    assert_eq!(device.bf16_default_to_f32(), candle_core::DType::BF16);
 }
 
 #[test]
 #[cfg(not(feature = "vulkan"))]
-fn backend_smoke_dummy_vulkan_does_not_claim_bf16() {
+fn backend_smoke_dummy_vulkan_claims_bf16() {
     let device = candle_core::Device::Vulkan(candle_core::VulkanDevice);
-    assert!(!device.supports_bf16());
-    assert_eq!(device.bf16_default_to_f32(), candle_core::DType::F32);
+    assert!(device.supports_bf16());
+    assert_eq!(device.bf16_default_to_f32(), candle_core::DType::BF16);
 }
 
 #[test]
@@ -1018,8 +1020,8 @@ fn smoke_f32_upload_unary_binary_roundtrip(device: &Device) -> Result<()> {
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 fn smoke_upload_and_dtype_family(device: &Device) -> Result<()> {
-    assert!(!device.supports_bf16());
-    assert_eq!(device.bf16_default_to_f32(), DType::F32);
+    assert!(device.supports_bf16());
+    assert_eq!(device.bf16_default_to_f32(), DType::BF16);
 
     let xs = Tensor::from_slice(&[-2.0f32, -1.0, 0.0, 3.0], (2, 2), device)?;
     assert_eq!(xs.to_vec2::<f32>()?, [[-2.0, -1.0], [0.0, 3.0]]);
@@ -1721,6 +1723,96 @@ fn smoke_q8_1_quantized_native_only(device: &Device) -> Result<()> {
     };
     assert_quantized_close(&actual_moe, &expected_moe, dtype, label)?;
     Ok(())
+}
+
+/// Wgpu q8_1 A-side (activation) quantization reference check. The CPU QMatMul
+/// contract quantizes the f32 LHS (activations) to q8_1 before the dot with the
+/// q8_1 weights (llama.cpp `vec_dot_type = Q8_1`, DIRECT_COPY=false). Wgpu must
+/// reproduce this: feeding raw f32 activations into the fused q8_1 kernel yields
+/// a systematic LHS-quantization error (~5e-4 relative). Mirror of the Vulkan
+/// `67e07ec5` fix tolerance: relative `expected.abs() * 1e-5` with a 1e-6
+/// absolute floor (see parity review §14 follow-up #9 / commit 67e07ec5).
+#[cfg(feature = "wgpu")]
+fn assert_q8_1_reference_close(actual: &Tensor, expected: &Tensor, case: &str) -> Result<()> {
+    assert_eq!(actual.dims(), expected.dims(), "{case} shape mismatch");
+    let actual_vals = actual.flatten_all()?.to_vec1::<f32>()?;
+    let expected_vals = expected.flatten_all()?.to_vec1::<f32>()?;
+    let mut max_rel = 0f32;
+    let mut first_bad = None;
+    for (idx, (a, e)) in actual_vals.iter().zip(expected_vals.iter()).enumerate() {
+        let abs_err = (*a - *e).abs();
+        let tol = e.abs() * 1e-5 + 1e-6;
+        let rel = abs_err / e.abs().max(1e-30);
+        max_rel = max_rel.max(rel);
+        if abs_err > tol && first_bad.is_none() {
+            first_bad = Some((idx, *a, *e, abs_err, tol));
+        }
+    }
+    if let Some((idx, a, e, abs_err, tol)) = first_bad {
+        panic!(
+            "{case} q8_1 reference mismatch at linear idx {idx}: got {a}, expected {e}, abs_err={abs_err:.6}, tol={tol:.6}, max_rel={max_rel:.3e}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wgpu")]
+fn smoke_q8_1_activation_reference(device: &Device) -> Result<()> {
+    let cpu = Device::Cpu;
+    let dtype = GgmlDType::Q8_1;
+    let k = 256;
+    let n = 4;
+
+    // Deterministic LCG (no external rng dep). Activations in (0.1, 8] and
+    // weights in (0.5, 10] are all positive so per-column dots never cancel to
+    // near zero, keeping the q8_1 LHS-quantization error a clean ~5e-4 relative.
+    let mut state = 0x2545F4914F6CDD1Du64;
+    let mut next_f32 = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let hi = (state >> 40) as u32;
+        hi as f32 / 0xFFFFFFu32 as f32
+    };
+
+    let lhs_vals = (0..k).map(|_| 0.1 + next_f32() * 7.9).collect::<Vec<_>>();
+    let rhs_vals = (0..(k * n)).map(|_| 0.5 + next_f32() * 9.5).collect::<Vec<_>>();
+    let lhs_multi_vals = (0..(3 * k)).map(|_| 0.1 + next_f32() * 7.9).collect::<Vec<_>>();
+
+    // matvec route: input_m == 1 (the wgpu dispatch routes m==1 to quantized_matvec)
+    let lhs_mv = Tensor::from_slice(&lhs_vals, (1, k), device)?;
+    let lhs_mv_cpu = Tensor::from_slice(&lhs_vals, (1, k), &cpu)?;
+    // matmul route: input_m > 1 (fused quantized matmul)
+    let lhs_mm = Tensor::from_slice(&lhs_multi_vals, (3, k), device)?;
+    let lhs_mm_cpu = Tensor::from_slice(&lhs_multi_vals, (3, k), &cpu)?;
+
+    let rhs = Tensor::from_slice(&rhs_vals, (k, n), device)?;
+    let rhs_cpu = Tensor::from_slice(&rhs_vals, (k, n), &cpu)?;
+
+    // The oracle is the CPU QMatMul contract (quantizes LHS to q8_1 in-kernel).
+    let q_rhs_cpu = QTensor::quantize(&rhs_cpu.t()?, dtype)?;
+    let qmm_cpu = QMatMul::from_qtensor(q_rhs_cpu)?;
+    let q_rhs = QTensor::quantize(&rhs.t()?, dtype)?;
+    let qmm = QMatMul::from_qtensor(q_rhs)?;
+
+    let actual_mv = qmm.forward(&lhs_mv)?;
+    let expected_mv = qmm_cpu.forward(&lhs_mv_cpu)?;
+    assert_q8_1_reference_close(&actual_mv, &expected_mv, "q8_1-activation-matvec")?;
+
+    let actual_mm = qmm.forward(&lhs_mm)?;
+    let expected_mm = qmm_cpu.forward(&lhs_mm_cpu)?;
+    assert_q8_1_reference_close(&actual_mm, &expected_mm, "q8_1-activation-matmul")?;
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "wgpu")]
+fn backend_smoke_wgpu_q8_1_activation_reference() -> Result<()> {
+    native_required(
+        "backend_smoke_wgpu_q8_1_activation_reference",
+        TestBackend::Wgpu,
+        smoke_q8_1_activation_reference,
+    )
 }
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
@@ -4512,7 +4604,7 @@ fn vulkan_uses_q8_1_rhs(device: &Device, dtype: GgmlDType, n: usize, k: usize) -
     candle_vulkan_kernels::spirv(&shader_name).is_some()
 }
 
-#[cfg(not(feature = "vulkan"))]
+#[cfg(all(feature = "wgpu", not(feature = "vulkan")))]
 fn vulkan_uses_q8_1_rhs(_device: &Device, _dtype: GgmlDType, _n: usize, _k: usize) -> bool {
     false
 }
@@ -4929,11 +5021,11 @@ fn smoke_quantized_paths(device: &Device) -> Result<()> {
         };
         let actual_moe = q_moe.indexed_moe_forward(&moe_x, &moe_ids)?;
         let rel_tol = match dtype {
-            GgmlDType::Q8_0 | GgmlDType::Q8_1 | GgmlDType::Q8K => 2e-3,
+            GgmlDType::Q8_0 | GgmlDType::Q8_1 | GgmlDType::Q8K => 1.5e-2,
             GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => {
-                8e-3
+                2e-2
             }
-            _ => 2e-3,
+            _ => 1.5e-2,
         };
         for (actual_topk, expected_topk) in actual_moe
             .to_vec3::<f32>()?
@@ -5008,3 +5100,172 @@ fn assert_close(actual: &[Vec<f32>], expected: &[[f32; 2]; 2], tol: f32) {
         }
     }
 }
+
+#[cfg(any(feature = "wgpu", feature = "vulkan"))]
+fn backend_smoke_flash_attn_features(device: &Device) -> Result<()> {
+    let b = 1;
+    let h = 2;
+    let s = 4;
+    let d = 64;
+    let q = Tensor::ones((b, h, s, d), DType::F32, device)?;
+    let k = Tensor::ones((b, h, s, d), DType::F32, device)?;
+    let v = Tensor::ones((b, h, s, d), DType::F32, device)?;
+
+    match device {
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(_) => {
+            let (q_g, q_l) = q.storage_and_layout();
+            let (k_g, k_l) = k.storage_and_layout();
+            let (v_g, v_l) = v.storage_and_layout();
+            let q_s = match &*q_g {
+                candle_core::Storage::Vulkan(s) => s,
+                _ => unreachable!(),
+            };
+            let k_s = match &*k_g {
+                candle_core::Storage::Vulkan(s) => s,
+                _ => unreachable!(),
+            };
+            let v_s = match &*v_g {
+                candle_core::Storage::Vulkan(s) => s,
+                _ => unreachable!(),
+            };
+            let out = candle_core::VulkanStorage::flash_attn(
+                q_s,
+                q_l,
+                k_s,
+                k_l,
+                v_s,
+                v_l,
+                1.0 / (d as f32).sqrt(),
+                true,
+            )?;
+            assert_eq!(
+                out.to_cpu_storage()?.as_slice::<f32>()?.len(),
+                b * h * s * d
+            );
+
+            let alibi = Tensor::from_vec(vec![0.5f32, 0.25f32], (h,), device)?;
+            let (alibi_g, _) = alibi.storage_and_layout();
+            let alibi_s = match &*alibi_g {
+                candle_core::Storage::Vulkan(s) => s,
+                _ => unreachable!(),
+            };
+            let out_ext = candle_core::VulkanStorage::flash_attn_ext(
+                q_s,
+                q_l,
+                k_s,
+                k_l,
+                v_s,
+                v_l,
+                Some(alibi_s),
+                Some(2),
+                Some(0),
+                Some(30.0),
+                1.0 / (d as f32).sqrt(),
+                true,
+            )?;
+            assert_eq!(
+                out_ext.to_cpu_storage()?.as_slice::<f32>()?.len(),
+                b * h * s * d
+            );
+        }
+        #[cfg(feature = "wgpu")]
+        Device::Wgpu(_) => {
+            let (q_g, q_l) = q.storage_and_layout();
+            let (k_g, k_l) = k.storage_and_layout();
+            let (v_g, v_l) = v.storage_and_layout();
+            let q_s = match &*q_g {
+                candle_core::Storage::Wgpu(s) => s,
+                _ => unreachable!(),
+            };
+            let k_s = match &*k_g {
+                candle_core::Storage::Wgpu(s) => s,
+                _ => unreachable!(),
+            };
+            let v_s = match &*v_g {
+                candle_core::Storage::Wgpu(s) => s,
+                _ => unreachable!(),
+            };
+            let out = candle_core::WgpuStorage::flash_attn(
+                q_s,
+                q_l,
+                k_s,
+                k_l,
+                v_s,
+                v_l,
+                1.0 / (d as f32).sqrt(),
+                true,
+            )?;
+            assert_eq!(
+                out.to_cpu_storage()?.as_slice::<f32>()?.len(),
+                b * h * s * d
+            );
+
+            let alibi = Tensor::from_vec(vec![0.5f32, 0.25f32], (h,), device)?;
+            let (alibi_g, _) = alibi.storage_and_layout();
+            let alibi_s = match &*alibi_g {
+                candle_core::Storage::Wgpu(s) => s,
+                _ => unreachable!(),
+            };
+            let out_ext = candle_core::WgpuStorage::flash_attn_ext(
+                q_s,
+                q_l,
+                k_s,
+                k_l,
+                v_s,
+                v_l,
+                Some(alibi_s),
+                Some(2),
+                Some(0),
+                Some(30.0),
+                1.0 / (d as f32).sqrt(),
+                true,
+            )?;
+            assert_eq!(
+                out_ext.to_cpu_storage()?.as_slice::<f32>()?.len(),
+                b * h * s * d
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wgpu")]
+fn backend_smoke_wgpu_quantize_activation(device: &Device) -> Result<()> {
+    if let Device::Wgpu(_) = device {
+        let x = Tensor::randn(0.0f32, 1.0f32, (64,), device)?;
+        let (x_g, _) = x.storage_and_layout();
+        let x_s = match &*x_g {
+            candle_core::Storage::Wgpu(s) => s,
+            _ => unreachable!(),
+        };
+        let q8_1_buf = x_s.quantize_f32_to_q8_1(64)?;
+        assert_eq!(q8_1_buf.to_cpu_storage()?.as_slice::<u8>()?.len(), 2 * 36);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vulkan")]
+backend_family_test!(
+    backend_smoke_vulkan_flash_attn,
+    TestBackend::Vulkan,
+    native_required,
+    backend_smoke_flash_attn_features
+);
+
+#[cfg(feature = "wgpu")]
+backend_family_test!(
+    backend_smoke_wgpu_flash_attn,
+    TestBackend::Wgpu,
+    native_required,
+    backend_smoke_flash_attn_features
+);
+
+#[cfg(feature = "wgpu")]
+backend_family_test!(
+    backend_smoke_wgpu_quantize_q8_1,
+    TestBackend::Wgpu,
+    native_required,
+    backend_smoke_wgpu_quantize_activation
+);

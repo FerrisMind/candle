@@ -68,13 +68,25 @@ fn ulp_diff_f32(a: f32, b: f32) -> u64 {
         return 0;
     }
     if a.is_nan() || b.is_nan() || a.is_infinite() || b.is_infinite() {
-        return if a.to_bits() == b.to_bits() { 0 } else { u64::MAX / 4 };
+        return if a.to_bits() == b.to_bits() {
+            0
+        } else {
+            u64::MAX / 4
+        };
     }
     let ai = a.to_bits() as i32;
     let bi = b.to_bits() as i32;
     // Two's complement ordering for floats
-    let ai = if ai < 0 { 0x8000_0000u32 as i32 - ai } else { ai };
-    let bi = if bi < 0 { 0x8000_0000u32 as i32 - bi } else { bi };
+    let ai = if ai < 0 {
+        0x8000_0000u32 as i32 - ai
+    } else {
+        ai
+    };
+    let bi = if bi < 0 {
+        0x8000_0000u32 as i32 - bi
+    } else {
+        bi
+    };
     (ai as i64 - bi as i64).unsigned_abs()
 }
 
@@ -189,8 +201,7 @@ fn run_suite(under: &Device, cuda: &Device, backend: &str) -> Result<Vec<CaseRep
             }
             // binary mul
             let data2 = f32_data(shape, 99);
-            let Ok(cpu_b) =
-                Tensor::from_vec(data2.clone(), *shape, &Device::Cpu)?.to_dtype(dtype)
+            let Ok(cpu_b) = Tensor::from_vec(data2.clone(), *shape, &Device::Cpu)?.to_dtype(dtype)
             else {
                 continue;
             };
@@ -244,8 +255,7 @@ fn run_suite(under: &Device, cuda: &Device, backend: &str) -> Result<Vec<CaseRep
         let Ok(cpu_a) = Tensor::from_vec(a.clone(), (7, 5), &Device::Cpu)?.to_dtype(dtype) else {
             continue;
         };
-        let Ok(cpu_b) = Tensor::from_vec(b.clone(), (5, 11), &Device::Cpu)?.to_dtype(dtype)
-        else {
+        let Ok(cpu_b) = Tensor::from_vec(b.clone(), (5, 11), &Device::Cpu)?.to_dtype(dtype) else {
             continue;
         };
         let Ok(ga) = Tensor::from_vec(a.clone(), (7, 5), under)?.to_dtype(dtype) else {
@@ -280,12 +290,21 @@ fn run_suite(under: &Device, cuda: &Device, backend: &str) -> Result<Vec<CaseRep
     // integer exact add (U8 is more widely supported on CUDA binary than I32)
     let ua: Vec<u8> = (0..15u8).collect();
     let ub: Vec<u8> = (0..15u8).map(|x| 20u8.saturating_sub(x)).collect();
-    let cpu_i = Tensor::from_vec(ua.clone(), (3, 5), &Device::Cpu)?
-        .add(&Tensor::from_vec(ub.clone(), (3, 5), &Device::Cpu)?)?;
-    let g_i = Tensor::from_vec(ua.clone(), (3, 5), under)?
-        .add(&Tensor::from_vec(ub.clone(), (3, 5), under)?)?;
-    let c_i = Tensor::from_vec(ua.clone(), (3, 5), cuda)?
-        .add(&Tensor::from_vec(ub.clone(), (3, 5), cuda)?)?;
+    let cpu_i = Tensor::from_vec(ua.clone(), (3, 5), &Device::Cpu)?.add(&Tensor::from_vec(
+        ub.clone(),
+        (3, 5),
+        &Device::Cpu,
+    )?)?;
+    let g_i = Tensor::from_vec(ua.clone(), (3, 5), under)?.add(&Tensor::from_vec(
+        ub.clone(),
+        (3, 5),
+        under,
+    )?)?;
+    let c_i = Tensor::from_vec(ua.clone(), (3, 5), cuda)?.add(&Tensor::from_vec(
+        ub.clone(),
+        (3, 5),
+        cuda,
+    )?)?;
     match (
         g_i.flatten_all()?.to_vec1::<u8>(),
         cpu_i.flatten_all()?.to_vec1::<u8>(),

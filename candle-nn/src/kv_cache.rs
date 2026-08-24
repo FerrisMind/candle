@@ -791,6 +791,152 @@ impl ConcatKvCache {
     }
 }
 
+/// A KV cache that writes new keys/values **in-place** into a single preallocated
+/// (geometrically growing) buffer, instead of re-copying the entire cache on every
+/// token like `ConcatKvCache` does.
+///
+/// `ConcatKvCache::append` builds a fresh buffer of length `seq_len + 1` and copies
+/// the whole cache into it on every token — an O(seq_len) copy per token, which
+/// makes an N-token prefill O(N²) in KV bytes. This cache keeps one buffer of
+/// `capacity` positions and, on append, copies only the newly supplied tokens into
+/// the region `[len, len + seq)` via `slice_set`, then returns a `narrow` view of
+/// the used prefix. That makes single-token append O(1) per token (amortized).
+///
+/// When the used length exceeds the current capacity the backing buffer doubles
+/// (and the live prefix is copied once into the new buffer), so the amortized cost
+/// per appended token stays O(1) and the buffer grows to at most ~2× the longest
+/// sequence actually seen.
+///
+/// # Aliasing safety (in-place)
+///
+/// `append` writes the new tokens at offset `[len, len + seq)`, i.e. **beyond** the
+/// existing live prefix, so it never overwrites entries produced by earlier appends.
+/// Views returned by earlier appends therefore remain valid for the prefix they
+/// describe. The only invalidation happens during a grow (backing buffer replaced),
+/// which is rare and amortized; callers consume the returned `(k, v)` (e.g. via
+/// `repeat_kv`/`matmul` which materialize fresh tensors) within the same forward
+/// pass, so no view is held across a grow. This matches `ConcatKvCache`'s usage
+/// contract where the returned tensors are consumed within one forward.
+#[derive(Debug, Clone)]
+pub struct GrowableKvCache {
+    k: Option<Tensor>,
+    v: Option<Tensor>,
+    dim: usize,
+    len: usize,
+    capacity: usize,
+}
+
+impl GrowableKvCache {
+    /// Create a new empty, growable, in-place KV cache.
+    ///
+    /// `dim` is the concatenation dimension, matching `ConcatKvCache::new`:
+    /// `2` for `[batch, heads, seq, head_dim]` and `1` for `[batch, seq, heads, head_dim]`.
+    pub fn new(dim: usize) -> Self {
+        Self {
+            k: None,
+            v: None,
+            dim,
+            len: 0,
+            capacity: 0,
+        }
+    }
+
+    /// Current sequence length in the cache (0 if empty).
+    pub fn current_seq_len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the cache currently holds no tokens.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The concatenation dimension.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Reset the cache to empty, keeping the preallocated backing buffers (their
+    /// content is ignored after a reset) so a warm sequence does not re-allocate on
+    /// every reset; the next append writes from position 0.
+    pub fn reset(&mut self) {
+        self.len = 0;
+    }
+
+    /// Allocate a zeroed backing buffer shaped like `src` but with `cap` positions
+    /// on `self.dim`.
+    fn alloc_like(&self, src: &Tensor, cap: usize) -> Result<Tensor> {
+        let mut shape = src.dims().to_vec();
+        shape[self.dim] = cap;
+        Tensor::zeros(shape, src.dtype(), src.device())
+    }
+
+    /// Ensure the backing buffers can hold `needed` positions, doubling capacity.
+    /// The live prefix is copied once into the new buffers.
+    fn ensure_capacity(&mut self, k: &Tensor, v: &Tensor, needed: usize) -> Result<()> {
+        if needed <= self.capacity {
+            return Ok(());
+        }
+        // Exact-ish growth: instead of doubling to a power of two (which grows the
+        // backing buffer to up to ~2x the longest live prefix and leaves a large
+        // pad every step after a warmup reset keeps the old capacity), grow to the
+        // live length plus a small slack. This keeps the backing buffer within
+        // ~12.5% (min 256 positions) of the live prefix so the `narrow` views
+        // derived from it stay much closer to the used range. The pad cannot be
+        // exactly zero without re-allocating every append (which would reintroduce
+        // the O(seq^2) re-copy), so a small slack is the best compromise. The slack
+        // grows with the sequence so the amortized number of grow-copies stays O(1)
+        // per appended token (a grow copies the live prefix; the slack bounds how
+        // many grows happen for a given sequence length).
+        let slack = (needed / 8).max(256);
+        let new_capacity = needed + slack;
+        let new_k = self.alloc_like(k, new_capacity)?;
+        let new_v = self.alloc_like(v, new_capacity)?;
+        if self.len > 0 {
+            if let (Some(old_k), Some(old_v)) = (&self.k, &self.v) {
+                // The narrow prefix may be strided (len < old capacity); `slice_set`
+                // requires a contiguous source, so materialize the prefix once here.
+                // This copy only happens on a grow (amortized O(1) per append).
+                let view_k = old_k.narrow(self.dim, 0, self.len)?.contiguous()?;
+                new_k.slice_set(&view_k, self.dim, 0)?;
+                let view_v = old_v.narrow(self.dim, 0, self.len)?.contiguous()?;
+                new_v.slice_set(&view_v, self.dim, 0)?;
+            }
+        }
+        self.k = Some(new_k);
+        self.v = Some(new_v);
+        self.capacity = new_capacity;
+        Ok(())
+    }
+
+    /// Append `k`/`v` to the cache in-place and return the full `(k, v)` views
+    /// (`narrow`ed to the used prefix), matching `ConcatKvCache::append`'s contract.
+    ///
+    /// The returned views alias the cache's backing buffers and are only valid until
+    /// the next grow; they must be consumed (e.g. by `repeat_kv`/`matmul`, which
+    /// materialize fresh tensors) within the same forward pass, as with the upstream
+    /// `ConcatKvCache` contract.
+    pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        let k = k.contiguous()?.detach();
+        let v = v.contiguous()?.detach();
+        let seq = k.dim(self.dim)?;
+        let new_len = self.len + seq;
+        self.ensure_capacity(&k, &v, new_len)?;
+        self.k
+            .as_mut()
+            .unwrap()
+            .slice_set(&k, self.dim, self.len)?;
+        self.v
+            .as_mut()
+            .unwrap()
+            .slice_set(&v, self.dim, self.len)?;
+        self.len = new_len;
+        let view_k = self.k.as_ref().unwrap().narrow(self.dim, 0, self.len)?;
+        let view_v = self.v.as_ref().unwrap().narrow(self.dim, 0, self.len)?;
+        Ok((view_k, view_v))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,6 +1118,46 @@ mod tests {
 
         assert_eq!(k.dims(), &[1, 5, 8, 64]); // Concatenated on dim 1
         assert_eq!(cache.current_seq_len(), 5);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_growable_kv_cache_exact_growth() -> Result<()> {
+        // Exhaustive single-token append across multiple exact-ish grows (the
+        // grow slack is max(256, len/8), so a run of ~600 tokens triggers several
+        // grow-copies). Verify the appended value is visible at its position and
+        // that seq len tracks correctly.
+        let device = Device::Cpu;
+        let mut cache = GrowableKvCache::new(2);
+        let total = 600usize;
+        for i in 0..total {
+            let k = Tensor::new(&[[[[i as f32]]]], &device)?.broadcast_as((1, 2, 1, 4))?;
+            let v = Tensor::new(&[[[[i as f32]]]], &device)?.broadcast_as((1, 2, 1, 4))?;
+            let (kv, vv) = cache.append(&k, &v)?;
+            assert_eq!(kv.dims(), &[1, 2, i + 1, 4]);
+            assert_eq!(vv.dims(), &[1, 2, i + 1, 4]);
+            assert_eq!(cache.current_seq_len(), i + 1);
+            // The token appended at position `i` holds value `i` (all heads, all
+            // head_dim slots).
+            let last_k = kv.narrow(2, i, 1)?.flatten_all()?.to_vec1::<f32>()?;
+            let last_v = vv.narrow(2, i, 1)?.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(last_k.len(), 8);
+            assert_eq!(last_v.len(), 8);
+            assert!(last_k.iter().all(|x| *x == i as f32));
+            assert!(last_v.iter().all(|x| *x == i as f32));
+        }
+        assert_eq!(cache.current_seq_len(), total);
+
+        // reset() must keep the (already-grown) capacity, so re-appending from 0
+        // does not re-grow and the live prefix is still correct.
+        cache.reset();
+        assert_eq!(cache.current_seq_len(), 0);
+        let k = Tensor::new(&[[[[99.0f32]]]], &device)?.broadcast_as((1, 2, 1, 4))?;
+        let v = Tensor::new(&[[[[99.0f32]]]], &device)?.broadcast_as((1, 2, 1, 4))?;
+        let (kv, _vv) = cache.append(&k, &v)?;
+        assert_eq!(kv.dims(), &[1, 2, 1, 4]);
+        assert_eq!(cache.current_seq_len(), 1);
 
         Ok(())
     }

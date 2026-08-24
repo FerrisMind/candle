@@ -118,6 +118,7 @@ fn bench_pp(
 
     // Warmup
     for _ in 0..warmup {
+        model.clear_kv_cache();
         for (pos, token) in tokens.iter().enumerate() {
             let input = Tensor::new(&[*token], device)?.unsqueeze(0)?;
             let logits = model.forward(&input, pos)?;
@@ -129,6 +130,7 @@ fn bench_pp(
     // Measure
     let mut durations = Vec::with_capacity(repeats);
     for _ in 0..repeats {
+        model.clear_kv_cache();
         let start = Instant::now();
         for (pos, token) in tokens.iter().enumerate() {
             let input = Tensor::new(&[*token], device)?.unsqueeze(0)?;
@@ -173,6 +175,7 @@ fn bench_tg(
 
     // Warmup
     for _ in 0..warmup {
+        model.clear_kv_cache();
         let mut pos = 0;
         let input = Tensor::new(&[seed_token], device)?.unsqueeze(0)?;
         let logits = model.forward(&input, pos)?;
@@ -190,6 +193,7 @@ fn bench_tg(
     // Measure
     let mut durations = Vec::with_capacity(repeats);
     for _ in 0..repeats {
+        model.clear_kv_cache();
         let start = Instant::now();
         let mut pos = 0;
         let input = Tensor::new(&[seed_token], device)?.unsqueeze(0)?;

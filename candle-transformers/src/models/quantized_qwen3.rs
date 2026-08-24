@@ -15,7 +15,7 @@ use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Result, Storage, Tensor};
 use candle_nn::attention::cpu_flash::causal::causal_decode_f32_interleaved;
 use candle_nn::attention::{flash_attn, AttnMask};
-use candle_nn::kv_cache::{ConcatKvCache, InterleavedKvCache, RawInterleavedKvCache};
+use candle_nn::kv_cache::{ConcatKvCache, GrowableKvCache, InterleavedKvCache, RawInterleavedKvCache};
 use candle_nn::{Activation, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -155,6 +155,78 @@ impl RotaryEmbedding {
     }
 }
 
+/// Union KV-cache type selecting between the amortized O(1)-per-token
+/// `GrowableKvCache` (used on Vulkan/WGPU, where the O(N²) re-copy of
+/// `ConcatKvCache::append` dominates prefill) and the original `ConcatKvCache`
+/// (used untouched on CPU/CUDA/Metal). Both implement the same `append`/`reset`
+/// contract; only the dispatch differs, so the CUDA/Metal path is unchanged.
+#[derive(Debug, Clone)]
+enum AttentionKvCache {
+    Concat(ConcatKvCache),
+    Growable(GrowableKvCache),
+}
+
+impl AttentionKvCache {
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        match self {
+            Self::Concat(c) => c.append(k, v),
+            Self::Growable(c) => c.append(k, v),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Concat(c) => c.reset(),
+            Self::Growable(c) => c.reset(),
+        }
+    }
+}
+
+/// Device-gated EXPANDED (num_heads-wide) KV cache used on Vulkan to avoid the
+/// O(N^2) whole-cache re-expansion of GQA every decode step.
+///
+/// The model stores an 8-head (num_kv_heads) cache and `repeat_kv`s it to the
+/// 16-head (num_heads) width inside every forward so the score/ctx matmuls can
+/// broadcast each KV head to its group of query heads. That re-expansion re-reads
+/// and re-writes the ENTIRE cache every token (~2.8 GB/token at 4096 ctx), which is
+/// the dominant pp4096 residual. This cache keeps the EXPANDED 16-head K/V buffers
+/// persistently and only `repeat_kv`s the NEW tail (the tokens being appended this
+/// step) before an in-place `GrowableKvCache` append, so the incremental per-token
+/// cost is O(seq_len_this_step) instead of O(total_len).
+///
+/// The expansion is a pure data duplication with the same head ordering as the CPU
+/// path's `repeat_kv`, so the attention math (scores, softmax, ctx) is bit-identical
+/// to the existing `repeat_kv` + matmul path — only the materialization is avoided.
+#[derive(Debug, Clone)]
+struct ExpandedKvCache {
+    inner: GrowableKvCache,
+    num_kv_groups: usize,
+}
+
+impl ExpandedKvCache {
+    fn new(num_kv_groups: usize) -> Self {
+        Self {
+            inner: GrowableKvCache::new(2),
+            num_kv_groups,
+        }
+    }
+
+    /// Expand the just-arrived `(k, v)` (num_kv_heads wide) to num_heads and append
+    /// in-place, returning the full (num_heads-wide) live-prefix views (`narrow`ed to
+    /// the used length, strided by the backing-buffer capacity). The returned views
+    /// alias the cache and are only valid until the next grow, matching the
+    /// `GrowableKvCache` contract (consumed within the same forward).
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        let k = repeat_kv(k.clone(), self.num_kv_groups)?.contiguous()?;
+        let v = repeat_kv(v.clone(), self.num_kv_groups)?.contiguous()?;
+        self.inner.append(&k, &v)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AttentionWeights {
     q_proj: QMatMul,
@@ -169,7 +241,8 @@ struct AttentionWeights {
     head_dim: usize,
     hidden_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    kv_cache: Option<ConcatKvCache>,
+    kv_cache: Option<AttentionKvCache>,
+    expanded_cache: Option<ExpandedKvCache>,
     interleaved_cache: Option<InterleavedKvCache>,
     raw_cache: Option<RawInterleavedKvCache>,
     span_attn: tracing::Span,
@@ -199,12 +272,23 @@ impl AttentionWeights {
         let k_norm = gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), rms_norm_eps)?;
 
         // CPU: use interleaved + raw caches for flash attention
-        // GPU: use standard concat KV cache (fallback path)
+        // GPU: standard KV-cache path. Vulkan uses the in-place GROWABLE EXPANDED
+        // (num_heads-wide) cache so the O(N^2) whole-cache GQA re-expansion on every
+        // decode step is replaced by an O(1)-per-token tail append; wgpu keeps the
+        // in-place 8-head growable cache + repeat_kv (B15 owns wgpu), and CUDA/Metal
+        // keep the original ConcatKvCache + repeat_kv path byte-for-byte.
         let on_cpu = device.is_cpu();
-        let kv_cache = if on_cpu {
-            None
+        let (kv_cache, expanded_cache) = if on_cpu {
+            (None, None)
+        } else if device.is_vulkan() {
+            (None, Some(ExpandedKvCache::new(num_kv_groups)))
+        } else if device.is_wgpu() {
+            (
+                Some(AttentionKvCache::Growable(GrowableKvCache::new(2))),
+                None,
+            )
         } else {
-            Some(ConcatKvCache::new(2))
+            (Some(AttentionKvCache::Concat(ConcatKvCache::new(2))), None)
         };
         let interleaved_cache = if on_cpu {
             Some(InterleavedKvCache::new(head_dim))
@@ -233,6 +317,7 @@ impl AttentionWeights {
             hidden_size,
             rotary_emb,
             kv_cache,
+            expanded_cache,
             interleaved_cache,
             raw_cache,
             span_attn,
@@ -358,11 +443,38 @@ impl AttentionWeights {
                 ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
             }
         } else {
-            // Standard matmul attention (no flash)
-            let (k, v) = self.kv_cache.as_mut().unwrap().append(&k, &v)?;
-
-            let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-            let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+            // Fused decode attention on wgpu (device-gated additive, P1): ONE
+            // dispatch per layer replaces the standard repeat_kv x2 + score GEMV +
+            // softmax + ctx matmul chain for the single-token decode step
+            // (l == 1). q/k/v are the post-rope F32 tensors; the cache views are
+            // `narrow`ed prefixes of the growable backing (strided by capacity),
+            // read via strides by the kernel — no V^T materialization. Non-decode
+            // (l > 1, batched prefill) keeps the standard matmul path below.
+            if std::env::var_os("CANDLE_DISABLE_FUSED_ATTN").is_none()
+                && x.device().is_wgpu()
+                && b == 1
+                && l == 1
+                && q.dtype() == DType::F32
+            {
+                let (k, v) = self.kv_cache.as_mut().unwrap().append(&k, &v)?;
+                let scale = 1.0 / (self.head_dim as f64).sqrt();
+                let q = q.contiguous()?;
+                let ctx = self.fused_decode_attn_wgpu(&q, &k, &v, scale)?;
+                let reshaped_ctx = ctx.transpose(1, 2)?.reshape((b, l, self.hidden_size))?;
+                return self.o_proj.forward(&reshaped_ctx);
+            }
+            // Standard matmul attention (no flash). On Vulkan the expanded cache
+            // returns the num_heads-wide (16-head) K/V live-prefix views already, so
+            // the whole-cache `repeat_kv` materialization is skipped (the pp4096
+            // residual); CUDA/Metal/wgpu keep the existing `repeat_kv` path.
+            let (k, v) = if let Some(ec) = &mut self.expanded_cache {
+                ec.append(&k, &v)?
+            } else {
+                let (k, v) = self.kv_cache.as_mut().unwrap().append(&k, &v)?;
+                let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
+                let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+                (k, v)
+            };
 
             let scale = 1.0 / (self.head_dim as f64).sqrt();
             let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
@@ -382,8 +494,34 @@ impl AttentionWeights {
         }
     }
 
+    /// Fused decode attention on wgpu: q @ k^T -> online softmax -> P @ V in ONE
+    /// dispatch (see `WgpuStorage::run_fused_decode_attn_f32`). `k`/`v` are the
+    /// live narrowed cache views (growable backing, strided by capacity) and `q`
+    /// is the post-rope (1, num_heads, 1, head_dim) tensor. Returns a tensor of
+    /// that same shape holding the per-head context vectors.
+    fn fused_decode_attn_wgpu(&self, q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+        let (q_g, q_l) = q.storage_and_layout();
+        let (k_g, k_l) = k.storage_and_layout();
+        let (v_g, v_l) = v.storage_and_layout();
+        let out = match (&*q_g, &*k_g, &*v_g) {
+            (Storage::Wgpu(qs), Storage::Wgpu(ks), Storage::Wgpu(vs)) => {
+                qs.run_fused_decode_attn_f32(ks, vs, q_l, k_l, v_l, scale as f32)?
+            }
+            _ => candle::bail!("Fused decode attention expects wgpu storage"),
+        };
+        Ok(Tensor::from_storage(
+            Storage::Wgpu(out),
+            (1, self.num_heads, 1, self.head_dim),
+            candle::op::BackpropOp::none(),
+            false,
+        ))
+    }
+
     fn clear_kv_cache(&mut self) {
         if let Some(c) = &mut self.kv_cache {
+            c.reset();
+        }
+        if let Some(c) = &mut self.expanded_cache {
             c.reset();
         }
         if let Some(c) = &mut self.interleaved_cache {
@@ -438,13 +576,13 @@ impl LayerWeights {
         })
     }
 
-    fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let h = self.ln1.forward(x)?;
         let h = self.self_attn.forward(&h, mask, offset)?;
-        let x = (x + h)?;
-        let h2 = self.ln2.forward(&x)?;
+        let x2 = (x + h)?;
+        let h2 = self.ln2.forward(&x2)?;
         let h2 = h2.apply(&self.mlp)?;
-        x + h2
+        x2 + h2
     }
 
     fn clear_kv_cache(&mut self) {
@@ -833,8 +971,20 @@ mod tests {
         let q_proj_wgpu = wgpu_model.layers[0].self_attn.q_proj.forward(&ln1_wgpu)?;
         assert_tensor_close("q_proj", &q_proj_wgpu, &q_proj_cpu, 3e-2)?;
 
-        let mask_cpu = cpu_model.causal_mask(1, ids.len(), 0, None)?;
-        let mask_wgpu = wgpu_model.causal_mask(1, ids.len(), 0, None)?;
+        let mask_cpu = crate::utils::build_additive_causal_mask(
+            ids.len(),
+            0,
+            None,
+            &cpu,
+            cpu_model.dtype,
+        )?;
+        let mask_wgpu = crate::utils::build_additive_causal_mask(
+            ids.len(),
+            0,
+            None,
+            &wgpu,
+            wgpu_model.dtype,
+        )?;
         let layer0_cpu = cpu_model.layers[0].forward(&emb_cpu, Some(&mask_cpu), 0)?;
         let layer0_wgpu = wgpu_model.layers[0].forward(&emb_wgpu, Some(&mask_wgpu), 0)?;
         assert_tensor_close("layer0", &layer0_wgpu, &layer0_cpu, 5e-2)?;
@@ -883,8 +1033,20 @@ mod tests {
         let ids = [1u32, 2, 3, 4];
         let ids_cpu = Tensor::from_slice(&ids, (1, ids.len()), &cpu)?;
         let ids_wgpu = Tensor::from_slice(&ids, (1, ids.len()), &wgpu)?;
-        let mask_cpu = cpu_model.causal_mask(1, ids.len(), 0, None)?;
-        let mask_wgpu = wgpu_model.causal_mask(1, ids.len(), 0, None)?;
+        let mask_cpu = crate::utils::build_additive_causal_mask(
+            ids.len(),
+            0,
+            None,
+            &cpu,
+            cpu_model.dtype,
+        )?;
+        let mask_wgpu = crate::utils::build_additive_causal_mask(
+            ids.len(),
+            0,
+            None,
+            &wgpu,
+            wgpu_model.dtype,
+        )?;
 
         let layer0_cpu_in = cpu_model.embed_tokens.forward(&ids_cpu)?;
         let layer0_wgpu_in = wgpu_model.embed_tokens.forward(&ids_wgpu)?;
@@ -958,6 +1120,587 @@ mod tests {
         Ok(())
     }
 
+    fn diff_stats_ab(label: &str, a: &Tensor, b: &Tensor) -> Result<()> {
+        let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(a.len(), b.len(), "{label}: len {} vs {}", a.len(), b.len());
+        let mut max_abs = 0f32;
+        let mut sum_err = 0f64;
+        let mut sum_abs = 0f64;
+        let mut sum_sq = 0f64;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let err = (*x as f64) - (*y as f64);
+            max_abs = max_abs.max(err.abs() as f32);
+            sum_err += err;
+            sum_abs += err.abs();
+            sum_sq += err * err;
+        }
+        let n = a.len() as f64;
+        println!(
+            "{label}: n={} max_abs={max_abs:.6} rmse={:.8} mean_err={:.6e} mean_abs={:.6e}",
+            a.len(),
+            (sum_sq / n).sqrt(),
+            sum_err / n,
+            sum_abs / n
+        );
+        Ok(())
+    }
+
+    // Op-level wgpu-vs-cuda trace of layer 0 + per-layer hidden-state chain.
+    // Compares wgpu and cuda on IDENTICAL inputs at every op inside the first
+    // transformer layer, tracking max_abs / rmse / MEAN(error) — a nonzero
+    // mean(error) at a single op is the systematic bias that compounds through
+    // the residual stream across all 24 layers.
+    #[test]
+    #[ignore = "requires cuda + wgpu adapters and Qwen3 GGUF from CANDLE_QWEN3_GGUF_PATH"]
+    #[cfg(all(feature = "cuda", feature = "wgpu"))]
+    fn qwen3_wgpu_cuda_layer0_op_trace() -> Result<()> {
+        let path = qwen3_gguf_path()?;
+        let cuda = Device::new_cuda(0)?;
+        let wgpu = Device::new_wgpu(0)?;
+        reset_gpu_fallback_count(&wgpu);
+        let mut cuda_model = load_model(&path, &cuda)?;
+        let mut wgpu_model = load_model(&path, &wgpu)?;
+
+        // Prefer the REAL generation prompt (tokenizer.json next to the model);
+        // fall back to synthetic ids when only the GGUF is available.
+        let tok_path = path
+            .parent()
+            .map(|p| p.join("tokenizer.json"))
+            .filter(|p| p.exists());
+        let ids: Vec<u32> = if let Some(tp) = tok_path {
+            let tok = tokenizers::Tokenizer::from_file(&tp).map_err(|e| {
+                candle::Error::msg(format!("failed to load tokenizer: {e}"))
+            })?;
+            let prompt = "<|im_start|>user\nThe capital of France is<|im_end|>\n<|im_start|>assistant\n";
+            let enc = tok
+                .encode(prompt, false)
+                .map_err(|e| candle::Error::msg(format!("tokenize failed: {e}")))?;
+            enc.get_ids().to_vec()
+        } else {
+            vec![1u32, 2, 3, 4]
+        };
+        let ids_cuda = Tensor::from_slice(&ids, (1, ids.len()), &cuda)?;
+        let ids_wgpu = Tensor::from_slice(&ids, (1, ids.len()), &wgpu)?;
+
+        let emb_cuda = cuda_model.embed_tokens.forward(&ids_cuda)?;
+        let emb_wgpu = wgpu_model.embed_tokens.forward(&ids_wgpu)?;
+        diff_stats_ab("L0 embed", &emb_wgpu, &emb_cuda)?;
+
+        let mask_cuda = crate::utils::build_additive_causal_mask(
+            ids.len(),
+            0,
+            None,
+            &cuda,
+            cuda_model.dtype,
+        )?;
+        let mask_wgpu = crate::utils::build_additive_causal_mask(
+            ids.len(),
+            0,
+            None,
+            &wgpu,
+            wgpu_model.dtype,
+        )?;
+        diff_stats_ab("L0 mask", &mask_wgpu, &mask_cuda)?;
+
+        // ---- replicate LayerWeights::forward op-by-op ----
+        let ac = &mut cuda_model.layers[0];
+        let aw = &mut wgpu_model.layers[0];
+
+        let xc = emb_cuda;
+        let xw = emb_wgpu;
+
+        let ln1_c = ac.ln1.forward(&xc)?;
+        let ln1_w = aw.ln1.forward(&xw)?;
+        diff_stats_ab("L0 ln1", &ln1_w, &ln1_c)?;
+
+        let (b, l, _) = xc.dims3()?;
+
+        let q_c = ac.self_attn.q_proj.forward(&ln1_c)?;
+        let q_w = aw.self_attn.q_proj.forward(&ln1_w)?;
+        diff_stats_ab("L0 q_proj", &q_w, &q_c)?;
+
+        let k_c = ac.self_attn.k_proj.forward(&ln1_c)?;
+        let k_w = aw.self_attn.k_proj.forward(&ln1_w)?;
+        diff_stats_ab("L0 k_proj", &k_w, &k_c)?;
+
+        // CPU reference for the projections: candle-cuda uses a fast-mmq kernel
+        // that quantizes the activation to q8_1 before the dot; candle-cpu uses
+        // the same q8_1 activation contract. Comparing all three triangulates
+        // which side carries the systematic mean error.
+        let cpu = Device::Cpu;
+        let cpu_model = load_model(&path, &cpu)?;
+        let ids_cpu = Tensor::from_slice(&ids, (1, ids.len()), &cpu)?;
+        let emb_cpu2 = cpu_model.embed_tokens.forward(&ids_cpu)?;
+        let ln1_cpu = cpu_model.layers[0].ln1.forward(&emb_cpu2)?;
+        let q_cpu = cpu_model.layers[0].self_attn.q_proj.forward(&ln1_cpu)?;
+        diff_stats_ab("L0 q_proj wgpu-vs-cpu", &q_w, &q_cpu.to_device(&wgpu)?)?;
+        diff_stats_ab("L0 q_proj cuda-vs-cpu", &q_c, &q_cpu.to_device(&cuda)?)?;
+        let k_cpu = cpu_model.layers[0].self_attn.k_proj.forward(&ln1_cpu)?;
+        diff_stats_ab("L0 k_proj wgpu-vs-cpu", &k_w, &k_cpu.to_device(&wgpu)?)?;
+        diff_stats_ab("L0 k_proj cuda-vs-cpu", &k_c, &k_cpu.to_device(&cuda)?)?;
+
+        let v_c = ac.self_attn.v_proj.forward(&ln1_c)?;
+        let v_w = aw.self_attn.v_proj.forward(&ln1_w)?;
+        diff_stats_ab("L0 v_proj", &v_w, &v_c)?;
+
+        let q_c = q_c
+            .reshape((b, l, ac.self_attn.num_heads, ac.self_attn.head_dim))?
+            .transpose(1, 2)?;
+        let q_w = q_w
+            .reshape((b, l, aw.self_attn.num_heads, aw.self_attn.head_dim))?
+            .transpose(1, 2)?;
+        diff_stats_ab("L0 q_reshape", &q_w, &q_c)?;
+
+        let k_c = k_c
+            .reshape((b, l, ac.self_attn.num_kv_heads, ac.self_attn.head_dim))?
+            .transpose(1, 2)?;
+        let k_w = k_w
+            .reshape((b, l, aw.self_attn.num_kv_heads, aw.self_attn.head_dim))?
+            .transpose(1, 2)?;
+        diff_stats_ab("L0 k_reshape", &k_w, &k_c)?;
+
+        let v_c = v_c
+            .reshape((b, l, ac.self_attn.num_kv_heads, ac.self_attn.head_dim))?
+            .transpose(1, 2)?;
+        let v_w = v_w
+            .reshape((b, l, aw.self_attn.num_kv_heads, aw.self_attn.head_dim))?
+            .transpose(1, 2)?;
+
+        let q_flat_c = ac.self_attn.q_norm.forward(&q_c.flatten(0, 2)?)?;
+        let q_flat_w = aw.self_attn.q_norm.forward(&q_w.flatten(0, 2)?)?;
+        diff_stats_ab("L0 q_norm(flat-stride)", &q_flat_w, &q_flat_c)?;
+        let q_c = q_flat_c.reshape((b, ac.self_attn.num_heads, l, ac.self_attn.head_dim))?;
+        let q_w = q_flat_w.reshape((b, aw.self_attn.num_heads, l, aw.self_attn.head_dim))?;
+
+        let k_flat_c = ac.self_attn.k_norm.forward(&k_c.flatten(0, 2)?)?;
+        let k_flat_w = aw.self_attn.k_norm.forward(&k_w.flatten(0, 2)?)?;
+        diff_stats_ab("L0 k_norm(flat-stride)", &k_flat_w, &k_flat_c)?;
+        let k_c = k_flat_c.reshape((b, ac.self_attn.num_kv_heads, l, ac.self_attn.head_dim))?;
+        let k_w = k_flat_w.reshape((b, aw.self_attn.num_kv_heads, l, aw.self_attn.head_dim))?;
+
+        let (q_rope_c, k_rope_c) = ac.self_attn.rotary_emb.apply(&q_c, &k_c, 0)?;
+        let (q_rope_w, k_rope_w) = aw.self_attn.rotary_emb.apply(&q_w, &k_w, 0)?;
+        diff_stats_ab("L0 q_rope(fused)", &q_rope_w, &q_rope_c)?;
+        diff_stats_ab("L0 k_rope(fused)", &k_rope_w, &k_rope_c)?;
+        // A/B: wgpu rope_slow vs wgpu fused (same tables, same tensors).
+        {
+            let cos = aw
+                .self_attn
+                .rotary_emb
+                .cos
+                .narrow(0, 0, l)?
+                .to_dtype(q_rope_w.dtype())?;
+            let sin = aw
+                .self_attn
+                .rotary_emb
+                .sin
+                .narrow(0, 0, l)?
+                .to_dtype(q_rope_w.dtype())?;
+            let q_slow = candle_nn::rotary_emb::rope_slow(&q_w, &cos, &sin)?;
+            diff_stats_ab("L0 q_rope_slow_vs_fused_wgpu", &q_slow, &q_rope_w)?;
+        }
+
+        let (k_c, v_c) = ac.self_attn.kv_cache.as_mut().unwrap().append(&k_rope_c, &v_c)?;
+        let (k_w, v_w) = aw.self_attn.kv_cache.as_mut().unwrap().append(&k_rope_w, &v_w)?;
+        diff_stats_ab("L0 cache_k", &k_w, &k_c)?;
+        diff_stats_ab("L0 cache_v", &v_w, &v_c)?;
+
+        let k_c = repeat_kv(k_c, ac.self_attn.num_kv_groups)?.contiguous()?;
+        let k_w = repeat_kv(k_w, aw.self_attn.num_kv_groups)?.contiguous()?;
+        let v_c = repeat_kv(v_c, ac.self_attn.num_kv_groups)?.contiguous()?;
+        let v_w = repeat_kv(v_w, aw.self_attn.num_kv_groups)?.contiguous()?;
+        diff_stats_ab("L0 k_repeat_kv", &k_w, &k_c)?;
+        diff_stats_ab("L0 v_repeat_kv", &v_w, &v_c)?;
+
+        let scale = 1.0 / (ac.self_attn.head_dim as f64).sqrt();
+        let scores_c = (q_rope_c.matmul(&k_c.transpose(2, 3)?)? * scale)?;
+        let scores_w = (q_rope_w.matmul(&k_w.transpose(2, 3)?)? * scale)?;
+        diff_stats_ab("L0 scores", &scores_w, &scores_c)?;
+
+        // Mirror the model's mask dtype conversion (mask follows scores dtype).
+        let mask_c = if mask_cuda.dtype() != scores_c.dtype() {
+            mask_cuda.to_dtype(scores_c.dtype())?
+        } else {
+            mask_cuda.clone()
+        };
+        let mask_w = if mask_wgpu.dtype() != scores_w.dtype() {
+            mask_wgpu.to_dtype(scores_w.dtype())?
+        } else {
+            mask_wgpu.clone()
+        };
+        let scores_c = scores_c.broadcast_add(&mask_c)?;
+        let scores_w = scores_w.broadcast_add(&mask_w)?;
+        diff_stats_ab("L0 scores+mask", &scores_w, &scores_c)?;
+
+        let probs_c = candle_nn::ops::softmax_last_dim(&scores_c)?;
+        let probs_w = candle_nn::ops::softmax_last_dim(&scores_w)?;
+        diff_stats_ab("L0 softmax", &probs_w, &probs_c)?;
+
+        let ctx_c = probs_c.matmul(&v_c)?;
+        let ctx_w = probs_w.matmul(&v_w)?;
+        diff_stats_ab("L0 ctx(p@v)", &ctx_w, &ctx_c)?;
+
+        let ctx_c = ctx_c.transpose(1, 2)?.reshape((b, l, ac.self_attn.hidden_size))?;
+        let ctx_w = ctx_w.transpose(1, 2)?.reshape((b, l, aw.self_attn.hidden_size))?;
+        let attn_c = ac.self_attn.o_proj.forward(&ctx_c)?;
+        let attn_w = aw.self_attn.o_proj.forward(&ctx_w)?;
+        diff_stats_ab("L0 o_proj", &attn_w, &attn_c)?;
+
+        let post_c = (&xc + &attn_c)?;
+        let post_w = (&xw + &attn_w)?;
+        diff_stats_ab("L0 x+attn", &post_w, &post_c)?;
+
+        let ln2_c = ac.ln2.forward(&post_c)?;
+        let ln2_w = aw.ln2.forward(&post_w)?;
+        diff_stats_ab("L0 ln2", &ln2_w, &ln2_c)?;
+
+        let gate_c = ac.mlp.gate_proj.forward(&ln2_c)?;
+        let gate_w = aw.mlp.gate_proj.forward(&ln2_w)?;
+        diff_stats_ab("L0 gate_proj", &gate_w, &gate_c)?;
+
+        let up_c = ac.mlp.up_proj.forward(&ln2_c)?;
+        let up_w = aw.mlp.up_proj.forward(&ln2_w)?;
+        diff_stats_ab("L0 up_proj", &up_w, &up_c)?;
+
+        let gate_c = gate_c.apply(&ac.mlp.act_fn)?;
+        let gate_w = gate_w.apply(&aw.mlp.act_fn)?;
+        diff_stats_ab("L0 silu", &gate_w, &gate_c)?;
+
+        let gated_c = (&gate_c * &up_c)?;
+        let gated_w = (&gate_w * &up_w)?;
+        diff_stats_ab("L0 gated", &gated_w, &gated_c)?;
+
+        let down_c = ac.mlp.down_proj.forward(&gated_c)?;
+        let down_w = aw.mlp.down_proj.forward(&gated_w)?;
+        diff_stats_ab("L0 down_proj", &down_w, &down_c)?;
+
+        let out_c = (&post_c + &down_c)?;
+        let out_w = (&post_w + &down_w)?;
+        diff_stats_ab("L0 output", &out_w, &out_c)?;
+
+        // ---- per-layer chain over the full model ----
+        // Start from the op-traced layer-0 output (its KV state already holds
+        // the 4-token prefill, exactly the state the chained forward expects).
+        let l1_in_c = out_c;
+        let l1_in_w = out_w;
+        let mut h_c = l1_in_c.clone();
+        let mut h_w = l1_in_w.clone();
+        for i in 1..cuda_model.layers.len() {
+            h_c = cuda_model.layers[i].forward(&h_c, Some(&mask_cuda), 0)?;
+            h_w = wgpu_model.layers[i].forward(&h_w, Some(&mask_wgpu), 0)?;
+            diff_stats_ab(&format!("L{i} hidden"), &h_w, &h_c)?;
+        }
+
+        // ---- layer-1 op drill-down: which op explodes on the F32 path? ----
+        {
+            let l1c = &mut cuda_model.layers[1];
+            let l1w = &mut wgpu_model.layers[1];
+            let ln1_c = l1c.ln1.forward(&l1_in_c)?;
+            let ln1_w = l1w.ln1.forward(&l1_in_w)?;
+            diff_stats_ab("L1 ln1", &ln1_w, &ln1_c)?;
+            let q_c = l1c.self_attn.q_proj.forward(&ln1_c)?;
+            let q_w = l1w.self_attn.q_proj.forward(&ln1_w)?;
+            diff_stats_ab("L1 q_proj", &q_w, &q_c)?;
+            let k_c = l1c.self_attn.k_proj.forward(&ln1_c)?;
+            let k_w = l1w.self_attn.k_proj.forward(&ln1_w)?;
+            diff_stats_ab("L1 k_proj", &k_w, &k_c)?;
+            let v_c = l1c.self_attn.v_proj.forward(&ln1_c)?;
+            let v_w = l1w.self_attn.v_proj.forward(&ln1_w)?;
+            diff_stats_ab("L1 v_proj", &v_w, &v_c)?;
+            // Reset cache so the attn drill-down matches the chain's fresh-4-token
+            // L1 step (the chain already populated a stale 4-token cache).
+            l1c.clear_kv_cache();
+            l1w.clear_kv_cache();
+            let attn_c = l1c.self_attn.forward(&ln1_c, Some(&mask_cuda), 0)?;
+            let attn_w = l1w.self_attn.forward(&ln1_w, Some(&mask_wgpu), 0)?;
+            diff_stats_ab("L1 attn", &attn_w, &attn_c)?;
+            let post_c = (&l1_in_c + &attn_c)?;
+            let post_w = (&l1_in_w + &attn_w)?;
+            diff_stats_ab("L1 x+attn", &post_w, &post_c)?;
+            let ln2_c = l1c.ln2.forward(&post_c)?;
+            let ln2_w = l1w.ln2.forward(&post_w)?;
+            diff_stats_ab("L1 ln2", &ln2_w, &ln2_c)?;
+            let gate_c = l1c.mlp.gate_proj.forward(&ln2_c)?;
+            let gate_w = l1w.mlp.gate_proj.forward(&ln2_w)?;
+            diff_stats_ab("L1 gate_proj", &gate_w, &gate_c)?;
+            // CPU snapshot of early wgpu tensors to detect in-place corruption of
+            // live tensors by later ops (pool aliasing).
+            let gate_w_snap = gate_w.flatten_all()?.to_vec1::<f32>()?;
+            let ln2_w_snap = ln2_w.flatten_all()?.to_vec1::<f32>()?;
+            let up_c = l1c.mlp.up_proj.forward(&ln2_c)?;
+            let up_w = l1w.mlp.up_proj.forward(&ln2_w)?;
+            diff_stats_ab("L1 up_proj", &up_w, &up_c)?;
+            let gate_c = gate_c.apply(&l1c.mlp.act_fn)?;
+            let gate_w = gate_w.apply(&l1w.mlp.act_fn)?;
+            diff_stats_ab("L1 silu", &gate_w, &gate_c)?;
+            let gated_c = (&gate_c * &up_c)?;
+            let gated_w = (&gate_w * &up_w)?;
+            diff_stats_ab("L1 gated", &gated_w, &gated_c)?;
+            let down_c = l1c.mlp.down_proj.forward(&gated_c)?;
+            let down_w = l1w.mlp.down_proj.forward(&gated_w)?;
+            diff_stats_ab("L1 down_proj", &down_w, &down_c)?;
+            let down_w_snap = down_w.flatten_all()?.to_vec1::<f32>()?;
+            let up_w_snap = up_w.flatten_all()?.to_vec1::<f32>()?;
+            // MICRO-DRIFT: quant matmul repeatedly on the SAME input, interleaved
+            // with unrelated quant matmuls, to isolate history-dependent results.
+            {
+                let a_w = l1w.mlp.gate_proj.forward(&ln2_w)?;
+                for _ in 0..8 {
+                    let _ = l1w.self_attn.v_proj.forward(&ln2_w)?;
+                    let _ = l1w.self_attn.k_proj.forward(&ln2_w)?;
+                }
+                let b_w = l1w.mlp.gate_proj.forward(&ln2_w)?;
+                diff_stats_ab("MICRO gate same-input drift", &b_w, &a_w)?;
+                let a_c = l1c.mlp.gate_proj.forward(&ln2_c)?;
+                for _ in 0..8 {
+                    let _ = l1c.self_attn.v_proj.forward(&ln2_c)?;
+                    let _ = l1c.self_attn.k_proj.forward(&ln2_c)?;
+                }
+                let b_c = l1c.mlp.gate_proj.forward(&ln2_c)?;
+                diff_stats_ab("MICRO gate same-input drift cuda", &b_c, &a_c)?;
+                // Frozen-input gate: rebuild ln2 from a CPU copy each time so no
+                // buffer aliasing exists between the two gate calls.
+                {
+                    let ln2_cpu = ln2_w.flatten_all()?.to_vec1::<f32>()?;
+                    let ln2_shape = ln2_w.dims().to_vec();
+                    let f1 = Tensor::from_vec(ln2_cpu.clone(), ln2_shape.clone(), &wgpu)?;
+                    let g1 = l1w.mlp.gate_proj.forward(&f1)?;
+                    for _ in 0..16 {
+                        let f = Tensor::from_vec(ln2_cpu.clone(), ln2_shape.clone(), &wgpu)?;
+                        let _ = l1w.mlp.gate_proj.forward(&f)?;
+                    }
+                    let f2 = Tensor::from_vec(ln2_cpu.clone(), ln2_shape.clone(), &wgpu)?;
+                    let g2 = l1w.mlp.gate_proj.forward(&f2)?;
+                    diff_stats_ab("FROZEN gate drift wgpu", &g2, &g1)?;
+                }
+                // Full mlp chain determinism.
+                let m1 = l1w.mlp.forward(&ln2_w)?;
+                let m2 = l1w.mlp.forward(&ln2_w)?;
+                diff_stats_ab("MICRO mlp same-input drift", &m2, &m1)?;
+                let silu1 = ln2_w.apply(&l1w.mlp.act_fn)?;
+                let silu2 = ln2_w.apply(&l1w.mlp.act_fn)?;
+                diff_stats_ab("MICRO silu drift", &silu2, &silu1)?;
+            }
+            // wgpu self-consistency: manual op-chain output vs full_forward output.
+            let trace_w = (&post_w + &down_w)?;
+            let trace_c = (&post_c + &down_c)?;
+            diff_stats_ab("L1 opchain_out", &trace_w, &trace_c)?;
+            l1c.clear_kv_cache();
+            l1w.clear_kv_cache();
+            let full_c = l1c.forward(&l1_in_c, Some(&mask_cuda), 0)?;
+            let full_w = l1w.forward(&l1_in_w, Some(&mask_wgpu), 0)?;
+            diff_stats_ab("L1 full_forward", &full_w, &full_c)?;
+            // DRIFT check: recompute the same manual mlp late, compare to the
+            // early drill result (`down_c`/`down_w`). If the wgpu result drifts
+            // while cuda stays bit-stable, a kernel is reading stale pooled
+            // buffer content that depends on the intervening allocation history.
+            l1w.clear_kv_cache();
+            l1c.clear_kv_cache();
+            let d_ln1_c = l1c.ln1.forward(&l1_in_c)?;
+            let d_ln1_w = l1w.ln1.forward(&l1_in_w)?;
+            let d_attn_c = l1c.self_attn.forward(&d_ln1_c, Some(&mask_cuda), 0)?;
+            let d_attn_w = l1w.self_attn.forward(&d_ln1_w, Some(&mask_wgpu), 0)?;
+            macro_rules! check_gate {
+                ($tag:literal) => {{
+                    let now = gate_w.flatten_all()?.to_vec1::<f32>()?;
+                    let mut m = 0f32;
+                    let mut ss = 0f64;
+                    let mut nbad = 0usize;
+                    for (a, b) in now.iter().zip(gate_w_snap.iter()) {
+                        let e = (*a as f64) - (*b as f64);
+                        m = m.max(e.abs() as f32);
+                        ss += e * e;
+                        if e.abs() > 1e-3 {
+                            nbad += 1;
+                        }
+                    }
+                    println!(
+                        "CKPT {} gate_w: max={:.4} rmse={:.5} nbad={}",
+                        $tag,
+                        m,
+                        (ss / now.len() as f64).sqrt(),
+                        nbad
+                    );
+                }};
+            }
+            check_gate!("after d_ln1");
+            let d_post_c = (&l1_in_c + &d_attn_c)?;
+            let d_post_w = (&l1_in_w + &d_attn_w)?;
+            check_gate!("after d_attn");
+            let d_ln2_c = l1c.ln2.forward(&d_post_c)?;
+            let d_ln2_w = l1w.ln2.forward(&d_post_w)?;
+            check_gate!("after d_ln2");
+            let d_mlp_c = d_ln2_c.apply(&l1c.mlp)?;
+            let d_mlp_w = d_ln2_w.apply(&l1w.mlp)?;
+            check_gate!("after d_mlp");
+            diff_stats_ab("DRIFT ln2 wgpu early-vs-late", &d_ln2_w, &ln2_w)?;
+            diff_stats_ab("DRIFT ln2 cuda early-vs-late", &d_ln2_c, &ln2_c)?;
+            diff_stats_ab("DRIFT mlp wgpu early-vs-late", &d_mlp_w, &down_w)?;
+            diff_stats_ab("DRIFT mlp cuda early-vs-late", &d_mlp_c, &down_c)?;
+            diff_stats_ab("DRIFT attn wgpu early-vs-late", &d_attn_w, &attn_w)?;
+            diff_stats_ab("DRIFT attn cuda early-vs-late", &d_attn_c, &attn_c)?;
+            // Narrow within the mlp: gate / up / silu / down individually.
+            let d_gate_w = l1w.mlp.gate_proj.forward(&d_ln2_w)?;
+            let d_up_w = l1w.mlp.up_proj.forward(&d_ln2_w)?;
+            let d_down_w = l1w.mlp.down_proj.forward(&(&d_gate_w.apply(&l1w.mlp.act_fn)? * &d_up_w)?)?;
+            diff_stats_ab("DRIFT gate wgpu early-vs-late", &d_gate_w, &gate_w)?;
+            diff_stats_ab("DRIFT up wgpu early-vs-late", &d_up_w, &up_w)?;
+            diff_stats_ab("DRIFT down wgpu early-vs-late", &d_down_w, &down_w)?;
+            // In-place corruption check on the LIVE early tensor objects.
+            {
+                let now = gate_w.flatten_all()?.to_vec1::<f32>()?;
+                let mut max_abs = 0f32;
+                let mut sum_sq = 0f64;
+                for (a, b) in now.iter().zip(gate_w_snap.iter()) {
+                    let err = (*a as f64) - (*b as f64);
+                    max_abs = max_abs.max(err.abs() as f32);
+                    sum_sq += err * err;
+                }
+                println!(
+                    "SNAP gate_w live-tensor mutated: max_abs={max_abs:.6} rmse={:.8} (n={})",
+                    (sum_sq / now.len() as f64).sqrt(),
+                    now.len()
+                );
+                let now2 = ln2_w.flatten_all()?.to_vec1::<f32>()?;
+                let mut max_abs2 = 0f32;
+                let mut sum_sq2 = 0f64;
+                for (a, b) in now2.iter().zip(ln2_w_snap.iter()) {
+                    let err = (*a as f64) - (*b as f64);
+                    max_abs2 = max_abs2.max(err.abs() as f32);
+                    sum_sq2 += err * err;
+                }
+                println!(
+                    "SNAP ln2_w live-tensor mutated: max_abs={max_abs2:.6} rmse={:.8} (n={})",
+                    (sum_sq2 / now2.len() as f64).sqrt(),
+                    now2.len()
+                );
+                let now3 = down_w.flatten_all()?.to_vec1::<f32>()?;
+                let mut max_abs3 = 0f32;
+                let mut sum_sq3 = 0f64;
+                for (a, b) in now3.iter().zip(down_w_snap.iter()) {
+                    let err = (*a as f64) - (*b as f64);
+                    max_abs3 = max_abs3.max(err.abs() as f32);
+                    sum_sq3 += err * err;
+                }
+                println!(
+                    "SNAP down_w live-tensor mutated: max_abs={max_abs3:.6} rmse={:.8} (n={})",
+                    (sum_sq3 / now3.len() as f64).sqrt(),
+                    now3.len()
+                );
+                let now4 = up_w.flatten_all()?.to_vec1::<f32>()?;
+                let mut max_abs4 = 0f32;
+                let mut sum_sq4 = 0f64;
+                for (a, b) in now4.iter().zip(up_w_snap.iter()) {
+                    let err = (*a as f64) - (*b as f64);
+                    max_abs4 = max_abs4.max(err.abs() as f32);
+                    sum_sq4 += err * err;
+                }
+                println!(
+                    "SNAP up_w live-tensor mutated: max_abs={max_abs4:.6} rmse={:.8} (n={})",
+                    (sum_sq4 / now4.len() as f64).sqrt(),
+                    now4.len()
+                );
+            }
+            let d_gate_c = l1c.mlp.gate_proj.forward(&d_ln2_c)?;
+            let d_up_c = l1c.mlp.up_proj.forward(&d_ln2_c)?;
+            diff_stats_ab("DRIFT gate cuda early-vs-late", &d_gate_c, &gate_c)?;
+            diff_stats_ab("DRIFT up cuda early-vs-late", &d_up_c, &up_c)?;
+            // Determinism check on wgpu itself: rerun the same layer forward.
+            l1w.clear_kv_cache();
+            l1c.clear_kv_cache();
+            let full_w2 = l1w.forward(&l1_in_w, Some(&mask_wgpu), 0)?;
+            let full_c2 = l1c.forward(&l1_in_c, Some(&mask_cuda), 0)?;
+            diff_stats_ab("wgpu::L1 run1_vs_run2", &full_w2, &full_w)?;
+            diff_stats_ab("cuda::L1 run1_vs_run2", &full_c2, &full_c)?;
+            // wgpu-vs-wgpu: op-chain vs full forward (should be ~0 on ONE device;
+            // a large delta => the manual replication diverges from model's forward).
+            diff_stats_ab("wgpu::L1 trace_vs_full", &full_w, &trace_w)?;
+            diff_stats_ab("cuda::L1 trace_vs_full", &full_c, &trace_c)?;
+            // Fresh-model (no churn) reference for the same L1 forward.
+            {
+                let mut c3 = load_model(&path, &cuda)?;
+                let mut w3 = load_model(&path, &wgpu)?;
+                let ids_c3 = Tensor::from_slice(&ids, (1, ids.len()), &cuda)?;
+                let ids_w3 = Tensor::from_slice(&ids, (1, ids.len()), &wgpu)?;
+                let mask_c3 = crate::utils::build_additive_causal_mask(
+                    ids.len(),
+                    0,
+                    None,
+                    &cuda,
+                    c3.dtype,
+                )?;
+                let mask_w3 = crate::utils::build_additive_causal_mask(
+                    ids.len(),
+                    0,
+                    None,
+                    &wgpu,
+                    w3.dtype,
+                )?;
+                let mut hc = c3.embed_tokens.forward(&ids_c3)?;
+                let mut hw = w3.embed_tokens.forward(&ids_w3)?;
+                hc = c3.layers[0].forward(&hc, Some(&mask_c3), 0)?;
+                hw = w3.layers[0].forward(&hw, Some(&mask_w3), 0)?;
+                let f0 = c3.layers[1].forward(&hc, Some(&mask_c3), 0)?;
+                let f0w = w3.layers[1].forward(&hw, Some(&mask_w3), 0)?;
+                diff_stats_ab("L1 fresh_forward wgpu-vs-cuda", &f0w, &f0)?;
+                diff_stats_ab("wgpu::L1 fresh_vs_churned_full", &f0w, &full_w)?;
+                diff_stats_ab("cuda::L1 fresh_vs_churned_full", &f0, &full_c)?;
+            }
+            // Locate the worst indices in the L1 full_forward divergence.
+            {
+                let fw = full_w.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                let fc = full_c.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                let mut worst: Vec<(usize, f32)> = fw
+                    .iter()
+                    .zip(fc.iter())
+                    .enumerate()
+                    .map(|(i, (a, b))| (i, (a - b).abs()))
+                    .collect();
+                worst.sort_by(|a, b| b.1.total_cmp(&a.1));
+                println!("L1 full_forward worst5: (index, |diff|, wgpu_val, cuda_val)");
+                for (idx, d) in worst.iter().take(5) {
+                    println!(
+                        "  idx={idx} diff={d:.4} wgpu={:.4} cuda={:.4}",
+                        fw[*idx], fc[*idx]
+                    );
+                }
+                let tw = trace_w.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                let tc = trace_c.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                println!("L1 trace worst5: (index, |diff|, wgpu_val, cuda_val)");
+                let mut tworst: Vec<(usize, f32)> = tw
+                    .iter()
+                    .zip(tc.iter())
+                    .enumerate()
+                    .map(|(i, (a, b))| (i, (a - b).abs()))
+                    .collect();
+                tworst.sort_by(|a, b| b.1.total_cmp(&a.1));
+                for (idx, d) in tworst.iter().take(5) {
+                    println!(
+                        "  idx={idx} diff={d:.4} wgpu={:.4} cuda={:.4}",
+                        tw[*idx], tc[*idx]
+                    );
+                }
+            }
+        }
+
+        let h_c = cuda_model.norm.forward(&h_c)?;
+        let h_w = wgpu_model.norm.forward(&h_w)?;
+        diff_stats_ab("output_norm", &h_w, &h_c)?;
+
+        let logits_c = cuda_model
+            .lm_head
+            .forward(&h_c.narrow(1, l - 1, 1)?)?
+            .squeeze(1)?;
+        let logits_w = wgpu_model
+            .lm_head
+            .forward(&h_w.narrow(1, l - 1, 1)?)?
+            .squeeze(1)?;
+        diff_stats_ab("final logits", &logits_w, &logits_c)?;
+        assert_no_gpu_fallbacks("qwen3_wgpu_cuda_layer0_op_trace", &wgpu)?;
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires a usable Vulkan device and Qwen3 GGUF from CANDLE_QWEN3_GGUF_PATH or hf-hub"]
     #[cfg(feature = "vulkan")]
@@ -997,8 +1740,20 @@ mod tests {
         let v_proj_vk = vk_model.layers[0].self_attn.v_proj.forward(&ln1_vk)?;
         assert_tensor_close("v_proj", &v_proj_vk, &v_proj_cpu, 3e-2)?;
 
-        let mask_cpu = cpu_model.causal_mask(1, ids.len(), 0, None)?;
-        let mask_vk = vk_model.causal_mask(1, ids.len(), 0, None)?;
+        let mask_cpu = crate::utils::build_additive_causal_mask(
+            ids.len(),
+            0,
+            None,
+            &cpu,
+            cpu_model.dtype,
+        )?;
+        let mask_vk = crate::utils::build_additive_causal_mask(
+            ids.len(),
+            0,
+            None,
+            &vk,
+            vk_model.dtype,
+        )?;
         let attn_cpu = &mut cpu_model.layers[0].self_attn;
         let attn_vk = &mut vk_model.layers[0].self_attn;
         let (b, l, _) = ln1_cpu.dims3()?;
@@ -1173,8 +1928,20 @@ mod tests {
         let ids = [1u32, 2, 3, 4];
         let ids_cpu = Tensor::from_slice(&ids, (1, ids.len()), &cpu)?;
         let ids_vk = Tensor::from_slice(&ids, (1, ids.len()), &vk)?;
-        let mask_cpu = cpu_model.causal_mask(1, ids.len(), 0, None)?;
-        let mask_vk = vk_model.causal_mask(1, ids.len(), 0, None)?;
+        let mask_cpu = crate::utils::build_additive_causal_mask(
+            ids.len(),
+            0,
+            None,
+            &cpu,
+            cpu_model.dtype,
+        )?;
+        let mask_vk = crate::utils::build_additive_causal_mask(
+            ids.len(),
+            0,
+            None,
+            &vk,
+            vk_model.dtype,
+        )?;
 
         let layer0_cpu_in = cpu_model.embed_tokens.forward(&ids_cpu)?;
         let layer0_vk_in = vk_model.embed_tokens.forward(&ids_vk)?;
@@ -1260,6 +2027,74 @@ mod tests {
         let l1_out_vk = (&l1_post_attn_vk + &l1_mlp_vk)?;
         assert_tensor_close_with_nmse("layer1_out", &l1_out_vk, &l1_out_cpu, 5e-2, 5e-3)?;
         assert_no_gpu_fallbacks("qwen3_local_vulkan_layer1_topology_parity", &vk)?;
+        Ok(())
+    }
+
+    /// Validates the device-gated expanded (num_heads-wide) KV cache against the
+    /// reference `repeat_kv` expansion used by the CPU/CUDA/Metal path. The expansion
+    /// is a pure data duplication with the SAME head ordering, so the attention values
+    /// must be identical; this guards the pp4096 optimization (w-b14) against any
+    /// subtle ordering divergence. Runs on CPU (no GPU needed) — the cache logic is
+    /// backend-agnostic.
+    #[test]
+    fn expanded_kv_cache_matches_repeat_kv_reference() -> Result<()> {
+        let device = Device::Cpu;
+        let num_kv_heads = 2usize;
+        let num_kv_groups = 2usize;
+        let head_dim = 4usize;
+        let mut ec = ExpandedKvCache::new(num_kv_groups);
+
+        // Chunk 1: 2 tokens, 8-head.
+        let k1 = Tensor::from_vec(
+            (0..num_kv_heads * 2 * head_dim).map(|i| i as f32 + 0.5).collect(),
+            (1, num_kv_heads, 2, head_dim),
+            &device,
+        )?;
+        let v1 = Tensor::from_vec(
+            (0..num_kv_heads * 2 * head_dim).map(|i| 100.0 + i as f32).collect(),
+            (1, num_kv_heads, 2, head_dim),
+            &device,
+        )?;
+        let (kf, vf) = ec.append(&k1, &v1)?;
+        let k_ref = repeat_kv(k1.clone(), num_kv_groups)?.contiguous()?;
+        let v_ref = repeat_kv(v1.clone(), num_kv_groups)?.contiguous()?;
+        assert_eq!(
+            kf.flatten_all()?.to_vec1::<f32>()?,
+            k_ref.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_eq!(
+            vf.flatten_all()?.to_vec1::<f32>()?,
+            v_ref.flatten_all()?.to_vec1::<f32>()?
+        );
+
+        // Chunk 2: append another 2 tokens. The live cache must equal
+        // repeat_kv(cat(k1, k2)) expanded — the same as expanding the whole cache.
+        let k2 = Tensor::from_vec(
+            (1000..1000 + num_kv_heads * 2 * head_dim)
+                .map(|i| i as f32 + 0.25)
+                .collect(),
+            (1, num_kv_heads, 2, head_dim),
+            &device,
+        )?;
+        let v2 = Tensor::from_vec(
+            (2000..2000 + num_kv_heads * 2 * head_dim)
+                .map(|i| i as f32 + 0.75)
+                .collect(),
+            (1, num_kv_heads, 2, head_dim),
+            &device,
+        )?;
+        let (kf, vf) = ec.append(&k2, &v2)?;
+        let kcat = Tensor::cat(&[&k1, &k2], 2)?;
+        let vcat = Tensor::cat(&[&v1, &v2], 2)?;
+        assert_eq!(kcat.dims4()?.2, 4);
+        let kcat_ref = repeat_kv(kcat.clone(), num_kv_groups)?.contiguous()?;
+        let vcat_ref = repeat_kv(vcat.clone(), num_kv_groups)?.contiguous()?;
+        let kf_c = kf.contiguous()?;
+        let vf_c = vf.contiguous()?;
+        assert_eq!(kf_c.dims(), kcat_ref.dims());
+        assert_eq!(vf_c.dims(), vcat_ref.dims());
+        assert_eq!(kf_c.flatten_all()?.to_vec1::<f32>()?, kcat_ref.flatten_all()?.to_vec1::<f32>()?);
+        assert_eq!(vf_c.flatten_all()?.to_vec1::<f32>()?, vcat_ref.flatten_all()?.to_vec1::<f32>()?);
         Ok(())
     }
 }

@@ -3,7 +3,6 @@ mod benchmarks;
 use criterion::criterion_main;
 
 criterion_main!(
-    benchmarks::vec_dot::benches,
     benchmarks::affine::benches,
     benchmarks::cat::benches,
     benchmarks::contiguous::benches,

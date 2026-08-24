@@ -38,12 +38,57 @@ struct Params {
 @group(0) @binding(3)
 var<uniform> params: Params;
 
+#ifdef KEY_F8E4M3
+// Mirrors the helpers in argsort.wgsl: one f8 byte per u32 storage word.
+fn decode_f8e4m3(x: u32) -> f32 {
+    let b = x & 0xFFu;
+    let sign = select(1.0, -1.0, (b & 0x80u) != 0u);
+    let exp = (b >> 3u) & 0xFu;
+    let man = b & 0x7u;
+    if exp == 0u {
+        if man == 0u {
+            return sign * 0.0;
+        }
+        return sign * (f32(man) / 8.0) * 0.015625;
+    }
+    if exp == 0xFu && man == 0x7u {
+        return bitcast<f32>(0x7FC00000u);
+    }
+    return sign * (1.0 + f32(man) / 8.0) * exp2(f32(exp) - 7.0);
+}
+
+fn orderable_from_f32(v: f32) -> u32 {
+    let b = bitcast<u32>(v);
+    let mask = select(0xFFFFFFFFu, 0x80000000u, (b & 0x80000000u) == 0u);
+    return b ^ mask;
+}
+#endif
+
+#ifdef KEY_FN
+fn sort_key(i: u32) -> u32 {
+    return KEY_BODY;
+}
+#else
+fn sort_key(i: u32) -> u32 {
+    return bitcast<u32>(src[i]);
+}
+#endif
+
 fn take_left(a_idx: u32, b_idx: u32, row_base: u32) -> bool {
-    let a_val = src[row_base + a_idx];
-    let b_val = src[row_base + b_idx];
+    let a_val = sort_key(row_base + a_idx);
+    let b_val = sort_key(row_base + b_idx);
 #if ORDER == 0
+    if (a_val == b_val) {
+        return a_idx <= b_idx;
+    }
     return a_val <= b_val;
 #else
+    // Tie comparator does NOT flip with ORDER: equal keys always resolve so
+    // the smaller original index ends first (CPU sort_by stability in both
+    // directions — matches argsort.wgsl TIE_UP/TIE_DOWN semantics).
+    if (a_val == b_val) {
+        return a_idx <= b_idx;
+    }
     return a_val >= b_val;
 #endif
 }

@@ -1,0 +1,138 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout (push_constant) uniform parameter
+{
+    uint ne;
+    uint num_blocks;
+    uint scale_bits;
+} p;
+
+#include "types.glsl"
+
+layout(constant_id = 0) const uint GROUP_SIZE = 32;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {vec4 data_a[];};
+layout (binding = 1) writeonly buffer D {block_q5_0 data_b[];};
+
+// Per-block working set: abs/value for the signed-max reduction and the 32
+// 5-bit quantized values. GROUP_SIZE=32 -> up to 4 blocks per workgroup.
+shared float shmem_abs[GROUP_SIZE];
+shared float shmem_val[GROUP_SIZE];
+shared uint shmem_xi[QUANT_K_Q5_0 * (GROUP_SIZE / 8)];
+
+// CPU quantize_row_q5_0: d = vmax/-16 with vmax = element at max |x| (first
+// occurrence wins ties), xi = min(31, (x*id + 16.5) trunc), nibble j of qs byte
+// j packs elements j (low) and j+16 (high), 5th bits go to qh bit j / j+16.
+// Byte-identical to the host path.
+
+// Vulkan permits division to be up to 2 ulp off the IEEE result and this
+// driver's OpFDiv is off by ~1 ulp for some operands, breaking exact byte
+// parity with the CPU quantizer. Correct it: the true quotient is within 2 ulp
+// of the driver's, so pick whichever of the 5 surrounding f32 values minimizes
+// the (correctly rounded, fma) residual. Bit/control-flow ops prevent the
+// optimizer from algebraically collapsing this back into a plain division.
+float div_ieee(float a, float b) {
+    float q = a / b;
+    int qb = floatBitsToInt(q);
+    float best = abs(fma(b, q, -a));
+    int bidx = 0;
+    float r = abs(fma(b, intBitsToFloat(qb + 1), -a));
+    if (r < best) { best = r; bidx = 1; }
+    r = abs(fma(b, intBitsToFloat(qb + 2), -a));
+    if (r < best) { best = r; bidx = 2; }
+    r = abs(fma(b, intBitsToFloat(qb - 1), -a));
+    if (r < best) { best = r; bidx = -1; }
+    r = abs(fma(b, intBitsToFloat(qb - 2), -a));
+    if (r < best) { best = r; bidx = -2; }
+    return intBitsToFloat(qb + bidx);
+}
+void quantize(const uint wgid) {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint blocks_per_group = GROUP_SIZE / 8;
+    const uint block_in_wg = tid / 8;
+    const uint ib = wgid * blocks_per_group + block_in_wg;
+    const uint iqs = tid % 8;
+
+    const uint a_idx = ib * 8 + iqs;
+    vec4 vals = a_idx < p.ne / 4 ? data_a[a_idx] : vec4(0.0f);
+
+    float la = 0.0;
+    float lv = 0.0;
+    if (abs(vals.x) > la) { la = abs(vals.x); lv = vals.x; }
+    if (abs(vals.y) > la) { la = abs(vals.y); lv = vals.y; }
+    if (abs(vals.z) > la) { la = abs(vals.z); lv = vals.z; }
+    if (abs(vals.w) > la) { la = abs(vals.w); lv = vals.w; }
+    shmem_abs[tid] = la;
+    shmem_val[tid] = lv;
+    barrier();
+
+    // Tie-safe reduction: strictly greater keeps the earlier element,
+    // matching CPU first-occurrence semantics.
+    [[unroll]] for (uint s = 4; s > 0; s >>= 1) {
+        if (iqs < s) {
+            if (shmem_abs[tid] < shmem_abs[tid + s]) {
+                shmem_abs[tid] = shmem_abs[tid + s];
+                shmem_val[tid] = shmem_val[tid + s];
+            }
+        }
+        barrier();
+    }
+
+    const float vmax = shmem_val[block_in_wg * 8];
+    // scale comes in as runtime data so the driver cannot constant-fold
+    // `/scale` or `1.0/d` into algebraic forms that differ by 1 ulp from the
+    // CPU reference (watch out: glslc rewrites x/15.0 and 1.0/(x/15.0)).
+    const float scale = uintBitsToFloat(p.scale_bits);
+    const float d = div_ieee(vmax, scale);
+    const float d_inv = d != 0.0 ? div_ieee(1.0, d) : 0.0;
+
+    if (ib < p.num_blocks) {
+        const uint base = block_in_wg * QUANT_K_Q5_0 + iqs * 4;
+        shmem_xi[base + 0] = min(31u, uint(vals.x * d_inv + 16.5));
+        shmem_xi[base + 1] = min(31u, uint(vals.y * d_inv + 16.5));
+        shmem_xi[base + 2] = min(31u, uint(vals.z * d_inv + 16.5));
+        shmem_xi[base + 3] = min(31u, uint(vals.w * d_inv + 16.5));
+    }
+
+    barrier();
+
+    if (ib < p.num_blocks) {
+        const uint bbase = block_in_wg * QUANT_K_Q5_0;
+        const uint j = iqs * 2;
+        const uint lo0 = shmem_xi[bbase + j + 0];
+        const uint hi0 = shmem_xi[bbase + j + 16];
+        const uint lo1 = shmem_xi[bbase + j + 1];
+        const uint hi1 = shmem_xi[bbase + j + 17];
+        data_b[ib].qs[j + 0] = uint8_t((lo0 & 0x0Fu) | ((hi0 & 0x0Fu) << 4));
+        data_b[ib].qs[j + 1] = uint8_t((lo1 & 0x0Fu) | ((hi1 & 0x0Fu) << 4));
+    }
+
+    barrier();
+    if (iqs == 0) {
+        const uint bbase = block_in_wg * QUANT_K_Q5_0;
+        // Little-endian 32-bit qh: low 15 bits for elements j<16, high bits
+        // for elements j+16 (bit j set when xi's 5th bit is set).
+        uint qh = 0u;
+        for (uint j = 0; j < 16; j++) {
+            if ((shmem_xi[bbase + j] & 0x10u) != 0u) { qh |= 1u << j; }
+            if ((shmem_xi[bbase + j + 16] & 0x10u) != 0u) { qh |= 1u << (j + 16); }
+        }
+        data_b[ib].qh[0] = uint16_t(qh & 0xFFFFu);
+        data_b[ib].qh[1] = uint16_t(qh >> 16);
+        data_b[ib].d = float16_t(d);
+    }
+}
+
+void main() {
+    const uint bpg = GROUP_SIZE / 8;
+    uint wgid = gl_WorkGroupID.x;
+    while (wgid * bpg < p.num_blocks) {
+        quantize(wgid);
+        wgid += gl_NumWorkGroups.x;
+    }
+}

@@ -7,7 +7,9 @@ fn atomic_store_bf16(dst_elem: u32, v: f32) {
     let half = dst_elem % 2u;
     let p = bf16_bits(v);
     let shift = half * 16u;
-    let mask = select(0xffff0000u, 0x0000ffffu, half == 0u);
+    // Keep the *other* half of the packed word: writing the low half (half==0)
+    // must preserve the high half and vice versa.
+    let mask = select(0x0000ffffu, 0xffff0000u, half == 0u);
     loop {
         let old = atomicLoad(&dst[wi]);
         let desired = (old & mask) | (p << shift);

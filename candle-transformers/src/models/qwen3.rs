@@ -6,11 +6,7 @@ use candle::{DType, Device, Module, Result, Tensor};
 use candle_nn::{kv_cache::ConcatKvCache, Activation, VarBuilder};
 use std::sync::Arc;
 
-#[cfg(feature = "flash-attn")]
-use candle_flash_attn;
-
-#[cfg(not(feature = "flash-attn"))]
-use candle_nn::attention::{flash_attn, AttnMask};
+use candle_nn::attention::AttnMask;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Config {
@@ -109,6 +105,7 @@ pub(crate) struct Qwen3Attention {
     // hyper params
     num_heads: usize,
     num_kv_heads: usize,
+    #[allow(dead_code)]
     num_kv_groups: usize,
     head_dim: usize,
     hidden_size: usize,
@@ -187,7 +184,7 @@ impl Qwen3Attention {
     pub(crate) fn forward(
         &mut self,
         x: &Tensor,
-        attn_mask: Option<&Tensor>,
+        _attn_mask: Option<&Tensor>,
         offset: usize,
     ) -> Result<Tensor> {
         let (b, l, _) = x.dims3()?;
@@ -228,20 +225,14 @@ impl Qwen3Attention {
         //    - Fallback:                    standard matmul attention
         let on_cpu = x.device().is_cpu();
 
-        #[cfg(not(feature = "flash-attn"))]
         if on_cpu {
             return self.forward_cpu_flash_attn(&q, &k, &v, offset, b, l);
         }
-        #[cfg(feature = "flash-attn")]
-        if !on_cpu {
-            return self.forward_flash_attn(&q, &k, &v, offset, b, l);
-        }
 
-        self.forward_standard_attn(&q, &k, &v, attn_mask, b, l)
+        self.forward_flash_attn(&q, &k, &v, offset, b, l)
     }
 
-    /// GPU flash attention path (requires flash-attn feature)
-    #[cfg(feature = "flash-attn")]
+    /// GPU flash attention path
     fn forward_flash_attn(
         &self,
         q: &Tensor,
@@ -258,18 +249,13 @@ impl Qwen3Attention {
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let causal = l > 1;
-        let ctx = candle_flash_attn::flash_attn(&q, &k, &v, scale, causal)?;
+        let ctx = flash_attn(&q, &k, &v, scale, causal)?;
 
         // Output: (B, S, H, D) -> (B, L, hidden_size)
         ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
     }
 
     /// CPU flash attention - optimized fused kernel for CPU
-    ///
-    /// The `flash_attn` dispatcher in candle-nn automatically selects:
-    /// - B=1: single-batch optimized kernels (direct slice access)
-    /// - B>1: packed varlen path (avoids batch-dim stride overhead)
-    #[cfg(not(feature = "flash-attn"))]
     fn forward_cpu_flash_attn(
         &self,
         q: &Tensor,
@@ -287,7 +273,7 @@ impl Qwen3Attention {
         let scale = 1.0 / (self.head_dim as f32).sqrt();
 
         let ctx = match q.dtype() {
-            DType::F32 => flash_attn::<f32>(
+            DType::F32 => candle_nn::attention::cpu_flash::flash_attn::<f32>(
                 &q,
                 &k,
                 &v,
@@ -303,7 +289,7 @@ impl Qwen3Attention {
                 let q_f32 = q.to_dtype(DType::F32)?;
                 let k_f32 = k.to_dtype(DType::F32)?;
                 let v_f32 = v.to_dtype(DType::F32)?;
-                let ctx_f32 = flash_attn::<f32>(
+                let ctx_f32 = candle_nn::attention::cpu_flash::flash_attn::<f32>(
                     &q_f32,
                     &k_f32,
                     &v_f32,
@@ -323,6 +309,7 @@ impl Qwen3Attention {
     }
 
     /// Standard matmul-based attention (works on any device)
+    #[allow(dead_code)]
     fn forward_standard_attn(
         &self,
         q: &Tensor,
@@ -495,4 +482,26 @@ impl ModelForCausalLM {
     pub fn clear_kv_cache(&mut self) {
         self.base.clear_kv_cache();
     }
+}
+
+#[cfg(feature = "flash-attn")]
+fn flash_attn(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
+    candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
+}
+
+#[cfg(not(feature = "flash-attn"))]
+fn flash_attn(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
+    candle_nn::ops::flash_attn(q, k, v, softmax_scale, causal)
 }

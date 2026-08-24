@@ -2880,7 +2880,7 @@
         "Q2K..Q6K",
         "IQ* where implemented"
       ],
-      "accumulator_notes": "GPU dequant shaders; host pack for quantize matches CUDA",
+      "accumulator_notes": "GPU dequant shaders; GPU quantize now native for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 (byte-identical CPU, see op quantized_quantize); Q2K..Q6K host pack",
       "contiguous": true,
       "strided": true,
       "broadcasting": true,
@@ -2968,6 +2968,68 @@
         "Q8_1",
         "Q2K",
         "Q3K"
+      ]
+    },
+    {
+      "op": "quantized_quantize",
+      "trait": "quantized",
+      "cuda_source": "candle-core/src/quantized (host pack; no CUDA GPU kernel)",
+      "vulkan_source": "candle-core/src/vulkan_backend.rs + candle-vulkan-kernels/src/shaders/quantize_q4_0/q4_1/q5_0/q5_1/q8_0/q8_1.comp",
+      "native_webgpu_source": "candle-core/src/wgpu_backend.rs + candle-wgpu-kernels/src/shaders/quantize_q4_0/q4_1/q5_0/q5_1/q8_0/q8_1.wgsl",
+      "portable_webgpu_source": "candle-core/src/wgpu_backend.rs (host pack fallback; no portable quantize kernel)",
+      "vulkan_status": "Native",
+      "native_webgpu_status": "Native",
+      "portable_webgpu_status": "GPUEmulated",
+      "cuda_baseline": "unsupported on CUDA (host pack; llama.cpp CUDA likewise has no GPU quantize)",
+      "storage_dtypes": [
+        "Q4_0",
+        "Q4_1",
+        "Q5_0",
+        "Q5_1",
+        "Q8_0",
+        "Q8_1"
+      ],
+      "compute_dtypes": [
+        "F32"
+      ],
+      "accumulator_notes": "GPU quantize on contiguous whole-block F32, GPU output bytes byte-identical to CPU pack (not dequant tolerance): wgpu word-packed blocks (one writer per u32 word), vulkan CPU-layout blocks on device. Byte parity required div_ieee (driver OpFDiv 1-ulp corrections, optimizer-proof FMA-residual selection) + runtime scale_bits uniforms (constant-divisor specialization), minNum/maxNum ±0.0 tie semantics, Q5 nibble &0xF masking. Q4_1/Q5_0/Q5_1 kernels (2026-08-22 wave) use div_ieee; legacy Q8_0/Q4_0 kernels share latent 1.0/d driver-division risk. Q2K..Q6K stay host pack (callers are offline CLI/tests only)",
+      "contiguous": true,
+      "strided": false,
+      "broadcasting": false,
+      "scalar": false,
+      "zero_sized": false,
+      "ranks": "1-d storage (elem count multiple of 32); non-multiple and non-contiguous inputs keep documented CPU path",
+      "tests": [
+        "candle-core/tests/backend_smoke_tests.rs"
+      ],
+      "portable_tests": [],
+      "bench": false,
+      "capability_requirements": [],
+      "known_limitations": [
+        "native path requires contiguous F32 + elem_count % 32 == 0; Q2K..Q6K host pack",
+        "byte-parity tests are #[ignore] unit tests (GPU required; not run in CI)"
+      ],
+      "evidence": "byte-parity unit tests in candle-core/src/vulkan_backend.rs (vulkan_quantize_*) and candle-core/src/wgpu_backend.rs (wgpu_quantize_tests::quantize_*): matches_cpu_bytes, dm_large_multi_workgroup, ties_and_zero_bytes, non_multiple_takes_cpu_behavior; detailed findings in .swarm/results/w-q1-quant-vk.md and w-q2-quant-wgpu.md",
+      "verified_dtypes": [
+        "Q4_0",
+        "Q4_1",
+        "Q5_0",
+        "Q5_1",
+        "Q8_0"
+      ],
+      "test_functions": [
+        "candle-core/src/vulkan_backend.rs::vulkan_quantize_q4_1_matches_cpu_bytes",
+        "candle-core/src/vulkan_backend.rs::vulkan_quantize_q5_0_matches_cpu_bytes",
+        "candle-core/src/vulkan_backend.rs::vulkan_quantize_q5_1_matches_cpu_bytes",
+        "candle-core/src/vulkan_backend.rs::vulkan_quantize_dm_large_multi_workgroup_matches_cpu",
+        "candle-core/src/vulkan_backend.rs::vulkan_quantize_ties_and_zero_bytes_match_cpu",
+        "candle-core/src/vulkan_backend.rs::vulkan_quantize_non_multiple_takes_cpu_behavior",
+        "candle-core/src/wgpu_backend.rs::quantize_q4_1_matches_cpu_bytes",
+        "candle-core/src/wgpu_backend.rs::quantize_q5_0_matches_cpu_bytes",
+        "candle-core/src/wgpu_backend.rs::quantize_q5_1_matches_cpu_bytes",
+        "candle-core/src/wgpu_backend.rs::quantize_dm_large_multi_workgroup_matches_cpu",
+        "candle-core/src/wgpu_backend.rs::quantize_ties_and_zero_bytes_match_cpu",
+        "candle-core/src/wgpu_backend.rs::quantize_non_multiple_takes_cpu_behavior"
       ]
     },
     {

@@ -275,12 +275,7 @@ fn generate_candle_spirv_modules(
         (
             "binary_int_i32",
             candle_shaders_dir.join("binary_int.comp"),
-            &[
-                "A_TYPE=int",
-                "B_TYPE=int",
-                "D_TYPE=int",
-                "FLOAT_TYPE=float",
-            ],
+            &["A_TYPE=int", "B_TYPE=int", "D_TYPE=int", "FLOAT_TYPE=float"],
         ),
         (
             "binary_int_i64",
@@ -318,6 +313,16 @@ fn generate_candle_spirv_modules(
             &[
                 "A_TYPE=int64_t",
                 "B_TYPE=int64_t",
+                "D_TYPE=uint8_t",
+                "FLOAT_TYPE=float",
+            ],
+        ),
+        (
+            "cmp_bf16",
+            candle_shaders_dir.join("cmp_bf16.comp"),
+            &[
+                "A_TYPE=uint16_t",
+                "B_TYPE=uint16_t",
                 "D_TYPE=uint8_t",
                 "FLOAT_TYPE=float",
             ],
@@ -575,12 +580,22 @@ fn generate_candle_spirv_modules(
         (
             "convert_bf16_f32",
             candle_shaders_dir.join("convert.comp"),
-            &["A_TYPE=uint16_t", "D_TYPE=float", "DST_VIA_F32", "DATA_A_BF16"],
+            &[
+                "A_TYPE=uint16_t",
+                "D_TYPE=float",
+                "DST_VIA_F32",
+                "DATA_A_BF16",
+            ],
         ),
         (
             "convert_bf16_f16",
             candle_shaders_dir.join("convert.comp"),
-            &["A_TYPE=uint16_t", "D_TYPE=float16_t", "DST_VIA_F32", "DATA_A_BF16"],
+            &[
+                "A_TYPE=uint16_t",
+                "D_TYPE=float16_t",
+                "DST_VIA_F32",
+                "DATA_A_BF16",
+            ],
         ),
         (
             "convert_u8_u8",
@@ -727,11 +742,7 @@ fn generate_candle_spirv_modules(
             candle_shaders_dir.join("dequant_q8_k_f32.comp"),
             &[],
         ),
-        (
-            "layernorm",
-            candle_shaders_dir.join("layernorm.comp"),
-            &[],
-        ),
+        ("layernorm", candle_shaders_dir.join("layernorm.comp"), &[]),
         (
             "flash_attn",
             candle_shaders_dir.join("flash_attn.comp"),
@@ -741,6 +752,129 @@ fn generate_candle_spirv_modules(
             "flash_attn_f16",
             candle_shaders_dir.join("flash_attn.comp"),
             &["INPUT_F16"],
+        ),
+        (
+            "flash_attn_varlen",
+            candle_shaders_dir.join("flash_attn_varlen.comp"),
+            &[],
+        ),
+        (
+            "flash_attn_paged",
+            candle_shaders_dir.join("flash_attn_paged.comp"),
+            &[],
+        ),
+        // F8E4M3 conversion shaders
+        (
+            "convert_f8e4m3_f32",
+            candle_shaders_dir.join("convert_fp8.comp"),
+            &["A_TYPE=uint8_t", "D_TYPE=float", "DATA_A_F8E4M3"],
+        ),
+        (
+            "convert_f32_f8e4m3",
+            candle_shaders_dir.join("convert_fp8.comp"),
+            &["A_TYPE=float", "D_TYPE=uint8_t", "DATA_D_F8E4M3"],
+        ),
+        (
+            "convert_f8e4m3_f16",
+            candle_shaders_dir.join("convert_fp8.comp"),
+            &[
+                "A_TYPE=uint8_t",
+                "D_TYPE=float16_t",
+                "DATA_A_F8E4M3",
+                "USE_F16",
+            ],
+        ),
+        (
+            "convert_f16_f8e4m3",
+            candle_shaders_dir.join("convert_fp8.comp"),
+            &[
+                "A_TYPE=float16_t",
+                "D_TYPE=uint8_t",
+                "DATA_D_F8E4M3",
+                "USE_F16",
+            ],
+        ),
+        // F64 native shaders
+        ("unary_f64", candle_shaders_dir.join("unary_f64.comp"), &[]),
+        (
+            "binary_f64",
+            candle_shaders_dir.join("binary_f64.comp"),
+            &[],
+        ),
+        ("cmp_f64", candle_shaders_dir.join("cmp_f64.comp"), &[]),
+        (
+            "sum_rows_f64",
+            candle_shaders_dir.join("sum_rows_f64.comp"),
+            &[],
+        ),
+        (
+            "reduce_extrema_f64",
+            candle_shaders_dir.join("reduce_extrema_f64.comp"),
+            &[],
+        ),
+        (
+            "argextrema_f64",
+            candle_shaders_dir.join("argextrema_f64.comp"),
+            &[],
+        ),
+        // Scatter-add extended dtypes
+        (
+            "set_rows_add_u8_i32",
+            candle_shaders_dir.join("set_rows_add_ext.comp"),
+            &[
+                "A_TYPE=uint8_t",
+                "B_TYPE=uint",
+                "D_TYPE=uint",
+                "FLOAT_TYPE=float",
+                "D_READ_WRITE",
+                "SRC_U8",
+            ],
+        ),
+        (
+            "set_rows_add_u32_i32",
+            candle_shaders_dir.join("set_rows_add_ext.comp"),
+            &[
+                "A_TYPE=uint",
+                "B_TYPE=uint",
+                "D_TYPE=uint",
+                "FLOAT_TYPE=float",
+                "D_READ_WRITE",
+                "SRC_U32",
+            ],
+        ),
+        (
+            "set_rows_add_i64_i32",
+            candle_shaders_dir.join("set_rows_add_ext.comp"),
+            &[
+                "A_TYPE=int64_t",
+                "B_TYPE=uint",
+                "D_TYPE=uint",
+                "FLOAT_TYPE=float",
+                "D_READ_WRITE",
+                "SRC_I64",
+            ],
+        ),
+        (
+            "set_rows_add_f64_i32",
+            candle_shaders_dir.join("set_rows_add_ext.comp"),
+            &[
+                "A_TYPE=float64_t",
+                "B_TYPE=uint",
+                "D_TYPE=uint",
+                "FLOAT_TYPE=float",
+                "D_READ_WRITE",
+                "SRC_F64",
+            ],
+        ),
+        (
+            "batched_gemv_f32",
+            candle_shaders_dir.join("batched_gemv_f32.comp"),
+            &[],
+        ),
+        (
+            "ctx_gemv_f32",
+            candle_shaders_dir.join("ctx_gemv_f32.comp"),
+            &[],
         ),
     ];
     for (name, source, defines) in modules {
@@ -906,10 +1040,8 @@ fn try_compile_with_msvc(
     // contains non-ASCII characters (e.g. Cyrillic user profile dirs) under
     // the system ANSI code page. Compile from %TEMP% (ASCII) and copy the
     // resulting binary back to OUT_DIR.
-    let temp_root = env::temp_dir().join(format!(
-        "candle-vulkan-shaders-gen-{}",
-        std::process::id()
-    ));
+    let temp_root =
+        env::temp_dir().join(format!("candle-vulkan-shaders-gen-{}", std::process::id()));
     fs::create_dir_all(&temp_root).map_err(|err| format!("cl/msvc: mkdir temp: {err}"))?;
     let temp_src = temp_root.join("vulkan-shaders-gen.cpp");
     let temp_exe = temp_root.join("vulkan-shaders-gen.exe");
@@ -980,7 +1112,8 @@ fn find_vcvars64() -> Option<PathBuf> {
         }
     }
     // Fall back to vswhere if present.
-    let vswhere = PathBuf::from(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe");
+    let vswhere =
+        PathBuf::from(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe");
     if vswhere.is_file() {
         if let Ok(out) = Command::new(&vswhere)
             .args([

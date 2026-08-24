@@ -68,6 +68,23 @@ Notes:
 Device selection in examples: `CANDLE_DEVICE=cpu|cuda|metal|wgpu|vulkan`.
 Pick a GPU with `CANDLE_WGPU_ADAPTER_NAME` or `CANDLE_VULKAN_DEVICE_NAME` when several adapters are present.
 
+### Backend performance (Vulkan & WGPU)
+
+End-to-end throughput for the [`quantized-qwen3`](./candle-examples/examples/quantized-qwen3/) example (model: **Qwen3-0.6B-GGUF Q4_K_M**, release build, same-session CUDA baseline). Hardware: **RTX 3060 12 GB**, **Ryzen 7 3700X**, **64 GB DDR4**. `%CUDA` is relative CUDA throughput; Min / Normal / Goal are SLO tiers from [`bench_examples.py`](./bench_examples.py) (values are % of CUDA).
+
+| Backend | Phase | Cell | tok/s | %CUDA | Min | Normal | Goal | Verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Vulkan | decode | tg128 | 116.35 | 199% | 75 | 90 | 90+ | PASS ×3 |
+| Vulkan | decode | tg256 | 116.28 | 207% | 75 | 90 | 90+ | PASS ×3 |
+| Vulkan | prefill | pp512 | 114.49 | 203% | 85 | 95 | 95+ | PASS ×3 |
+| Vulkan | prefill | pp1024 | 105.08 | 184% | 85 | 95 | 95+ | PASS ×3 |
+| Vulkan | prefill | pp2048 | 100.27 | 184% | 85 | 95 | 95+ | PASS ×3 |
+| Vulkan | prefill | pp4096 | 89.24 | 206% | 85 | 95 | 95+ | PASS ×3 |
+| WGPU | decode | tg128/256 | 5.21/5.26 | 8.9/9.4% | 10 | 18 | 30+ | FAIL — platform limit |
+| WGPU | prefill | pp512/1024 | 5.06/5.36 | 8.9/9.4% | 12 | 20 | 35+ | FAIL — platform limit |
+
+Vulkan meets all decode/prefill SLO tiers on every cell. WGPU is functionally correct but host-bound at ~5.2 tok/s on this hardware — a platform limit of the wgpu stack, not a Candle correctness gap.
+
 ## Check out our examples
 
 These online demos run entirely in your browser:

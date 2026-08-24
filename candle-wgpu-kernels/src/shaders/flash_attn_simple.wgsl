@@ -16,6 +16,10 @@ struct Params {
     batch_size: u32,
     scale: f32,
     causal: u32,
+    window_size_left: u32,
+    window_size_right: u32,
+    softcap: f32,
+    has_alibi: u32,
 };
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
@@ -23,6 +27,7 @@ struct Params {
 @group(0) @binding(2) var<storage, read> V: array<f32>;
 @group(0) @binding(3) var<storage, read_write> O: array<f32>;
 @group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(5) var<storage, read> alibi_slopes: array<f32>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -49,17 +54,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var m: f32 = -1e30;
     var l: f32 = 0.0;
 
-    // Output accumulator (max Dv is 128)
-    var o_acc = array<f32, 128>();
+    // Output accumulator (max Dv is 512)
+    var o_acc = array<f32, 512>();
     for (var d: u32 = 0u; d < Dv; d++) {
         o_acc[d] = 0.0;
     }
 
+    let q_pos = i32(s + (params.seq_kv - params.seq_q));
+
     // Iterate over KV positions
     for (var kv: u32 = 0u; kv < params.seq_kv; kv++) {
-        // Causal mask with cross-attention offset
-        let causal_limit = s + (params.seq_kv - params.seq_q);
-        if (params.causal != 0u && kv > causal_limit) { continue; }
+        let k_pos = i32(kv);
+        if (params.causal != 0u && k_pos > q_pos) { continue; }
+        if (params.window_size_left != 0u && k_pos < q_pos - i32(params.window_size_left)) { continue; }
+        if (params.window_size_right != 0u && k_pos > q_pos + i32(params.window_size_right)) { continue; }
 
         // Compute score = dot(Q[s], K[kv]) * scale
         var score: f32 = 0.0;
@@ -67,6 +75,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             score += Q[q_base + s * D + d] * K[k_base + kv * D + d];
         }
         score *= params.scale;
+
+        // ALiBi bias
+        if (params.has_alibi != 0u) {
+            let slope = alibi_slopes[h_q];
+            score += slope * f32(k_pos - q_pos);
+        }
+
+        // Logit softcapping
+        if (params.softcap > 0.0) {
+            score = params.softcap * tanh(score / params.softcap);
+        }
 
         // Online softmax update
         let m_new = max(m, score);

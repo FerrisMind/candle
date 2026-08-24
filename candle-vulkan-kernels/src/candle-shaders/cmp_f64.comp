@@ -1,0 +1,90 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+// F64 native comparison kernel. Uses the same push-constant layout as GgmlBinaryParams.
+
+layout (push_constant) uniform parameter {
+    uint ne;
+    uint ne00; uint ne01; uint ne02; uint ne03; uint nb00; uint nb01; uint nb02; uint nb03;
+    uint ne10; uint ne11; uint ne12; uint ne13; uint nb10; uint nb11; uint nb12; uint nb13;
+    uint ne20; uint ne21; uint ne22; uint ne23; uint nb20; uint nb21; uint nb22; uint nb23;
+    uint misalign_offsets;
+    float param1; float param2; int param3;
+} p;
+
+layout (binding = 0) readonly buffer A { double data_a[]; };
+layout (binding = 1) readonly buffer B { double data_b[]; };
+layout (binding = 2) writeonly buffer D { uint8_t data_d[]; };
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+uint get_idx() {
+    return gl_GlobalInvocationID.z * 262144u + gl_GlobalInvocationID.y * 512u + gl_GlobalInvocationID.x;
+}
+
+uint get_aoffset() { return p.misalign_offsets >> 16u; }
+uint get_boffset() { return (p.misalign_offsets >> 8u) & 0xFFu; }
+uint get_doffset() { return p.misalign_offsets & 0xFFu; }
+
+void get_indices(uint idx, out uint i00, out uint i01, out uint i02, out uint i03) {
+    uint ne0 = p.ne00;
+    uint ne1 = p.ne01;
+    uint ne2 = p.ne02;
+    i03 = idx / (ne2 * ne1 * ne0);
+    uint r03 = idx - i03 * ne2 * ne1 * ne0;
+    i02 = r03 / (ne1 * ne0);
+    uint r02 = r03 - i02 * ne1 * ne0;
+    i01 = r02 / ne0;
+    i00 = r02 - i01 * ne0;
+}
+
+uint src0_idx(uint i00, uint i01, uint i02, uint i03) {
+    return i03 * p.nb03 + i02 * p.nb02 + i01 * p.nb01 + i00 * p.nb00;
+}
+
+uint src1_idx(uint i00, uint i01, uint i02, uint i03) {
+    return (i03 % p.ne13) * p.nb13 + (i02 % p.ne12) * p.nb12
+         + (i01 % p.ne11) * p.nb11 + (i00 % p.ne10) * p.nb10;
+}
+
+uint dst_idx(uint i00, uint i01, uint i02, uint i03) {
+    return i03 * p.nb23 + i02 * p.nb22 + i01 * p.nb21 + i00 * p.nb20;
+}
+
+uint8_t cmp_result_f64(double a, double b, int op) {
+    switch (op) {
+        case 0: return uint8_t(a == b);
+        case 1: return uint8_t(a != b);
+        case 2: return uint8_t(a <  b);
+        case 3: return uint8_t(a <= b);
+        case 4: return uint8_t(a >  b);
+        case 5: return uint8_t(a >= b);
+        default: return uint8_t(0u);
+    }
+}
+
+void main() {
+    uint idx = get_idx();
+
+    const uint num_threads = 128u;
+    const uint num_iter = 4u;
+
+    [[unroll]] for (uint i = 0u; i < num_iter; ++i) {
+        if (idx >= p.ne) {
+            continue;
+        }
+
+        uint i00, i01, i02, i03;
+        get_indices(idx, i00, i01, i02, i03);
+
+        double a = data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)];
+        double b = data_b[get_boffset() + src1_idx(i00, i01, i02, i03)];
+        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = cmp_result_f64(a, b, p.param3);
+
+        idx += num_threads;
+    }
+}

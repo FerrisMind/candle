@@ -15,6 +15,8 @@
 mod support;
 
 #[cfg(all(feature = "cuda", any(feature = "wgpu", feature = "vulkan")))]
+use candle_core::backend::BackendStorage;
+#[cfg(all(feature = "cuda", any(feature = "wgpu", feature = "vulkan")))]
 use candle_core::{DType, Device, Result, Tensor};
 #[cfg(all(feature = "cuda", any(feature = "wgpu", feature = "vulkan")))]
 use support::{
@@ -711,6 +713,136 @@ fn parity_f64_surface(under_test: &Device, cuda: &Device) -> Result<()> {
 }
 
 #[cfg(all(feature = "cuda", any(feature = "wgpu", feature = "vulkan")))]
+fn parity_flash_attn_features(under_test: &Device, _cuda: &Device) -> Result<()> {
+    let b = 1;
+    let h = 2;
+    let s = 4;
+    let d = 64;
+    let q = Tensor::ones((b, h, s, d), DType::F32, under_test)?;
+    let k = Tensor::ones((b, h, s, d), DType::F32, under_test)?;
+    let v = Tensor::ones((b, h, s, d), DType::F32, under_test)?;
+
+    match under_test {
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(_) => {
+            let (q_g, q_l) = q.storage_and_layout();
+            let (k_g, k_l) = k.storage_and_layout();
+            let (v_g, v_l) = v.storage_and_layout();
+            let q_s = match &*q_g {
+                candle_core::Storage::Vulkan(s) => s,
+                _ => unreachable!(),
+            };
+            let k_s = match &*k_g {
+                candle_core::Storage::Vulkan(s) => s,
+                _ => unreachable!(),
+            };
+            let v_s = match &*v_g {
+                candle_core::Storage::Vulkan(s) => s,
+                _ => unreachable!(),
+            };
+            let out = candle_core::VulkanStorage::flash_attn(
+                q_s,
+                q_l,
+                k_s,
+                k_l,
+                v_s,
+                v_l,
+                1.0 / (d as f32).sqrt(),
+                true,
+            )?;
+            assert_eq!(
+                out.to_cpu_storage()?.as_slice::<f32>()?.len(),
+                b * h * s * d
+            );
+
+            let alibi = Tensor::from_vec(vec![0.5f32, 0.25f32], (h,), under_test)?;
+            let (alibi_g, _) = alibi.storage_and_layout();
+            let alibi_s = match &*alibi_g {
+                candle_core::Storage::Vulkan(s) => s,
+                _ => unreachable!(),
+            };
+            let out_ext = candle_core::VulkanStorage::flash_attn_ext(
+                q_s,
+                q_l,
+                k_s,
+                k_l,
+                v_s,
+                v_l,
+                Some(alibi_s),
+                Some(2),
+                Some(0),
+                Some(30.0),
+                1.0 / (d as f32).sqrt(),
+                true,
+            )?;
+            assert_eq!(
+                out_ext.to_cpu_storage()?.as_slice::<f32>()?.len(),
+                b * h * s * d
+            );
+        }
+        #[cfg(feature = "wgpu")]
+        Device::Wgpu(_) => {
+            let (q_g, q_l) = q.storage_and_layout();
+            let (k_g, k_l) = k.storage_and_layout();
+            let (v_g, v_l) = v.storage_and_layout();
+            let q_s = match &*q_g {
+                candle_core::Storage::Wgpu(s) => s,
+                _ => unreachable!(),
+            };
+            let k_s = match &*k_g {
+                candle_core::Storage::Wgpu(s) => s,
+                _ => unreachable!(),
+            };
+            let v_s = match &*v_g {
+                candle_core::Storage::Wgpu(s) => s,
+                _ => unreachable!(),
+            };
+            let out = candle_core::WgpuStorage::flash_attn(
+                q_s,
+                q_l,
+                k_s,
+                k_l,
+                v_s,
+                v_l,
+                1.0 / (d as f32).sqrt(),
+                true,
+            )?;
+            assert_eq!(
+                out.to_cpu_storage()?.as_slice::<f32>()?.len(),
+                b * h * s * d
+            );
+
+            let alibi = Tensor::from_vec(vec![0.5f32, 0.25f32], (h,), under_test)?;
+            let (alibi_g, _) = alibi.storage_and_layout();
+            let alibi_s = match &*alibi_g {
+                candle_core::Storage::Wgpu(s) => s,
+                _ => unreachable!(),
+            };
+            let out_ext = candle_core::WgpuStorage::flash_attn_ext(
+                q_s,
+                q_l,
+                k_s,
+                k_l,
+                v_s,
+                v_l,
+                Some(alibi_s),
+                Some(2),
+                Some(0),
+                Some(30.0),
+                1.0 / (d as f32).sqrt(),
+                true,
+            )?;
+            assert_eq!(
+                out_ext.to_cpu_storage()?.as_slice::<f32>()?.len(),
+                b * h * s * d
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", any(feature = "wgpu", feature = "vulkan")))]
 fn run_parity_matrix(under_test: &Device, cuda: &Device) -> Result<()> {
     parity_unary_dtype_matrix(under_test, cuda)?;
     parity_binary_dtype_matrix(under_test, cuda)?;
@@ -732,6 +864,7 @@ fn run_parity_matrix(under_test: &Device, cuda: &Device) -> Result<()> {
     parity_argsort_bf16_f16(under_test, cuda)?;
     parity_f64_surface(under_test, cuda)?;
     parity_rng_determinism(under_test, cuda)?;
+    parity_flash_attn_features(under_test, cuda)?;
     Ok(())
 }
 
