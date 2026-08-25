@@ -4387,16 +4387,49 @@ struct Params {{
     m1: f32,
     row_base: u32,
 }};
-@group(0) @binding(0) var<storage, read_write> src: array<u32>;
+@group(0) @binding(0) var<storage, read_write> src: array<atomic<u32>>;
 @group(0) @binding(1) var<uniform> params: Params;
 fn load_elem(i: u32) -> f32 {{
-    return bf16_to_f32(src[i / 2u], i % 2u);
+    return bf16_to_f32(atomicLoad(&src[i / 2u]), i % 2u);
 }}
+// Elements are packed two-per-u32. For ODD row length the last element of a row
+// shares its u32 word with the FIRST element of the next row, and those rows are
+// independent workgroups that run concurrently. A plain read-modify-write
+// (src[wi] = word) either lost the sibling half (word started at 0) or raced
+// with the neighbor row, so the softmax output was nondeterministic at the odd
+// last column. Write ONE element (one half) at a time with an atomic CAS that
+// preserves the concurrently-written sibling half. Correct for even i0 (both
+// halves in one word) and odd i0 (pair spans two words).
 fn store_pair(i0: u32, v0: f32, v1: f32, has_v1: bool) {{
     let wi = i0 / 2u;
-    var word = bf16_store_half(0u, i0 % 2u, v0);
-    if (has_v1) {{ word = bf16_store_half(word, 1u, v1); }}
-    src[wi] = word;
+    let h0 = i0 % 2u;
+    let p0 = bf16_bits(v0);
+    let sh0 = h0 * 16u;
+    // keep the SIBLING half: half==0 owns the low bits -> keep high (0xffff0000).
+    let keep0 = select(0x0000ffffu, 0xffff0000u, h0 == 0u);
+    var w = atomicLoad(&src[wi]);
+    loop {{
+        let old = w;
+        let desired = (old & keep0) | (p0 << sh0);
+        let res = atomicCompareExchangeWeak(&src[wi], old, desired);
+        if res.exchanged {{ break; }}
+        w = res.old_value;
+    }}
+    if (has_v1) {{
+        let wi1 = (i0 + 1u) / 2u;
+        let h1 = (i0 + 1u) % 2u;
+        let p1 = bf16_bits(v1);
+        let sh1 = h1 * 16u;
+        let keep1 = select(0x0000ffffu, 0xffff0000u, h1 == 0u);
+        var w1 = atomicLoad(&src[wi1]);
+        loop {{
+            let old = w1;
+            let desired = (old & keep1) | (p1 << sh1);
+            let res = atomicCompareExchangeWeak(&src[wi1], old, desired);
+            if res.exchanged {{ break; }}
+            w1 = res.old_value;
+        }}
+    }}
 }}
 const CACHE_SIZE: u32 = 16;
 var<workgroup> scratch: array<f32, WG_SIZE>;
@@ -4423,7 +4456,7 @@ fn main(
         max_val = max(max_val, v0);
         if (col + 1u < params.ne0) {{ max_val = max(max_val, load_elem(i0 + 1u) * params.scale); }}
         if (col < CACHE_SIZE) {{ cache[col] = v0; }}
-        if (col + 1u < CACHE_SIZE) {{ cache[col + 1u] = load_elem(i0 + 1u) * params.scale; }}
+        if (col + 1u < params.ne0 && col + 1u < CACHE_SIZE) {{ cache[col + 1u] = load_elem(i0 + 1u) * params.scale; }}
         col += WG_SIZE * 2u;
     }}
     scratch[lid.x] = max_val;
