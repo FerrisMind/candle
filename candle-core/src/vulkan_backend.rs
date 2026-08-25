@@ -1606,6 +1606,12 @@ impl VulkanDevice {
     const CLEANUP_DEBT_THRESHOLD: u32 = 32;
     /// Maximum number of staging buffers per size class in the pool.
     const MAX_STAGING_PER_SIZE_CLASS: usize = 32;
+    // Large upload staging buffers (weight uploads during model load) are
+    // one-shot: holding them in the power-of-two pool hoards host-visible
+    // memory (observed ~0.7GB shared spill on the 16B MoE load). Pool only
+    // small staging; defer-free larger ones so the host memory is returned
+    // instead of retained across the whole process.
+    const MAX_POOLED_STAGING_BYTES: usize = 4 * 1024 * 1024;
     /// Maximum number of reusable non-staging GPU buffers retained per size
     /// class in `gpu_buffer_pool` before overflowing to the deferred-free
     /// list. Kept small: MoE reuses a handful of distinct sizes, and larger
@@ -2239,7 +2245,24 @@ impl VulkanDevice {
             };
             let mut pool = pool.lock().map_err(|e| Error::wrap(e.to_string()))?;
             let entry = pool.entry(size_class).or_default();
-            if entry.len() < Self::MAX_STAGING_PER_SIZE_CLASS {
+            if buf.size > Self::MAX_POOLED_STAGING_BYTES {
+                // Large one-shot staging (weight uploads during model load):
+                // defer-free instead of pooling to bound the host-visible
+                // (shared) memory that otherwise stays reserved across the whole
+                // process. Small staging is pooled for the many small transfer
+                // cycles.
+                drop(pool);
+                if let Ok(mut alloc) = buf.allocation.lock() {
+                    if let Some(allocation) = alloc.take() {
+                        if let Ok(mut deferred) = self.inner.deferred_buffer_frees.lock() {
+                            deferred.push(VulkanDeferredBuffer {
+                                buffer: buf.buffer,
+                                allocation,
+                            });
+                        }
+                    }
+                }
+            } else if entry.len() < Self::MAX_STAGING_PER_SIZE_CLASS {
                 entry.push(buf);
             } else {
                 // Pool full: defer free instead
@@ -9284,7 +9307,7 @@ impl VulkanStorage {
                 vulkan_dmmv_shader_name(
                     &self.device,
                     qdtype,
-                    format!("mul_mat_vec_id_{}_f32", vulkan_quantized_stem(qdtype)?),
+                    format!("mul_mat_vec_id_{}_f32_f32", vulkan_quantized_stem(qdtype)?),
                     dmmv_workgroup,
                 ),
                 vulkan_quantized_vec_rows(qdtype)?,
