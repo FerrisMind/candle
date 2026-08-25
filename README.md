@@ -1,79 +1,118 @@
-# candle
-[![discord server](https://dcbadge.limes.pink/api/server/hugging-face-879548962464493619)](https://discord.gg/hugging-face-879548962464493619)
-[![Latest version](https://img.shields.io/crates/v/candle-core.svg)](https://crates.io/crates/candle-core)
-[![Documentation](https://docs.rs/candle-core/badge.svg)](https://docs.rs/candle-core)
-[![License](https://img.shields.io/github/license/base-org/node?color=blue)](https://github.com/huggingface/candle/blob/main/LICENSE-MIT)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](https://github.com/huggingface/candle/blob/main/LICENSE-APACHE)
+<p align="left">
+  <a href="README.md"><img src="https://img.shields.io/badge/English-5B7CFA" alt="English"></a>
+  <a href="README.RU.md"><img src="https://img.shields.io/badge/Русский-232323" alt="Русский"></a>
+  <a href="README.PT_BR.md"><img src="https://img.shields.io/badge/Português_BR-232323" alt="Português"></a>
+</p>
 
-Candle is a minimalist ML framework for Rust with a focus on performance (including GPU support) 
-and ease of use. Try our online demos: 
-[whisper](https://huggingface.co/spaces/lmz/candle-whisper),
-[LLaMA2](https://huggingface.co/spaces/lmz/candle-llama2),
-[T5](https://huggingface.co/spaces/radames/Candle-T5-Generation-Wasm),
-[yolo](https://huggingface.co/spaces/lmz/candle-yolo),
-[Segment
-Anything](https://huggingface.co/spaces/radames/candle-segment-anything-wasm).
+---
 
-## Get started
+<p align="center">
+  <b>Candle fork with native Vulkan and WGPU / WebGPU backends.</b><br>
+  CUDA-parity focus for inference on Linux, Windows, macOS, Android, and WASM.
+</p>
 
-Make sure that you have [`candle-core`](https://github.com/huggingface/candle/tree/main/candle-core) correctly installed as described in [**Installation**](https://huggingface.github.io/candle/guide/installation.html).
+<p align="center">
+  <img src="https://img.shields.io/badge/License-Apache--2.0%20%2F%20MIT-2ea44f" alt="Apache 2.0 / MIT">
+  <img src="https://img.shields.io/badge/Rust-edition%202021-93450a?logo=rust" alt="Rust edition 2021">
+  <img src="https://img.shields.io/badge/Backends-Vulkan%20%2B%20WGPU-5B7CFA" alt="Vulkan and WGPU">
+  <img src="https://img.shields.io/badge/Branch-wgpu%2Fvulkan-232323" alt="wgpu/vulkan branch">
+</p>
 
-Let's see how to run a simple matrix multiplication.
-Write the following to your `myapp/src/main.rs` file:
-```rust
-use candle_core::{Device, Tensor};
+<h1 align="center">Candle / wgpu · vulkan</h1>
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let device = Device::Cpu;
+## Table of Contents
 
-    let a = Tensor::randn(0f32, 1., (2, 3), &device)?;
-    let b = Tensor::randn(0f32, 1., (3, 4), &device)?;
+- [What is this?](#what-is-this)
+- [Key Features](#key-features)
+- [Repository Layout](#repository-layout)
+- [Quick Start](#quick-start)
+- [Backend Performance](#backend-performance)
+- [System Requirements](#system-requirements)
+- [License](#license)
 
-    let c = a.matmul(&b)?;
-    println!("{c}");
-    Ok(())
-}
+## What is this?
+
+This is a fork of [huggingface/candle](https://github.com/huggingface/candle) on the default branch [`wgpu/vulkan`](https://github.com/FerrisMind/candle/tree/wgpu/vulkan). Upstream remains the source for the tensor API, models, and CUDA/Metal paths. This branch adds and hardens:
+
+- a **native Vulkan** compute backend (`ash` + SPIR-V)
+- a **WGPU / WebGPU** compute backend (`wgpu` + WGSL)
+- parity docs, smoke tests, and CUDA differential coverage for those backends
+
+Parity is tracked in three separate profiles (do not mix results):
+
+| Profile | Meaning |
+|---------|---------|
+| Native Vulkan | Direct Vulkan / SPIR-V |
+| Native WebGPU | Native `wgpu` with runtime feature detection |
+| Portable WebGPU | Browser / WASM-safe WGSL; no native-only claims |
+
+Normative docs:
+
+- [`docs/backend-parity-spec.md`](./docs/backend-parity-spec.md)
+- [`docs/backend-parity.md`](./docs/backend-parity.md)
+- [`docs/backend-parity-manifest.json`](./docs/backend-parity-manifest.json)
+
+## Key Features
+
+- Cargo features `vulkan` and `wgpu` enable the new GPU backends.
+- Device selection via `CANDLE_DEVICE=vulkan|wgpu` (also `cuda`, `metal`, `cpu`).
+- Adapter pick: `CANDLE_VULKAN_DEVICE_NAME`, `CANDLE_WGPU_ADAPTER_NAME`.
+- WGPU API override: `WGPU_BACKEND=vulkan|dx12|metal|gl`.
+- No hidden CPU compute returned as GPU; no silent dtype cast to F32.
+- Static parity audit, smoke tests, CUDA differential matrix, fallback audit, and example bench harness.
+
+## Repository Layout
+
+| Path | Purpose |
+|------|---------|
+| `candle-core` | Tensor API, devices, Vulkan / WGPU storage and ops |
+| `candle-vulkan-kernels` | SPIR-V compute shaders |
+| `candle-wgpu-kernels` | WGSL compute shaders |
+| `candle-nn` | Layers (incl. MoE and flash-attn dispatch) |
+| `candle-transformers` | Model implementations |
+| `candle-examples` | Runnable examples for e2e backend coverage |
+| `docs/` | Parity specification, manifest, and evidence |
+| `scripts/` | Parity audit and related tooling |
+| `bench_examples.py` | Multi-backend example throughput harness |
+
+## Quick Start
+
+### Run an example on Vulkan or WGPU
+
+```powershell
+$env:CANDLE_DEVICE = "vulkan"   # or "wgpu"
+cargo run -p candle-examples --release --features vulkan --example quantized-qwen3 -- --model <path-to-gguf>
+cargo run -p candle-examples --release --features wgpu --example quantized-qwen3 -- --model <path-to-gguf>
 ```
 
-`cargo run` should display a tensor of shape `Tensor[[2, 4], f32]`.
+### Parity checks
 
+```powershell
+python scripts/backend_parity_audit.py
 
-Having installed `candle` with Cuda support, simply define the `device` to be on GPU:
+cargo test -p candle-core --features vulkan --test backend_smoke_tests
+cargo test -p candle-core --features wgpu --test backend_smoke_tests
 
-```diff
-- let device = Device::Cpu;
-+ let device = Device::new_cuda(0)?;
+# CUDA differential matrix (requires GPUs)
+$env:CANDLE_REQUIRE_CUDA_TEST_DEVICE = "1"
+$env:CANDLE_REQUIRE_VULKAN_TEST_DEVICE = "1"
+$env:CANDLE_REQUIRE_WGPU_TEST_DEVICE = "1"
+cargo test -p candle-core --features "cuda,vulkan,wgpu" --test gpu_parity_matrix_tests
+
+cargo run -p candle-core --release --features "vulkan,wgpu" --example fallback_runtime_audit
+cargo run -p candle-core --release --features "cuda,vulkan,wgpu" --example backend_parity_microbench -- --suite
+
+python bench_examples.py --models-root <models-root> --backend cuda --backend vulkan --backend wgpu
 ```
 
-For more advanced examples, please have a look at the following section.
+## Backend Performance
 
-## Platforms and backends
+End-to-end throughput for [`quantized-qwen3`](./candle-examples/examples/quantized-qwen3/) (**Qwen3-0.6B-GGUF Q4_K_M**, release, same-session CUDA baseline).
 
-| Backend | Cargo feature | Linux | Windows | macOS | iOS | Android | WebAssembly |
-|---------|---------------|:-----:|:-------:|:-----:|:---:|:-------:|:-----------:|
-| CPU | (default) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| CUDA | `cuda` | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Metal | `metal` | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
-| WGPU | `wgpu` | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
-| Vulkan | `vulkan` | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
-
-Notes:
-
-- GPU backends are opt-in Cargo features; CPU is always available.
-- **CUDA** — NVIDIA GPUs only.
-- **WGPU** — Vulkan on Linux/Android, Vulkan or DX12 on Windows, Metal on macOS, WebGPU in the browser. Override with `WGPU_BACKEND=vulkan|dx12|metal|gl`.
-- **Vulkan** — native Vulkan via ash (Linux, Windows, and Android).
-- CPU extras: `mkl` on Linux/Windows x86_64, `accelerate` on macOS.
-
-Device selection in examples: `CANDLE_DEVICE=cpu|cuda|metal|wgpu|vulkan`.
-Pick a GPU with `CANDLE_WGPU_ADAPTER_NAME` or `CANDLE_VULKAN_DEVICE_NAME` when several adapters are present.
-
-### Backend performance (Vulkan & WGPU)
-
-End-to-end throughput for the [`quantized-qwen3`](./candle-examples/examples/quantized-qwen3/) example (model: **Qwen3-0.6B-GGUF Q4_K_M**, release build, same-session CUDA baseline). Hardware: **RTX 3060 12 GB**, **Ryzen 7 3700X**, **64 GB DDR4**. `%CUDA` is relative CUDA throughput; Min / Normal / Goal are SLO tiers from [`bench_examples.py`](./bench_examples.py) (values are % of CUDA).
+Hardware: **RTX 3060 12 GB**, **Ryzen 7 3700X**, **64 GB DDR4**. `%CUDA` is relative CUDA throughput; Min / Normal / Goal are SLO tiers from [`bench_examples.py`](./bench_examples.py).
 
 | Backend | Phase | Cell | tok/s | %CUDA | Min | Normal | Goal | Verdict |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+|---------|-------|------|------:|------:|----:|-------:|-----:|---------|
 | Vulkan | decode | tg128 | 121.51 | 202% | 75 | 90 | 90+ | PASS ×3 |
 | Vulkan | decode | tg256 | 121.26 | 203% | 75 | 90 | 90+ | PASS ×3 |
 | Vulkan | prefill | pp512 | 120.72 | 205% | 85 | 95 | 95+ | PASS ×3 |
@@ -89,412 +128,27 @@ End-to-end throughput for the [`quantized-qwen3`](./candle-examples/examples/qua
 
 CUDA baseline (same session): tg128 60.09, tg256 59.57, pp512 58.79, pp1024 56.74, pp2048 58.78, pp4096 43.91 tok/s.
 
-Vulkan meets all decode/prefill SLO tiers on every cell. WGPU meets all portability-class SLO tiers on every cell (decode 89–90%, prefill 50–90% of CUDA): the earlier ~5 tok/s host-bound ceiling was traced to per-dispatch WGSL regeneration (~800 µs/op) plus a double full-device drain per readback and an address-keyed bind-group cache race — all fixed in the backend layer. Logs: `bench_logs/qwen3-q4km_{cuda,vulkan,wgpu}_final.log`.
+Release SLO targets (end-to-end vs CUDA): **Vulkan ≤ 15% slower** (stretch 10%); **native WebGPU ≤ 30% slower** (stretch 20%). Portable WebGPU has no fixed CUDA %; investigate if more than 2× slower than native WebGPU on the same GPU.
 
-## Check out our examples
+Logs: `bench_logs/qwen3-q4km_{cuda,vulkan,wgpu}_final.log`.
 
-These online demos run entirely in your browser:
-- [yolo](https://huggingface.co/spaces/lmz/candle-yolo): pose estimation and
-  object recognition.
-- [whisper](https://huggingface.co/spaces/lmz/candle-whisper): speech recognition.
-- [LLaMA2](https://huggingface.co/spaces/lmz/candle-llama2): text generation.
-- [T5](https://huggingface.co/spaces/radames/Candle-T5-Generation-Wasm): text generation.
-- [Phi-1.5, and Phi-2](https://huggingface.co/spaces/radames/Candle-Phi-1.5-Wasm): text generation.
-- [Segment Anything Model](https://huggingface.co/spaces/radames/candle-segment-anything-wasm): Image segmentation.
-- [BLIP](https://huggingface.co/spaces/radames/Candle-BLIP-Image-Captioning): image captioning.
+## System Requirements
 
-We also provide some command line based examples using state of the art models:
+- Rust toolchain with workspace `edition = "2021"`
+- For **Vulkan**: working Vulkan loader / ICD (Linux, Windows, Android)
+- For **WGPU**: a `wgpu`-supported adapter (Vulkan, DX12, Metal, or browser WebGPU)
+- Optional CUDA for differential parity and SLO baselines
+- Python 3.x for `scripts/backend_parity_audit.py` and `bench_examples.py`
 
-- [LLaMA v1, v2, and v3](./candle-examples/examples/llama/): general LLM, includes
-  the SOLAR-10.7B variant.
-- [Falcon](./candle-examples/examples/falcon/): general LLM.
-- [Codegeex4](./candle-examples/examples/codegeex4-9b/): Code completion, code interpreter, web search, function calling, repository-level
-- [GLM4](./candle-examples/examples/glm4/): Open Multilingual Multimodal Chat LMs by THUDM
-- [Gemma v1 and v2](./candle-examples/examples/gemma/): 2b and 7b+/9b general LLMs from Google Deepmind.
-- [RecurrentGemma](./candle-examples/examples/recurrent-gemma/): 2b and 7b
-  Griffin based models from Google that mix attention with a RNN like state.
-- [Phi-1, Phi-1.5, Phi-2, and Phi-3](./candle-examples/examples/phi/): 1.3b,
-  2.7b, and 3.8b general LLMs with performance on par with 7b models.
-- [StableLM-3B-4E1T](./candle-examples/examples/stable-lm/): a 3b general LLM
-  pre-trained on 1T tokens of English and code datasets. Also supports
-  StableLM-2, a 1.6b LLM trained on 2T tokens, as well as the code variants.
-- [Mamba](./candle-examples/examples/mamba/): an inference only
-  implementation of the Mamba state space model.
-- [Mistral7b-v0.1](./candle-examples/examples/mistral/): a 7b general LLM with
-  better performance than all publicly available 13b models as of 2023-09-28.
-- [Mixtral8x7b-v0.1](./candle-examples/examples/mixtral/): a sparse mixture of
-  experts 8x7b general LLM with better performance than a Llama 2 70B model with
-  much faster inference.
-- [StarCoder](./candle-examples/examples/bigcode/) and
-  [StarCoder2](./candle-examples/examples/starcoder2/): LLM specialized to code generation.
-- [Qwen1.5](./candle-examples/examples/qwen/): Bilingual (English/Chinese) LLMs.
-- [RWKV v5 and v6](./candle-examples/examples/rwkv/): An RNN with transformer level LLM
-  performance.
-- [Replit-code-v1.5](./candle-examples/examples/replit-code/): a 3.3b LLM specialized for code completion.
-- [Yi-6B / Yi-34B](./candle-examples/examples/yi/): two bilingual
-  (English/Chinese) general LLMs with 6b and 34b parameters.
-- [Quantized LLaMA](./candle-examples/examples/quantized/): quantized version of
-  the LLaMA model using the same quantization techniques as
-  [llama.cpp](https://github.com/ggerganov/llama.cpp).
-- [Quantized Qwen3 MoE](./candle-examples/examples/quantized-qwen3-moe/): support gguf quantized models of Qwen3 MoE models.
+Platform matrix:
 
-<img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/quantized/assets/aoc.gif" width="600">
-  
-- [Stable Diffusion](./candle-examples/examples/stable-diffusion/): text to
-  image generative model, support for the 1.5, 2.1, SDXL 1.0 and Turbo versions.
+| Backend | Feature | Linux | Windows | macOS | Android | WASM |
+|---------|---------|:-----:|:-------:|:-----:|:-------:|:----:|
+| WGPU | `wgpu` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Vulkan | `vulkan` | ✅ | ✅ | ❌ | ✅ | ❌ |
 
-<img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/stable-diffusion/assets/stable-diffusion-xl.jpg" width="200">
+## License
 
-- [Wuerstchen](./candle-examples/examples/wuerstchen/): another text to
-  image generative model.
+Code in this repository follows upstream Candle dual licensing: [Apache-2.0](./LICENSE-APACHE) and [MIT](./LICENSE-MIT).
 
-<img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/wuerstchen/assets/cat.jpg" width="200">
-
-- [yolo-v3](./candle-examples/examples/yolo-v3/) and
-  [yolo-v8](./candle-examples/examples/yolo-v8/): object detection and pose
-  estimation models.
-
-<img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/yolo-v8/assets/bike.od.jpg" width="200"><img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/yolo-v8/assets/bike.pose.jpg" width="200">
-- [segment-anything](./candle-examples/examples/segment-anything/): image
-  segmentation model with prompt.
-
-<img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/segment-anything/assets/sam_merged.jpg" width="200">
-
-- [SegFormer](./candle-examples/examples/segformer/): transformer based semantic segmentation model.
-- [Whisper](./candle-examples/examples/whisper/): speech recognition model.
-- [EnCodec](./candle-examples/examples/encodec/): high-quality audio compression
-  model using residual vector quantization.
-- [MetaVoice](./candle-examples/examples/metavoice/): foundational model for
-  text-to-speech.
-- [Parler-TTS](./candle-examples/examples/parler-tts/): large text-to-speech
-  model.
-- [T5](./candle-examples/examples/t5), [Bert](./candle-examples/examples/bert/),
-  [JinaBert](./candle-examples/examples/jina-bert/) : useful for sentence embeddings.
-- [DINOv2](./candle-examples/examples/dinov2/): computer vision model trained
-  using self-supervision (can be used for imagenet classification, depth
-  evaluation, segmentation).
-- [VGG](./candle-examples/examples/vgg/),
-  [RepVGG](./candle-examples/examples/repvgg): computer vision models.
-- [BLIP](./candle-examples/examples/blip/): image to text model, can be used to
-  generate captions for an image.
-- [CLIP](./candle-examples/examples/clip/): multi-model vision and language
-  model.
-- [TrOCR](./candle-examples/examples/trocr/): a transformer OCR model, with
-  dedicated submodels for hand-writing and printed recognition.
-- [Marian-MT](./candle-examples/examples/marian-mt/): neural machine translation
-  model, generates the translated text from the input text.
-- [Moondream](./candle-examples/examples/moondream/): tiny computer-vision model 
-  that can answer real-world questions about images.
-
-Run them using commands like:
-```
-cargo run --example quantized --release
-```
-
-In order to use a GPU backend, add the matching feature to the example command
-line: `--features cuda`, `--features metal`, `--features wgpu`, or
-`--features vulkan`. If you have cuDNN installed, use `--features cudnn` for
-even more CUDA speedups.
-
-There are also some wasm examples for whisper and
-[llama2.c](https://github.com/karpathy/llama2.c). You can either build them with
-`trunk` or try them online:
-[whisper](https://huggingface.co/spaces/lmz/candle-whisper),
-[llama2](https://huggingface.co/spaces/lmz/candle-llama2),
-[T5](https://huggingface.co/spaces/radames/Candle-T5-Generation-Wasm),
-[Phi-1.5, and Phi-2](https://huggingface.co/spaces/radames/Candle-Phi-1.5-Wasm),
-[Segment Anything Model](https://huggingface.co/spaces/radames/candle-segment-anything-wasm).
-
-For LLaMA2, run the following command to retrieve the weight files and start a
-test server:
-```bash
-# install target platform 'wasm32-unknown-unknown'
-rustup target add wasm32-unknown-unknown
-
-cd candle-wasm-examples/llama2-c
-wget https://huggingface.co/spaces/lmz/candle-llama2/resolve/main/model.bin
-wget https://huggingface.co/spaces/lmz/candle-llama2/resolve/main/tokenizer.json
-trunk serve --release --port 8081
-```
-And then head over to
-[http://localhost:8081/](http://localhost:8081/).
-
-<!--- ANCHOR: useful_libraries --->
-
-## Useful External Resources
-- [`candle-tutorial`](https://github.com/ToluClassics/candle-tutorial): A
-  very detailed tutorial showing how to convert a PyTorch model to Candle.
-- [`candle-lora`](https://github.com/EricLBuehler/candle-lora): Efficient and
-  ergonomic LoRA implementation for Candle. `candle-lora` has      
-  out-of-the-box LoRA support for many models from Candle, which can be found
-  [here](https://github.com/EricLBuehler/candle-lora/tree/master/candle-lora-transformers/examples).
-- [`candle-video`](https://github.com/FerrisMind/candle-video): Rust library for text-to-video generation (LTX-Video and related models) built on Candle, focused on fast, Python-free inference.
-- [`optimisers`](https://github.com/KGrewal1/optimisers): A collection of optimisers
-  including SGD with momentum, AdaGrad, AdaDelta, AdaMax, NAdam, RAdam, and RMSprop.
-- [`candle-vllm`](https://github.com/EricLBuehler/candle-vllm): Efficient platform for inference and
-  serving local LLMs including an OpenAI compatible API server.
-- [`candle-ext`](https://github.com/mokeyish/candle-ext): An extension library to Candle that provides PyTorch functions not currently available in Candle.
-- [`candle-coursera-ml`](https://github.com/vishpat/candle-coursera-ml): Implementation of ML algorithms from Coursera's [Machine Learning Specialization](https://www.coursera.org/specializations/machine-learning-introduction) course.
-- [`kalosm`](https://github.com/floneum/floneum/tree/master/interfaces/kalosm): A multi-modal meta-framework in Rust for interfacing with local pre-trained models with support for controlled generation, custom samplers, in-memory vector databases, audio transcription, and more.
-- [`candle-sampling`](https://github.com/EricLBuehler/candle-sampling): Sampling techniques for Candle.
-- [`gpt-from-scratch-rs`](https://github.com/jeroenvlek/gpt-from-scratch-rs): A port of Andrej Karpathy's _Let's build GPT_ tutorial on YouTube showcasing the Candle API on a toy problem.
-- [`candle-einops`](https://github.com/tomsanbear/candle-einops): A pure rust implementation of the python [einops](https://github.com/arogozhnikov/einops) library.
-- [`atoma-infer`](https://github.com/atoma-network/atoma-infer): A Rust library for fast inference at scale, leveraging FlashAttention2 for efficient attention computation, PagedAttention for efficient KV-cache memory management, and multi-GPU support. It is OpenAI api compatible.
-- [`llms-from-scratch-rs`](https://github.com/nerdai/llms-from-scratch-rs): A comprehensive Rust translation of the code from Sebastian Raschka's Build an LLM from Scratch book.
-- [`vllm.rs`](https://github.com/guoqingbao/vllm.rs): A minimalist vLLM implementation in Rust based on Candle.
-
-If you have an addition to this list, please submit a pull request.
-
-<!--- ANCHOR_END: useful_libraries --->
-
-<!--- ANCHOR: features --->
-
-## Features
-
-- Simple syntax, looks and feels like PyTorch.
-    - Model training.
-    - Embed user-defined ops/kernels, such as [flash-attention v2](https://github.com/huggingface/candle/blob/89ba005962495f2bfbda286e185e9c3c7f5300a3/candle-flash-attn/src/lib.rs#L152).
-- Backends.
-    - Optimized CPU backend with optional MKL support for x86 and Accelerate for macs.
-    - CUDA backend for efficiently running on NVIDIA GPUs, multiple GPU distribution via NCCL.
-    - Metal backend for Apple GPUs (macOS and iOS).
-    - WGPU backend for cross-platform GPU compute (Vulkan, DX12, Metal).
-    - Vulkan backend for native Vulkan GPU compute on Linux and Windows.
-    - WASM support, run your models in a browser.
-- Included models.
-    - Language Models.
-        - LLaMA v1, v2, and v3 with variants such as SOLAR-10.7B.
-        - Falcon.
-        - StarCoder, StarCoder2.
-        - Phi 1, 1.5, 2, and 3.
-        - Mamba, Minimal Mamba
-        - Gemma v1 2b and 7b+, v2 2b and 9b.
-        - Mistral 7b v0.1.
-        - Mixtral 8x7b v0.1.
-        - StableLM-3B-4E1T, StableLM-2-1.6B, Stable-Code-3B.
-        - Replit-code-v1.5-3B.
-        - Bert.
-        - Yi-6B and Yi-34B.
-        - Qwen1.5, Qwen1.5 MoE, Qwen3 MoE.
-        - RWKV v5 and v6.
-    - Quantized LLMs.
-        - Llama 7b, 13b, 70b, as well as the chat and code variants.
-        - Mistral 7b, and 7b instruct.
-        - Mixtral 8x7b.
-        - Zephyr 7b a and b (Mistral-7b based).
-        - OpenChat 3.5 (Mistral-7b based).
-        - Qwen3 MoE (16B-A3B, 32B-A3B)
-    - Text to text.
-        - T5 and its variants: FlanT5, UL2, MADLAD400 (translation), CoEdit (Grammar correction).
-        - Marian MT (Machine Translation).
-    - Text to image.
-        - Stable Diffusion v1.5, v2.1, XL v1.0.
-        - Wurstchen v2.
-    - Image to text.
-        - BLIP.
-        - TrOCR.
-    - Audio.
-        - Whisper, multi-lingual speech-to-text.
-        - EnCodec, audio compression model.
-        - MetaVoice-1B, text-to-speech model.
-        - Parler-TTS, text-to-speech model.
-    - Computer Vision Models.
-        - DINOv2, ConvMixer, EfficientNet, ResNet, ViT, VGG, RepVGG, ConvNeXT,
-          ConvNeXTv2, MobileOne, EfficientVit (MSRA), MobileNetv4, Hiera, FastViT.
-        - yolo-v3, yolo-v8.
-        - Segment-Anything Model (SAM).
-        - SegFormer.
-- File formats: load models from safetensors, npz, ggml, or PyTorch files.
-- Serverless (on CPU), small and fast deployments.
-- Quantization support using the llama.cpp quantized types.
-
-<!--- ANCHOR_END: features --->
-
-## How to use
-
-<!--- ANCHOR: cheatsheet --->
-Cheatsheet:
-
-|            | Using PyTorch                            | Using Candle                                                     |
-|------------|------------------------------------------|------------------------------------------------------------------|
-| Creation   | `torch.Tensor([[1, 2], [3, 4]])`         | `Tensor::new(&[[1f32, 2.], [3., 4.]], &Device::Cpu)?`           |
-| Creation   | `torch.zeros((2, 2))`                    | `Tensor::zeros((2, 2), DType::F32, &Device::Cpu)?`               |
-| Indexing   | `tensor[:, :4]`                          | `tensor.i((.., ..4))?`                                           |
-| Operations | `tensor.view((2, 2))`                    | `tensor.reshape((2, 2))?`                                        |
-| Operations | `a.matmul(b)`                            | `a.matmul(&b)?`                                                  |
-| Arithmetic | `a + b`                                  | `&a + &b`                                                        |
-| Device     | `tensor.to(device="cuda")`               | `tensor.to_device(&Device::new_cuda(0)?)?`                            |
-| Dtype      | `tensor.to(dtype=torch.float16)`         | `tensor.to_dtype(&DType::F16)?`                                  |
-| Saving     | `torch.save({"A": A}, "model.bin")`      | `candle::safetensors::save(&HashMap::from([("A", A)]), "model.safetensors")?` |
-| Loading    | `weights = torch.load("model.bin")`      | `candle::safetensors::load("model.safetensors", &device)`        |
-
-<!--- ANCHOR_END: cheatsheet --->
-
-
-## Structure
-
-- [candle-core](./candle-core): Core ops, devices, and `Tensor` struct definition
-- [candle-nn](./candle-nn/): Tools to build real models
-- [candle-examples](./candle-examples/): Examples of using the library in realistic settings
-- [candle-kernels](./candle-kernels/): CUDA custom kernels
-- [candle-wgpu-kernels](./candle-wgpu-kernels/): WGPU compute shaders (WGSL)
-- [candle-vulkan-kernels](./candle-vulkan-kernels/): Vulkan compute shaders (SPIR-V)
-- [candle-datasets](./candle-datasets/): Datasets and data loaders.
-- [candle-transformers](./candle-transformers): transformers-related utilities.
-- [candle-flash-attn](./candle-flash-attn): Flash attention v2 layer.
-- [candle-onnx](./candle-onnx/): ONNX model evaluation.
-
-## FAQ
-
-### Why should I use Candle?
-
-<!--- ANCHOR: goals --->
-
-Candle's core goal is to *make serverless inference possible*. Full machine learning frameworks like PyTorch
-are very large, which makes creating instances on a cluster slow. Candle allows deployment of lightweight
-binaries.
-
-Secondly, Candle lets you *remove Python* from production workloads. Python overhead can seriously hurt performance,
-and the [GIL](https://www.backblaze.com/blog/the-python-gil-past-present-and-future/) is a notorious source of headaches.
-
-Finally, Rust is cool! A lot of the HF ecosystem already has Rust crates, like [safetensors](https://github.com/huggingface/safetensors) and [tokenizers](https://github.com/huggingface/tokenizers).
-
-<!--- ANCHOR_END: goals --->
-
-### Other ML frameworks
-
-- [dfdx](https://github.com/coreylowman/dfdx) is a formidable crate, with shapes being included
-  in types. This prevents a lot of headaches by getting the compiler to complain about shape mismatches right off the bat.
-  However, we found that some features still require nightly, and writing code can be a bit daunting for non rust experts.
-
-  We're leveraging and contributing to other core crates for the runtime so hopefully both crates can benefit from each
-  other.
-
-- [burn](https://github.com/burn-rs/burn) is a general crate that can leverage multiple backends so you can choose the best
-  engine for your workload.
-
-- [tch-rs](https://github.com/LaurentMazare/tch-rs.git) Bindings to the torch library in Rust. Extremely versatile, but they 
-  bring in the entire torch library into the runtime. The main contributor of `tch-rs` is also involved in the development
-  of `candle`.
-
-### Common Errors
-
-#### Missing symbols when compiling with the mkl feature.
-
-If you get some missing symbols when compiling binaries/tests using the mkl
-or accelerate features, e.g. for mkl you get:
-```
-  = note: /usr/bin/ld: (....o): in function `blas::sgemm':
-          .../blas-0.22.0/src/lib.rs:1944: undefined reference to `sgemm_' collect2: error: ld returned 1 exit status
-
-  = note: some `extern` functions couldn't be found; some native libraries may need to be installed or have their path specified
-  = note: use the `-l` flag to specify native libraries to link
-  = note: use the `cargo:rustc-link-lib` directive to specify the native libraries to link with Cargo
-```
-or for accelerate:
-```
-Undefined symbols for architecture arm64:
-            "_dgemm_", referenced from:
-                candle_core::accelerate::dgemm::h1b71a038552bcabe in libcandle_core...
-            "_sgemm_", referenced from:
-                candle_core::accelerate::sgemm::h2cf21c592cba3c47 in libcandle_core...
-          ld: symbol(s) not found for architecture arm64
-```
-
-This is likely due to a missing linker flag that was needed to enable the mkl library. You
-can try adding the following for mkl at the top of your binary:
-```rust
-extern crate intel_mkl_src;
-```
-or for accelerate:
-```rust
-extern crate accelerate_src;
-```
-
-#### Cannot run the LLaMA examples: access to source requires login credentials
-
-```
-Error: request error: https://huggingface.co/meta-llama/Llama-2-7b-hf/resolve/main/tokenizer.json: status code 401
-```
-
-This is likely because you're not permissioned for the LLaMA-v2 model. To fix
-this, you have to register on the huggingface-hub, accept the [LLaMA-v2 model
-conditions](https://huggingface.co/meta-llama/Llama-2-7b-hf), and set up your
-authentication token. See issue
-[#350](https://github.com/huggingface/candle/issues/350) for more details.
-
-#### Docker build
-
-When building CUDA kernels inside a Dockerfile, nvidia-smi cannot be used to auto-detect compute capability.
-
-You must explicitly set CUDA_COMPUTE_CAP, for example:
-
-```
-FROM nvidia/cuda:12.9.0-devel-ubuntu22.04
-
-# Install git and curl
-RUN set -eux; \
-  apt-get update; \
-  apt-get install -y curl git ca-certificates;
-
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-
-# Clone candle repo
-RUN git clone https://github.com/huggingface/candle.git
-
-# Set compute capability for the build
-ARG CUDA_COMPUTE_CAP=90
-ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
-
-# Build with explicit compute cap
-WORKDIR /app
-COPY . .
-RUN cargo build --release features cuda
-```
-
-#### Compiling with flash-attention fails
-
-```
-/usr/include/c++/11/bits/std_function.h:530:146: error: parameter packs not expanded with ‘...’:
-```
-
-This is a bug in gcc-11 triggered by the Cuda compiler. To fix this, install a different, supported gcc version - for example gcc-10, and specify the path to the compiler in the NVCC_CCBIN environment variable.
-```
-env NVCC_CCBIN=/usr/lib/gcc/x86_64-linux-gnu/10 cargo ...
-```
-
-#### Linking error on windows when running rustdoc or mdbook tests
-
-```
-Couldn't compile the test.
----- .\candle-book\src\inference\hub.md - Using_the_hub::Using_in_a_real_model_ (line 50) stdout ----
-error: linking with `link.exe` failed: exit code: 1181
-//very long chain of linking
- = note: LINK : fatal error LNK1181: cannot open input file 'windows.0.48.5.lib'
-```
-
-Make sure you link all native libraries that might be located outside a project target, e.g., to run mdbook tests, you should run:
-
-```
-mdbook test candle-book -L .\target\debug\deps\ `
--L native=$env:USERPROFILE\.cargo\registry\src\index.crates.io-6f17d22bba15001f\windows_x86_64_msvc-0.42.2\lib `
--L native=$env:USERPROFILE\.cargo\registry\src\index.crates.io-6f17d22bba15001f\windows_x86_64_msvc-0.48.5\lib
-```
-
-#### Extremely slow model load time with WSL
-
-This may be caused by the models being loaded from `/mnt/c`, more details on
-[stackoverflow](https://stackoverflow.com/questions/68972448/why-is-wsl-extremely-slow-when-compared-with-native-windows-npm-yarn-processing).
-
-#### Tracking down errors
-
-You can set `RUST_BACKTRACE=1` to be provided with backtraces when a candle
-error is generated.
-
-#### CudaRC error
-
-If you encounter an error like this one `called `Result::unwrap()` on an `Err` value: LoadLibraryExW { source: Os { code: 126, kind: Uncategorized, message: "The specified module could not be found." } }` on windows. To fix copy and rename these 3 files (make sure they are in path). The paths depend on your cuda version.
-`c:\Windows\System32\nvcuda.dll` -> `cuda.dll`
-`c:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin\cublas64_12.dll` -> `cublas.dll`
-`c:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin\curand64_10.dll` -> `curand.dll`
+Upstream model weights keep their original licenses and usage restrictions.
