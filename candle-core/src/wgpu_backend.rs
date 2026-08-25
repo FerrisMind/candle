@@ -717,6 +717,12 @@ struct WgpuElemBgKey {
     shader_len: usize,
     /// All storage buffer object ids (excludes trailing uniform).
     storage_ptrs: Vec<usize>,
+    /// Logical binding range size (bytes) of each storage buffer, aligned with
+    /// `storage_ptrs`. A buffer reused for a DIFFERENT logical size (best-fit
+    /// pool reuse) must produce a FRESH bind group, since the cached bind group
+    /// carries the binding range of its first use. Keying by the binding size
+    /// makes the cache correct across cross-size reuse.
+    storage_sizes: Vec<u64>,
 }
 
 struct WgpuPendingDispatch {
@@ -1237,11 +1243,35 @@ impl WgpuDevice {
         // ~1 GiB VRAM is used. Poll-only (never `wait_indefinitely`) so we do
         // not serialize the pipeline.
         self.maybe_flush_storage_pool_pending();
-        if let Ok(mut pool) = self.inner.storage_buffer_pool.lock() {
-            if let Some(bucket) = pool.get_mut(&key) {
-                if let Some(arc) = bucket.pop() {
-                    return arc;
-                }
+        // F6: best-fit size-class reuse. The prior exact-size-only lookup made
+        // the free pool thrash under SD-512: the ~1 GiB byte cap evicted the
+        // reusable 2.5MiB/10MiB conv/attention intermediates, which were then
+        // immediately re-carved fresh, so gpu-allocator kept claiming new device
+        // blocks and OOM'd near 12 GiB. Reuse the SMALLEST pooled buffer with
+        // size >= requested. Storage bindings use the logical tensor range
+        // (buffer_binding_range size_bytes from num_elems*dtype), so a larger
+        // buffer is safe. Collapses similar SD scratch sizes onto fewer classes
+        // -> far fewer fresh carves. Correctness is preserved because the
+        // elementwise bind-group cache key now includes per-storage-buffer
+        // binding sizes (see WgpuElemBgKey.storage_sizes), so reusing a buffer
+        // for a different logical size can never hit a stale bind group.
+        if let Some(arc) = self.take_reusable_from_pool(key) {
+            return arc;
+        }
+        // F6 pressure-reclaim: we are about to carve a fresh device block. Before
+        // doing so, poll completed submissions (recycling their now-sole-owner
+        // buffers into `pending`) and promote pending -> free pool, then retry
+        // best-fit. This releases in-flight intermediate buffers immediately
+        // instead of holding them until a (rare) >=16MiB alloc / synchronize, so
+        // SD-512's mostly-small scratch buffers get reused within the forward.
+        // Poll-only: never `wait_indefinitely` here (the 32-in-flight cap in
+        // flush_active_batch already does the blocking wait). Env-gated so the
+        // pre-fix behavior is reproducible (CANDLE_WGPU_NO_PRESSURE=1).
+        if std::env::var("CANDLE_WGPU_NO_PRESSURE").is_err() {
+            let _ = self.cleanup_pending_submissions(false);
+            self.flush_storage_pool_pending();
+            if let Some(arc) = self.take_reusable_from_pool(key) {
+                return arc;
             }
         }
         let buffer = self.inner.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1253,6 +1283,28 @@ impl WgpuDevice {
             mapped_at_creation: false,
         });
         Arc::new(buffer)
+    }
+
+    /// Best-fit storage reuse: pop the SMALLEST pooled buffer that is at least
+    /// the requested `key` bytes. Bounding the search to buffers that fit the
+    /// request keeps a large buffer from being consumed by a small tensor when
+    /// a smaller pooled buffer is available (fair reuse of scarce VRAM).
+    fn take_reusable_from_pool(&self, key: u64) -> Option<Arc<wgpu::Buffer>> {
+        let mut pool = self.inner.storage_buffer_pool.lock().ok()?;
+        // Fast path: exact size-class present and non-empty.
+        if let Some(bucket) = pool.get_mut(&key) {
+            if let Some(arc) = bucket.pop() {
+                return Some(arc);
+            }
+        }
+        // Slow path: smallest existing size-class with size >= key.
+        let mut best_key: Option<u64> = None;
+        for (k, bucket) in pool.iter_mut() {
+            if *k >= key && !bucket.is_empty() && best_key.map(|bk| *k < bk).unwrap_or(true) {
+                best_key = Some(*k);
+            }
+        }
+        best_key.and_then(|bk| pool.get_mut(&bk).and_then(|b| b.pop()))
     }
 
     /// Opportunistically recycle dropped storage buffers back into the free
@@ -1354,7 +1406,14 @@ impl WgpuDevice {
         // exceeded we DROP the Arc so the wgpu buffer is destroyed and its
         // sub-allocation returns to gpu-allocator, instead of recycling it.
         const BUCKET_CAP: usize = 8;
-        const MAX_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB of pooled buffers
+        // F6: raise the pooled-bytes ceiling. The D2.3 1 GiB cap was sized for the
+        // KV-cat monotonic-growth case, but it made SD-512 drop the ~1 GiB f32
+        // attention-score intermediate every time it was recycled (total_bytes
+        // + 1 GiB > cap), forcing a fresh carve and a fresh gpu-allocator block
+        // on each forward -> the peak compounded to ~11.8 GiB. The larger
+        // ceiling lets that big intermediate survive in the free pool and be
+        // reused across steps, avoiding the re-carve.
+        const MAX_BYTES: usize = 3 * 1024 * 1024 * 1024; // 3 GiB of pooled buffers
         let pending = match self.inner.storage_pool_pending.lock() {
             Ok(mut g) => std::mem::take(&mut *g),
             Err(_) => return,
@@ -2110,11 +2169,19 @@ impl WgpuDevice {
         // smoke suite under allocation churn).
         let cacheable = use_immediates || (!dynamic_offsets.is_empty() && bindings.len() >= 3);
         let bind_group = if cacheable {
-            let ptrs: Vec<usize> = bindings
+            let ptrs: Vec<(usize, u64)> = bindings
                 .iter()
                 .filter_map(|e| match &e.resource {
                     wgpu::BindingResource::Buffer(bb) => {
-                        Some(self.buffer_oid(bb.buffer) as usize)
+                        // Binding size: the logical range for storage_buffer_binding /
+                        // buffer_binding_range, or the whole-buffer size for
+                        // as_entire_binding (size=None). Included in the cache key so
+                        // cross-size reuse never aliases a stale bind-group range.
+                        let size = bb
+                            .size
+                            .map(|s| s.get())
+                            .unwrap_or_else(|| bb.buffer.size());
+                        Some((self.buffer_oid(bb.buffer) as usize, size))
                     }
                     other => {
                         let _ = other;
@@ -2123,10 +2190,17 @@ impl WgpuDevice {
                 })
                 .collect();
             let storage_ptrs = if use_immediates {
-                ptrs
+                ptrs.iter().map(|(o, _)| *o).collect::<Vec<_>>()
             } else if ptrs.len() >= 3 {
                 // Last ptr is the uniform params buffer; rest are storage.
-                ptrs[..ptrs.len() - 1].to_vec()
+                ptrs[..ptrs.len() - 1].iter().map(|(o, _)| *o).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let storage_sizes = if use_immediates {
+                ptrs.iter().map(|(_, s)| *s).collect::<Vec<_>>()
+            } else if ptrs.len() >= 3 {
+                ptrs[..ptrs.len() - 1].iter().map(|(_, s)| *s).collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
@@ -2135,6 +2209,7 @@ impl WgpuDevice {
                     shader_hash,
                     shader_len,
                     storage_ptrs,
+                    storage_sizes,
                 };
                 let mut cache = self
                     .inner
@@ -5524,7 +5599,7 @@ impl WgpuStorage {
         }
         let needs_materialize = !layout.is_contiguous()
             || layout.start_offset() != 0
-            || (layout.start_offset().saturating_mul(elem_size)) % align != 0;
+            || !(layout.start_offset().saturating_mul(elem_size)).is_multiple_of(align);
         if needs_materialize {
             let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
             <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
