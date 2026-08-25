@@ -7642,16 +7642,11 @@ impl VulkanStorage {
             let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
             return out_f32.to_dtype(&out_l, DType::BF16);
         }
-        // ponytail: F16 — upconvert to F32 for matmul, matching wgpu fix.
-        if self.dtype == DType::F16 {
-            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
-            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
-            let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
-            let rhs_f32_l = Layout::contiguous(rhs_l.shape().clone());
-            let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
-            let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
-            return out_f32.to_dtype(&out_l, DType::F16);
-        }
+        // F16: dispatch directly to the `matmul_f16_fp32` kernel, which binds the
+        // ORIGINAL F16 weights and accumulates in f32. Previously the whole weight
+        // was upconverted to F32 via `to_dtype` (an f32 copy of e.g. lm_head
+        // [128256, 2048] ~1 GiB on EVERY decode step) which ballooned VRAM. Keep
+        // f32 accumulation for numeric parity with the cpu/wgpu reference.
         if self.dtype != DType::F32
             && self.dtype != DType::F16
             && self.dtype != DType::BF16
