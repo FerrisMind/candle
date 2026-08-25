@@ -519,6 +519,12 @@ pub struct VulkanDevice {
     inner: Arc<VulkanInner>,
 }
 
+// Same wgpu/ash auto-trait recursion overflow (E0275) as WgpuDevice: fields are
+// genuinely Send+Sync (ash::Entry/Instance and vk handles are Send+Sync), but
+// rustc's solver recurses too deep. Short-circuit explicitly.
+unsafe impl Send for VulkanDevice {}
+unsafe impl Sync for VulkanDevice {}
+
 struct VulkanInner {
     ordinal: usize,
     physical_device_name: String,
@@ -570,6 +576,12 @@ struct VulkanInner {
     /// Staging buffers whose GPU references have been released and are pending
     /// return to the pool (drained during cleanup).
     staging_pending_return: Mutex<Vec<Arc<VulkanBuffer>>>,
+    /// Pool of reusable non-staging GPU compute buffers, keyed by exact byte
+    /// size. MoE per-layer dequant buffers are allocated with identical sizes
+    /// every layer; recycling them here (analogous to the staging pool) stops
+    /// the allocator from accumulating transient buffers across layers, which
+    /// otherwise surfaces as monotonic VRAM growth and OOM on 12GB cards.
+    gpu_buffer_pool: Mutex<HashMap<usize, Vec<Arc<VulkanBuffer>>>>,
 }
 
 impl VulkanDevice {
@@ -883,6 +895,11 @@ pub struct VulkanStorage {
     count: usize,
     dtype: DType,
 }
+
+// Fields are genuinely Send+Sync (Arc<VulkanBuffer> + VulkanDevice). See the
+// note on `unsafe impl Send/Sync for VulkanDevice` for the recursion reason.
+unsafe impl Send for VulkanStorage {}
+unsafe impl Sync for VulkanStorage {}
 
 fn unsupported(op: &'static str) -> Error {
     Error::Msg(format!("vulkan backend op {op} not implemented")).bt()
@@ -1589,6 +1606,11 @@ impl VulkanDevice {
     const CLEANUP_DEBT_THRESHOLD: u32 = 32;
     /// Maximum number of staging buffers per size class in the pool.
     const MAX_STAGING_PER_SIZE_CLASS: usize = 32;
+    /// Maximum number of reusable non-staging GPU buffers retained per size
+    /// class in `gpu_buffer_pool` before overflowing to the deferred-free
+    /// list. Kept small: MoE reuses a handful of distinct sizes, and larger
+    /// values only hoard memory that could otherwise return to the allocator.
+    const MAX_GPU_POOL_PER_SIZE_CLASS: usize = 4;
 
     fn copy_queue_and_family(
         &self,
@@ -2082,6 +2104,22 @@ impl VulkanDevice {
     }
 
     fn create_buffer(&self, size: usize, name: &'static str) -> Result<Arc<VulkanBuffer>> {
+        // Reuse a pooled non-staging buffer of the exact requested size before
+        // allocating a fresh one. Pooled buffers are only returned to the pool
+        // after every submission referencing them completes (they are retained
+        // via `batch.retained_buffers` Arc clones), so reusing them is safe and
+        // skips the allocator's deferred-free round-trip — which otherwise
+        // accumulates per-layer dequant buffers on MoE prefill and grows VRAM
+        // monotonically (the reported vulkan OOM). Mirror of the staging pool.
+        if size > 0 {
+            if let Some(buf) = self.take_pooled_gpu_buffer(size)? {
+                // Pool hit: still advance the amortized cleanup counter so fence
+                // polling and deferred-drain cadence are maintained even though
+                // we skip the allocation path below.
+                self.cleanup_pending_submissions_amortized()?;
+                return Ok(buf);
+            }
+        }
         self.create_buffer_with_location(
             size,
             name,
@@ -2093,6 +2131,17 @@ impl VulkanDevice {
             false,
             StagingKind::None,
         )
+    }
+
+    /// Pop a reusable non-staging compute buffer of the exact byte `size` from
+    /// the recycle pool, if one is available.
+    fn take_pooled_gpu_buffer(&self, size: usize) -> Result<Option<Arc<VulkanBuffer>>> {
+        let mut pool = self
+            .inner
+            .gpu_buffer_pool
+            .lock()
+            .map_err(|e| Error::wrap(e.to_string()))?;
+        Ok(pool.get_mut(&size).and_then(|entry| entry.pop()))
     }
 
     /// Power-of-two size class for staging buffer pooling.
@@ -9299,7 +9348,31 @@ impl Drop for VulkanBuffer {
                         return;
                     }
                 }
-                // Non-staging buffers always route through the device-level
+                // Non-staging GPU compute buffers: recycle into the exact-size
+                // reuse pool before falling back to the deferred-free list.
+                // Pooled buffers are retained via `retained_buffers` until every
+                // referencing submission completes, so a buffer reaching this
+                // point is confirmed free of in-flight GPU work — making reuse
+                // safe. This is what lets per-layer MoE dequant buffers (fixed
+                // per-layer sizes) be recycled instead of re-allocated, which is
+                // the allocator accumulation that caused the vulkan prefill OOM.
+                if self.size > 0 {
+                    if let Ok(mut pool) = self.device.inner.gpu_buffer_pool.lock() {
+                        let entry = pool.entry(self.size).or_default();
+                        if entry.len() < VulkanDevice::MAX_GPU_POOL_PER_SIZE_CLASS {
+                            entry.push(Arc::new(VulkanBuffer {
+                                device: self.device.clone(),
+                                buffer: self.buffer,
+                                allocation: Mutex::new(Some(allocation)),
+                                size: self.size,
+                                is_staging: self.is_staging,
+                                staging_kind: self.staging_kind,
+                            }));
+                            return;
+                        }
+                    }
+                }
+                // Pool full (or 0-byte buffer): route through the device-level
                 // deferred-free list: the actual `allocator.free` runs in
                 // `destroy_deferred_buffers` under the allocator lock (never
                 // here — VulkanBuffer::drop can run while that lock is held).
@@ -9428,7 +9501,11 @@ impl Drop for VulkanInner {
                             }
                         }
                     }
-                    for pool in [&self.upload_staging_pool, &self.readback_staging_pool] {
+                    for pool in [
+                        &self.upload_staging_pool,
+                        &self.readback_staging_pool,
+                        &self.gpu_buffer_pool,
+                    ] {
                         if let Ok(mut pool) = pool.lock() {
                             for (_, bufs) in pool.drain() {
                                 for buf in bufs {
@@ -10763,6 +10840,7 @@ impl BackendDevice for VulkanDevice {
             upload_staging_pool: Mutex::new(HashMap::default()),
             readback_staging_pool: Mutex::new(HashMap::default()),
             staging_pending_return: Mutex::new(Vec::new()),
+            gpu_buffer_pool: Mutex::new(HashMap::default()),
         });
         // Device cache: `Device::new_vulkan(ordinal)` is called per test /
         // per component in the wild, but VulkanInner holds GPU resources that

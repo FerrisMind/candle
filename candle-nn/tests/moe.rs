@@ -146,3 +146,69 @@ fn moe_gemm_gguf_cpu_fallback() -> Result<()> {
     assert_close_2d(&gguf.to_vec2::<f32>()?, &dense_ref.to_vec2::<f32>()?, 1e-3);
     Ok(())
 }
+
+#[test]
+#[ignore = "requires a usable Vulkan compute device and driver"]
+#[cfg(feature = "vulkan")]
+fn moe_gemm_gguf_vulkan() -> Result<()> {
+    let device = Device::new_vulkan(0)?;
+    // Same tiny synthetic MoE as the CPU fallback test, but on the Vulkan
+    // device: exercises the dequantize -> index_select -> matmul dequant
+    // fallback path that previously accumulated per-layer buffers (vulkan
+    // prefill OOM). Runs through the same heavy `moe_gemm_gguf_*` API used by
+    // quantized_qwen3_moe so the allocator reuse pool is hit on repeated calls.
+    let input_data = (1..=32).map(|v| v as f32 / 8.0).collect::<Vec<_>>();
+    let input = Tensor::from_vec(input_data, (1, 32), &device)?;
+    let weight_data = (0..(2 * 2 * 32))
+        .map(|v| (v as f32 - 64.0) / 32.0)
+        .collect::<Vec<_>>();
+    let dense_weights = Tensor::from_vec(weight_data, (2, 2, 32), &device)?;
+    let qweights = QTensor::quantize(&dense_weights, GgmlDType::Q8_0)?;
+
+    let topk_ids = Tensor::new(&[[1u32, 0u32]], &device)?;
+    let (expert_ids, sorted_token_ids) = topk_ids.flatten_all()?.sort_last_dim(true)?;
+
+    // Reference: dense matmul against the dequantized weights.
+    let dense_ref = candle_nn::moe::moe_gemm(
+        &input,
+        &qweights.dequantize(&device)?,
+        &None,
+        &sorted_token_ids,
+        &expert_ids,
+        2,
+        false,
+    )?;
+
+    // Prefill path (is_prefill=true) is the one that OOM'd; exercise it a few
+    // times across "layers" so the reuse pool must recycle the same buffers.
+    // The vulkan path returns [batch, topk, n] and the caller reshapes+sums, so
+    // compare flattened values against the dense reference (shape-independent).
+    let dense_flat = dense_ref.flatten_all()?.to_vec1::<f32>()?;
+    let mut prev: Option<Vec<f32>> = None;
+    for _ in 0..4 {
+        let gguf = candle_nn::moe::moe_gemm_gguf(
+            &input,
+            &qweights,
+            &None,
+            &sorted_token_ids,
+            &expert_ids,
+            2,
+            true,
+            DType::F32,
+        )?;
+        let vals = gguf.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(vals.len(), dense_flat.len(), "flattened length mismatch");
+        for (i, (a, e)) in vals.iter().zip(dense_flat.iter()).enumerate() {
+            // Fused quantized indexed-MoE accumulates in a different order than
+            // the dense dequant+matmul reference, so use a relative tolerance.
+            let tol = 1e-3 * e.abs().max(1.0) + 1e-3;
+            assert!(
+                (a - e).abs() <= tol,
+                "mismatch at {i}: got {a}, expected {e}, tol {tol}"
+            );
+        }
+        prev = Some(vals);
+    }
+    assert!(prev.is_some());
+    Ok(())
+}
