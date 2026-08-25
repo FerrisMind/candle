@@ -68,3 +68,6 @@ AGENTS.md
 cuda-wgpu-vulkan-parity-matrix.md
 wgpu-vulkan-parity-audit.md
 profiling/
+
+# agent-swarm orchestration artifacts (plans, worker results, archived patches)
+.swarm/
