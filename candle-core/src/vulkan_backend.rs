@@ -547,6 +547,7 @@ struct VulkanInner {
     max_workgroup_size_log2: u32,
     max_workgroup_count_x: u32,
     max_workgroup_count_y: u32,
+    max_workgroup_count_z: u32,
     max_push_constants_size: u32,
     robust_buffer_access: bool,
     vulkan_memory_model: bool,
@@ -7083,8 +7084,17 @@ impl VulkanStorage {
     }
 
     pub fn sigmoid(&self, layout: &Layout) -> Result<Self> {
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 && self.dtype != DType::BF16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan sigmoid").bt());
+        }
+        if self.dtype == DType::BF16 {
+            // CUDA parity: emulate via an F32 hub so the BF16 result is computed
+            // in f32 precision rather than a dedicated BF16 shader.
+            let src_f32 = self.to_dtype(layout, DType::F32)?;
+            let src_f32_l = Layout::contiguous(layout.shape().clone());
+            let out_f32 = src_f32.sigmoid(&src_f32_l)?;
+            let out_l = Layout::contiguous(layout.shape().clone());
+            return out_f32.to_dtype(&out_l, DType::BF16);
         }
         let (spirv, kind) = unary_spirv("sigmoid", self.dtype)?;
         match kind {
@@ -8157,14 +8167,21 @@ impl VulkanStorage {
         ];
         let spirv = candle_vulkan_kernels::spirv("im2col_f32")
             .ok_or_else(|| Error::Msg("vulkan shader im2col_f32 not generated".into()).bt())?;
+        // Clamp each dispatch dimension to the device limit. The im2col kernel
+        // grid-strides over any remainder (ow += gl_NumWorkGroups.y etc), so a
+        // clamped count stays correct even when l_out/w_out exceeds the common
+        // maxComputeWorkGroupCount of 65535.
+        let gx: u32 = chw.div_ceil(512).try_into()?;
+        let gy: u32 = l_out.try_into()?;
+        let gz: u32 = params.b_size.try_into()?;
         self.device.run_compute_specialized(
             spirv,
             &bindings,
             Some(any_as_bytes(&push)),
             (
-                chw.div_ceil(512).try_into()?,
-                l_out.try_into()?,
-                params.b_size.try_into()?,
+                gx.min(self.device.inner.max_workgroup_count_x).max(1),
+                gy.min(self.device.inner.max_workgroup_count_y).max(1),
+                gz.min(self.device.inner.max_workgroup_count_z).max(1),
             ),
             Some(&[(0, 32)]),
         )?;
@@ -8264,14 +8281,17 @@ impl VulkanStorage {
         ];
         let spirv = candle_vulkan_kernels::spirv("im2col_f32")
             .ok_or_else(|| Error::Msg("vulkan shader im2col_f32 not generated".into()).bt())?;
+        let gx: u32 = chw.div_ceil(512).try_into()?;
+        let gy: u32 = w_out.try_into()?;
+        let gz: u32 = (params.b_size * h_out).try_into()?;
         self.device.run_compute_specialized(
             spirv,
             &bindings,
             Some(any_as_bytes(&push)),
             (
-                chw.div_ceil(512).try_into()?,
-                w_out.try_into()?,
-                (params.b_size * h_out).try_into()?,
+                gx.min(self.device.inner.max_workgroup_count_x).max(1),
+                gy.min(self.device.inner.max_workgroup_count_y).max(1),
+                gz.min(self.device.inner.max_workgroup_count_z).max(1),
             ),
             Some(&[(0, 32)]),
         )?;
@@ -10648,6 +10668,11 @@ impl BackendDevice for VulkanDevice {
             .limits
             .max_compute_work_group_count[1]
             .max(1);
+        let max_workgroup_count_z = physical_device_properties
+            .properties
+            .limits
+            .max_compute_work_group_count[2]
+            .max(1);
         let max_push_constants_size = physical_device_properties
             .properties
             .limits
@@ -10877,6 +10902,7 @@ impl BackendDevice for VulkanDevice {
             max_workgroup_size_log2,
             max_workgroup_count_x,
             max_workgroup_count_y,
+            max_workgroup_count_z,
             max_push_constants_size,
             robust_buffer_access,
             vulkan_memory_model,
