@@ -1618,6 +1618,13 @@ impl VulkanDevice {
     /// values only hoard memory that could otherwise return to the allocator.
     const MAX_GPU_POOL_PER_SIZE_CLASS: usize = 4;
 
+    /// Weight buffers at or above this size are allocated as dedicated exact-sized
+    /// blocks instead of sub-allocation into shared blocks. Large enough that the
+    /// per-buffer dedicated overhead is negligible, small enough that the dominant
+    /// weight tensors (the 16B MoE gate/down/up projections, ~16-255MB) are all
+    /// dedicated and stop leaving intra-block slack in 256MB gpu-allocator blocks.
+    const WEIGHT_DEDICATED_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+
     fn copy_queue_and_family(
         &self,
         prefer_transfer: bool,
@@ -2025,6 +2032,7 @@ impl VulkanDevice {
         self.inner.vendor_id
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_buffer_with_location(
         &self,
         size: usize,
@@ -2033,6 +2041,7 @@ impl VulkanDevice {
         location: MemoryLocation,
         is_staging: bool,
         staging_kind: StagingKind,
+        dedicated_allocation: bool,
     ) -> Result<Arc<VulkanBuffer>> {
         self.cleanup_pending_submissions_amortized()?;
         let mut info = vk::BufferCreateInfo::default()
@@ -2053,6 +2062,14 @@ impl VulkanDevice {
         let buffer =
             unsafe { self.inner.device.create_buffer(&info, None) }.map_err(Error::wrap)?;
         let requirements = unsafe { self.inner.device.get_buffer_memory_requirements(buffer) };
+        let alloc_scheme = if dedicated_allocation {
+            // Dedicated, exact-sized block per weight tensor: avoids the intra-block
+            // slack from sub-allocating many mid-size weights into shared 256MB
+            // blocks (measured ~754MB slack on the 16B MoE). Load-time only.
+            AllocationScheme::DedicatedBuffer(buffer)
+        } else {
+            AllocationScheme::GpuAllocatorManaged
+        };
         let allocate_once = || -> Result<Allocation> {
             let mut allocator = self
                 .inner
@@ -2068,7 +2085,7 @@ impl VulkanDevice {
                     requirements,
                     location,
                     linear: true,
-                    allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+                    allocation_scheme: alloc_scheme,
                 })
                 .map_err(Error::wrap)
         };
@@ -2136,6 +2153,25 @@ impl VulkanDevice {
             MemoryLocation::GpuOnly,
             false,
             StagingKind::None,
+            false,
+        )
+    }
+
+    /// Create a dedicated, exact-sized device-local buffer. Used for weight-load
+    /// buffers whose sizes are large enough that sub-allocating them into shared
+    /// blocks leaves significant intra-block slack (see create_buffer_with_location).
+    fn create_dedicated_buffer(&self, size: usize, name: &'static str) -> Result<Arc<VulkanBuffer>> {
+        self.create_buffer_with_location(
+            size,
+            name,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::UNIFORM_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuOnly,
+            false,
+            StagingKind::None,
+            true,
         )
     }
 
@@ -2179,6 +2215,7 @@ impl VulkanDevice {
                     location,
                     false,
                     StagingKind::None,
+                    false,
                 );
             }
         };
@@ -2207,7 +2244,7 @@ impl VulkanDevice {
         }
         // Pool miss: create a new buffer with the requested size (not size_class)
         // to avoid allocating more than needed.
-        self.create_buffer_with_location(size, name, usage, location, true, staging_kind)
+        self.create_buffer_with_location(size, name, usage, location, true, staging_kind, false)
     }
 
     /// Drain the staging pending return list into the free pools.
@@ -10934,7 +10971,16 @@ impl BackendDevice for VulkanDevice {
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
         let (dtype, count, bytes) = cpu_storage_to_bytes(storage)?;
-        let buffer = self.create_buffer(bytes.len(), "candle-vulkan-upload")?;
+        // Weights at/above this size are given a dedicated exact-sized block so
+        // they do not leave intra-block slack when sub-allocated into shared
+        // 256MB blocks (measured ~754MB slack on the 16B MoE). Small weights
+        // stay sub-allocated (they pack tightly with negligible slack and avoid
+        // per-dedicated tiny-allocation driver overhead).
+        let buffer = if bytes.len() >= Self::WEIGHT_DEDICATED_THRESHOLD_BYTES {
+            self.create_dedicated_buffer(bytes.len(), "candle-vulkan-upload")?
+        } else {
+            self.create_buffer(bytes.len(), "candle-vulkan-upload")?
+        };
         self.write_buffer(&buffer, &bytes)?;
         Ok(VulkanStorage {
             buffer,
