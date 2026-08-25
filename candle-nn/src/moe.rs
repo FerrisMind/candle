@@ -112,16 +112,20 @@ fn moe_gemm_fallback(
     Ok(out)
 }
 
-// Vulkan: dequantize ONLY the routed experts, keeping the per-layer QTensor
-// weights quantized on-device. This is the memory-efficient equivalent of the
-// CUDA `moe_gemm_gguf[_prefill]` kernel. The dense fallback (used by cpu/metal/
-// wgpu and any non-vulkan device) fully dequantizes [num_experts, n, k] every
+// GPU (Vulkan/Wgpu): dequantize ONLY the routed experts, keeping the per-layer
+// QTensor weights quantized on-device. This is the memory-efficient equivalent
+// of the CUDA `moe_gemm_gguf[_prefill]` kernel. The dense fallback (used by
+// cpu/metal and any non-gpu device) fully dequantizes [num_experts, n, k] every
 // forward, which on a 9.75GB 12GB-card MoE pushes prefill past the VRAM budget
 // even with an otherwise-recycling allocator (verified: peak, not accumulation,
-// because the pool recycles with deferred/pending empty yet OOMs).
-#[cfg(feature = "vulkan")]
+// because the pool recycles with deferred/pending empty yet OOMs). The body is
+// device-generic: `QTensor::indexed_moe_forward` dispatches internally to the
+// backend-specific fused kernel (VegaQuant / wgpu `quantized_indexed_moe_f32`),
+// so this single function serves both the vulkan and wgpu devices. Gating on
+// `feature = "wgpu"`/`"vulkan"` keeps the branch out of cpu/cuda/metal builds.
+#[cfg(any(feature = "vulkan", feature = "wgpu"))]
 #[allow(clippy::too_many_arguments)]
-fn moe_gemm_gguf_vulkan(
+fn moe_gemm_gguf_fused(
     input: &Tensor,
     weights: &QTensor,
     topk_weights: &Option<Tensor>,
@@ -130,20 +134,20 @@ fn moe_gemm_gguf_vulkan(
     topk: usize,
 ) -> Result<Tensor> {
     if topk == 0 {
-        candle::bail!("moe_gemm_gguf_vulkan topk must be > 0")
+        candle::bail!("moe_gemm_gguf_fused topk must be > 0")
     }
     let (num_experts, size_n, _size_k) = weights.shape().dims3()?;
     let assignments = sorted_token_ids.dim(0)?;
     if assignments != experts_ids.dim(0)? {
         candle::bail!(
-            "moe_gemm_gguf_vulkan id length mismatch: {} vs {}",
+            "moe_gemm_gguf_fused id length mismatch: {} vs {}",
             assignments,
             experts_ids.dim(0)?
         );
     }
     if assignments % topk != 0 {
         candle::bail!(
-            "moe_gemm_gguf_vulkan assignments ({assignments}) must be divisible by topk ({topk})"
+            "moe_gemm_gguf_fused assignments ({assignments}) must be divisible by topk ({topk})"
         )
     }
     let batch = assignments / topk;
@@ -167,7 +171,7 @@ fn moe_gemm_gguf_vulkan(
     let max_expert_id = pos_to_expert.max_all()?.to_scalar::<u32>()? as usize;
     if max_expert_id >= num_experts {
         candle::bail!(
-            "moe_gemm_gguf_vulkan expert id {max_expert_id} out of range for {num_experts} experts"
+            "moe_gemm_gguf_fused expert id {max_expert_id} out of range for {num_experts} experts"
         );
     }
     let ids = pos_to_expert.reshape((batch, topk))?;
@@ -184,7 +188,7 @@ fn moe_gemm_gguf_vulkan(
     }
     if out.rank() != 3 || out.shape() != &candle::Shape::from((batch, topk, size_n)) {
         candle::bail!(
-            "moe_gemm_gguf_vulkan produced unexpected output shape {:?}, expected ({batch}, {topk}, {size_n})",
+            "moe_gemm_gguf_fused produced unexpected output shape {:?}, expected ({batch}, {topk}, {size_n})",
             out.shape()
         );
     }
@@ -202,11 +206,13 @@ fn moe_gemm_gguf_fallback(
     is_prefill: bool,
     dtype: DType,
 ) -> Result<Tensor> {
-    #[cfg(feature = "vulkan")]
+    #[cfg(any(feature = "vulkan", feature = "wgpu"))]
     {
-        // Route the Vulkan device through the fused, memory-efficient path.
-        if input.device().is_vulkan() {
-            return moe_gemm_gguf_vulkan(
+        // Route GPU devices (Vulkan/Wgpu) through the fused, memory-efficient
+        // selected-expert path. cpu/metal (and any other device) keep the dense
+        // fallback below.
+        if input.device().is_vulkan() || input.device().is_wgpu() {
+            return moe_gemm_gguf_fused(
                 input,
                 weights,
                 topk_weights,
