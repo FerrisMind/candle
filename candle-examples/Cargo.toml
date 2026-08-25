@@ -1,6 +1,6 @@
 [package]
 name = "candle-examples"
-version.workspace = true
+version = "0.0.174"
 edition.workspace = true
 description.workspace = true
 repository.workspace = true

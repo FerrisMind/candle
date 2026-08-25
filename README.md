@@ -15,13 +15,40 @@
   <img src="https://img.shields.io/badge/License-Apache--2.0%20%2F%20MIT-2ea44f" alt="Apache 2.0 / MIT">
   <img src="https://img.shields.io/badge/Rust-edition%202021-93450a?logo=rust" alt="Rust edition 2021">
   <img src="https://img.shields.io/badge/Backends-Vulkan%20%2B%20WGPU-5B7CFA" alt="Vulkan and WGPU">
+  <img src="https://img.shields.io/badge/Fork-0.0.174-d4730e" alt="Fork version 0.0.174">
+  <img src="https://img.shields.io/badge/Upstream-Candle%200.11.0-232323" alt="Upstream Candle 0.11.0">
   <img src="https://img.shields.io/badge/Branch-wgpu%2Fvulkan-232323" alt="wgpu/vulkan branch">
 </p>
 
 <h1 align="center">Candle / wgpu · vulkan</h1>
 
+## Platform matrix
+
+| Backend | Feature | Linux | Windows | macOS | Android | WASM |
+|---------|---------|:-----:|:-------:|:-----:|:-------:|:----:|
+| CPU | (default) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| CUDA | `cuda` | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Metal | `metal` | ❌ | ❌ | ✅ | ❌ | ❌ |
+| WGPU | `wgpu` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Vulkan | `vulkan` | ✅ | ✅ | ❌ | ✅ | ❌ |
+
+**CPU** and **CUDA** backends are kept in direct sync with [huggingface/candle](https://github.com/huggingface/candle) `main`. Nothing from those upstream backends has been removed; this fork only adds Vulkan and WGPU on top.
+
+## Upstream correspondence
+
+| Fork ([FerrisMind/candle](https://github.com/FerrisMind/candle)) | Upstream ([huggingface/candle](https://github.com/huggingface/candle)) |
+|------------------------------------------------------------------|------------------------------------------------------------------------|
+| Branch `wgpu/vulkan` | `main` |
+| Fork crates **0.0.174** (`candle-core` / `candle-nn` / `candle-transformers` / `candle-examples` / `candle-*-kernels` for Vulkan & WGPU); unchanged crates stay **0.11.0** | Candle **0.11.0** |
+| Last CPU/CUDA sync [`b3e5b40f`](https://github.com/FerrisMind/candle/commit/b3e5b40f) (2026-08-17) | Tip [`162b59b9`](https://github.com/FerrisMind/candle/commit/162b59b9) (#3892) |
+| Fork-only | Native **Vulkan** + **WGPU / WebGPU** |
+
+CPU and CUDA stay in sync with upstream `main` (nothing removed). Vulkan and WGPU exist only in this fork.
+
 ## Table of Contents
 
+- [Platform matrix](#platform-matrix)
+- [Upstream correspondence](#upstream-correspondence)
 - [What is this?](#what-is-this)
 - [Key Features](#key-features)
 - [Repository Layout](#repository-layout)
@@ -32,7 +59,7 @@
 
 ## What is this?
 
-This is a fork of [huggingface/candle](https://github.com/huggingface/candle) on the default branch [`wgpu/vulkan`](https://github.com/FerrisMind/candle/tree/wgpu/vulkan). Upstream remains the source for the tensor API, models, and CUDA/Metal paths. This branch adds and hardens:
+This is a fork of [huggingface/candle](https://github.com/huggingface/candle) on the default branch [`wgpu/vulkan`](https://github.com/FerrisMind/candle/tree/wgpu/vulkan). Upstream remains the source for the tensor API, models, and CPU / CUDA / Metal paths — those backends stay synchronized with `main` and are not stripped. This branch adds and hardens:
 
 - a **native Vulkan** compute backend (`ash` + SPIR-V)
 - a **WGPU / WebGPU** compute backend (`wgpu` + WGSL)
@@ -139,13 +166,6 @@ Logs: `bench_logs/qwen3-q4km_{cuda,vulkan,wgpu}_final.log`.
 - For **WGPU**: a `wgpu`-supported adapter (Vulkan, DX12, Metal, or browser WebGPU)
 - Optional CUDA for differential parity and SLO baselines
 - Python 3.x for `scripts/backend_parity_audit.py` and `bench_examples.py`
-
-Platform matrix:
-
-| Backend | Feature | Linux | Windows | macOS | Android | WASM |
-|---------|---------|:-----:|:-------:|:-----:|:-------:|:----:|
-| WGPU | `wgpu` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Vulkan | `vulkan` | ✅ | ✅ | ❌ | ✅ | ❌ |
 
 ## License
 
