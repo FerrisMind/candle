@@ -620,7 +620,14 @@ fn run(args: Args) -> Result<()> {
     let seed = seed.unwrap_or(rand::rng().random_range(0u64..u64::MAX));
 
     println!("Using seed {seed}");
-    device.set_seed(seed)?;
+    // The CPU device has no seedable RNG (CpuDevice::set_seed bails), so seeding it
+    // would hard-error SD on CPU. Skip it there; the seed is only honored on devices
+    // that expose a seeded RNG (cuda/wgpu/vulkan/metal). No behavior change on those.
+    if !device.is_cpu() {
+        device.set_seed(seed)?;
+    } else {
+        eprintln!("warning: seed {seed} ignored on CPU (no seedable RNG); output not reproducible");
+    }
     let use_guide_scale = guidance_scale > 1.0;
 
     let which = match sd_version {
