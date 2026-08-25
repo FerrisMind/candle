@@ -1294,6 +1294,12 @@ pub fn quantized_mul_mat_id_shader(dtype: QuantizedDType, rhs_dtype: DType) -> O
         defines.push("INIT_SRC1_SHMEM_FLOAT".to_string());
         defines.push("U32_DEQUANT_HELPERS".to_string());
         defines.push(quantized_mul_mat_id_init_define(dtype).to_string());
+        // Full f32 shmem + accumulator for the routed-expert GEMM. The legacy
+        // f16 accumulator drops ~7% relative at k=1024 (f16 mantissa over a
+        // long reduction), which compounds over 48 MoE layers and drives greedy
+        // decode into degenerate repetition. f32 matches the dense/CUDA
+        // reference accumulation precision and restores coherent output.
+        defines.push("FLOAT_ACC_SHMEM".to_string());
         defines.push("TILE_M".to_string());
         defines.push("TILE_N".to_string());
         defines.push("WORKGROUP_SIZE_M".to_string());

@@ -6,13 +6,13 @@ enable f16;
 #include "mul_mat_decls.tmpl"
 
 #ifdef VEC
-fn store_val(acc: array<array<f16, TILE_M>, TILE_N>, tn: u32, tm: u32) -> vec4<f32> {
+fn store_val(acc: array<array<f32, TILE_M>, TILE_N>, tn: u32, tm: u32) -> vec4<f32> {
     return vec4<f32>(f32(acc[tn][tm]), f32(acc[tn][tm + 1]), f32(acc[tn][tm + 2]), f32(acc[tn][tm + 3]));
 }
 #endif
 
 #ifdef SCALAR
-fn store_val(acc: array<array<f16, TILE_M>, TILE_N>, tn: u32, tm: u32) -> f32 {
+fn store_val(acc: array<array<f32, TILE_M>, TILE_N>, tn: u32, tm: u32) -> f32 {
     return f32(acc[tn][tm]);
 }
 #endif
@@ -55,7 +55,7 @@ const TOTAL_WORKGROUP_SIZE = WORKGROUP_SIZE_M * WORKGROUP_SIZE_N;
 const TILE_SRC0_SHMEM = TILE_K * WORKGROUP_SIZE_M * TILE_M;
 const TILE_SRC1_SHMEM = TILE_K * WORKGROUP_SIZE_N * TILE_N;
 
-var<workgroup> shmem: array<f16, TILE_SRC0_SHMEM + TILE_SRC1_SHMEM>;
+var<workgroup> shmem: array<f32, TILE_SRC0_SHMEM + TILE_SRC1_SHMEM>;
 var<workgroup> gathered_expert_used: array<u32, TILE_N * WORKGROUP_SIZE_N>;
 var<workgroup> gathered_tokens: array<u32, TILE_N * WORKGROUP_SIZE_N>;
 
@@ -140,7 +140,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
     let dst2_stride = params.m * params.n_expert_used;
     let dst1_stride = params.m;
 
-    var acc: array<array<f16, TILE_M>, TILE_N>;
+    var acc: array<array<f32, TILE_M>, TILE_N>;
 
     for (var k_outer = 0u; k_outer < params.k; k_outer += TILE_K) {
 
@@ -155,7 +155,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
             let k_end = min(TILE_K, params.k - k_outer);
 
             for (var k_inner = 0u; k_inner < k_end; k_inner++) {
-                var src0_tile: array<f16, TILE_M>;
+                var src0_tile: array<f32, TILE_M>;
                 for (var tm = 0u; tm < TILE_M; tm++) {
                     let src0_m = local_m * TILE_M + tm;
                     let src0_idx = k_inner + src0_m * TILE_K;
