@@ -8201,6 +8201,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let (k_buf, k_l) = ensure_contiguous(k, k_layout)?;
         let (v_buf, v_l) = ensure_contiguous(v, v_layout)?;
 
+        // F32 compute hub for non-F32 dtypes (F16/BF16 are exactly representable
+        // in F32; the accumulator stays F32 like CUDA flash-attn). The shader
+        // binds q/k/v as `array<f32>`, so F16/BF16 byte layouts cannot be
+        // reinterpreted directly. Output stays F32; the caller casts back.
+        let to_f32 = |src: WgpuStorage, l: &Layout| -> Result<(WgpuStorage, Layout)> {
+            if src.dtype == DType::F32 {
+                Ok((src, l.clone()))
+            } else {
+                let converted = src.to_dtype(l, DType::F32)?;
+                Ok((converted, Layout::contiguous(l.shape().clone())))
+            }
+        };
+        let (q_buf, q_l) = to_f32(q_buf, &q_l)?;
+        let (k_buf, k_l) = to_f32(k_buf, &k_l)?;
+        let (v_buf, v_l) = to_f32(v_buf, &v_l)?;
+
         let dims_q = q_l.dims();
         let (b, h, seq_q, head_dim) = if dims_q.len() == 4 {
             (dims_q[0], dims_q[1], dims_q[2], dims_q[3])
@@ -9368,8 +9384,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }
 
     pub fn sigmoid(&self, layout: &Layout) -> Result<Self> {
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+        if !matches!(self.dtype, DType::F32 | DType::F16 | DType::BF16) {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu sigmoid").bt());
+        }
+        // BF16 isn't a native wgpu shader dtype: compute in F32 (exactly
+        // representable) and cast back, mirroring the F16 emulation below.
+        if self.dtype == DType::BF16 {
+            let src_f32 = self.materialize_to_f32(layout)?;
+            let src_l = Layout::contiguous(layout.shape());
+            let out_f32 = src_f32.sigmoid(&src_l)?;
+            return out_f32.to_dtype(&src_l, DType::BF16);
         }
         if wgpu_f16_emulates_f32(&self.device, self.dtype) {
             let src_f32 = self.materialize_to_f32(layout)?;
@@ -17625,6 +17649,156 @@ mod wgpu_flash_attn_varlen_tests {
             1e-3,
         )
         .unwrap();
+    }
+
+    /// CPU reference for the simple [B,H,S,D] flash_attn path with GQA + causal.
+    /// q is (b,h_q,s,d), k/v are (b,h_kv,s,d); output is (b,h_q,s,dv).
+    #[allow(clippy::too_many_arguments)]
+    fn reference_flash_simple(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        b: usize,
+        h: usize,
+        h_kv: usize,
+        s: usize,
+        d: usize,
+        dv: usize,
+        scale: f32,
+        causal: bool,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; b * h * s * dv];
+        for bb in 0..b {
+            for hh in 0..h {
+                let kv_h = hh * h_kv / h;
+                for sq in 0..s {
+                    let mut scores = Vec::new();
+                    let mut kv_pos = Vec::new();
+                    for sk in 0..s {
+                        if causal && sq < sk {
+                            continue;
+                        }
+                        let mut acc = 0.0f32;
+                        for dd in 0..d {
+                            let qi = ((bb * h + hh) * s + sq) * d + dd;
+                            let ki = ((bb * h_kv + kv_h) * s + sk) * d + dd;
+                            acc += q[qi] * k[ki];
+                        }
+                        scores.push(acc * scale);
+                        kv_pos.push(sk);
+                    }
+                    if scores.is_empty() {
+                        continue;
+                    }
+                    let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0f32;
+                    for sc in &scores {
+                        sum += (sc - m).exp();
+                    }
+                    let inv = 1.0 / sum;
+                    for (i, sk) in kv_pos.iter().enumerate() {
+                        let w = (scores[i] - m).exp() * inv;
+                        for dd in 0..dv {
+                            let vi = ((bb * h_kv + kv_h) * s + sk) * d + dd;
+                            out[((bb * h + hh) * s + sq) * dv + dd] += w * v[vi];
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// F16 q/k/v simple-path flash_attn with GQA (4 q heads -> 2 kv heads) and
+    /// causal masking. Before the F32-compute-hub fix this FAILED: the shader
+    /// binds q/k/v as `array<f32>` while the buffers were passed as F16, so the
+    /// bytes were reinterpreted and produced garbage. After the fix the q/k/v
+    /// are converted to F32 and the output matches the CPU reference.
+    #[test]
+    fn flash_attn_f16_gqa_causal() -> Result<()> {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        let (b, h, h_kv, s, d) = (1, 4, 2, 8, 32);
+        let scale = 1.0 / 32.0_f32.sqrt();
+        let mut q = vec![0.0f32; b * h * s * d];
+        let mut k = vec![0.0f32; b * h_kv * s * d];
+        let mut v = vec![0.0f32; b * h_kv * s * d];
+        fill(&mut q, 98765);
+        fill(&mut k, 54321);
+        fill(&mut v, 13579);
+
+        let reference = reference_flash_simple(&q, &k, &v, b, h, h_kv, s, d, d, scale, true);
+
+        let (q_s, q_l) = make_storage(&dev, DType::F16, &q, &[b, h, s, d])?;
+        let (k_s, k_l) = make_storage(&dev, DType::F16, &k, &[b, h_kv, s, d])?;
+        let (v_s, v_l) = make_storage(&dev, DType::F16, &v, &[b, h_kv, s, d])?;
+
+        let out = WgpuStorage::flash_attn(&q_s, &q_l, &k_s, &k_l, &v_s, &v_l, scale, true)?;
+        assert_eq!(out.dtype, DType::F32, "flash_attn output must be F32");
+        let got = download_f32(&out)?;
+        assert_eq!(got.len(), reference.len());
+        for i in 0..got.len() {
+            assert!(
+                close(got[i], reference[i], 1e-2, 1e-2),
+                "flash_attn_f16_gqa_causal mismatch at {i}: got {} ref {}",
+                got[i],
+                reference[i]
+            );
+        }
+        Ok(())
+    }
+
+    /// BF16 sigmoid via the F32 emulation hub: bf16 input -> f32 sigmoid ->
+    /// bf16, compared against a CPU sigmoid of the bf16-quantized input in f32.
+    #[test]
+    fn sigmoid_bf16_matches_cpu() -> Result<()> {
+        let dev = match wgpu_device() {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        let shape = [32, 8];
+        let n: usize = shape.iter().product();
+        let mut vals = vec![0.0f32; n];
+        fill(&mut vals, 24680);
+        for x in vals.iter_mut() {
+            *x *= 3.0; // widen the range so sigmoid isn't trivially linear
+        }
+
+        // CPU reference computed on the same bf16-quantized input.
+        let cpu_dev = crate::Device::Cpu;
+        let bf16_vals: Vec<f32> = crate::Tensor::from_vec(vals.clone(), &shape, &cpu_dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let reference: Vec<f32> = bf16_vals.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect();
+
+        let (src, layout) = make_storage(&dev, DType::BF16, &vals, &shape)?;
+        let out = src.sigmoid(&layout)?;
+        assert_eq!(out.dtype, DType::BF16, "sigmoid output dtype");
+        let got = download_f32(&out)?;
+        assert_eq!(got.len(), reference.len());
+        for i in 0..got.len() {
+            let rel = if reference[i].abs() > 0.0 {
+                (got[i] - reference[i]).abs() / reference[i].abs()
+            } else {
+                (got[i] - reference[i]).abs()
+            };
+            assert!(
+                close(got[i], reference[i], 2e-2, 2e-2),
+                "sigmoid_bf16 mismatch at {i}: got {} ref {} rel {rel}",
+                got[i],
+                reference[i]
+            );
+        }
+        Ok(())
     }
 }
 
