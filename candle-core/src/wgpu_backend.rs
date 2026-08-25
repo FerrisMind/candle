@@ -626,6 +626,13 @@ pub struct WgpuDevice {
     inner: Arc<WgpuInner>,
 }
 
+// wgpu-core's recursive type graph (OnceLock<Weak<..>>, Vec<Weak<..>>) makes the
+// Send/Sync auto-trait solver recurse and overflow (E0275), even though every
+// field is genuinely `Send + Sync` (wgpu::Device/Queue/Buffer are Send+Sync by
+// design). Short-circuit the solver with explicit impls.
+unsafe impl Send for WgpuDevice {}
+unsafe impl Sync for WgpuDevice {}
+
 #[derive(Debug)]
 struct WgpuInner {
     ordinal: usize,
@@ -816,6 +823,11 @@ pub struct WgpuStorage {
     count: usize,
     dtype: DType,
 }
+
+// Fields are genuinely Send+Sync (Arc<wgpu::Buffer> + WgpuDevice). See the note
+// on `unsafe impl Send/Sync for WgpuDevice` for the wgpu-core recursion reason.
+unsafe impl Send for WgpuStorage {}
+unsafe impl Sync for WgpuStorage {}
 
 impl Drop for WgpuStorage {
     fn drop(&mut self) {
@@ -5270,6 +5282,13 @@ fn storage_buffer_binding<'a>(
     }
     let align = device.inner.limits.min_storage_buffer_offset_alignment as u64;
     if !offset_bytes.is_multiple_of(align) {
+        if std::env::var_os("CANDLE_DEBUG_GPU_ALIGN").is_some() {
+            eprintln!(
+                "[candle][wgpu] misaligned storage bind: offset_bytes={offset_bytes} start_elem={start_elem} dtype={dtype:?} num_elems={num_elems} size_bytes={size_bytes}"
+            );
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("{bt}");
+        }
         return Err(Error::Msg(format!(
             "wgpu buffer binding offset {offset_bytes} not aligned to {align}"
         ))
@@ -5486,6 +5505,32 @@ impl WgpuStorage {
     }
 
     fn run_scale(&self, layout: &Layout, scale: f32, bias: f32) -> Result<Self> {
+        // wgpu requires storage-binding offsets to be a multiple of the device's
+        // min_storage_buffer_offset_alignment. A strided or offset view can start
+        // at a byte offset that is not aligned, which cannot be represented as a
+        // single sub-range buffer binding. Materialize such a view into a
+        // contiguous buffer so the binding begins at offset 0 (always aligned).
+        let elem_size = self.dtype.size_in_bytes().max(1);
+        let align = self.device.inner.limits.min_storage_buffer_offset_alignment as usize;
+        // The scale/bias shader indexes a fixed 4D grid (`ne0/ne1/ne2` + 3
+        // strides), so rank>4 inputs (video latents are [B,C,T,H,W]) cannot be
+        // described directly. Scale is a flat elementwise op, so compact rank-5+
+        // into a contiguous rank-4 tensor first. `materialize_rank_gt4_compact`
+        // anchors the result at offset 0 (always aligned), which also covers the
+        // strided/offset views handled below for rank<=4.
+        if layout.dims().len() > 4 {
+            let (materialized, compact_l) = self.materialize_rank_gt4_compact(layout)?;
+            return materialized.run_scale(&compact_l, scale, bias);
+        }
+        let needs_materialize = !layout.is_contiguous()
+            || layout.start_offset() != 0
+            || (layout.start_offset().saturating_mul(elem_size)) % align != 0;
+        if needs_materialize {
+            let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
+            let mat_layout = Layout::contiguous(layout.shape());
+            return materialized.run_scale(&mat_layout, scale, bias);
+        }
         let count = layout.shape().elem_count();
         let params = ScaleParams {
             offset_src: 0,
@@ -14236,6 +14281,25 @@ impl BackendStorage for WgpuStorage {
             )
         }
         if !src_l.is_contiguous() {
+            if src_l.dims().len() > 4 {
+                // wgpu copy/compute shaders index a fixed 4D grid (see dims4), so a
+                // rank-5+ strided/offset source (video VAE latents [B,C,T,H,W], cat
+                // along a non-zeroth dim) cannot be copied in one dispatch. Decompose
+                // the leading dims into a batch of rank-3 slices: each slice keeps the
+                // trailing 3 dims' strides and start offset, and lands in the
+                // flat-contiguous destination region at dst_offset + p*tail_len.
+                let rank = src_l.dims().len();
+                let tail_shape = Shape::from(&src_l.dims()[rank - 3..]);
+                let tail_len = tail_shape.elem_count();
+                let tail_stride = src_l.stride()[rank - 3..].to_vec();
+                let prefix: usize = src_l.dims()[..rank - 3].iter().product();
+                for p in 0..prefix {
+                    let off = Self::compact_rank_gt4_start_offset(src_l, p);
+                    let slice_layout = Layout::new(tail_shape.clone(), tail_stride.clone(), off);
+                    self.copy_strided_src(dst, dst_offset + p * tail_len, &slice_layout)?;
+                }
+                return Ok(());
+            }
             if src_l.dims().len() > 4
                 && dst_offset == 0
                 && dst.count == src_l.shape().elem_count()
@@ -14644,6 +14708,15 @@ impl BackendDevice for WgpuDevice {
                 self.cleanup_pending_submissions(false)?;
             }
             self.prune_buffer_registry();
+            // Promote buffers reclaimed from the completed submissions above
+            // into the free size-class pool so the large allocation we are
+            // about to make (and the rest of this forward pass) reuses them
+            // instead of carving a fresh device block. Without this, a single
+            // SD-512 f32 UNet forward that never calls `synchronize()` keeps
+            // asking gpu-allocator for a new block per conv/groupnorm/attention
+            // scratch buffer and OOMs at ~8.6 GB even though the computation
+            // only needs ~1-2 GB of scratch.
+            self.flush_storage_pool_pending();
         }
         let buffer = self.register_buffer_arc(
             self.create_storage_buffer_arc(alloc_size, "candle-wgpu-alloc-uninit"),
