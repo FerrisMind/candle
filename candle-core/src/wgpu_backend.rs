@@ -13952,6 +13952,24 @@ impl BackendStorage for WgpuStorage {
                 "wgpu avg_pool2d",
             );
         }
+        if self.dtype == DType::F32 {
+            // F32 uses the native pool shader too. The im2col-based F32 path
+            // (run_pool2d_im2col_f32) builds a col workspace whose size is
+            // (b*c)*out_h*out_w*k but lets the im2col shader fill only
+            // K*out_h*out_w*width elements, so when b*c > width (yolo SPPF
+            // [1,256,h,w]) the workspace is mostly UNINITIALIZED and the
+            // reduction reads garbage -> corrupted + nondeterministic pooling.
+            // run_pool2d_native strides the input directly (offset_src +
+            // explicit dims4 strides) and never depends on width vs b*c.
+            return self.run_pool2d_native(
+                layout,
+                &out_shape,
+                kernel_size,
+                stride,
+                false,
+                "wgpu avg_pool2d",
+            );
+        }
         self.gpu_resident_via_f32(layout, &out_shape, "wgpu avg_pool2d", |src, src_l| {
             src.run_pool2d_im2col_f32(src_l, kernel_size, stride, false)
         })
@@ -13978,6 +13996,19 @@ impl BackendStorage for WgpuStorage {
                 .features
                 .contains(wgpu::Features::SHADER_F16);
         if self.dtype == DType::BF16 || f16_native {
+            return self.run_pool2d_native(
+                layout,
+                &out_shape,
+                kernel_size,
+                stride,
+                true,
+                "wgpu max_pool2d",
+            );
+        }
+        if self.dtype == DType::F32 {
+            // F32 uses the native pool shader: the im2col path corrupts when
+            // b*c > width (see the avg_pool2d comment). Direct windowed
+            // pooling via offset_src + dims4 strides is correct for all shapes.
             return self.run_pool2d_native(
                 layout,
                 &out_shape,
