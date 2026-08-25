@@ -106,7 +106,7 @@ pub(crate) fn setup_output_stream() -> Result<(cpal::Stream, AudioOutputData)> {
             .context("no audio output available")?,
         Some(config_range) => config_range,
     };
-    let sample_rate = cpal::SampleRate(SAMPLE_RATE as u32).clamp(
+    let sample_rate = (SAMPLE_RATE as u32).clamp(
         config_range.min_sample_rate(),
         config_range.max_sample_rate(),
     );
@@ -115,11 +115,11 @@ pub(crate) fn setup_output_stream() -> Result<(cpal::Stream, AudioOutputData)> {
     println!(
         "cpal device: {} {} {config:?}",
         device.name().unwrap_or_else(|_| "unk".to_string()),
-        config.sample_rate.0
+        config.sample_rate
     );
     let audio_data = Arc::new(Mutex::new(AudioOutputData_::new(
         SAMPLE_RATE,
-        config.sample_rate.0 as usize,
+        config.sample_rate as usize,
     )?));
     let ad = audio_data.clone();
     let stream = device.build_output_stream(
@@ -161,7 +161,7 @@ pub(crate) fn setup_input_stream() -> Result<(cpal::Stream, AudioOutputData)> {
     let config_range = supported_configs_range
         .find(|c| c.channels() == 1)
         .context("no audio input available")?;
-    let sample_rate = cpal::SampleRate(SAMPLE_RATE as u32).clamp(
+    let sample_rate = (SAMPLE_RATE as u32).clamp(
         config_range.min_sample_rate(),
         config_range.max_sample_rate(),
     );
@@ -169,10 +169,10 @@ pub(crate) fn setup_input_stream() -> Result<(cpal::Stream, AudioOutputData)> {
     println!(
         "cpal device: {} {} {config:?}",
         device.name().unwrap_or_else(|_| "unk".to_string()),
-        config.sample_rate.0
+        config.sample_rate
     );
     let audio_data = Arc::new(Mutex::new(AudioOutputData_::new(
-        config.sample_rate.0 as usize,
+        config.sample_rate as usize,
         SAMPLE_RATE,
     )?));
     let ad = audio_data.clone();
