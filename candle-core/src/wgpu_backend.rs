@@ -13759,6 +13759,14 @@ impl BackendStorage for WgpuStorage {
             return self.run_reduce_multi_dim(op, layout, reduce_dims);
         }
         let dim = reduce_dims[0];
+        // The last-dim kernels (sum_rows / extrema) index src assuming UNIT stride
+        // along the reduced dim. A non-contiguous view (reduced-dim stride != 1,
+        // e.g. reshape((b,c,l))->transpose(1,2) feeds layer_norm) would read
+        // consecutive memory instead of strided elements -> silently wrong on GPU.
+        // Materialize via run_reduce_non_last_dim (strides-aware copy) instead.
+        if layout.stride()[rank - 1] != 1 {
+            return self.run_reduce_non_last_dim(op, layout, dim);
+        }
         if dim != rank - 1 {
             return self.run_reduce_non_last_dim(op, layout, dim);
         }
