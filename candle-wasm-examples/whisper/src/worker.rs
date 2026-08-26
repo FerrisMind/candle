@@ -13,6 +13,8 @@ pub use candle_transformers::models::whisper::{self as m, Config};
 use candle_wasm_device_select::{DeviceMode, ResolvedKind};
 use rand::{distr::Distribution, rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::rc::Rc;
 use tokenizers::Tokenizer;
 use wasm_bindgen::prelude::*;
 use yew_agent::{HandlerId, Public, WorkerLink};
@@ -189,7 +191,7 @@ impl Decoder {
         self.resolved
     }
 
-    fn decode(&mut self, mel: &Tensor, t: f64) -> anyhow::Result<DecodingResult> {
+    async fn decode(&mut self, mel: &Tensor, t: f64) -> anyhow::Result<DecodingResult> {
         let model = &mut self.model;
         let language_token = match (self.is_multilingual, &self.language) {
             (true, None) => Some(detect_language(model, &self.tokenizer, mel)?),
@@ -228,6 +230,14 @@ impl Decoder {
             // it so we add it at this point.
             let tokens_t = tokens_t.unsqueeze(0)?;
             let ys = model.decoder_forward(&tokens_t, &audio_features, i == 0)?;
+
+            // At each token boundary yield to the JS event loop so the wgpu backend can
+            // `on_submitted_work_done` and recycle its storage buffers back into the pool.
+            // This is what prevents the wasm wgpu VRAM balloon + garbage output. On the CPU
+            // (and dummy-wgpu) path this arm is a no-op.
+            if let Device::Wgpu(dev) = &self.device {
+                dev.synchronize_async().await?;
+            }
 
             // Extract the no speech probability on the first iteration by looking at the first
             // token logits and the probability for the according token.
@@ -287,9 +297,9 @@ impl Decoder {
         })
     }
 
-    fn decode_with_fallback(&mut self, segment: &Tensor) -> anyhow::Result<DecodingResult> {
+    async fn decode_with_fallback(&mut self, segment: &Tensor) -> anyhow::Result<DecodingResult> {
         for (i, &t) in m::TEMPERATURES.iter().enumerate() {
-            let dr: Result<DecodingResult, _> = self.decode(segment, t);
+            let dr: Result<DecodingResult, _> = self.decode(segment, t).await;
             if i == m::TEMPERATURES.len() - 1 {
                 return dr;
             }
@@ -310,7 +320,7 @@ impl Decoder {
         unreachable!()
     }
 
-    fn run(&mut self, mel: &Tensor) -> anyhow::Result<Vec<Segment>> {
+    async fn run(&mut self, mel: &Tensor) -> anyhow::Result<Vec<Segment>> {
         let (_, _, content_frames) = mel.dims3()?;
         let mut seek = 0;
         let mut segments = vec![];
@@ -319,7 +329,7 @@ impl Decoder {
             let segment_size = usize::min(content_frames - seek, m::N_FRAMES);
             let mel_segment = mel.narrow(2, seek, segment_size)?;
             let segment_duration = (segment_size * m::HOP_LENGTH) as f64 / m::SAMPLE_RATE as f64;
-            let dr = self.decode_with_fallback(&mel_segment)?;
+            let dr = self.decode_with_fallback(&mel_segment).await?;
             seek += segment_size;
             if dr.no_speech_prob > m::NO_SPEECH_THRESHOLD && dr.avg_logprob < m::LOGPROB_THRESHOLD {
                 console_log!("no speech detected, skipping {seek} {dr:?}");
@@ -406,7 +416,7 @@ impl Decoder {
         Self::load_on_device(md, Device::Cpu, ResolvedKind::Cpu, None)
     }
 
-    pub fn convert_and_run(&mut self, wav_input: &[u8]) -> anyhow::Result<Vec<Segment>> {
+    pub async fn convert_and_run(&mut self, wav_input: &[u8]) -> anyhow::Result<Vec<Segment>> {
         let device = &self.device;
         let mut wav_input = std::io::Cursor::new(wav_input);
         let wav_reader = hound::WavReader::new(&mut wav_input)?;
@@ -428,7 +438,7 @@ impl Decoder {
         let n_mels = self.model.config().num_mel_bins;
         let mel = Tensor::from_vec(mel, (1, n_mels, mel_len / n_mels), device)?;
         console_log!("loaded mel: {:?}", mel.dims());
-        let segments = self.run(&mel)?;
+        let segments = self.run(&mel).await?;
         Ok(segments)
     }
 }
@@ -500,7 +510,7 @@ pub struct ModelData {
 
 pub struct Worker {
     link: WorkerLink<Self>,
-    decoder: Option<Decoder>,
+    decoder: Rc<RefCell<Option<Decoder>>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -541,7 +551,7 @@ impl yew_agent::Worker for Worker {
     fn create(link: WorkerLink<Self>) -> Self {
         Self {
             link,
-            decoder: None,
+            decoder: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -550,16 +560,19 @@ impl yew_agent::Worker for Worker {
     }
 
     fn handle_input(&mut self, msg: Self::Input, id: HandlerId) {
-        let output = match msg {
+        // `SetDevice` stays fully synchronous (CPU-only Yew path): load + respond inline.
+        // `DecodeTask` must drive the now-async decode, so it takes the decoder out and
+        // spawns a local future that responds only once the decode completes.
+        match msg {
             WorkerInput::SetDevice { mode, mut model } => {
                 model.device_mode = mode;
-                match mode {
+                let output = match mode {
                     // Sync Yew agent cannot await wgpu; Cpu and Auto load on CPU.
                     DeviceMode::Cpu | DeviceMode::Auto => match Decoder::load_cpu(model) {
                         Ok(decoder) => {
                             let resolved = resolved_label(decoder.resolved_kind());
                             let adapter_name = decoder.adapter_name().map(str::to_string);
-                            self.decoder = Some(decoder);
+                            *self.decoder.borrow_mut() = Some(decoder);
                             Ok(WorkerOutput::WeightsLoaded {
                                 resolved,
                                 adapter_name,
@@ -571,17 +584,32 @@ impl yew_agent::Worker for Worker {
                         message: "Yew agent path is CPU-only in slice 1 (sync handle_input cannot await WebGPU init); use the JS lib worker (m.wasm load_with_device) for wgpu".to_string(),
                         requested: DeviceMode::Wgpu,
                     }),
-                }
+                };
+                self.link.respond(id, output);
             }
-            WorkerInput::DecodeTask { wav_bytes } => match &mut self.decoder {
-                None => Err("model has not been set".to_string()),
-                Some(decoder) => decoder
-                    .convert_and_run(&wav_bytes)
-                    .map(WorkerOutput::Decoded)
-                    .map_err(|e| e.to_string()),
-            },
-        };
-        self.link.respond(id, output);
+            WorkerInput::DecodeTask { wav_bytes } => {
+                // Take the decoder out so the spawned future owns it (`'static`). The slot is
+                // left `None` for the duration of the decode and restored afterwards, so the
+                // `RefCell` is never held borrowed across an await point.
+                let decoded = self.decoder.borrow_mut().take();
+                let Some(mut decoder) = decoded else {
+                    self.link
+                        .respond(id, Err("model has not been set".to_string()));
+                    return;
+                };
+                let slot = Rc::clone(&self.decoder);
+                let link = self.link.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let result = decoder.convert_and_run(&wav_bytes).await;
+                    *slot.borrow_mut() = Some(decoder);
+                    let output = match result {
+                        Ok(segments) => Ok(WorkerOutput::Decoded(segments)),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    link.respond(id, output);
+                });
+            }
+        }
     }
 
     fn name_of_resource() -> &'static str {

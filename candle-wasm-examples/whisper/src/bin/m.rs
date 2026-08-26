@@ -89,10 +89,11 @@ impl Decoder {
     }
 
     #[wasm_bindgen]
-    pub fn decode(&mut self, wav_input: Vec<u8>) -> Result<String, JsError> {
+    pub async fn decode(&mut self, wav_input: Vec<u8>) -> Result<String, JsError> {
         let segments = self
             .decoder
             .convert_and_run(&wav_input)
+            .await
             .map_err(|e| JsError::new(&e.to_string()))?;
         let json = serde_json::to_string(&segments)?;
         Ok(json)

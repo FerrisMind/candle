@@ -248,7 +248,15 @@ self.addEventListener("message", async (event) => {
 
       let segments;
       try {
-        segments = entry.decoder.decode(audioArrayU8);
+        // `decode` is an async wasm-bindgen export → returns a JS Promise. Await it so the
+        // wasm autoregressive loop yields to the JS event loop between tokens (wgpu buffer
+        // recycle, prevents the 12GB VRAM balloon). Normalize: a sync CPU build or older
+        // wasm may still return the JSON string directly.
+        let raw = entry.decoder.decode(audioArrayU8);
+        if (raw && typeof raw.then === "function") {
+          raw = await raw;
+        }
+        segments = raw;
       } catch (e) {
         self.postMessage({
           status: "error",
