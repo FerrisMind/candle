@@ -1326,6 +1326,17 @@ impl WgpuDevice {
     /// a smaller pooled buffer is available (fair reuse of scarce VRAM).
     fn take_reusable_from_pool(&self, key: u64) -> Option<Arc<wgpu::Buffer>> {
         let mut pool = self.inner.storage_buffer_pool.lock().ok()?;
+        // A buffer larger than max_storage_buffer_binding_size can never be bound
+        // as a whole storage buffer, and most kernels bind their storage operands
+        // with `buffer_binding` (`as_entire_binding`). Handing such a buffer to a
+        // request that is itself at-or-under the limit makes the NEXT storage op
+        // that binds it whole exceed the limit and hit a wgpu validation panic
+        // (see the recurrent-gemma-2b q4k >2GiB binding crash). Only reuse an
+        // oversized buffer for a request that itself exceeds the limit (those take
+        // the split / chunk dispatch paths). Requests under the limit always get a
+        // buffer that is safe to bind whole.
+        let max_binding = self.inner.limits.max_storage_buffer_binding_size;
+        let oversized_ok = key >= max_binding;
         // Fast path: exact size-class present and non-empty.
         if let Some(bucket) = pool.get_mut(&key) {
             if let Some(arc) = bucket.pop() {
@@ -1335,7 +1346,11 @@ impl WgpuDevice {
         // Slow path: smallest existing size-class with size >= key.
         let mut best_key: Option<u64> = None;
         for (k, bucket) in pool.iter_mut() {
-            if *k >= key && !bucket.is_empty() && best_key.map(|bk| *k < bk).unwrap_or(true) {
+            if *k >= key
+                && !bucket.is_empty()
+                && (oversized_ok || *k <= max_binding)
+                && best_key.map(|bk| *k < bk).unwrap_or(true)
+            {
                 best_key = Some(*k);
             }
         }
@@ -10953,10 +10968,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             storage_entry(2, false),
             uniform_entry(3),
         ];
+        // `dst` is freshly allocated via alloc_uninit, so its logical byte range is
+        // [0, count * elem_size). The backing wgpu buffer may come from the best-fit
+        // size-class pool and be far larger (e.g. a reused multi-GB block), so binding
+        // the whole buffer would exceed max_storage_buffer_binding_size. Bind only the
+        // logical tensor range (same convention as the get-rows fix in b75ee967).
         let bindings = [
             buffer_binding(0, &kernel.buffer),
             buffer_binding(1, &self.buffer),
-            buffer_binding(2, &dst.buffer),
+            storage_layout_binding(&dst, &out_shader_layout, 2)?,
             buffer_binding(3, &param_buffer),
         ];
         let workgroups = (out_shape.elem_count() as u32).div_ceil(WG_SIZE);
@@ -11038,10 +11058,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             storage_entry(2, false),
             uniform_entry(3),
         ];
+        // `dst` is freshly allocated via alloc_uninit; its logical byte range is
+        // [0, count * elem_size). The backing wgpu buffer may come from the best-fit
+        // size-class pool and be far larger, so bind only the logical tensor range
+        // (same convention as the conv1d/get-rows fixes).
         let bindings = [
             buffer_binding(0, &kernel.buffer),
             buffer_binding(1, &self.buffer),
-            buffer_binding(2, &dst.buffer),
+            storage_layout_binding(&dst, &out_layout, 2)?,
             buffer_binding(3, &param_buffer),
         ];
         let workgroups = (out_shape.elem_count() as u32).div_ceil(WG_SIZE);
