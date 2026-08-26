@@ -544,6 +544,26 @@ struct BatchedGemvParams {
     _pad6: u32,
 }
 
+/// Uniform params for the dense m == 1 GEMV kernel (gemv.wgsl). Field order must
+/// match the WGSL `GemvParams` struct exactly.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GemvParams {
+    k: u32,
+    n: u32,
+    offset_x: u32,
+    offset_w: u32,
+    stride_k: u32,
+    stride_n: u32,
+    offset_d: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+    _pad4: u32,
+    _pad5: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Conv2dParams {
@@ -9928,6 +9948,81 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     /// the contiguous (batch, n, k) view/V such that B[b, i, k] = rhs_t[b, i, k].
     /// `lhs` (self) is (batch, m, k) with m == 1, so A[b, k] = self[b, 0, k].
     #[allow(clippy::too_many_arguments)]
+    fn run_m1_gemv(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+        b: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        debug_assert_eq!(m, 1);
+        let dst_shape = Shape::from(vec![b, m, n]);
+        // Native f16 GEMV accumulates/writes f32, then the caller rounds to F16
+        // (same behaviour as the tail of the generic native-f16 GEMM path); F32
+        // writes f32 directly.
+        let native_dst_dtype = if self.dtype == DType::F16 {
+            DType::F32
+        } else {
+            self.dtype
+        };
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, native_dst_dtype)? };
+        // Column-contiguous [k, n] RHS: stride_n == 1 is guaranteed by the dispatch
+        // guard so a warp's 32 consecutive output columns read contiguous addresses.
+        let params = GemvParams {
+            k: k.try_into()?,
+            n: n.try_into()?,
+            offset_x: lhs_layout.start_offset().try_into()?,
+            offset_w: rhs_layout.start_offset().try_into()?,
+            stride_k: rhs_layout.stride()[0].try_into()?,
+            stride_n: rhs_layout.stride()[1].try_into()?,
+            offset_d: 0,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+            _pad4: 0,
+            _pad5: 0,
+        };
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &rhs.buffer),
+            buffer_binding(2, &dst.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let shader_storage =
+            candle_wgpu_kernels::gemv_shader(wgpu_kernel_dtype(self.dtype)?).ok_or_else(|| {
+                Error::Msg("wgpu shader gemv.wgsl not embedded".into()).bt()
+            })?;
+        let shader = shader_storage.as_str();
+        // One thread per output column: grid.x = ceil(n / WG_SIZE).
+        let total_wg = n.div_ceil(WG_SIZE as usize);
+        let (wg_x, wg_y) = compute_2d_workgroups(
+            total_wg.try_into()?,
+            wgpu_dispatch_wg_cap(&self.device),
+        );
+        self.device.run_compute_xyz(
+            shader,
+            &entries,
+            &bindings,
+            (wg_x, wg_y, 1),
+            &[],
+            None,
+            "candle-wgpu-gemv",
+        )?;
+        Ok(dst)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn run_batched_gemv_f32(
         &self,
         rhs_t: &Self,
@@ -10223,6 +10318,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         {
             let dst = self.run_ctx_gemv_f32(rhs, lhs_l, rhs_l, b, m, n, k)?;
             return Ok(dst);
+        }
+
+        // m == 1 rank-2 dense matmul (decode-time weight projections: qkv/o_proj/
+        // gate_up/down/lm_head): route to a purpose-built GEMV instead of the generic
+        // tiled GEMM, which is catastrophic for m == 1 (one thread per output element
+        // with strided transposed-RHS reads; measured ~5-12 GFLOP/s). Guard requires a
+        // contiguous (k, n) RHS with unit column stride (coalesced warp reads) and a
+        // contiguous (1, k) LHS; anything else keeps the generic dispatch.
+        if b == 1
+            && m == 1
+            && rank == 2
+            && self.dtype == DType::F16
+            && lhs_l.is_contiguous()
+            && rhs_l.is_contiguous()
+            && rhs_l.stride()[1] == 1
+        {
+            let dst = self.run_m1_gemv(rhs, lhs_l, rhs_l, b, m, n, k)?;
+            let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
+            return dst.to_dtype(&out_l, self.dtype);
         }
 
         let mut lhs_contiguous = None;
@@ -14865,11 +14979,13 @@ impl BackendDevice for WgpuDevice {
         // only if there is actually in-flight work.
         if alloc_size >= 16 * 1024 * 1024 {
             let flushed = self.flush_active_batch("large_alloc")?;
-            if flushed {
-                self.cleanup_pending_submissions(true)?;
-            } else {
-                self.cleanup_pending_submissions(false)?;
-            }
+            // Poll-only, never `wait_indefinitely` here. A blocking drain on every
+            // >=16MiB alloc serializes decode: llama allocates ~80 such buffers per
+            // token (32MiB KV/scratch), each forcing a full CPU-GPU round-trip.
+            // Backpressure instead comes from the 32-in-flight cap inside
+            // `flush_active_batch`; recycling is lazy via the pool.
+            let _ = flushed;
+            self.cleanup_pending_submissions(false)?;
             self.prune_buffer_registry();
             // Promote buffers reclaimed from the completed submissions above
             // into the free size-class pool so the large allocation we are

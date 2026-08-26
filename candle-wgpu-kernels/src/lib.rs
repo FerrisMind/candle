@@ -762,6 +762,20 @@ pub fn matmul_f64_shader() -> Option<&'static str> {
     get("mul_mat_f64.wgsl").map(|module| module.source())
 }
 
+/// Dense m == 1 GEMV (decode-weight matmul fast path). Reads a contiguous [k, n]
+/// RHS with unit column stride and a contiguous [1, k] LHS; one thread per output
+/// column, f32 accumulation. `dtype` controls SRC_TYPE and whether `enable f16;`
+/// is injected (preprocess strips it for F32).
+pub fn gemv_shader(dtype: DType) -> Option<String> {
+    let src_type = match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+    };
+    let source = get("gemv.wgsl")?.source();
+    let replacements = vec![("SRC_TYPE".to_string(), src_type.to_string())];
+    Some(preprocess(source, &[], &replacements, dtype))
+}
+
 pub fn matmul_fast_tile_shape() -> (u32, u32, u32, u32, u32) {
     (
         MUL_MAT_TILE_M,
