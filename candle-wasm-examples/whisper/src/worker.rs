@@ -208,6 +208,17 @@ impl Decoder {
         };
 
         let audio_features = model.encoder_forward(mel, true)?;
+        // D8: drain the encoder's pending_submissions before decode begins. The
+        // encoder issues ~50+ dispatches (a few batch-limit submissions) and on
+        // WebGPU completion is UNOBSERVABLE without an event-loop yield, so the
+        // backend free pool stays empty and gpu-allocator keeps carving fresh
+        // device blocks during the synchronous chain. Yielding here (device-gated;
+        // CPU / dummy-wgpu no-op) lets wgpu service `onSubmittedWorkDone`, recycle
+        // the encoder's retained buffers into the pool, and return blocks — same
+        // pattern as the per-token boundary below.
+        if let Device::Wgpu(dev) = &self.device {
+            dev.synchronize_async().await?;
+        }
         println!("audio features: {:?}", audio_features.dims());
         let sample_len = model.config().max_target_positions / 2;
         let mut sum_logprob = 0f64;

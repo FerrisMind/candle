@@ -731,6 +731,23 @@ struct WgpuInner {
     elem_bg_misses: std::sync::atomic::AtomicU64,
 }
 
+/// Drop impl: destroy the underlying `wgpu::Device` when the last
+/// `Arc<WgpuInner>` (the whole wgpu backend device) is dropped. `WgpuInner` is
+/// only ever held behind an `Arc`, so `Drop` runs exactly once, at true device
+/// teardown — never while a `WgpuStorage`/`WgpuDevice` handle is still alive
+/// (every one of those holds a clone of the `Arc`, keeping the count > 0).
+/// On WebGPU `device.destroy()` is the documented way to tell the browser to
+/// release the `GPUDevice`, its storage-buffer pool (up to `MAX_BYTES`) and its
+/// gpu-allocator blocks *immediately*, instead of leaking them until JS GC.
+/// Without this a browser device-switch / re-load leaks the prior device's
+/// buffers and the per-load VRAM climbs (D7). `wgpu::Device::destroy(&self)`
+/// takes a shared ref and is legal on an already-lost device.
+impl Drop for WgpuInner {
+    fn drop(&mut self) {
+        self.device.destroy();
+    }
+}
+
 /// Permanent buffer ring for one size class (e.g. 4MiB for 1024² f32).
 #[derive(Debug)]
 struct WgpuHotRing {
@@ -1543,14 +1560,24 @@ impl WgpuDevice {
         // exceeded we DROP the Arc so the wgpu buffer is destroyed and its
         // sub-allocation returns to gpu-allocator, instead of recycling it.
         const BUCKET_CAP: usize = 8;
-        // F6: raise the pooled-bytes ceiling. The D2.3 1 GiB cap was sized for the
-        // KV-cat monotonic-growth case, but it made SD-512 drop the ~1 GiB f32
-        // attention-score intermediate every time it was recycled (total_bytes
-        // + 1 GiB > cap), forcing a fresh carve and a fresh gpu-allocator block
-        // on each forward -> the peak compounded to ~11.8 GiB. The larger
-        // ceiling lets that big intermediate survive in the free pool and be
-        // reused across steps, avoiding the re-carve.
+        // F6 (native): raise the pooled-bytes ceiling. The D2.3 1 GiB cap was
+        // sized for the KV-cat monotonic-growth case, but it made SD-512 drop
+        // the ~1 GiB f32 attention-score intermediate every time it was recycled
+        // (total_bytes + 1 GiB > cap), forcing a fresh carve and a fresh
+        // gpu-allocator block on each forward -> the peak compounded to ~11.8 GiB.
+        // The larger ceiling lets that big intermediate survive in the free pool
+        // and be reused across steps, avoiding the re-carve. Keep 3 GiB on native.
+        #[cfg(not(target_arch = "wasm32"))]
         const MAX_BYTES: usize = 3 * 1024 * 1024 * 1024; // 3 GiB of pooled buffers
+        // D8 (wasm): the recycled free pool is the largest *persistent* holder on
+        // WebGPU and never auto-shrinks, so a 3 GiB cap lets it retain ~700 MiB+
+        // of whisper scratch while the GPU delta is ~4x that in gpu-allocator
+        // blocks. Cap it to real scratch (512 MiB) on wasm32 — small models are
+        // well under this and the size-class pool is repopulated each step, so
+        // dropping the over-cap Arc (wgpu destroys the buffer, its block returns
+        // to gpu-allocator) is safe at a confirmed-drain point.
+        #[cfg(target_arch = "wasm32")]
+        const MAX_BYTES: usize = 512 * 1024 * 1024; // 512 MiB on wasm (WebGPU)
         let pending = match self.inner.storage_pool_pending.lock() {
             Ok(mut g) => std::mem::take(&mut *g),
             Err(_) => return,
