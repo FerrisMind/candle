@@ -74,7 +74,9 @@ pub use avx::{CurrentCpu, CurrentCpuBF16, CurrentCpuF16};
 pub mod simd128;
 #[cfg(target_arch = "wasm32")]
 #[cfg(target_feature = "simd128")]
-pub use simd128::CurrentCpu;
+pub use simd128::{CurrentCpu, CurrentCpuBF16, CurrentCpuF16};
+// wasm32+simd128 provides `CurrentCpu` for f32 and a widen/narrow fallback
+// for `CurrentCpuF16` / `CurrentCpuBF16` (f16/bf16 via f32 SIMD lanes).
 
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 #[cfg(target_feature = "neon")]
@@ -249,11 +251,7 @@ pub(crate) unsafe fn vec_dot_bf16(a_row: *const bf16, b_row: *const bf16, c: *mu
     *c = sum;
 }
 
-#[cfg(any(
-    target_feature = "neon",
-    target_feature = "avx2",
-    target_feature = "simd128"
-))]
+#[cfg(any(target_feature = "neon", target_feature = "avx2", target_feature = "simd128"))]
 pub(crate) unsafe fn vec_add_f16(a_row: *const f16, b_row: *const f16, c: *mut f16, k: usize) {
     let mut i = 0;
     while i + CurrentCpuF16::STEP <= k {
@@ -287,11 +285,7 @@ pub(crate) unsafe fn vec_add_f16(a_row: *const f16, b_row: *const f16, c: *mut f
     }
 }
 
-#[cfg(any(
-    target_feature = "neon",
-    target_feature = "avx2",
-    target_feature = "simd128"
-))]
+#[cfg(any(target_feature = "neon", target_feature = "avx2", target_feature = "simd128"))]
 pub(crate) unsafe fn vec_add_bf16(a_row: *const bf16, b_row: *const bf16, c: *mut bf16, k: usize) {
     let mut i = 0;
     while i + CurrentCpuBF16::STEP <= k {
@@ -325,11 +319,7 @@ pub(crate) unsafe fn vec_add_bf16(a_row: *const bf16, b_row: *const bf16, c: *mu
     }
 }
 
-#[cfg(any(
-    target_feature = "neon",
-    target_feature = "avx2",
-    target_feature = "simd128"
-))]
+#[cfg(any(target_feature = "neon", target_feature = "avx2", target_feature = "simd128"))]
 #[inline(always)]
 pub(crate) unsafe fn vec_scalar_add_f16(scalar: f16, xs: *const f16, ys: *mut f16, k: usize) {
     let sv = CurrentCpuF16::from_f32(scalar.to_f32());
@@ -360,11 +350,7 @@ pub(crate) unsafe fn vec_scalar_add_f16(scalar: f16, xs: *const f16, ys: *mut f1
     }
 }
 
-#[cfg(any(
-    target_feature = "neon",
-    target_feature = "avx2",
-    target_feature = "simd128"
-))]
+#[cfg(any(target_feature = "neon", target_feature = "avx2", target_feature = "simd128"))]
 #[inline(always)]
 pub(crate) unsafe fn vec_scalar_add_bf16(scalar: bf16, xs: *const bf16, ys: *mut bf16, k: usize) {
     let sv = CurrentCpuBF16::from_f32(scalar.to_f32());

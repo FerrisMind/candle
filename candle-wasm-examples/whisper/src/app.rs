@@ -1,5 +1,6 @@
 use crate::console_log;
 use crate::worker::{ModelData, Segment, Worker, WorkerInput, WorkerOutput};
+use candle_wasm_device_select::DeviceMode;
 use js_sys::Date;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -97,6 +98,8 @@ async fn model_data_load() -> Result<ModelData, JsValue> {
         task: None,
         is_multilingual,
         language: None,
+        // Yew agent is CPU-only in slice 1 (sync worker cannot await WebGPU).
+        device_mode: DeviceMode::Cpu,
     })
 }
 
@@ -146,7 +149,9 @@ impl Component for App {
                 self.status = "weights loaded successfully!".to_string();
                 self.loaded = true;
                 console_log!("loaded weights");
-                self.worker.send(WorkerInput::ModelData(md));
+                let mode = md.device_mode;
+                self.worker
+                    .send(WorkerInput::SetDevice { mode, model: md });
                 true
             }
             Msg::Run(sample_index) => {
@@ -180,13 +185,24 @@ impl Component for App {
                 });
                 self.current_decode = None;
                 match output {
-                    Ok(WorkerOutput::WeightsLoaded) => self.status = "weights loaded!".to_string(),
+                    Ok(WorkerOutput::WeightsLoaded {
+                        resolved,
+                        adapter_name,
+                    }) => {
+                        self.status = match adapter_name {
+                            Some(name) => format!("weights loaded on {resolved} ({name})"),
+                            None => format!("weights loaded on {resolved}"),
+                        };
+                    }
                     Ok(WorkerOutput::Decoded(segments)) => {
                         self.status = match dt {
                             None => "decoding succeeded!".to_string(),
                             Some(dt) => format!("decoding succeeded in {dt:.2}s"),
                         };
                         self.segments = segments;
+                    }
+                    Ok(WorkerOutput::DeviceError { message, requested }) => {
+                        self.status = format!("device error ({requested:?}): {message}");
                     }
                     Err(err) => {
                         self.status = format!("decoding error {err:?}");

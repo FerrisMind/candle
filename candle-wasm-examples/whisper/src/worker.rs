@@ -1,8 +1,16 @@
+//! Whisper WASM worker / decoder.
+//!
+//! **Yew agent limitation (slice 1):** `yew_agent::Worker::handle_input` is synchronous, so the
+//! Yew path only loads on CPU (`DeviceMode::Cpu`, and `Auto` ≡ CPU). Explicit `Wgpu` returns
+//! [`WorkerOutput::DeviceError`]. Prefer the JS lib worker (`bin/m.rs` async `load_with_device`)
+//! for portable WebGPU.
+
 use crate::languages::LANGUAGES;
 use anyhow::Error as E;
 use candle::{safetensors::Load, DType, Device, IndexOp, Tensor, D};
 use candle_nn::{ops::softmax, VarBuilder};
 pub use candle_transformers::models::whisper::{self as m, Config};
+use candle_wasm_device_select::{DeviceMode, ResolvedKind};
 use rand::{distr::Distribution, rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
@@ -100,6 +108,10 @@ pub struct Decoder {
     eot_token: u32,
     no_speech_token: u32,
     no_timestamps_token: u32,
+    /// Device used for all tensors / inference (must match load).
+    device: Device,
+    resolved: ResolvedKind,
+    adapter_name: Option<String>,
 }
 
 impl Decoder {
@@ -108,7 +120,9 @@ impl Decoder {
         model: Model,
         tokenizer: Tokenizer,
         mel_filters: Vec<f32>,
-        device: &Device,
+        device: Device,
+        resolved: ResolvedKind,
+        adapter_name: Option<String>,
         task: Option<Task>,
         language: Option<String>,
         is_multilingual: bool,
@@ -124,7 +138,7 @@ impl Decoder {
             })
             .collect();
         let no_timestamps_token = token_id(&tokenizer, m::NO_TIMESTAMPS_TOKEN)?;
-        let suppress_tokens = Tensor::new(suppress_tokens.as_slice(), device)?;
+        let suppress_tokens = Tensor::new(suppress_tokens.as_slice(), &device)?;
         let sot_token = token_id(&tokenizer, m::SOT_TOKEN)?;
         let transcribe_token = token_id(&tokenizer, m::TRANSCRIBE_TOKEN)?;
         let translate_token = token_id(&tokenizer, m::TRANSLATE_TOKEN)?;
@@ -153,7 +167,26 @@ impl Decoder {
             eot_token,
             no_speech_token,
             no_timestamps_token,
+            device,
+            resolved,
+            adapter_name,
         })
+    }
+
+    /// Label for JS / UI: `"cpu"` or `"wgpu"`.
+    pub fn resolved_device(&self) -> &'static str {
+        match self.resolved {
+            ResolvedKind::Cpu => "cpu",
+            ResolvedKind::Wgpu => "wgpu",
+        }
+    }
+
+    pub fn adapter_name(&self) -> Option<&str> {
+        self.adapter_name.as_deref()
+    }
+
+    pub fn resolved_kind(&self) -> ResolvedKind {
+        self.resolved
     }
 
     fn decode(&mut self, mel: &Tensor, t: f64) -> anyhow::Result<DecodingResult> {
@@ -303,8 +336,13 @@ impl Decoder {
         Ok(segments)
     }
 
-    pub fn load(md: ModelData) -> anyhow::Result<Self> {
-        let device = Device::Cpu;
+    /// Load weights onto a resolved device (shared by async resolve and Yew CPU path).
+    fn load_on_device(
+        md: ModelData,
+        device: Device,
+        resolved: ResolvedKind,
+        adapter_name: Option<String>,
+    ) -> anyhow::Result<Self> {
         let tokenizer = Tokenizer::from_bytes(&md.tokenizer).map_err(E::msg)?;
 
         let mel_filters = safetensors::tensor::SafeTensors::deserialize(&md.mel_filters)?;
@@ -322,28 +360,54 @@ impl Decoder {
             let vb = VarBuilder::from_buffered_safetensors(md.weights, m::DTYPE, &device)?;
             Model::Normal(m::model::Whisper::load(&vb, config)?)
         };
-        console_log!("done loading model");
+        console_log!(
+            "done loading model on {}{}",
+            match resolved {
+                ResolvedKind::Cpu => "cpu",
+                ResolvedKind::Wgpu => "wgpu",
+            },
+            adapter_name
+                .as_ref()
+                .map(|n| format!(" ({n})"))
+                .unwrap_or_default()
+        );
 
         let task = match md.task.as_deref() {
             Some("translate") => Some(Task::Translate),
             _ => Some(Task::Transcribe),
         };
 
-        let decoder = Self::new(
+        Self::new(
             model,
             tokenizer,
             mel_filters,
-            &device,
+            device,
+            resolved,
+            adapter_name,
             task,
             md.language,
             md.is_multilingual,
             md.timestamps,
-        )?;
-        Ok(decoder)
+        )
+    }
+
+    /// Async load: resolve [`ModelData::device_mode`] then build the decoder on that device.
+    pub async fn load(md: ModelData) -> anyhow::Result<Self> {
+        let resolved = md
+            .device_mode
+            .resolve()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Self::load_on_device(md, resolved.device, resolved.resolved, resolved.adapter_name)
+    }
+
+    /// Synchronous CPU-only load for the Yew agent (cannot await wgpu init).
+    pub fn load_cpu(md: ModelData) -> anyhow::Result<Self> {
+        Self::load_on_device(md, Device::Cpu, ResolvedKind::Cpu, None)
     }
 
     pub fn convert_and_run(&mut self, wav_input: &[u8]) -> anyhow::Result<Vec<Segment>> {
-        let device = Device::Cpu;
+        let device = &self.device;
         let mut wav_input = std::io::Cursor::new(wav_input);
         let wav_reader = hound::WavReader::new(&mut wav_input)?;
         let spec = wav_reader.spec();
@@ -362,7 +426,7 @@ impl Decoder {
         let mel = crate::audio::pcm_to_mel(self.model.config(), &pcm_data, &self.mel_filters)?;
         let mel_len = mel.len();
         let n_mels = self.model.config().num_mel_bins;
-        let mel = Tensor::from_vec(mel, (1, n_mels, mel_len / n_mels), &device)?;
+        let mel = Tensor::from_vec(mel, (1, n_mels, mel_len / n_mels), device)?;
         console_log!("loaded mel: {:?}", mel.dims());
         let segments = self.run(&mel)?;
         Ok(segments)
@@ -430,6 +494,8 @@ pub struct ModelData {
     pub is_multilingual: bool,
     pub language: Option<String>,
     pub task: Option<String>,
+    /// Preferred device for load / setDevice. Inference (`DecodeTask`) does not carry a mode.
+    pub device_mode: DeviceMode,
 }
 
 pub struct Worker {
@@ -439,14 +505,31 @@ pub struct Worker {
 
 #[derive(Serialize, Deserialize)]
 pub enum WorkerInput {
-    ModelData(ModelData),
+    /// Load (or reload) weights for the given device mode. Yew path: Cpu / Auto→Cpu only.
+    SetDevice { mode: DeviceMode, model: ModelData },
+    /// Run decode on the currently loaded decoder. Must not include device mode.
     DecodeTask { wav_bytes: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize)]
 pub enum WorkerOutput {
+    WeightsLoaded {
+        /// `"cpu"` or `"wgpu"`.
+        resolved: String,
+        adapter_name: Option<String>,
+    },
     Decoded(Vec<Segment>),
-    WeightsLoaded,
+    DeviceError {
+        message: String,
+        requested: DeviceMode,
+    },
+}
+
+fn resolved_label(kind: ResolvedKind) -> String {
+    match kind {
+        ResolvedKind::Cpu => "cpu".to_string(),
+        ResolvedKind::Wgpu => "wgpu".to_string(),
+    }
 }
 
 impl yew_agent::Worker for Worker {
@@ -468,13 +551,28 @@ impl yew_agent::Worker for Worker {
 
     fn handle_input(&mut self, msg: Self::Input, id: HandlerId) {
         let output = match msg {
-            WorkerInput::ModelData(md) => match Decoder::load(md) {
-                Ok(decoder) => {
-                    self.decoder = Some(decoder);
-                    Ok(WorkerOutput::WeightsLoaded)
+            WorkerInput::SetDevice { mode, mut model } => {
+                model.device_mode = mode;
+                match mode {
+                    // Sync Yew agent cannot await wgpu; Cpu and Auto load on CPU.
+                    DeviceMode::Cpu | DeviceMode::Auto => match Decoder::load_cpu(model) {
+                        Ok(decoder) => {
+                            let resolved = resolved_label(decoder.resolved_kind());
+                            let adapter_name = decoder.adapter_name().map(str::to_string);
+                            self.decoder = Some(decoder);
+                            Ok(WorkerOutput::WeightsLoaded {
+                                resolved,
+                                adapter_name,
+                            })
+                        }
+                        Err(err) => Err(format!("model creation error {err:?}")),
+                    },
+                    DeviceMode::Wgpu => Ok(WorkerOutput::DeviceError {
+                        message: "Yew agent path is CPU-only in slice 1 (sync handle_input cannot await WebGPU init); use the JS lib worker (m.wasm load_with_device) for wgpu".to_string(),
+                        requested: DeviceMode::Wgpu,
+                    }),
                 }
-                Err(err) => Err(format!("model creation error {err:?}")),
-            },
+            }
             WorkerInput::DecodeTask { wav_bytes } => match &mut self.decoder {
                 None => Err("model has not been set".to_string()),
                 Some(decoder) => decoder

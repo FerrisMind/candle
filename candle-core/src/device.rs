@@ -299,6 +299,14 @@ impl Device {
         Ok(Self::Wgpu(crate::WgpuDevice::new(ordinal)?))
     }
 
+    /// Async wgpu device creation.
+    ///
+    /// On `wasm32`, uses `BROWSER_WEBGPU` only and must be awaited (never
+    /// `pollster::block_on`). On native hosts this wraps the sync create path.
+    pub async fn new_wgpu_async(ordinal: usize) -> Result<Self> {
+        Ok(Self::Wgpu(crate::WgpuDevice::new_async(ordinal).await?))
+    }
+
     pub fn new_vulkan(ordinal: usize) -> Result<Self> {
         Ok(Self::Vulkan(crate::VulkanDevice::new(ordinal)?))
     }

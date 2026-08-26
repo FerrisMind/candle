@@ -9,6 +9,22 @@ impl WgpuDevice {
     pub fn transfer_to_device(&self, _: &WgpuStorage) -> Result<WgpuStorage> {
         Err(Error::NotCompiledWithWgpuSupport)
     }
+
+    pub fn adapter_name(&self) -> &str {
+        ""
+    }
+
+    pub fn take_runtime_error(&self) -> Option<String> {
+        None
+    }
+
+    pub fn is_lost(&self) -> bool {
+        false
+    }
+
+    pub async fn new_async(_: usize) -> Result<Self> {
+        Err(Error::NotCompiledWithWgpuSupport)
+    }
 }
 
 #[derive(Debug)]

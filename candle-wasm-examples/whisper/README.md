@@ -49,7 +49,11 @@ trunk serve --release --public-url / --port 8080
 To build and test the UI made in Vanilla JS and WebWorkers, first we need to build the WASM library:
 
 ```bash
-sh build-lib.sh
+# CPU-only
+./build-lib.sh
+
+# Portable WebGPU (opt-in; larger wasm). Requires crate feature `wgpu`.
+./build-lib.sh wgpu
 ```
 
 This will bundle the library under `./build` and we can import it inside our WebWorker like a normal JS module:
@@ -65,4 +69,37 @@ Finally, you can preview the example by running a local HTTP server. For example
 python -m http.server
 ```
 
-Then open `http://localhost:8000/lib-example.html` in your browser.
+Then open `http://localhost:8000/lib-example.html` in your browser (secure context / localhost required for WebGPU).
+
+#### Device switch (`cpu` | `wgpu` | `auto`)
+
+The JS demo exposes a device radio (default **auto**):
+
+| Mode | Behavior |
+| --- | --- |
+| `cpu` | Load on CPU |
+| `wgpu` | Require portable WebGPU; on failure the UI rolls back to the previous mode |
+| `auto` | Try WebGPU, else explicit CPU (`resolvedDevice: "cpu"` — not a silent GPU claim) |
+
+Protocol (UI → worker):
+
+- `{ command: "setDevice", deviceMode, /* model URLs */ }` — loads/reloads weights on the chosen device
+- `{ command: "run", audioURL }` — inference only; **no** `deviceMode`
+
+Worker reports `resolvedDevice` and `adapterName` on `ready` / `complete`. Cache key is `modelID:resolvedDevice` (so `auto→cpu` and `cpu` share one instance).
+
+#### Limitations (portable WebGPU)
+
+- Browser **portable WebGPU** only (`BROWSER_WEBGPU`); do not treat native wgpu backends as portable proof.
+- F64 shader ops are capability-gated; F32 path when the adapter lacks F64.
+- `wgpu::Device` lives on the **worker** thread; the UI never owns the GPU device.
+- Opt-in `--features wgpu` increases wasm size by roughly 2–4 MB.
+- Build **without** `wgpu`: Auto behaves as CPU; explicit `wgpu` fails with `deviceError`.
+
+#### Manual smoke (Chrome)
+
+1. Build with `./build-lib.sh wgpu`, serve over `http://localhost…`, open `lib-example.html`.
+2. With WebGPU available: leave **Auto**, confirm status shows `resolved: wgpu` and an adapter name; transcribe a sample.
+3. Switch to **CPU**, confirm reload and `resolved: cpu`; run again.
+4. Switch to **WebGPU**; on success keep wgpu; if init fails, radio rolls back and status shows the error.
+5. Disable WebGPU (or use a browser without it): **Auto** should become `resolved: cpu` without error; explicit **WebGPU** should `deviceError` + rollback.

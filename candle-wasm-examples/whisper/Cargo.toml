@@ -8,10 +8,16 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Opt-in portable WebGPU (~2–4 MB). Forwards to shared device-select + candle-core.
+wgpu = ["candle-wasm-device-select/wgpu", "candle/wgpu"]
+
 [dependencies]
 candle = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
+candle-wasm-device-select = { path = "../device-select" }
 num-traits = { workspace = true }
 tokenizers = { workspace = true, features = ["unstable_wasm"] }
 

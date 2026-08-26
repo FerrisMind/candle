@@ -1,30 +1,88 @@
-export async function getEmbeddings(
+/**
+ * Resolve / reload the worker-owned model for a device mode.
+ * Does not run inference. On success, worker reports resolvedDevice + adapterName.
+ */
+export async function setDevice(
   worker,
   weightsURL,
   tokenizerURL,
   configURL,
   modelID,
-  sentences,
+  deviceMode,
   updateStatus = null
 ) {
   return new Promise((resolve, reject) => {
     worker.postMessage({
+      command: "setDevice",
       weightsURL,
       tokenizerURL,
       configURL,
       modelID,
-      sentences,
+      deviceMode,
     });
     function messageHandler(event) {
-      if ("error" in event.data) {
+      const data = event.data;
+      if (data.status === "deviceError") {
         worker.removeEventListener("message", messageHandler);
-        reject(new Error(event.data.error));
+        const err = new Error(data.error || "deviceError");
+        err.deviceError = data;
+        reject(err);
+        return;
       }
-      if (event.data.status === "complete") {
+      if ("error" in data && data.status === "error") {
         worker.removeEventListener("message", messageHandler);
-        resolve(event.data);
+        reject(new Error(data.error));
+        return;
       }
-      if (updateStatus) updateStatus(event.data);
+      if (data.status === "ready") {
+        worker.removeEventListener("message", messageHandler);
+        resolve(data);
+        return;
+      }
+      if (updateStatus) updateStatus(data);
+    }
+    worker.addEventListener("message", messageHandler);
+  });
+}
+
+/**
+ * Run embeddings on the already-loaded instance.
+ * Must NOT pass deviceMode — device is fixed by setDevice.
+ */
+export async function getEmbeddings(
+  worker,
+  modelID,
+  sentences,
+  updateStatus = null,
+  normalize = true
+) {
+  return new Promise((resolve, reject) => {
+    worker.postMessage({
+      command: "run",
+      modelID,
+      sentences,
+      normalize,
+    });
+    function messageHandler(event) {
+      const data = event.data;
+      if (data.status === "deviceError") {
+        worker.removeEventListener("message", messageHandler);
+        const err = new Error(data.error || "deviceError");
+        err.deviceError = data;
+        reject(err);
+        return;
+      }
+      if ("error" in data || data.status === "error") {
+        worker.removeEventListener("message", messageHandler);
+        reject(new Error(data.error));
+        return;
+      }
+      if (data.status === "complete") {
+        worker.removeEventListener("message", messageHandler);
+        resolve(data);
+        return;
+      }
+      if (updateStatus) updateStatus(data);
     }
     worker.addEventListener("message", messageHandler);
   });

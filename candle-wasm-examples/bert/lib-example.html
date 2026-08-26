@@ -27,6 +27,7 @@
       import {
         getModelInfo,
         getEmbeddings,
+        setDevice,
         getWikiText,
         cosineSimilarity,
       } from "./utils.js";
@@ -44,6 +45,9 @@
       const searchWikiEl = document.querySelector("#search-wiki");
       const outputStatusEl = document.querySelector("#output-status");
       const modelSelectEl = document.querySelector("#model");
+      const deviceStatusEl = document.querySelector("#device-status");
+      const deviceRadios = () =>
+        document.querySelectorAll('input[name="device-mode"]');
 
       const sentencesRegex =
         /(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<![A-Z]\.)(?<=\.|\?)\s/gm;
@@ -51,6 +55,68 @@
       let sentenceEmbeddings = [];
       let currInputText = "";
       let isCalculating = false;
+      let currentDeviceMode = "auto";
+      let deviceReady = false;
+
+      function selectedDeviceMode() {
+        const checked = document.querySelector(
+          'input[name="device-mode"]:checked'
+        );
+        return checked ? checked.value : "auto";
+      }
+
+      function setDeviceRadio(mode) {
+        deviceRadios().forEach((el) => {
+          el.checked = el.value === mode;
+        });
+        currentDeviceMode = mode;
+      }
+
+      function updateDeviceStatus(data) {
+        if (!deviceStatusEl) return;
+        const parts = [];
+        if (data.resolvedDevice) {
+          parts.push(`resolved: ${data.resolvedDevice}`);
+        }
+        if (data.adapterName) {
+          parts.push(`adapter: ${data.adapterName}`);
+        }
+        if (data.message && !parts.length) {
+          parts.push(data.message);
+        }
+        deviceStatusEl.textContent = parts.join(" · ");
+      }
+
+      async function ensureDevice(updateStatus = null) {
+        const modelID = modelSelectEl.value;
+        const { modelURL, tokenizerURL, configURL } = getModelInfo(modelID);
+        const deviceMode = selectedDeviceMode();
+        const previous = currentDeviceMode;
+        try {
+          const ready = await setDevice(
+            bertWorker,
+            modelURL,
+            tokenizerURL,
+            configURL,
+            modelID,
+            deviceMode,
+            updateStatus
+          );
+          currentDeviceMode = deviceMode;
+          deviceReady = true;
+          updateDeviceStatus(ready);
+          return ready;
+        } catch (e) {
+          deviceReady = false;
+          const rollback =
+            e.deviceError?.previousDeviceMode ?? previous ?? "auto";
+          setDeviceRadio(rollback);
+          if (deviceStatusEl) {
+            deviceStatusEl.textContent = `deviceError: ${e.message} (rolled back to ${rollback})`;
+          }
+          throw e;
+        }
+      }
 
       function toggleTextArea(state) {
         if (state) {
@@ -73,10 +139,34 @@
         calculateEmbeddings(textAreaEl.value);
       });
 
-      modelSelectEl.addEventListener("change", (e) => {
+      modelSelectEl.addEventListener("change", async () => {
+        deviceReady = false;
+        try {
+          await ensureDevice(updateStatus);
+        } catch {
+          return;
+        }
         if (currInputText === "" || isCalculating) return;
         populateOutputArea(textAreaEl.value);
         calculateEmbeddings(textAreaEl.value);
+      });
+
+      deviceRadios().forEach((el) => {
+        el.addEventListener("change", async () => {
+          if (isCalculating) {
+            setDeviceRadio(currentDeviceMode);
+            return;
+          }
+          try {
+            await ensureDevice(updateStatus);
+            if (currInputText !== "") {
+              populateOutputArea(textAreaEl.value);
+              calculateEmbeddings(textAreaEl.value);
+            }
+          } catch {
+            // radio already rolled back in ensureDevice
+          }
+        });
       });
 
       function populateOutputArea(text) {
@@ -96,60 +186,72 @@
         if (isCalculating || currInputText === "") return;
         toggleInputs(true);
         const modelID = modelSelectEl.value;
-        const { modelURL, tokenizerURL, configURL, search_prefix } =
-          getModelInfo(modelID);
+        const { search_prefix } = getModelInfo(modelID);
 
-        const text = searchInputEl.value;
         const query = search_prefix + searchInputEl.value;
         outputStatusEl.classList.remove("invisible");
         outputStatusEl.innerText = "Calculating embeddings for query...";
         isCalculating = true;
-        const out = await getEmbeddings(
-          bertWorker,
-          modelURL,
-          tokenizerURL,
-          configURL,
-          modelID,
-          [query]
-        );
-        outputStatusEl.classList.add("invisible");
-        const queryEmbeddings = out.output[0];
-        // calculate cosine similarity with all sentences given the query
-        const distances = sentenceEmbeddings
-          .map((embedding, id) => ({
-            id,
-            similarity: cosineSimilarity(queryEmbeddings, embedding),
-          }))
-          .sort((a, b) => b.similarity - a.similarity)
-          // getting top 10 most similar sentences
-          .slice(0, 10);
+        try {
+          if (!deviceReady) await ensureDevice(updateStatus);
+          const out = await getEmbeddings(bertWorker, modelID, [query]);
+          outputStatusEl.classList.add("invisible");
+          const queryEmbeddings = out.output[0];
+          // calculate cosine similarity with all sentences given the query
+          const distances = sentenceEmbeddings
+            .map((embedding, id) => ({
+              id,
+              similarity: cosineSimilarity(queryEmbeddings, embedding),
+            }))
+            .sort((a, b) => b.similarity - a.similarity)
+            // getting top 10 most similar sentences
+            .slice(0, 10);
 
-        const colorScale = scaleLinear()
-          .domain([
-            distances[distances.length - 1].similarity,
-            distances[0].similarity,
-          ])
-          .range([0, 1])
-          .interpolate(() => interpolateReds);
-        outputAreaEl.querySelectorAll("span").forEach((el) => {
-          el.style.color = "unset";
-          el.style.backgroundColor = "unset";
-        });
-        distances.forEach((d) => {
-          const el = outputAreaEl.querySelector(`#sentence-${d.id}`);
-          const color = colorScale(d.similarity);
-          const fontColor = hcl(color).l < 70 ? "white" : "black";
-          el.style.color = fontColor;
-          el.style.backgroundColor = color;
-        });
+          if (distances.length === 0) {
+            isCalculating = false;
+            toggleInputs(false);
+            return;
+          }
 
-        outputAreaEl
-          .querySelector(`#sentence-${distances[0].id}`)
-          .scrollIntoView({
-            behavior: "smooth",
-            block: "center",
-            inline: "nearest",
+          const colorScale = scaleLinear()
+            .domain([
+              distances[distances.length - 1].similarity,
+              distances[0].similarity,
+            ])
+            .range([0, 1])
+            .interpolate(() => interpolateReds);
+          outputAreaEl.querySelectorAll("span").forEach((el) => {
+            el.style.color = "unset";
+            el.style.backgroundColor = "unset";
           });
+          distances.forEach((d) => {
+            const el = outputAreaEl.querySelector(`#sentence-${d.id}`);
+            const color = colorScale(d.similarity);
+            const fontColor = hcl(color).l < 70 ? "white" : "black";
+            el.style.color = fontColor;
+            el.style.backgroundColor = color;
+          });
+
+          outputAreaEl
+            .querySelector(`#sentence-${distances[0].id}`)
+            .scrollIntoView({
+              behavior: "smooth",
+              block: "center",
+              inline: "nearest",
+            });
+        } catch (err) {
+          if (err.deviceError) {
+            const rollback =
+              err.deviceError.previousDeviceMode ?? currentDeviceMode;
+            setDeviceRadio(rollback);
+            deviceReady = false;
+            if (deviceStatusEl) {
+              deviceStatusEl.textContent = `deviceError: ${err.message} (rolled back to ${rollback})`;
+            }
+          }
+          outputStatusEl.innerText = `Error: ${err.message}`;
+          outputStatusEl.classList.remove("invisible");
+        }
 
         isCalculating = false;
         toggleInputs(false);
@@ -158,39 +260,63 @@
         isCalculating = true;
         toggleInputs(true);
         const modelID = modelSelectEl.value;
-        const { modelURL, tokenizerURL, configURL, document_prefix } =
-          getModelInfo(modelID);
+        const { document_prefix } = getModelInfo(modelID);
+
+        try {
+          if (!deviceReady) await ensureDevice(updateStatus);
+        } catch {
+          isCalculating = false;
+          toggleInputs(false);
+          return;
+        }
 
         const sentences = text.split(sentencesRegex);
         const allEmbeddings = [];
         outputStatusEl.classList.remove("invisible");
-        for (const [id, sentence] of sentences.entries()) {
-          const query = document_prefix + sentence;
-          outputStatusEl.innerText = `Calculating embeddings: sentence ${
-            id + 1
-          } of ${sentences.length}`;
-          const embeddings = await getEmbeddings(
-            bertWorker,
-            modelURL,
-            tokenizerURL,
-            configURL,
-            modelID,
-            [query],
-            updateStatus
-          );
-          allEmbeddings.push(embeddings);
+        try {
+          for (const [id, sentence] of sentences.entries()) {
+            const query = document_prefix + sentence;
+            outputStatusEl.innerText = `Calculating embeddings: sentence ${
+              id + 1
+            } of ${sentences.length}`;
+            const embeddings = await getEmbeddings(
+              bertWorker,
+              modelID,
+              [query],
+              updateStatus
+            );
+            allEmbeddings.push(embeddings);
+          }
+          sentenceEmbeddings = allEmbeddings.map((e) => e.output[0]);
+        } catch (e) {
+          if (e.deviceError) {
+            const rollback =
+              e.deviceError.previousDeviceMode ?? currentDeviceMode;
+            setDeviceRadio(rollback);
+            deviceReady = false;
+            if (deviceStatusEl) {
+              deviceStatusEl.textContent = `deviceError: ${e.message} (rolled back to ${rollback})`;
+            }
+          }
+          outputStatusEl.innerText = `Error: ${e.message}`;
         }
         outputStatusEl.classList.add("invisible");
-        sentenceEmbeddings = allEmbeddings.map((e) => e.output[0]);
         isCalculating = false;
         toggleInputs(false);
       }
 
       function updateStatus(data) {
         if ("status" in data) {
-          if (data.status === "loading") {
+          if (
+            data.status === "loading" ||
+            data.status === "reloading" ||
+            data.status === "embedding"
+          ) {
             outputStatusEl.innerText = data.message;
             outputStatusEl.classList.remove("invisible");
+          }
+          if (data.resolvedDevice || data.adapterName) {
+            updateDeviceStatus(data);
           }
         }
       }
@@ -287,6 +413,43 @@
             sentence-transformers/all-MiniLM-L12-v2 (133 MB)
           </option>
         </select>
+      </div>
+      <div>
+        <span class="font-medium block">Device:</span>
+        <div class="flex flex-wrap gap-4 items-center mt-1">
+          <label class="inline-flex items-center gap-1 font-light">
+            <input
+              type="radio"
+              name="device-mode"
+              value="cpu"
+              class="interactive disabled:cursor-not-allowed"
+            />
+            CPU
+          </label>
+          <label class="inline-flex items-center gap-1 font-light">
+            <input
+              type="radio"
+              name="device-mode"
+              value="wgpu"
+              class="interactive disabled:cursor-not-allowed"
+            />
+            WebGPU
+          </label>
+          <label class="inline-flex items-center gap-1 font-light">
+            <input
+              type="radio"
+              name="device-mode"
+              value="auto"
+              checked
+              class="interactive disabled:cursor-not-allowed"
+            />
+            Auto
+          </label>
+          <span
+            id="device-status"
+            class="text-xs font-light text-gray-600"
+          ></span>
+        </div>
       </div>
       <div>
         <h3 class="font-medium">Examples:</h3>

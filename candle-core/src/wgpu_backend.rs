@@ -682,6 +682,10 @@ struct WgpuInner {
     limits: wgpu::Limits,
     /// Cached `CANDLE_WGPU_COOP_MATMUL` (default true when hardware allows).
     coop_matmul_enabled: bool,
+    /// Last uncaptured / device-lost error message (worker-safe; no panic).
+    runtime_error: Arc<Mutex<Option<String>>>,
+    /// Set by `set_device_lost_callback` when the GPU device is lost.
+    device_lost: Arc<AtomicBool>,
     seed_value: RwLock<u64>,
     pipeline_cache: Mutex<HashMap<WgpuPipelineCacheKey, Arc<WgpuCachedPipeline>>>,
     buffer_registry: Mutex<HashMap<usize, (Weak<wgpu::Buffer>, u64)>>,
@@ -905,6 +909,38 @@ impl WgpuDevice {
 
     pub fn shader_f64_enabled(&self) -> bool {
         wgpu_shader_f64_enabled(self)
+    }
+
+    /// Take the last uncaptured / device-lost error, if any.
+    ///
+    /// Full async `pop_error_scope` around every dispatch is a follow-up; at
+    /// minimum uncaptured + lost must not panic the WASM worker.
+    pub fn take_runtime_error(&self) -> Option<String> {
+        self.inner
+            .runtime_error
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+    }
+
+    /// Whether the underlying `wgpu::Device` has reported a device-lost event.
+    pub fn is_lost(&self) -> bool {
+        self.inner.device_lost.load(Ordering::SeqCst)
+    }
+
+    /// Async device creation. On `wasm32` this is the only supported path
+    /// (`BROWSER_WEBGPU`, no `pollster::block_on`). On native this wraps sync
+    /// [`BackendDevice::new`](crate::backend::BackendDevice::new).
+    pub async fn new_async(ordinal: usize) -> Result<Self> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            wgpu_new_async_wasm(ordinal).await
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Native: reuse the pollster-based create path.
+            <Self as BackendDevice>::new(ordinal)
+        }
     }
 
     fn advance_rand_seed(&self, count: usize) -> Result<u64> {
@@ -9611,8 +9647,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 let r1 = (r0 + rows_per_seg).min(src_dim);
                 let mut sub_ids: Vec<u32> = Vec::new();
                 let mut dst_map: Vec<u32> = Vec::new();
-                for p in 0..ids_len {
-                    let iv = ids_vals[p];
+                for (p, &iv) in ids_vals.iter().enumerate().take(ids_len) {
                     if iv >= r0 as u32 && iv < r1 as u32 {
                         sub_ids.push(iv - r0 as u32);
                         let dst_off =
@@ -14951,207 +14986,309 @@ impl BackendStorage for WgpuStorage {
     }
 }
 
+/// Optional wgpu features enabled when the adapter exposes them.
+/// Never force `SHADER_F64` — browsers often lack it and wgpu panics if a
+/// required feature is missing from the adapter.
+fn wgpu_required_features(adapter_features: wgpu::Features) -> wgpu::Features {
+    let optional = wgpu::Features::SHADER_F16
+        | wgpu::Features::SUBGROUP
+        | wgpu::Features::SUBGROUP_BARRIER
+        | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
+        | wgpu::Features::IMMEDIATES
+        | wgpu::Features::SHADER_F64;
+    adapter_features & optional
+}
+
+#[cfg(test)]
+mod wgpu_required_features_tests {
+    use super::wgpu_required_features;
+
+    #[test]
+    fn wgpu_required_features_never_adds_unsupported_f64() {
+        let without_f64 = wgpu::Features::SHADER_F16;
+        let req = wgpu_required_features(without_f64);
+        assert!(!req.contains(wgpu::Features::SHADER_F64));
+        assert!(req.contains(wgpu::Features::SHADER_F16));
+    }
+}
+
+fn wgpu_install_runtime_handlers(
+    device: &wgpu::Device,
+    runtime_error: &Arc<Mutex<Option<String>>>,
+    device_lost: &Arc<AtomicBool>,
+) {
+    let err_slot = Arc::clone(runtime_error);
+    device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+        let msg = format!("wgpu uncaptured error: {error}");
+        if let Ok(mut guard) = err_slot.lock() {
+            *guard = Some(msg);
+        }
+    }));
+    let err_slot = Arc::clone(runtime_error);
+    let lost_flag = Arc::clone(device_lost);
+    device.set_device_lost_callback(move |reason, message| {
+        lost_flag.store(true, Ordering::SeqCst);
+        let msg = format!("wgpu device lost ({reason:?}): {message}");
+        if let Ok(mut guard) = err_slot.lock() {
+            *guard = Some(msg);
+        }
+    });
+}
+
+fn wgpu_finish_device(
+    ordinal: usize,
+    adapter_info: wgpu::AdapterInfo,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    required_features: wgpu::Features,
+    adapter_limits: wgpu::Limits,
+) -> WgpuDevice {
+    let runtime_error = Arc::new(Mutex::new(None));
+    let device_lost = Arc::new(AtomicBool::new(false));
+    wgpu_install_runtime_handlers(&device, &runtime_error, &device_lost);
+    // Cache env once — env::var on every matmul was measurable host cost.
+    let coop_matmul_enabled = std::env::var("CANDLE_WGPU_COOP_MATMUL")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    // WebGPU requires dynamic uniform offsets multiple of this alignment.
+    let uniform_dyn_slot =
+        u64::from(adapter_limits.min_uniform_buffer_offset_alignment).max(256);
+    WgpuDevice {
+        inner: Arc::new(WgpuInner {
+            ordinal,
+            adapter_name: adapter_info.name,
+            adapter_backend: format!("{:?}", adapter_info.backend),
+            adapter_driver: adapter_info.driver,
+            adapter_driver_info: adapter_info.driver_info,
+            adapter_pci_bus_id: adapter_info.device_pci_bus_id,
+            device,
+            queue,
+            features: required_features,
+            limits: adapter_limits,
+            coop_matmul_enabled,
+            runtime_error,
+            device_lost,
+            seed_value: RwLock::new(299_792_458),
+            pipeline_cache: Mutex::new(HashMap::new()),
+            buffer_registry: Mutex::new(HashMap::new()),
+            buffer_oid_next: std::sync::atomic::AtomicU64::new(1),
+            storage_buffer_pool: Mutex::new(HashMap::new()),
+            storage_pool_pending: Mutex::new(Vec::new()),
+            pending_submissions: Mutex::new(Vec::new()),
+            active_batch: Mutex::new(None),
+            uniform_ring: Mutex::new((Vec::new(), 0)),
+            uniform_params_cache: Mutex::new(Vec::new()),
+            uniform_dyn: Mutex::new(None),
+            uniform_dyn_cursor: AtomicUsize::new(0),
+            uniform_dyn_slot,
+            hot_rings: Mutex::new(HashMap::new()),
+            retain_seen: Mutex::new(HashSet::new()),
+            elem_bg_cache: Mutex::new(HashMap::new()),
+            elem_bg_tick: std::sync::atomic::AtomicU64::new(0),
+            elem_bg_hits: std::sync::atomic::AtomicU64::new(0),
+            elem_bg_misses: std::sync::atomic::AtomicU64::new(0),
+        }),
+    }
+}
+
+async fn wgpu_device_from_adapter(ordinal: usize, adapter: wgpu::Adapter) -> Result<WgpuDevice> {
+    let adapter_info = adapter.get_info();
+    let adapter_features = adapter.features();
+    let adapter_limits = adapter.limits();
+    // Request optional accelerate features when the adapter exposes them.
+    // EXPERIMENTAL_COOPERATIVE_MATRIX enables tensor-core 8x8 f32 MMA on
+    // Vulkan (NVIDIA/AMD) for dense GEMM warptile paths. SHADER_F64 is
+    // capability-gated (never forced).
+    let mut required_features = wgpu_required_features(adapter_features);
+    // SAFETY: cooperative matrix is experimental; we only enable it when
+    // the adapter advertises EXPERIMENTAL_COOPERATIVE_MATRIX and fall back
+    // to software warptile otherwise. Report bugs to gfx-rs/wgpu if hit.
+    let experimental_features =
+        if required_features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            unsafe { wgpu::ExperimentalFeatures::enabled() }
+        } else {
+            wgpu::ExperimentalFeatures::disabled()
+        };
+    // IMMEDIATES (push constants): BinaryContigParams=16 B, UnaryParams=48 B.
+    // Adapter may report max_immediate_size=0 until we request a non-zero
+    // limit with the feature bit — try 128, fall back without immediates.
+    let mut required_limits = adapter_limits.clone();
+    let want_immediates = required_features.contains(wgpu::Features::IMMEDIATES);
+    if want_immediates {
+        let cap = if adapter_limits.max_immediate_size > 0 {
+            adapter_limits.max_immediate_size.min(256)
+        } else {
+            128
+        };
+        required_limits.max_immediate_size = cap.max(16);
+    }
+    let (device, queue) = match adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("candle-wgpu"),
+            required_features,
+            required_limits: required_limits.clone(),
+            experimental_features,
+            // Favor smaller gpu-allocator device blocks (MemoryUsage => 8-64
+            // MiB vs Performance => 128-256 MiB). The KV-cat loop allocates
+            // many small buffers that are recycled, so large blocks carve
+            // fresh VRAM per alloc and never get returned -> OOM at low VRAM.
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(dq) => dq,
+        Err(e) if want_immediates => {
+            // Retry without IMMEDIATES (some drivers reject the limit).
+            required_features.remove(wgpu::Features::IMMEDIATES);
+            required_limits.max_immediate_size = 0;
+            adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("candle-wgpu"),
+                    required_features,
+                    required_limits: required_limits.clone(),
+                    experimental_features,
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e2| {
+                    Error::wrap(format!(
+                        "wgpu request_device failed (immediates retry also failed): {e}; {e2}"
+                    ))
+                })?
+        }
+        Err(e) => return Err(Error::wrap(e)),
+    };
+    Ok(wgpu_finish_device(
+        ordinal,
+        adapter_info,
+        device,
+        queue,
+        required_features,
+        required_limits,
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn wgpu_new_async_wasm(ordinal: usize) -> Result<WgpuDevice> {
+    if ordinal != 0 {
+        crate::bail!("wasm WebGPU exposes a single adapter; ordinal must be 0, got {ordinal}");
+    }
+    let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    instance_desc.backends = wgpu::Backends::BROWSER_WEBGPU;
+    let instance = wgpu::Instance::new(instance_desc);
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        })
+        .await
+        .map_err(|e| Error::wrap(format!("wgpu request_adapter failed: {e}")))?;
+    wgpu_device_from_adapter(ordinal, adapter).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn wgpu_select_native_adapter(ordinal: usize) -> Result<wgpu::Adapter> {
+    let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    // Prefer native Vulkan under wgpu when available — DX12 compute has
+    // historically shown higher dispatch/overhead for our GEMM kernels on
+    // NVIDIA Windows. Fall back to all backends if Vulkan is unavailable.
+    let backend_pref = std::env::var("CANDLE_WGPU_BACKENDS")
+        .ok()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "vulkan,primary".into());
+    instance_desc.backends = if backend_pref.contains("all") {
+        wgpu::Backends::all()
+    } else if backend_pref.contains("dx12") && !backend_pref.contains("vulkan") {
+        wgpu::Backends::DX12
+    } else if backend_pref.contains("vulkan") && !backend_pref.contains("dx12") {
+        wgpu::Backends::VULKAN
+    } else {
+        // Default: try Vulkan first by restricting enumeration order later;
+        // keep all backends so we can fall back.
+        wgpu::Backends::all()
+    };
+    let backends = instance_desc.backends;
+    let instance = wgpu::Instance::new(instance_desc);
+    let mut adapters = pollster::block_on(instance.enumerate_adapters(backends));
+    if adapters.is_empty() && backends != wgpu::Backends::all() {
+        // Fallback if preferred backend had no adapters.
+        let mut fallback = wgpu::InstanceDescriptor::new_without_display_handle();
+        fallback.backends = wgpu::Backends::all();
+        let fb_backends = fallback.backends;
+        let fb_instance = wgpu::Instance::new(fallback);
+        adapters = pollster::block_on(fb_instance.enumerate_adapters(fb_backends));
+    }
+    if adapters.is_empty() {
+        crate::bail!("no wgpu adapters found")
+    }
+    // Prefer Vulkan adapters over DX12/GL when multiple backends enumerate.
+    adapters.sort_by_key(|a| {
+        let b = a.get_info().backend;
+        match b {
+            wgpu::Backend::Vulkan => 0u8,
+            wgpu::Backend::Metal => 1,
+            wgpu::Backend::Dx12 => 2,
+            wgpu::Backend::Gl => 3,
+            _ => 4,
+        }
+    });
+    let requested_name = std::env::var("CANDLE_WGPU_ADAPTER_NAME")
+        .ok()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty());
+    let selected_index = if let Some(requested_name) = requested_name {
+        let requested_name = requested_name.to_ascii_lowercase();
+        adapters
+            .iter()
+            .position(|adapter| {
+                adapter
+                    .get_info()
+                    .name
+                    .to_ascii_lowercase()
+                    .contains(&requested_name)
+            })
+            .ok_or_else(|| {
+                Error::msg(format!(
+                    "no wgpu adapter matching CANDLE_WGPU_ADAPTER_NAME={requested_name:?}"
+                ))
+            })?
+    } else {
+        let mut preferred = adapters
+            .iter()
+            .enumerate()
+            .filter(|(_, adapter)| adapter.get_info().device_type != wgpu::DeviceType::Cpu)
+            .map(|(index, _)| index);
+        preferred
+            .nth(ordinal)
+            .or_else(|| {
+                adapters
+                    .iter()
+                    .position(|adapter| adapter.get_info().device_type != wgpu::DeviceType::Cpu)
+            })
+            .unwrap_or(ordinal.min(adapters.len() - 1))
+    };
+    Ok(adapters.swap_remove(selected_index))
+}
+
 impl BackendDevice for WgpuDevice {
     type Storage = WgpuStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
-        let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        // Prefer native Vulkan under wgpu when available — DX12 compute has
-        // historically shown higher dispatch/overhead for our GEMM kernels on
-        // NVIDIA Windows. Fall back to all backends if Vulkan is unavailable.
-        let backend_pref = std::env::var("CANDLE_WGPU_BACKENDS")
-            .ok()
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_else(|| "vulkan,primary".into());
-        instance_desc.backends = if backend_pref.contains("all") {
-            wgpu::Backends::all()
-        } else if backend_pref.contains("dx12") && !backend_pref.contains("vulkan") {
-            wgpu::Backends::DX12
-        } else if backend_pref.contains("vulkan") && !backend_pref.contains("dx12") {
-            wgpu::Backends::VULKAN
-        } else {
-            // Default: try Vulkan first by restricting enumeration order later;
-            // keep all backends so we can fall back.
-            wgpu::Backends::all()
-        };
-        let backends = instance_desc.backends;
-        let instance = wgpu::Instance::new(instance_desc);
-        let mut adapters = pollster::block_on(instance.enumerate_adapters(backends));
-        if adapters.is_empty() && backends != wgpu::Backends::all() {
-            // Fallback if preferred backend had no adapters.
-            let mut fallback = wgpu::InstanceDescriptor::new_without_display_handle();
-            fallback.backends = wgpu::Backends::all();
-            let fb_backends = fallback.backends;
-            let fb_instance = wgpu::Instance::new(fallback);
-            adapters = pollster::block_on(fb_instance.enumerate_adapters(fb_backends));
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = ordinal;
+            crate::bail!(
+                "WgpuDevice::new is unavailable on wasm32; use WgpuDevice::new_async / Device::new_wgpu_async"
+            )
         }
-        if adapters.is_empty() {
-            crate::bail!("no wgpu adapters found")
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let adapter = wgpu_select_native_adapter(ordinal)?;
+            pollster::block_on(wgpu_device_from_adapter(ordinal, adapter))
         }
-        // Prefer Vulkan adapters over DX12/GL when multiple backends enumerate.
-        adapters.sort_by_key(|a| {
-            let b = a.get_info().backend;
-            match b {
-                wgpu::Backend::Vulkan => 0u8,
-                wgpu::Backend::Metal => 1,
-                wgpu::Backend::Dx12 => 2,
-                wgpu::Backend::Gl => 3,
-                _ => 4,
-            }
-        });
-        let requested_name = std::env::var("CANDLE_WGPU_ADAPTER_NAME")
-            .ok()
-            .map(|name| name.trim().to_owned())
-            .filter(|name| !name.is_empty());
-        let selected_index = if let Some(requested_name) = requested_name {
-            let requested_name = requested_name.to_ascii_lowercase();
-            adapters
-                .iter()
-                .position(|adapter| {
-                    adapter
-                        .get_info()
-                        .name
-                        .to_ascii_lowercase()
-                        .contains(&requested_name)
-                })
-                .ok_or_else(|| {
-                    Error::msg(format!(
-                        "no wgpu adapter matching CANDLE_WGPU_ADAPTER_NAME={requested_name:?}"
-                    ))
-                })?
-        } else {
-            let mut preferred = adapters
-                .iter()
-                .enumerate()
-                .filter(|(_, adapter)| adapter.get_info().device_type != wgpu::DeviceType::Cpu)
-                .map(|(index, _)| index);
-            preferred
-                .nth(ordinal)
-                .or_else(|| {
-                    adapters
-                        .iter()
-                        .position(|adapter| adapter.get_info().device_type != wgpu::DeviceType::Cpu)
-                })
-                .unwrap_or(ordinal.min(adapters.len() - 1))
-        };
-        let adapter = adapters.swap_remove(selected_index);
-        let adapter_info = adapter.get_info();
-        let adapter_features = adapter.features();
-        let adapter_limits = adapter.limits();
-        if !adapter_features.contains(wgpu::Features::SHADER_F64) {
-            return Err(Error::msg(format!(
-                "wgpu adapter {:?} does not support SHADER_F64 (required for native f64)",
-                adapter_info.name
-            )));
-        }
-        // Request optional accelerate features when the adapter exposes them.
-        // EXPERIMENTAL_COOPERATIVE_MATRIX enables tensor-core 8×8 f32 MMA on
-        // Vulkan (NVIDIA/AMD) for dense GEMM warptile paths.
-        let optional = wgpu::Features::SHADER_F16
-            | wgpu::Features::SUBGROUP
-            | wgpu::Features::SUBGROUP_BARRIER
-            | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
-            | wgpu::Features::IMMEDIATES;
-        let required_features = wgpu::Features::SHADER_F64 | (adapter_features & optional);
-        // SAFETY: cooperative matrix is experimental; we only enable it when
-        // the adapter advertises EXPERIMENTAL_COOPERATIVE_MATRIX and fall back
-        // to software warptile otherwise. Report bugs to gfx-rs/wgpu if hit.
-        let experimental_features =
-            if required_features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
-                unsafe { wgpu::ExperimentalFeatures::enabled() }
-            } else {
-                wgpu::ExperimentalFeatures::disabled()
-            };
-        // IMMEDIATES (push constants): BinaryContigParams=16 B, UnaryParams=48 B.
-        // Adapter may report max_immediate_size=0 until we request a non-zero
-        // limit with the feature bit — try 128, fall back without immediates.
-        let mut required_features = required_features;
-        let mut required_limits = adapter_limits.clone();
-        let want_immediates = required_features.contains(wgpu::Features::IMMEDIATES);
-        if want_immediates {
-            let cap = if adapter_limits.max_immediate_size > 0 {
-                adapter_limits.max_immediate_size.min(256)
-            } else {
-                128
-            };
-            required_limits.max_immediate_size = cap.max(16);
-        }
-        let (device, queue) =
-            match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("candle-wgpu"),
-                required_features,
-                required_limits: required_limits.clone(),
-                experimental_features,
-                // Favor smaller gpu-allocator device blocks (MemoryUsage ⇒ 8–64
-                // MiB vs Performance ⇒ 128–256 MiB). The KV-cat loop allocates
-                // many small buffers that are recycled, so large blocks carve
-                // fresh VRAM per alloc and never get returned → OOM at low VRAM.
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                ..Default::default()
-            })) {
-                Ok(dq) => dq,
-                Err(e) if want_immediates => {
-                    // Retry without IMMEDIATES (some drivers reject the limit).
-                    required_features.remove(wgpu::Features::IMMEDIATES);
-                    required_limits.max_immediate_size = 0;
-                    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                        label: Some("candle-wgpu"),
-                        required_features,
-                        required_limits: required_limits.clone(),
-                        experimental_features,
-                        memory_hints: wgpu::MemoryHints::MemoryUsage,
-                        ..Default::default()
-                    }))
-                    .map_err(|e2| {
-                        Error::wrap(format!(
-                            "wgpu request_device failed (immediates retry also failed): {e}; {e2}"
-                        ))
-                    })?
-                }
-                Err(e) => return Err(Error::wrap(e)),
-            };
-        let adapter_limits = required_limits;
-        // Cache env once — env::var on every matmul was measurable host cost.
-        let coop_matmul_enabled = std::env::var("CANDLE_WGPU_COOP_MATMUL")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-            .unwrap_or(true);
-        // WebGPU requires dynamic uniform offsets multiple of this alignment.
-        let uniform_dyn_slot =
-            u64::from(adapter_limits.min_uniform_buffer_offset_alignment).max(256);
-        Ok(Self {
-            inner: Arc::new(WgpuInner {
-                ordinal,
-                adapter_name: adapter_info.name,
-                adapter_backend: format!("{:?}", adapter_info.backend),
-                adapter_driver: adapter_info.driver,
-                adapter_driver_info: adapter_info.driver_info,
-                adapter_pci_bus_id: adapter_info.device_pci_bus_id,
-                device,
-                queue,
-                features: required_features,
-                limits: adapter_limits,
-                coop_matmul_enabled,
-                seed_value: RwLock::new(299_792_458),
-                pipeline_cache: Mutex::new(HashMap::new()),
-                buffer_registry: Mutex::new(HashMap::new()),
-                buffer_oid_next: std::sync::atomic::AtomicU64::new(1),
-                storage_buffer_pool: Mutex::new(HashMap::new()),
-                storage_pool_pending: Mutex::new(Vec::new()),
-                pending_submissions: Mutex::new(Vec::new()),
-                active_batch: Mutex::new(None),
-                uniform_ring: Mutex::new((Vec::new(), 0)),
-                uniform_params_cache: Mutex::new(Vec::new()),
-                uniform_dyn: Mutex::new(None),
-                uniform_dyn_cursor: AtomicUsize::new(0),
-                uniform_dyn_slot,
-                hot_rings: Mutex::new(HashMap::new()),
-                retain_seen: Mutex::new(HashSet::new()),
-                elem_bg_cache: Mutex::new(HashMap::new()),
-                elem_bg_tick: std::sync::atomic::AtomicU64::new(0),
-                elem_bg_hits: std::sync::atomic::AtomicU64::new(0),
-                elem_bg_misses: std::sync::atomic::AtomicU64::new(0),
-            }),
-        })
     }
 
     fn location(&self) -> crate::DeviceLocation {
