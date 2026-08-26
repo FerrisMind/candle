@@ -77,6 +77,227 @@ fn reshape_from_chunks(x: &Tensor) -> Result<Tensor> {
     x.reshape(new_shape)
 }
 
+// Chunked SSD (Algorithm 1 in the Mamba2 paper) on the generic path (CPU/CUDA/Metal).
+// This materializes rank-5/6 temporaries, which is fine for those backends.
+fn ssd_chunked_impl(
+    x: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    chunk_size: usize,
+    initial_state: Option<&Tensor>,
+    d_state: usize,
+) -> Result<(Tensor, Tensor)> {
+    let device = x.device();
+    let dtype = x.dtype();
+    let (batch, seq_len, nheads, headdim) = x.dims4()?;
+    let n_chunks = seq_len / chunk_size;
+
+    let x = reshape_into_chunks(x, chunk_size)?;
+    let a = reshape_into_chunks(a, chunk_size)?;
+    let b = reshape_into_chunks(b, chunk_size)?;
+    let c = reshape_into_chunks(c, chunk_size)?;
+
+    // contiguous() required for Metal: cumsum uses matmul internally
+    let a = a.permute((0, 3, 1, 2))?.contiguous()?;
+    let a_cumsum = a.cumsum(D::Minus1)?;
+
+    // Intra-chunk (diagonal blocks)
+    let l = segsum(&a)?.exp()?;
+
+    let c_expanded = c.unsqueeze(3)?;
+    let b_expanded = b.unsqueeze(2)?;
+    let cb_shape = (batch, n_chunks, chunk_size, chunk_size, nheads, d_state);
+    let cb = (c_expanded.broadcast_as(cb_shape)? * b_expanded.broadcast_as(cb_shape)?)?
+        .sum(D::Minus1)?;
+    let cb = cb.permute((0, 1, 4, 2, 3))?;
+
+    let l_t = l.permute((0, 2, 1, 3, 4))?;
+    let cb_l = (&cb * &l_t)?;
+
+    let x_t = x.permute((0, 1, 3, 2, 4))?;
+    let y_diag_shape = (batch, n_chunks, nheads, chunk_size, chunk_size, headdim);
+    let y_diag = (cb_l.unsqueeze(D::Minus1)?.broadcast_as(y_diag_shape)?
+        * x_t.unsqueeze(3)?.broadcast_as(y_diag_shape)?)?
+    .sum(4)?
+    .permute((0, 1, 3, 2, 4))?;
+
+    // Intra-chunk states
+    let a_last = a_cumsum.narrow(D::Minus1, chunk_size - 1, 1)?;
+    let decay_states = (a_last.broadcast_as(a_cumsum.shape())? - &a_cumsum)?.exp()?;
+
+    let decay_s = decay_states.permute((0, 2, 1, 3))?.unsqueeze(D::Minus1)?;
+    let b_t = b.permute((0, 1, 3, 2, 4))?;
+    let b_weighted = b_t.broadcast_mul(&decay_s)?;
+
+    let x_t2 = x.permute((0, 1, 3, 2, 4))?;
+    let states_shape = (batch, n_chunks, nheads, chunk_size, headdim, d_state);
+    let states = (x_t2.unsqueeze(D::Minus1)?.broadcast_as(states_shape)?
+        * b_weighted.unsqueeze(4)?.broadcast_as(states_shape)?)?
+    .sum(3)?;
+
+    // Inter-chunk recurrence
+    let init_state = match initial_state {
+        Some(s) => s.unsqueeze(1)?,
+        None => Tensor::zeros((batch, 1, nheads, headdim, d_state), dtype, device)?,
+    };
+    let states_with_init = Tensor::cat(&[&init_state, &states], 1)?;
+
+    let a_chunk = a_cumsum
+        .narrow(D::Minus1, chunk_size - 1, 1)?
+        .squeeze(D::Minus1)?;
+    let zeros = Tensor::zeros((batch, nheads, 1), dtype, device)?;
+    let a_chunk_padded = Tensor::cat(&[&zeros, &a_chunk], D::Minus1)?;
+    let decay_chunk = segsum(&a_chunk_padded)?.exp()?;
+
+    let states_p = states_with_init.permute((0, 2, 1, 3, 4))?;
+    let inter_shape = (batch, nheads, n_chunks + 1, n_chunks + 1, headdim, d_state);
+    let new_states = (decay_chunk
+        .unsqueeze(D::Minus1)?
+        .unsqueeze(D::Minus1)?
+        .broadcast_as(inter_shape)?
+        * states_p.unsqueeze(2)?.broadcast_as(inter_shape)?)?
+    .sum(3)?
+    .permute((0, 2, 1, 3, 4))?;
+
+    let states_out = new_states.narrow(1, 0, n_chunks)?;
+    let final_state = new_states.narrow(1, n_chunks, 1)?.squeeze(1)?;
+
+    // State-to-output (off-diagonal blocks)
+    let state_decay_out = a_cumsum.exp()?;
+
+    let c_t2 = c.permute((0, 1, 3, 2, 4))?;
+    let off_shape = (batch, n_chunks, nheads, chunk_size, headdim, d_state);
+    let c_states = (c_t2.unsqueeze(4)?.broadcast_as(off_shape)?
+        * states_out.unsqueeze(3)?.broadcast_as(off_shape)?)?
+    .sum(D::Minus1)?;
+
+    let decay_out = state_decay_out
+        .permute((0, 2, 1, 3))?
+        .unsqueeze(D::Minus1)?;
+    let y_off = c_states
+        .broadcast_mul(&decay_out)?
+        .permute((0, 1, 3, 2, 4))?;
+
+    let y = (&y_diag + &y_off)?;
+    let y = reshape_from_chunks(&y)?;
+
+    Ok((y, final_state))
+}
+
+// Rank-4 flattened SSD for backends that reject rank-5/6 temporaries (wgpu/vulkan cap at
+// rank 4). Mathematically identical to `ssd_chunked_impl`: every dot-product reduction
+// (over d_state, over chunk position, and the inter-chunk chunk recurrence) is expressed as
+// an explicit `matmul` on flattened rank-4 tensors. The leading `batch x n_chunks` dims are
+// folded into a single `BN` (= `b * n_chunks`) axis for the chunk-local part; the inter-chunk
+// recurrence uses a `BF` (= `b * nheads`) batch so the chunk axis stays a real sequence dim.
+#[allow(clippy::too_many_arguments)]
+fn ssd_chunked_gpu_impl(
+    x: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    chunk_size: usize,
+    initial_state: Option<&Tensor>,
+    d_state: usize,
+) -> Result<(Tensor, Tensor)> {
+    let device = x.device();
+    let dtype = x.dtype();
+    let (batch, seq_len, nheads, headdim) = x.dims4()?;
+    let n_chunks = seq_len / chunk_size;
+    let cs = chunk_size;
+    let (h, ds, d) = (nheads, d_state, headdim);
+    let bn = batch * n_chunks;
+    let bf = batch * h;
+
+    let x = x.contiguous()?;
+    let a = a.contiguous()?;
+    let b = b.contiguous()?;
+    let c = c.contiguous()?;
+
+    // Chunk-local flattened inputs, all rank <= 4.
+    // x: [B, L, H, D]          -> [BN, CS, H, D]
+    // a: [B, L, H]             -> [BN, H, CS]
+    // b, c: [B, L, H, DState]  -> [BN, CS, H, DState]
+    let x_bn = x.reshape((bn, cs, h, d))?;
+    let a_bn = a
+        .reshape((batch, n_chunks, cs, h))?
+        .permute((0, 1, 3, 2))?
+        .contiguous()?
+        .reshape((bn, h, cs))?;
+    let b_bn = b.reshape((bn, cs, h, ds))?;
+    let c_bn = c.reshape((bn, cs, h, ds))?;
+
+    let a_cumsum = a_bn.cumsum(D::Minus1)?; // [BN, H, CS]
+
+    // l[i, j] = exp(cumsum[i] - cumsum[j]) for i >= j, 0 otherwise.
+    let l = segsum(&a_bn)?.exp()?; // [BN, H, CS, CS]
+
+    // Intra-chunk diagonal kernel: cb[i, j] = sum_dstate c[i, :] * b[j, :].
+    let c_perm = c_bn.permute((0, 2, 1, 3))?.contiguous()?; // [BN, H, CS, DState]
+    let b_perm = b_bn.permute((0, 2, 1, 3))?.contiguous()?; // [BN, H, CS, DState]
+    let cb = c_perm.matmul(&b_perm.transpose(D::Minus2, D::Minus1)?)?; // [BN, H, CS, CS]
+    let cb_l = (&cb * &l)?; // [BN, H, CS, CS]
+
+    let x_t = x_bn.permute((0, 2, 1, 3))?.contiguous()?; // [BN, H, CS, D]
+    let y_diag = cb_l.matmul(&x_t)?; // [BN, H, CS, D]
+    let y_diag = y_diag.permute((0, 2, 1, 3))?; // [BN, CS, H, D]
+
+    // Intra-chunk state contribution: states[bn, h, d, ds] = sum_t x[t, d] * b_weighted[t, ds]
+    let a_last = a_cumsum.narrow(D::Minus1, cs - 1, 1)?; // [BN, H, 1]
+    let decay_states = (a_last.broadcast_as(a_cumsum.shape())? - &a_cumsum)?.exp()?; // [BN, H, CS]
+    let decay_s = decay_states.unsqueeze(D::Minus1)?; // [BN, H, CS, 1]
+    let b_weighted = b_perm.broadcast_mul(&decay_s)?; // [BN, H, CS, DState]
+    let states = x_t
+        .transpose(D::Minus2, D::Minus1)?
+        .matmul(&b_weighted)?; // [BN, H, D, DState]
+
+    // Inter-chunk recurrence over the chunk axis, batched over BF = B * H.
+    let states_hd = states.contiguous()?.reshape((batch, n_chunks, h, d * ds))?; // [B, NC, H, D*DS]
+    let states_perm = states_hd.permute((0, 2, 1, 3))?.contiguous()?; // [B, H, NC, D*DS]
+    let init_state = match initial_state {
+        Some(s) => s.contiguous()?.reshape((batch, h, d * ds))?.unsqueeze(2)?, // [B,H,1,D*DS]
+        None => Tensor::zeros((batch, h, 1, d * ds), dtype, device)?,
+    };
+    let states_with_init = Tensor::cat(&[&init_state, &states_perm], 2)?; // [B,H,NC+1,D*DS]
+    let states_pf = states_with_init.reshape((bf, n_chunks + 1, d * ds))?; // [BF,NC+1,D*DS]
+
+    let a_chunk_bn = a_cumsum
+        .narrow(D::Minus1, cs - 1, 1)?
+        .squeeze(D::Minus1)? // [BN, H]
+        .reshape((batch, n_chunks, h))?
+        .permute((0, 2, 1))?; // [B, H, NC]
+    let zeros_chunk = Tensor::zeros((batch, h, 1), dtype, device)?;
+    let a_chunk_padded = Tensor::cat(&[&zeros_chunk, &a_chunk_bn], D::Minus1)?; // [B,H,NC+1]
+    let decay_chunk = segsum(&a_chunk_padded)?.exp()?; // [B,H,NC+1,NC+1]
+    let decay_chunk = decay_chunk.reshape((bf, n_chunks + 1, n_chunks + 1))?; // [BF,NC+1,NC+1]
+
+    let new_states = decay_chunk.matmul(&states_pf)?; // [BF,NC+1,D*DS]
+    let states_out_bn = new_states
+        .narrow(1, 0, n_chunks)? // [BF,NC,D*DS]
+        .reshape((batch, h, n_chunks, d * ds))? // [B,H,NC,D*DS]
+        .permute((0, 2, 1, 3))? // [B,NC,H,D*DS]
+        .contiguous()?
+        .reshape((bn, h, d, ds))?; // [BN,H,D,DState]
+    let final_state = new_states
+        .narrow(1, n_chunks, 1)? // [BF,1,D*DS]
+        .squeeze(1)? // [BF,D*DS]
+        .reshape((batch, h, d, ds))?; // [B,H,D,DState]
+
+    // State-to-output (off-diagonal blocks).
+    let c_t2 = c_bn.permute((0, 2, 1, 3))?.contiguous()?; // [BN,H,CS,DState]
+    let c_states = c_t2.matmul(&states_out_bn.transpose(D::Minus2, D::Minus1)?)?; // [BN,H,CS,D]
+    let decay_out = a_cumsum.exp()?.unsqueeze(D::Minus1)?; // [BN,H,CS,1]
+    let y_off = c_states
+        .broadcast_mul(&decay_out)?
+        .permute((0, 2, 1, 3))?; // [BN,CS,H,D]
+
+    let y = (&y_diag + &y_off)?; // [BN,CS,H,D]
+    let y = y.reshape((batch, seq_len, h, d))?; // [B,L,H,D]
+
+    Ok((y, final_state))
+}
+
 fn default_d_state() -> usize {
     64
 }
@@ -334,102 +555,13 @@ impl Mamba2Block {
         chunk_size: usize,
         initial_state: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
-        let device = x.device();
-        let dtype = x.dtype();
-        let (batch, seq_len, nheads, headdim) = x.dims4()?;
-        let d_state = self.d_state;
-        let n_chunks = seq_len / chunk_size;
-
-        let x = reshape_into_chunks(x, chunk_size)?;
-        let a = reshape_into_chunks(a, chunk_size)?;
-        let b = reshape_into_chunks(b, chunk_size)?;
-        let c = reshape_into_chunks(c, chunk_size)?;
-
-        // contiguous() required for Metal: cumsum uses matmul internally
-        let a = a.permute((0, 3, 1, 2))?.contiguous()?;
-        let a_cumsum = a.cumsum(D::Minus1)?;
-
-        // Intra-chunk (diagonal blocks)
-        let l = segsum(&a)?.exp()?;
-
-        let c_expanded = c.unsqueeze(3)?;
-        let b_expanded = b.unsqueeze(2)?;
-        let cb_shape = (batch, n_chunks, chunk_size, chunk_size, nheads, d_state);
-        let cb = (c_expanded.broadcast_as(cb_shape)? * b_expanded.broadcast_as(cb_shape)?)?
-            .sum(D::Minus1)?;
-        let cb = cb.permute((0, 1, 4, 2, 3))?;
-
-        let l_t = l.permute((0, 2, 1, 3, 4))?;
-        let cb_l = (&cb * &l_t)?;
-
-        let x_t = x.permute((0, 1, 3, 2, 4))?;
-        let y_diag_shape = (batch, n_chunks, nheads, chunk_size, chunk_size, headdim);
-        let y_diag = (cb_l.unsqueeze(D::Minus1)?.broadcast_as(y_diag_shape)?
-            * x_t.unsqueeze(3)?.broadcast_as(y_diag_shape)?)?
-        .sum(4)?
-        .permute((0, 1, 3, 2, 4))?;
-
-        // Intra-chunk states
-        let a_last = a_cumsum.narrow(D::Minus1, chunk_size - 1, 1)?;
-        let decay_states = (a_last.broadcast_as(a_cumsum.shape())? - &a_cumsum)?.exp()?;
-
-        let decay_s = decay_states.permute((0, 2, 1, 3))?.unsqueeze(D::Minus1)?;
-        let b_t = b.permute((0, 1, 3, 2, 4))?;
-        let b_weighted = b_t.broadcast_mul(&decay_s)?;
-
-        let x_t2 = x.permute((0, 1, 3, 2, 4))?;
-        let states_shape = (batch, n_chunks, nheads, chunk_size, headdim, d_state);
-        let states = (x_t2.unsqueeze(D::Minus1)?.broadcast_as(states_shape)?
-            * b_weighted.unsqueeze(4)?.broadcast_as(states_shape)?)?
-        .sum(3)?;
-
-        // Inter-chunk recurrence
-        let init_state = match initial_state {
-            Some(s) => s.unsqueeze(1)?,
-            None => Tensor::zeros((batch, 1, nheads, headdim, d_state), dtype, device)?,
-        };
-        let states_with_init = Tensor::cat(&[&init_state, &states], 1)?;
-
-        let a_chunk = a_cumsum
-            .narrow(D::Minus1, chunk_size - 1, 1)?
-            .squeeze(D::Minus1)?;
-        let zeros = Tensor::zeros((batch, nheads, 1), dtype, device)?;
-        let a_chunk_padded = Tensor::cat(&[&zeros, &a_chunk], D::Minus1)?;
-        let decay_chunk = segsum(&a_chunk_padded)?.exp()?;
-
-        let states_p = states_with_init.permute((0, 2, 1, 3, 4))?;
-        let inter_shape = (batch, nheads, n_chunks + 1, n_chunks + 1, headdim, d_state);
-        let new_states = (decay_chunk
-            .unsqueeze(D::Minus1)?
-            .unsqueeze(D::Minus1)?
-            .broadcast_as(inter_shape)?
-            * states_p.unsqueeze(2)?.broadcast_as(inter_shape)?)?
-        .sum(3)?
-        .permute((0, 2, 1, 3, 4))?;
-
-        let states_out = new_states.narrow(1, 0, n_chunks)?;
-        let final_state = new_states.narrow(1, n_chunks, 1)?.squeeze(1)?;
-
-        // State-to-output (off-diagonal blocks)
-        let state_decay_out = a_cumsum.exp()?;
-
-        let c_t2 = c.permute((0, 1, 3, 2, 4))?;
-        let off_shape = (batch, n_chunks, nheads, chunk_size, headdim, d_state);
-        let c_states = (c_t2.unsqueeze(4)?.broadcast_as(off_shape)?
-            * states_out.unsqueeze(3)?.broadcast_as(off_shape)?)?
-        .sum(D::Minus1)?;
-
-        let decay_out = state_decay_out
-            .permute((0, 2, 1, 3))?
-            .unsqueeze(D::Minus1)?;
-        let y_off = c_states
-            .broadcast_mul(&decay_out)?
-            .permute((0, 1, 3, 2, 4))?;
-
-        let y = (&y_diag + &y_off)?;
-        let y = reshape_from_chunks(&y)?;
-
-        Ok((y, final_state))
+        // wgpu/vulkan cap tensor rank at 4, but the chunked-SSD math is intrinsically
+        // rank-5/6. For those backends we run a flattened rank-4 path; all other backends
+        // (CPU/CUDA/Metal) keep the original implementation unchanged.
+        if x.device().is_wgpu() || x.device().is_vulkan() {
+            return ssd_chunked_gpu_impl(x, a, b, c, chunk_size, initial_state, self.d_state);
+        }
+        ssd_chunked_impl(x, a, b, c, chunk_size, initial_state, self.d_state)
     }
 
     pub fn forward_prefill(
@@ -643,5 +775,80 @@ impl Model {
 
     pub fn dtype(&self) -> DType {
         self.dtype
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Verifies the rank-4 flattened GPU path is mathematically identical to the generic
+    // (broadcast/sum) path. The GPU path is device-gated in `ssd_chunked`, so we call both
+    // helper functions directly on CPU tensors to prove equivalence.
+    fn check_ssd_gpu_impl(x: &Tensor, a: &Tensor, b: &Tensor, c: &Tensor, cs: usize, ds: usize) {
+        check_ssd_gpu_impl_result(x, a, b, c, cs, ds).unwrap()
+    }
+
+    fn check_ssd_gpu_impl_result(
+        x: &Tensor,
+        a: &Tensor,
+        b: &Tensor,
+        c: &Tensor,
+        cs: usize,
+        ds: usize,
+    ) -> Result<()> {
+        let init =
+            Tensor::randn(0f32, 1f32, (x.dim(0)?, x.dim(2)?, x.dim(3)?, ds), x.device())?;
+        let (y1, f1) = ssd_chunked_impl(x, a, b, c, cs, Some(&init), ds)?;
+        let (y2, f2) = ssd_chunked_gpu_impl(x, a, b, c, cs, Some(&init), ds)?;
+
+        assert_eq!(y1.shape(), y2.shape(), "y shape mismatch");
+        assert_eq!(f1.shape(), f2.shape(), "final_state shape mismatch");
+
+        let tol = 2e-3f32;
+        let y1_v = y1.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let y2_v = y2.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (i, (a, b)) in y1_v.iter().zip(y2_v.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= tol,
+                "y[{i}] mismatch: gpu={b} generic={a}"
+            );
+        }
+        let f1_v = f1.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let f2_v = f2.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (i, (a, b)) in f1_v.iter().zip(f2_v.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= tol,
+                "final_state[{i}] mismatch: gpu={b} generic={a}"
+            );
+        }
+
+        // Also check the zero-initial-state branch (None).
+        let (_, _) = ssd_chunked_gpu_impl(x, a, b, c, cs, None, ds).unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn ssd_gpu_matches_generic_inner_state() {
+        let device = Device::Cpu;
+        // L=16 divisible by cs=4 -> n_chunks=4, with an inner state (d_state=8) and headdim=16.
+        let (b_sz, l, h, d, ds, cs) = (2usize, 16usize, 4usize, 16usize, 8usize, 4usize);
+        let x = Tensor::randn(0f32, 1f32, (b_sz, l, h, d), &device).unwrap();
+        let a = Tensor::randn(0f32, 1f32, (b_sz, l, h), &device).unwrap();
+        let b = Tensor::randn(0f32, 1f32, (b_sz, l, h, ds), &device).unwrap();
+        let c = Tensor::randn(0f32, 1f32, (b_sz, l, h, ds), &device).unwrap();
+        check_ssd_gpu_impl(&x, &a, &b, &c, cs, ds);
+    }
+
+    #[test]
+    fn ssd_gpu_matches_generic_single_chunk() {
+        let device = Device::Cpu;
+        // L=8 single chunk (n_chunks=1) exercises the n_chunks=1 edge of the recurrence.
+        let (b_sz, l, h, d, ds, cs) = (1usize, 8usize, 2usize, 8usize, 4usize, 8usize);
+        let x = Tensor::randn(0f32, 1f32, (b_sz, l, h, d), &device).unwrap();
+        let a = Tensor::randn(0f32, 1f32, (b_sz, l, h), &device).unwrap();
+        let b = Tensor::randn(0f32, 1f32, (b_sz, l, h, ds), &device).unwrap();
+        let c = Tensor::randn(0f32, 1f32, (b_sz, l, h, ds), &device).unwrap();
+        check_ssd_gpu_impl(&x, &a, &b, &c, cs, ds);
     }
 }
