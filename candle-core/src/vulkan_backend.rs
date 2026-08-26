@@ -746,6 +746,12 @@ struct VulkanPendingSubmission {
     retained_buffers: Vec<Arc<VulkanBuffer>>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct BufferAccess {
+    was_read: bool,
+    was_written: bool,
+}
+
 struct VulkanActiveBatch {
     resources: VulkanSubmissionResources,
     queue_kind: SubmissionQueueKind,
@@ -758,6 +764,13 @@ struct VulkanActiveBatch {
     compute_bytes: usize,
     retained_buffers: Vec<Arc<VulkanBuffer>>,
     cached_descriptor_sets: HashMap<vk::DescriptorSetLayout, SmallVec<[vk::DescriptorSet; 8]>>,
+    // Fine-grained write->read dependency tracking. Keyed by the address of the
+    // VulkanBuffer object of a buffer first touched in this batch (kept alive by
+    // retained_buffers, so the object cannot be recycled mid-batch; mirrors
+    // wgpu_backend's wgpu_buffer_key). Lets us emit a buffer-scoped barrier only
+    // when a buffer is reused, instead of a full pipeline-wide barrier after
+    // every dispatch, so independent dispatches on disjoint buffers overlap.
+    buffer_access: HashMap<usize, BufferAccess>,
 }
 
 struct VulkanSubmissionResources {
@@ -1829,6 +1842,7 @@ impl VulkanDevice {
             compute_bytes: 0,
             retained_buffers: Vec::new(),
             cached_descriptor_sets: HashMap::default(),
+            buffer_access: HashMap::default(),
         })
     }
 
@@ -3201,10 +3215,72 @@ impl VulkanDevice {
                 bytes,
             );
         }
+        // Buffer-scoped dependency barrier: replace the previous pipeline-wide
+        // barrier after each dispatch with a barrier scoped to each individual
+        // buffer that this dispatch reuses after an earlier dispatch in the same
+        // batch touched it. Because the barrier is scoped to the reused buffer
+        // (not ALL memory), independent dispatches that operate on disjoint
+        // buffers can overlap, which was impossible with a full barrier.
+        //
+        // We conservatively treat every bound buffer as both readable and
+        // writable by the shader: bindings are the only witness we have of a
+        // buffer's role and (as the argsort/radix kernels show) scratch buffers
+        // are written at non-final binding slots, so a "last binding = output"
+        // heuristic is unsound. Marking both sides is always correct and only
+        // costs a barrier when a buffer is genuinely reused.
+        {
+            let mut handled: SmallVec<[usize; 8]> = SmallVec::new();
+            for binding in bindings.iter() {
+                let handle = std::ptr::from_ref(binding.buffer()) as usize;
+                if handled.contains(&handle) {
+                    continue;
+                }
+                handled.push(handle);
+                let prior = batch
+                    .buffer_access
+                    .get(&handle)
+                    .copied()
+                    .unwrap_or_default();
+                let mut src = vk::AccessFlags::empty();
+                if prior.was_read || prior.was_written {
+                    src = vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE;
+                }
+                if !src.is_empty() {
+                    let buffer_barrier = vk::BufferMemoryBarrier::default()
+                        .src_access_mask(src)
+                        .dst_access_mask(src)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(binding.buffer().buffer)
+                        .offset(0)
+                        .size(binding.buffer().size as u64);
+                    unsafe {
+                        self.inner.device.cmd_pipeline_barrier(
+                            command_buffer,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            std::slice::from_ref(&buffer_barrier),
+                            &[],
+                        );
+                    }
+                }
+                // Record that this dispatch touched the buffer. The flag is NOT
+                // reset on reuse, so any later dispatch touching the same buffer
+                // gets a barrier that orders its access after this one.
+                batch.buffer_access.insert(
+                    handle,
+                    BufferAccess {
+                        was_read: true,
+                        was_written: true,
+                    },
+                );
+            }
+        }
         self.inner
             .device
             .cmd_dispatch(command_buffer, workgroups.0, workgroups.1, workgroups.2);
-        self.cmd_batch_memory_barrier(command_buffer);
         batch.dispatch_count += 1;
         batch.descriptor_set_count += 1;
         batch.storage_descriptor_count += storage_count;
