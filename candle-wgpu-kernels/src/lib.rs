@@ -776,6 +776,19 @@ pub fn gemv_shader(dtype: DType) -> Option<String> {
     Some(preprocess(source, &[], &replacements, dtype))
 }
 
+/// Compacted index-select (gather) for dense F32/F16 sources that exceed a single
+/// storage binding (index_select_map.wgsl). Reads explicit (relative-src-row,
+/// dst-offset) per output row; `dtype` controls SRC_TYPE and f16 gating.
+pub fn index_select_map_shader(dtype: DType) -> Option<String> {
+    let src_type = match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+    };
+    let source = get("index_select_map.wgsl")?.source();
+    let replacements = vec![("SRC_TYPE".to_string(), src_type.to_string())];
+    Some(preprocess(source, &[], &replacements, dtype))
+}
+
 pub fn matmul_fast_tile_shape() -> (u32, u32, u32, u32, u32) {
     (
         MUL_MAT_TILE_M,

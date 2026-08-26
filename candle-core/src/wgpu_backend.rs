@@ -544,6 +544,21 @@ struct BatchedGemvParams {
     _pad6: u32,
 }
 
+/// Uniform params for the compacted index-select map shader (index_select_map.wgsl).
+/// Field order must match the WGSL `MapParams` struct exactly.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IndexSelectMapParams {
+    right_size: u32,
+    count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+    _pad4: u32,
+    _pad5: u32,
+}
+
 /// Uniform params for the dense m == 1 GEMV kernel (gemv.wgsl). Field order must
 /// match the WGSL `GemvParams` struct exactly.
 #[repr(C)]
@@ -9526,12 +9541,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             storage_entry(2, false),
             uniform_entry(3),
         ];
-        let bindings = [
-            buffer_binding(0, &src.buffer),
-            buffer_binding(1, &ids.buffer),
-            buffer_binding(2, &dst.buffer),
-            buffer_binding(3, &param_buffer),
-        ];
         let shader = match src.dtype {
             DType::F32 => candle_wgpu_kernels::get_rows_f32_shader(WG_SIZE),
             DType::F16 => candle_wgpu_kernels::get_rows_f16_shader(WG_SIZE),
@@ -9543,19 +9552,128 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             _ => None,
         }
         .ok_or_else(|| Error::Msg("wgpu shader get_rows.wgsl not embedded".into()).bt())?;
-        let rows: u32 = (left_size * ids_len).try_into()?;
-        let work_items = match src.dtype {
-            DType::U8 => rows.div_ceil(4),
-            DType::BF16 => rows.div_ceil(2),
-            _ => rows,
-        };
-        src.device.run_compute(
-            &shader,
-            &entries,
-            &bindings,
-            work_items.div_ceil(WG_SIZE),
-            "candle-wgpu-get-rows",
-        )?;
+        // A dense F32/F16 table (e.g. a dequantized vocab embedding, 2.6GB) can exceed
+        // `max_storage_buffer_binding_size`; wgpu refuses a whole-buffer storage
+        // binding. Split the source into contiguous row segments and gather via the
+        // compacted map shader (buckets ids by row on the host). left_size == 1 is
+        // the supported case (table select/embed); a strided multi-left source falls
+        // back to a clean error rather than an incorrect binding.
+        let max_binding = src.device.inner.limits.max_storage_buffer_binding_size as usize;
+        let src_bytes = byte_len(src.dtype, src.count, "wgpu index_select src")?;
+        if src_bytes > max_binding {
+            if left_size != 1 {
+                return Err(Error::Msg(format!(
+                    "wgpu index_select src exceeds max_storage_buffer_binding_size and \
+                     left_size ({left_size}) > 1 (split unsupported)"
+                ))
+                .bt());
+            }
+            let elems_per_row = right_size;
+            let src_elem_bytes = src.dtype.size_in_bytes();
+            let rows_per_seg = (max_binding / (elems_per_row * src_elem_bytes)).max(1);
+            let ids_size = byte_len(DType::U32, ids.count, "wgpu index ids")?;
+            let ids_bytes = src.device.read_buffer(&ids.buffer, ids_size)?;
+            let ids_vals: Vec<u32> = ids_bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let map_shader =
+                candle_wgpu_kernels::index_select_map_shader(wgpu_kernel_dtype(src.dtype)?)
+                    .ok_or_else(|| {
+                        Error::Msg("wgpu shader index_select_map.wgsl not embedded".into()).bt()
+                    })?;
+            let map_entries = [
+                storage_entry(0, true),
+                storage_entry(1, true),
+                storage_entry(2, true),
+                storage_entry(3, false),
+                uniform_entry(4),
+            ];
+            let dst_bytes = byte_len(DType::F32, dst.count, "wgpu index_select dst")?;
+            let seg_count = src_dim.div_ceil(rows_per_seg);
+            for seg in 0..seg_count {
+                let r0 = seg * rows_per_seg;
+                let r1 = (r0 + rows_per_seg).min(src_dim);
+                let mut sub_ids: Vec<u32> = Vec::new();
+                let mut dst_map: Vec<u32> = Vec::new();
+                for p in 0..ids_len {
+                    let iv = ids_vals[p];
+                    if iv >= r0 as u32 && iv < r1 as u32 {
+                        sub_ids.push(iv - r0 as u32);
+                        let dst_off =
+                            params.offset_dst as usize + p * elems_per_row;
+                        dst_map.push(dst_off as u32);
+                    }
+                }
+                if sub_ids.is_empty() {
+                    continue;
+                }
+                let sub_buf = src.device.register_buffer_arc(src.device.create_storage_buffer_arc(
+                    sub_ids.len() * 4,
+                    "wgpu-index-map-subids",
+                ));
+                src.device
+                    .inner
+                    .queue
+                    .write_buffer(&sub_buf, 0, typed_as_bytes(&sub_ids));
+                let map_buf = src.device.register_buffer_arc(src.device.create_storage_buffer_arc(
+                    dst_map.len() * 4,
+                    "wgpu-index-map-dstmap",
+                ));
+                src.device
+                    .inner
+                    .queue
+                    .write_buffer(&map_buf, 0, typed_as_bytes(&dst_map));
+                let map_params = IndexSelectMapParams {
+                    right_size: elems_per_row.try_into()?,
+                    count: sub_ids.len().try_into()?,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                    _pad3: 0,
+                    _pad4: 0,
+                    _pad5: 0,
+                };
+                let map_param_buffer = src.device.write_uniform_params(any_as_bytes(&map_params))?;
+                let src_byte_off = (r0 * elems_per_row * src_elem_bytes) as u64;
+                let src_byte_len = ((r1 - r0) * elems_per_row * src_elem_bytes) as u64;
+                let map_bindings = [
+                    buffer_binding_range(0, &src.buffer, src_byte_off, src_byte_len)?,
+                    buffer_binding(1, &sub_buf),
+                    buffer_binding(2, &map_buf),
+                    buffer_binding_range(3, &dst.buffer, 0, dst_bytes as u64)?,
+                    buffer_binding(4, &map_param_buffer),
+                ];
+                let count: u32 = sub_ids.len().try_into()?;
+                src.device.run_compute(
+                    &map_shader,
+                    &map_entries,
+                    &map_bindings,
+                    count.div_ceil(WG_SIZE),
+                    "candle-wgpu-get-rows",
+                )?;
+            }
+        } else {
+            let bindings = [
+                buffer_binding(0, &src.buffer),
+                buffer_binding(1, &ids.buffer),
+                buffer_binding(2, &dst.buffer),
+                buffer_binding(3, &param_buffer),
+            ];
+            let rows: u32 = (left_size * ids_len).try_into()?;
+            let work_items = match src.dtype {
+                DType::U8 => rows.div_ceil(4),
+                DType::BF16 => rows.div_ceil(2),
+                _ => rows,
+            };
+            src.device.run_compute(
+                &shader,
+                &entries,
+                &bindings,
+                work_items.div_ceil(WG_SIZE),
+                "candle-wgpu-get-rows",
+            )?;
+        }
         debug_assert_eq!(dst.count, dst_el);
         if src.dtype == DType::F16 {
             let copy = copy_shader(DType::F32, DType::F16)?;
@@ -11780,25 +11898,85 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             storage_entry(2, false),
             uniform_entry(3),
         ];
-        let bindings = [
-            buffer_binding(0, &self.buffer),
-            buffer_binding(1, &ids_data.buffer),
-            buffer_binding(2, &dst.buffer),
-            buffer_binding(3, &param_buffer),
-        ];
         let shader = candle_wgpu_kernels::quantized_get_rows_f32_shader(
             wgpu_quantized_dtype(qdtype)?,
             WG_SIZE,
         )
         .ok_or_else(|| Error::Msg("wgpu quantized get_rows shader not embedded".into()).bt())?;
-        let rows: u32 = (left_size * ids_len).try_into()?;
-        self.device.run_compute(
-            &shader,
-            &entries,
-            &bindings,
-            rows.div_ceil(WG_SIZE),
-            "candle-wgpu-quant-get-rows",
+        // The get-rows destination can be very large (e.g. an embedding/selection
+        // over the whole vocab, [left, ids_len, right] f32), and wgpu caps a single
+        // storage binding at `max_storage_buffer_binding_size`. The src (weight) and
+        // ids usually fit; the dst often does not. Split the dispatch along the id
+        // positions so each piece binds a contiguous dst range under the cap.
+        // (P1 fix for the recurrent-gemma-2b q4k >2GB dst binding panic.)
+        let max_binding = self.device.inner.limits.max_storage_buffer_binding_size as usize;
+        let dst_bytes = byte_len(
+            DType::F32,
+            left_size * ids_len * right_size,
+            "wgpu quantized index_select dst",
         )?;
+        let dispatch = |entries: &[wgpu::BindGroupLayoutEntry],
+                        shader: &str,
+                        param_buffer: &wgpu::Buffer,
+                        dst_byte_off: u64,
+                        dst_byte_len: u64,
+                        rows: u32| {
+            let bindings = [
+                buffer_binding(0, &self.buffer),
+                buffer_binding(1, &ids_data.buffer),
+                buffer_binding_range(2, &dst.buffer, dst_byte_off, dst_byte_len)?,
+                buffer_binding(3, param_buffer),
+            ];
+            self.device.run_compute(
+                shader,
+                entries,
+                &bindings,
+                rows.div_ceil(WG_SIZE),
+                "candle-wgpu-quant-get-rows",
+            )
+        };
+        if dst_bytes <= max_binding {
+            let rows: u32 = (left_size * ids_len).try_into()?;
+            dispatch(&entries, &shader, &param_buffer, 0, dst_bytes as u64, rows)?;
+        } else if left_size == 1 {
+            // Split along id positions: each chunk binds a contiguous dst range.
+            // (Covers the vocab-embedding/selection case; left>1 would need a
+            // strided dst range and is left as a clean error below.)
+            let elem_per_pos = right_size; // == stride_dst1
+            let bytes_per_id = right_size * 4;
+            let id_chunk = (max_binding / bytes_per_id).max(1);
+            let mut p0 = 0usize;
+            while p0 < ids_len {
+                let p1 = (p0 + id_chunk).min(ids_len);
+                let mut chunk_params = params;
+                chunk_params.offset_dst =
+                    (params.offset_dst as usize + p0 * elem_per_pos).try_into()?;
+                chunk_params.offset_idx =
+                    (params.offset_idx as usize + p0 * params.stride_idx0 as usize).try_into()?;
+                chunk_params.n_rows = (p1 - p0).try_into()?;
+                let chunk_param_buffer =
+                    self.device.write_uniform_params(any_as_bytes(&chunk_params))?;
+                let chunk_len = p1 - p0;
+                let dst_byte_off = (p0 * elem_per_pos * 4) as u64;
+                let dst_byte_len = (chunk_len * elem_per_pos * 4) as u64;
+                let rows: u32 = chunk_len.try_into()?;
+                dispatch(
+                    &entries,
+                    &shader,
+                    &chunk_param_buffer,
+                    dst_byte_off,
+                    dst_byte_len,
+                    rows,
+                )?;
+                p0 = p1;
+            }
+        } else {
+            return Err(Error::Msg(format!(
+                "wgpu quantized index_select dst exceeds max_storage_buffer_binding_size and \
+                 left_size ({left_size}) > 1 (tiled dst splitting unsupported)"
+            ))
+            .bt());
+        }
         Ok(dst)
     }
 
