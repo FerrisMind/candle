@@ -36,18 +36,6 @@ macro_rules! console_log {
 
 pub const DTYPE: DType = DType::F32;
 
-// DBG temporary diagnostics for CPU-vs-wgpu bisection.
-// Reads back a fixed small slice and logs its sum so the orchestrator can find
-// which layer/output first diverges between CPU and wgpu. Remove once bisected.
-// Expects the tensor to be F32 (DTYPE); no coercion performed here.
-async fn dbg_sum(t: &Tensor, label: &str) -> anyhow::Result<()> {
-    let n = t.elem_count().min(256);
-    let v = t.flatten_all()?.narrow(0, 0, n)?.to_vec1_async::<f32>().await?;
-    let s: f32 = v.iter().sum();
-    console_log!("DBG {label}: first {n} sum = {s}");
-    Ok(())
-}
-
 pub enum Model {
     Normal(m::model::Whisper),
     Quantized(m::quantized_model::Whisper),
@@ -221,8 +209,6 @@ impl Decoder {
 
         let audio_features = model.encoder_forward(mel, true)?;
         println!("audio features: {:?}", audio_features.dims());
-        // DBG temp diagnostics
-        dbg_sum(&audio_features, "audio_features").await?;
         let sample_len = model.config().max_target_positions / 2;
         let mut sum_logprob = 0f64;
         let mut no_speech_prob = f64::NAN;
@@ -260,8 +246,6 @@ impl Decoder {
                 no_speech_prob = softmax(&logits, 0)?
                     .i(self.no_speech_token as usize)?
                     .to_scalar_async::<f32>().await? as f64;
-                // DBG temp diagnostics (first-position logits, i==0)
-                dbg_sum(&logits, "logits_i0").await?;
             }
 
             let (_, seq_len, _) = ys.dims3()?;
