@@ -11,7 +11,7 @@ license.workspace = true
 [features]
 default = []
 # Opt-in portable WebGPU (~2–4 MB). Forwards to shared device-select + candle-core.
-wgpu = ["candle-wasm-device-select/wgpu", "candle/wgpu"]
+wgpu = ["candle-wasm-device-select/wgpu", "candle/wgpu", "candle-nn/wgpu", "candle-transformers/wgpu"]
 
 [dependencies]
 candle = { workspace = true }
