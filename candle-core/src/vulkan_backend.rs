@@ -3913,6 +3913,75 @@ impl VulkanStorage {
         Ok(dst)
     }
 
+    /// m == 1 GEMV on F16 weights (decode weight matmuls: qkv/o/gate/up/down/lm_head).
+    /// Mirrors `run_batched_gemv_f32` but binds the F16 LHS activation and the F16 [n, k]
+    /// weight directly (float16_t reads) and accumulates in F32. The generic F16 tile
+    /// kernel wastes M-tiles on m == 1; this routes those to a dedicated coalesced GEMV.
+    /// Accumulation order matches `batched_gemv_f32` (32-lane K split + shared reduction).
+    #[allow(clippy::too_many_arguments)]
+    fn run_batched_gemv_f16(
+        &self,
+        rhs_t: &Self,
+        lhs_layout: &Layout,
+        rhs_t_layout: &Layout,
+        b: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        debug_assert_eq!(m, 1);
+        // Output is F32 to match the current `matmul_f16_fp32` decode path (f32 accum).
+        let dst_shape = Shape::from(vec![b, 1, n]);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let rank = rhs_t_layout.dims().len();
+        let batch_stride_a = if lhs_layout.dims().len() >= 3 {
+            lhs_layout.stride()[lhs_layout.dims().len() - 3]
+        } else {
+            m * k
+        };
+        let batch_stride_b = if rank >= 3 {
+            rhs_t_layout.stride()[rank - 3]
+        } else {
+            n * k
+        };
+        let params = VulkanBatchedGemvParams {
+            k_dim: k.try_into()?,
+            n_dim: n.try_into()?,
+            batch: b.try_into()?,
+            offset_a: lhs_layout.start_offset().try_into()?,
+            offset_b: rhs_t_layout.start_offset().try_into()?,
+            offset_d: 0,
+            batch_stride_a: batch_stride_a.try_into()?,
+            batch_stride_b: batch_stride_b.try_into()?,
+            batch_stride_d: n.try_into()?,
+        };
+        // LHS activation (F16) on 0, F16 weight [n, k] on 1, F32 output on 2.
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&rhs_t.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("batched_gemv_f16")
+            .ok_or_else(|| Error::Msg("vulkan shader batched_gemv_f16 not generated".into()).bt())?;
+        let workgroups = (n.div_ceil(4).try_into()?, b.try_into()?, 1u32);
+        self.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            workgroups,
+        )?;
+        // Accumulate in F32 then round back to the F16 activation dtype, matching the
+        // `matmul_f16_fp32` decode path (f32 accum, f16 result) so downstream ops see
+        // the same dtype as before (fixes dtype mismatch in the MLP silu*up chain).
+        if self.dtype != DType::F32 {
+            let out_l = Layout::contiguous(dst_shape);
+            let out = dst.to_dtype(&out_l, self.dtype)?;
+            Ok(out)
+        } else {
+            Ok(dst)
+        }
+    }
+
     /// Context-attention GEMV for the m == 1 case, reading V in its NATURAL
     /// (batch, k, n) layout and reducing over the outer `k`, outputting over the
     /// inner `n` (head_dim). This is the `out = scores @ v` shape where v is the
@@ -7841,6 +7910,21 @@ impl VulkanStorage {
                 use_dmmv_subgroups,
                 required_subgroup_size,
             )?;
+            drop(lhs_contiguous);
+            return Ok(dst);
+        }
+        if rank == 2
+            && self.dtype == DType::F16
+            && m == 1
+            && b == 1
+            && lhs_layout.is_contiguous()
+            && rhs_t_layout.is_contiguous()
+        {
+            // Decode weight matmuls (qkv/o/gate/up/down/lm_head) are m == 1 on F16
+            // activations with F16 [n, k] weights. The generic F16 tile kernel wastes
+            // M-tiles on m == 1, so route to the dedicated coalesced GEMV. Accumulates
+            // in F32 (matches the `matmul_f16_fp32` output dtype).
+            let dst = lhs.run_batched_gemv_f16(rhs_t, &lhs_layout, &rhs_t_layout, b, m, n, k)?;
             drop(lhs_contiguous);
             return Ok(dst);
         }
