@@ -1346,6 +1346,12 @@ impl WgpuDevice {
             // tail). Native keeps the opportunistic recycle (blocking drain).
             #[cfg(not(target_arch = "wasm32"))]
             self.flush_storage_pool_pending();
+            // wasm32 (DD-3a): drop the oldest excess pending buffers (safe — wgpu
+            // defers their destruction until in-flight work completes) to bound
+            // peak VRAM under a synchronous forward, without reusing an
+            // in-flight buffer.
+            #[cfg(target_arch = "wasm32")]
+            self.trim_storage_pool_pending_wasm();
             if let Some(arc) = self.take_reusable_from_pool(key) {
                 return arc;
             }
@@ -1440,6 +1446,42 @@ impl WgpuDevice {
         // confirmed-drain point (`synchronize_async` / async readback tail).
         #[cfg(not(target_arch = "wasm32"))]
         self.flush_storage_pool_pending();
+        // wasm32 (DD-3a): we can never PUSH pending → free here (reuse of a
+        // possibly in-flight buffer corrupts). But leaving the backlog uncapped
+        // lets a synchronous forward (whisper encoder) carve a fresh device block
+        // per alloc while old buffers sit unflushed → VRAM balloons toward 12GB.
+        // wgpu defers destruction of a dropped sole-owner Buffer until its
+        // in-flight submissions finish, so DROPPING excess is safe (frees VRAM
+        // back to gpu-allocator) whereas REUSING is not. Trim the backlog to a
+        // small working set by dropping the oldest excess buffers.
+        #[cfg(target_arch = "wasm32")]
+        self.trim_storage_pool_pending_wasm();
+    }
+
+    /// wasm32 (DD-3a): bound the `storage_pool_pending` backlog to a small working
+    /// set by DROPPING the oldest excess Arc clones. On wasm32 `PollType::Poll`
+    /// cannot confirm completion, so a dropped buffer may still be in flight; we
+    /// therefore never promote pending → free here (reuse before a confirmed
+    /// drain is the garbage-output bug). Only *promotion* is forbidden. Dropping
+    /// is safe because wgpu defers destroying a dropped sole-owner Buffer until
+    /// after every submission that referenced it completes, then returns the block
+    /// to gpu-allocator — so this bounds wasm peak VRAM without aliasing a live
+    /// dispatch. Reuse-eligible buffers are promoted at the confirmed-drain points
+    /// (`synchronize_async`). Exceeding the cap, the NEWEST buffers are kept (the
+    /// likely live working set) and the oldest excess are dropped.
+    #[cfg(target_arch = "wasm32")]
+    fn trim_storage_pool_pending_wasm(&self) {
+        const WORKING_SET: usize = 32;
+        let mut pending = match self.inner.storage_pool_pending.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if pending.len() <= WORKING_SET {
+            return;
+        }
+        let excess = pending.len() - WORKING_SET;
+        // Drain from the front (oldest) so the most recently dropped buffers stay.
+        pending.drain(..excess);
     }
 
     /// After GPU drain, promote pending_free → free for hot-ring reuse.
@@ -10681,14 +10723,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if b == 1
             && m == 1
             && rank == 2
-            && self.dtype == DType::F16
+            && (self.dtype == DType::F16 || self.dtype == DType::F32)
             && lhs_l.is_contiguous()
             && rhs_l.is_contiguous()
             && rhs_l.stride()[1] == 1
         {
             let dst = self.run_m1_gemv(rhs, lhs_l, rhs_l, b, m, n, k)?;
-            let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
-            return dst.to_dtype(&out_l, self.dtype);
+            // F32: `run_m1_gemv` writes f32 directly (native_dst_dtype == F32), so
+            // return it unchanged. F16: GEMV accumulates/writes f32, then round to
+            // F16 — same as the generic native-f16 GEMM tail.
+            if self.dtype == DType::F16 {
+                let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
+                return dst.to_dtype(&out_l, self.dtype);
+            }
+            return Ok(dst);
         }
 
         let mut lhs_contiguous = None;
@@ -15846,6 +15894,18 @@ mod wgpu_matmul_tests {
     #[test]
     fn wgpu_matmul_bf16_native_noncontig() {
         check_matmul(DType::BF16, 64, 64, 64, true);
+    }
+
+    /// m == 1 rank-2 F32 decode projections (whisper lm_head [1,k]@[k,n] and
+    /// per-token qkv): these MUST route to the dedicated `run_m1_gemv` kernel
+    /// rather than the naive tiled generic GEMM. A correct result on the exact
+    /// m==1, rank==2, contiguous shape proves the broadened guard neither
+    /// mis-routes nor corrupts; the shape is what the old F16-only guard dropped
+    /// into the generic GEMM. Differential vs CPU (round inputs through F32).
+    #[test]
+    fn wgpu_matmul_f32_m1_rank2_gemv() {
+        check_matmul(DType::F32, 1, 256, 128, false);
+        check_matmul(DType::F32, 1, 384, 51864, false);
     }
 
     /// Perf probe: median wall time for F16/BF16 1024³ matmul over N iters.
