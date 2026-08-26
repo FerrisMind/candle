@@ -453,7 +453,6 @@ impl Decoder {
         let mel_len = mel.len();
         let n_mels = self.model.config().num_mel_bins;
         let mel = Tensor::from_vec(mel, (1, n_mels, mel_len / n_mels), device)?;
-        dbg_sum(&mel, "mel").await?; // DBG
         console_log!("loaded mel: {:?}", mel.dims());
         let segments = self.run(&mel).await?;
         Ok(segments)
