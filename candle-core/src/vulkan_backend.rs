@@ -1604,7 +1604,18 @@ impl VulkanDevice {
     /// cascade over this many hot-path ops (alloc/copy/dispatch). Kept small so fences
     /// still get polled and deferred buffers/caps still get drained promptly, but large
     /// enough to remove ~all of the per-op host overhead from the decode loop.
-    const CLEANUP_DEBT_THRESHOLD: u32 = 32;
+    ///
+    /// D5: raised 32 -> 128. The qwen3-0.6B prefill/decode loop is host/dispatch-bound
+    /// (~hundreds of tiny dependent ops per token), and every hot-path op previously ran
+    /// a real `cleanup_pending_submissions(false)` fence-poll + multi-lock cascade every
+    /// 32 ops (~17x/token). Batching fewer, larger amortized cleanups (~4x/token) removes
+    /// most of that host overhead from the common path. Correctness is preserved: the
+    /// deferred-buffer force-drain boundary is still guarded by the independent
+    /// `deferred_buffer_frees` cap check (the `deferred_near_cap` guard in
+    /// `cleanup_pending_submissions_amortized` and the `> MAX_DEFERRED_BUFFER_FREES`
+    /// force-drain in `cleanup_pending_submissions_impl`), and explicit sync points
+    /// (`synchronize`/`read_buffer`/`wait_for_transfer_dependencies`) still poll fences.
+    const CLEANUP_DEBT_THRESHOLD: u32 = 128;
     /// Maximum number of staging buffers per size class in the pool.
     const MAX_STAGING_PER_SIZE_CLASS: usize = 32;
     // Large upload staging buffers (weight uploads during model load) are
