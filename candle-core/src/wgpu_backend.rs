@@ -10707,6 +10707,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // Large F32 GEMM binds contiguous (K,N) RHS as a virtual B^T via
         // stride_0k — measured faster than materializing on RTX 3060 (including
         // tall 64×4096: materialize regressed ~6× batch20). Keep virtual.
+        #[cfg(target_arch = "wasm32")]
+        let will_use_warptile = false;
+        #[cfg(not(target_arch = "wasm32"))]
         let will_use_warptile = self.dtype == DType::F32 && m >= 64 && n >= 64 && k >= 64;
         let rhs_skip_transpose = will_use_warptile
             && rhs_l.is_contiguous()
