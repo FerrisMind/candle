@@ -49,11 +49,11 @@ trunk serve --release --public-url / --port 8080
 To build and test the UI made in Vanilla JS and WebWorkers, first we need to build the WASM library:
 
 ```bash
-# CPU-only
+# Portable WebGPU (default; larger wasm). `wgpu`/`auto` resolve to WebGPU when available.
 ./build-lib.sh
 
-# Portable WebGPU (opt-in; larger wasm). Requires crate feature `wgpu`.
-./build-lib.sh wgpu
+# CPU-only (smaller wasm; `wgpu` fails and `auto` resolves to `cpu`)
+./build-lib.sh cpu
 ```
 
 This will bundle the library under `./build` and we can import it inside our WebWorker like a normal JS module:
@@ -93,12 +93,12 @@ Worker reports `resolvedDevice` and `adapterName` on `ready` / `complete`. Cache
 - Browser **portable WebGPU** only (`BROWSER_WEBGPU`); do not treat native wgpu backends as portable proof.
 - F64 shader ops are capability-gated; F32 path when the adapter lacks F64.
 - `wgpu::Device` lives on the **worker** thread; the UI never owns the GPU device.
-- Opt-in `--features wgpu` increases wasm size by roughly 2–4 MB.
-- Build **without** `wgpu`: Auto behaves as CPU; explicit `wgpu` fails with `deviceError`.
+- The `wgpu` feature increases wasm size by roughly 2–4 MB; it is the **default** build.
+- Build **without** `wgpu` (i.e. `./build-lib.sh cpu`): Auto behaves as CPU; explicit `wgpu` fails with `deviceError`.
 
 #### Manual smoke (Chrome)
 
-1. Build with `./build-lib.sh wgpu`, serve over `http://localhost…`, open `lib-example.html`.
+1. Build with `./build-lib.sh` (wgpu default), serve over `http://localhost…`, open `lib-example.html`.
 2. With WebGPU available: leave **Auto**, confirm status shows `resolved: wgpu` and an adapter name; transcribe a sample.
 3. Switch to **CPU**, confirm reload and `resolved: cpu`; run again.
 4. Switch to **WebGPU**; on success keep wgpu; if init fails, radio rolls back and status shows the error.

@@ -133,6 +133,32 @@ class Whisper {
         : undefined;
       const key = this.cacheKey(modelID, resolvedDevice);
 
+      // Truthfulness guard: an explicit `wgpu` selection must never silently
+      // resolve to (or reuse) a CPU backend. If the built wasm lacks the wgpu
+      // feature, or WebGPU init degrades to CPU, surface a deviceError instead
+      // of claiming success and running inference on CPU while the UI shows
+      // `wgpu`. `auto` may legitimately resolve to `cpu`; only `wgpu` is strict.
+      if (deviceMode === "wgpu" && resolvedDevice !== "wgpu") {
+        if (decoder.free) {
+          try {
+            decoder.free();
+          } catch (_) {
+            /* ignore */
+          }
+        }
+        const err = new Error(
+          `WebGPU requested but resolved to ${resolvedDevice}; WebGPU unavailable in this build`
+        );
+        self.postMessage({
+          status: "deviceError",
+          error: err.message,
+          previousDeviceMode,
+          requestedDeviceMode: deviceMode,
+          phase: "init",
+        });
+        throw err;
+      }
+
       // Reuse existing instance for this resolved device (e.g. auto→cpu after cpu).
       if (this.instance[key]) {
         if (decoder.free) {
