@@ -1619,6 +1619,15 @@ impl VulkanDevice {
     /// values only hoard memory that could otherwise return to the allocator.
     const MAX_GPU_POOL_PER_SIZE_CLASS: usize = 4;
 
+    /// Total byte ceiling for `gpu_buffer_pool` residency. Decode of GQA models
+    /// reallocates the KV-cache into a new distinct size every step (cat +
+    /// contiguous), so over a long generation the pool otherwise accumulates a
+    /// buffer per distinct seq-dependent size and the parent device blocks never
+    /// empty — the llama decode VRAM floor (observed ~8-10 GB vs ~3 GB of live
+    /// activations). Once the ceiling is exceeded, a recycled buffer falls through
+    /// to the deferred-free path so its device block can actually be released.
+    const MAX_GPU_POOL_TOTAL_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
+
     /// Weight buffers at or above this size are allocated as dedicated exact-sized
     /// blocks instead of sub-allocation into shared blocks. Large enough that the
     /// per-buffer dedicated overhead is negligible, small enough that the dominant
@@ -9433,8 +9442,12 @@ impl Drop for VulkanBuffer {
                 // the allocator accumulation that caused the vulkan prefill OOM.
                 if self.size > 0 {
                     if let Ok(mut pool) = self.device.inner.gpu_buffer_pool.lock() {
+                        let total_bytes: usize =
+                            pool.values().flatten().map(|b| b.size).sum();
                         let entry = pool.entry(self.size).or_default();
-                        if entry.len() < VulkanDevice::MAX_GPU_POOL_PER_SIZE_CLASS {
+                        if entry.len() < VulkanDevice::MAX_GPU_POOL_PER_SIZE_CLASS
+                            && total_bytes + self.size <= VulkanDevice::MAX_GPU_POOL_TOTAL_BYTES
+                        {
                             entry.push(Arc::new(VulkanBuffer {
                                 device: self.device.clone(),
                                 buffer: self.buffer,
