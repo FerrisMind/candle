@@ -194,7 +194,7 @@ impl Decoder {
     async fn decode(&mut self, mel: &Tensor, t: f64) -> anyhow::Result<DecodingResult> {
         let model = &mut self.model;
         let language_token = match (self.is_multilingual, &self.language) {
-            (true, None) => Some(detect_language(model, &self.tokenizer, mel)?),
+            (true, None) => Some(detect_language(model, &self.tokenizer, mel).await?),
             (false, None) => None,
             (true, Some(language)) => {
                 match token_id(&self.tokenizer, &format!("<|{:?}|>", self.language)) {
@@ -245,7 +245,7 @@ impl Decoder {
                 let logits = model.decoder_final_linear(&ys.i(..1)?)?.i(0)?.i(0)?;
                 no_speech_prob = softmax(&logits, 0)?
                     .i(self.no_speech_token as usize)?
-                    .to_scalar::<f32>()? as f64;
+                    .to_scalar_async::<f32>().await? as f64;
             }
 
             let (_, seq_len, _) = ys.dims3()?;
@@ -263,11 +263,11 @@ impl Decoder {
             let logits = logits.broadcast_add(&self.suppress_tokens)?;
             let next_token = if t > 0f64 {
                 let prs = softmax(&(&logits / t)?, 0)?;
-                let logits_v: Vec<f32> = prs.to_vec1()?;
+                let logits_v: Vec<f32> = prs.to_vec1_async().await?;
                 let distr = rand::distr::weighted::WeightedIndex::new(&logits_v)?;
                 distr.sample(&mut self.rng) as u32
             } else {
-                let logits_v: Vec<f32> = logits.to_vec1()?;
+                let logits_v: Vec<f32> = logits.to_vec1_async().await?;
                 logits_v
                     .iter()
                     .enumerate()
@@ -278,7 +278,7 @@ impl Decoder {
             tokens.push(next_token);
             let prob = softmax(&logits, candle::D::Minus1)?
                 .i(next_token as usize)?
-                .to_scalar::<f32>()? as f64;
+                .to_scalar_async::<f32>().await? as f64;
             if next_token == self.eot_token || tokens.len() > model.config().max_target_positions {
                 break;
             }
@@ -356,7 +356,7 @@ impl Decoder {
         let tokenizer = Tokenizer::from_bytes(&md.tokenizer).map_err(E::msg)?;
 
         let mel_filters = safetensors::tensor::SafeTensors::deserialize(&md.mel_filters)?;
-        let mel_filters = mel_filters.tensor("mel_80")?.load(&device)?;
+        let mel_filters = mel_filters.tensor("mel_80")?.load(&Device::Cpu)?;
         console_log!("loaded mel filters {:?}", mel_filters.shape());
         let mel_filters = mel_filters.flatten_all()?.to_vec1::<f32>()?;
         let config: Config = serde_json::from_slice(&md.config)?;
@@ -444,7 +444,7 @@ impl Decoder {
 }
 
 /// Returns the token id for the selected language.
-pub fn detect_language(model: &mut Model, tokenizer: &Tokenizer, mel: &Tensor) -> Result<u32, E> {
+pub async fn detect_language(model: &mut Model, tokenizer: &Tokenizer, mel: &Tensor) -> Result<u32, E> {
     console_log!("detecting language");
     let (_bsize, _, seq_len) = mel.dims3()?;
     let mel = mel.narrow(
@@ -468,7 +468,7 @@ pub fn detect_language(model: &mut Model, tokenizer: &Tokenizer, mel: &Tensor) -
     let logits = model.decoder_final_linear(&ys.i(..1)?)?.i(0)?.i(0)?;
     let logits = logits.index_select(&language_token_ids, 0)?;
     let probs = candle_nn::ops::softmax(&logits, D::Minus1)?;
-    let probs = probs.to_vec1::<f32>()?;
+    let probs = probs.to_vec1_async::<f32>().await?;
     let mut probs = LANGUAGES.iter().zip(probs.iter()).collect::<Vec<_>>();
     probs.sort_by(|(_, p1), (_, p2)| p2.total_cmp(p1));
     for ((_, language), p) in probs.iter().take(5) {
