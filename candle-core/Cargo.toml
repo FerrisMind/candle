@@ -31,6 +31,7 @@ memmap2 = { workspace = true }
 num-traits = { workspace = true }
 num_cpus = { workspace = true }
 pollster = { workspace = true, optional = true }
+futures-channel = { version = "0.3", optional = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 rayon = { workspace = true }
@@ -76,7 +77,7 @@ metal = [
     "candle-ug?/metal",
 ]
 metal-debug-labels = ["metal", "candle-metal-kernels/debug-labels"]
-wgpu = ["dep:wgpu", "dep:pollster", "dep:candle-wgpu-kernels"]
+wgpu = ["dep:wgpu", "dep:pollster", "dep:candle-wgpu-kernels", "dep:futures-channel"]
 vulkan = ["dep:ash", "dep:gpu-allocator", "dep:candle-vulkan-kernels", "dep:rustc-hash"]
 ug = ["dep:candle-ug"]
 

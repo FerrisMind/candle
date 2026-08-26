@@ -1699,6 +1699,31 @@ impl WgpuDevice {
         buffer
     }
 
+    /// Upload host bytes into a GPU storage buffer (COPY_BUFFER_ALIGNMENT padded).
+    /// Chunked to avoid oversized single `queue.write_buffer` calls on browsers.
+    fn write_storage_bytes(&self, buffer: &wgpu::Buffer, bytes: &[u8]) -> Result<()> {
+        const UPLOAD_CHUNK: usize = 1024 * 1024;
+        let padded = wgpu_padded_write_bytes(bytes);
+        let mut off = 0usize;
+        while off < padded.len() {
+            let end = (off + UPLOAD_CHUNK).min(padded.len());
+            // Keep each write 4-byte aligned (WebGPU writeBuffer requirement).
+            let end = if end < padded.len() {
+                end & !3
+            } else {
+                end
+            };
+            if end <= off {
+                break;
+            }
+            self.inner
+                .queue
+                .write_buffer(buffer, off as u64, &padded[off..end]);
+            off = end;
+        }
+        Ok(())
+    }
+
     fn trim_pipeline_cache(&self) -> Result<()> {
         let mut cache = self
             .inner
@@ -1956,10 +1981,16 @@ impl WgpuDevice {
         Self::encode_pending_dispatches(self, &mut batch);
         let completed = Arc::new(AtomicBool::new(false));
         let done = completed.clone();
+        // WebGPU `onSubmittedWorkDone` covers only work already submitted
+        // (wgpu webgpu backend / llama.cpp WaitAny pattern). Registering the
+        // callback *before* submit resolves against prior work (or immediately
+        // on an empty queue) and lets us recycle buffers still in use by this
+        // submit — silent numeric corruption on wasm, masked on native by
+        // blocking `PollType::Wait`.
+        self.inner.queue.submit([batch.encoder.finish()]);
         self.inner
             .queue
             .on_submitted_work_done(move || done.store(true, Ordering::Release));
-        self.inner.queue.submit([batch.encoder.finish()]);
         const MAX_IN_FLIGHT_SUBMISSIONS: usize = 32;
         let mut pending = self
             .inner
@@ -1968,6 +1999,11 @@ impl WgpuDevice {
             .map_err(|e| Error::wrap(e.to_string()))?;
         if pending.len() >= MAX_IN_FLIGHT_SUBMISSIONS {
             drop(pending);
+            // On wasm Wait is a no-op; poll-only cleanup still drops submissions
+            // whose on_submitted_work_done already fired via the event loop.
+            #[cfg(target_arch = "wasm32")]
+            self.cleanup_pending_submissions(false)?;
+            #[cfg(not(target_arch = "wasm32"))]
             self.cleanup_pending_submissions(true)?;
             pending = self
                 .inner
@@ -2033,6 +2069,24 @@ impl WgpuDevice {
     }
 
     fn read_buffer(&self, buffer: &wgpu::Buffer, size: usize) -> Result<Vec<u8>> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (buffer, size);
+            // WebGPU treats `PollType::Wait` as a no-op; a blocking `mpsc::recv` after
+            // `map_async` freezes the worker event loop so the map callback never runs.
+            // Use `read_buffer_async` (awaited from async wasm-bindgen entry points).
+            return Err(Error::msg(
+                "sync wgpu readback is unsupported on wasm32; use async GPU→CPU APIs",
+            ));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.read_buffer_sync_native(buffer, size)
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_buffer_sync_native(&self, buffer: &wgpu::Buffer, size: usize) -> Result<Vec<u8>> {
         let copy_size = wgpu_copy_size(size);
         // Submit any pending compute first. The single queue is FIFO, so the
         // readback copy below (submitted after this batch) observes it, and
@@ -2099,6 +2153,65 @@ impl WgpuDevice {
                 try_read()
             }
         }
+    }
+
+    /// Async GPU→CPU readback. Required on `wasm32` where blocking poll + `recv`
+    /// deadlocks the browser/worker event loop.
+    pub async fn read_buffer_async(&self, buffer: &wgpu::Buffer, size: usize) -> Result<Vec<u8>> {
+        let copy_size = wgpu_copy_size(size);
+        self.flush_active_batch("readback")?;
+
+        let staging = self.inner.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("candle-wgpu-readback"),
+            size: copy_size as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder =
+            self.inner
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("candle-wgpu-readback"),
+                });
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, copy_size as u64);
+        let sub_idx = self.inner.queue.submit([encoder.finish()]);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = futures_channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.inner
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(sub_idx),
+                    timeout: None,
+                })
+                .map_err(Error::wrap)?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Wait is a no-op on WebGPU; yield to the event loop via `.await` below.
+            let _ = sub_idx;
+            let _ = self.inner.device.poll(wgpu::PollType::Poll);
+        }
+        rx.await
+            .map_err(|_| Error::msg("wgpu readback oneshot canceled"))?
+            .map_err(Error::wrap)
+            .map_err(|e| {
+                Error::Msg(format!("wgpu readback map_async failed (size={size}): {e}")).bt()
+            })?;
+        let mut data = slice.get_mapped_range().to_vec();
+        data.truncate(size);
+        staging.unmap();
+
+        self.cleanup_pending_submissions(false)?;
+        self.reset_hot_rings_if_idle();
+        self.flush_storage_pool_pending();
+        self.prune_buffer_registry();
+        Ok(data)
     }
 
     fn run_compute(
@@ -5546,6 +5659,13 @@ impl WgpuStorage {
     /// Number of elements stored in this buffer (elements, not bytes).
     pub fn count(&self) -> usize {
         self.count
+    }
+
+    /// Async GPU→CPU download (required on `wasm32` / portable WebGPU).
+    pub async fn to_cpu_storage_async(&self) -> Result<CpuStorage> {
+        let size = byte_len(self.dtype, self.count, "wgpu download")?;
+        let bytes = self.device.read_buffer_async(&self.buffer, size).await?;
+        bytes_to_cpu_storage(self.dtype, self.count, &bytes)
     }
 
     fn run_unary_like(&self, layout: &Layout, shader: &str, label: &'static str) -> Result<Self> {
@@ -10647,6 +10767,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let mut use_warptile = false;
         let shader: &str = match self.dtype {
             DType::F32 => {
+                // Portable WebGPU (wasm32): use the generic dense GEMM only.
+                // Warptile / reg-tile / coop paths are tuned and validated on
+                // native Vulkan-via-wgpu; on browsers they have produced silent
+                // wrong Whisper decode (CPU and desktop wgpu remain correct).
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = (m, n, k);
+                    matmul_label = "candle-wgpu-matmul";
+                    shader_storage = candle_wgpu_kernels::matmul_f32_shader().ok_or_else(|| {
+                        Error::Msg("wgpu shader mul_mat.wgsl not embedded".into()).bt()
+                    })?;
+                    &shader_storage
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
                 // Cooperative matrix: Ampere+ Vulkan exposes 16×16 f16 A/B → f32 C.
                 // Mixed-precision for large GEMMs; small squares stay full-f32 warptile.
                 let coop_ok = self.device.inner.coop_matmul_enabled
@@ -10709,6 +10844,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     })?;
                     &shader_storage
                 }
+                } // not(wasm32)
             }
             DType::F16 => {
                 // f16 reg-tile is valid (shmem is f16). Restrict to tile-aligned
@@ -13604,12 +13740,13 @@ impl BackendStorage for WgpuStorage {
             encoder.copy_buffer_to_buffer(&self.buffer, 0, &buffer, 0, wgpu_copy_size(size) as u64);
             let completed = Arc::new(AtomicBool::new(false));
             let done = completed.clone();
+            self.device.flush_before_standalone_submit()?;
+            // Submit first: WebGPU onSubmittedWorkDone is "work already queued".
+            self.device.inner.queue.submit([encoder.finish()]);
             self.device
                 .inner
                 .queue
                 .on_submitted_work_done(move || done.store(true, Ordering::Release));
-            self.device.flush_before_standalone_submit()?;
-            self.device.inner.queue.submit([encoder.finish()]);
             if let Ok(mut pending) = self.device.inner.pending_submissions.lock() {
                 pending.push(WgpuPendingSubmission {
                     retained_buffers: vec![self.buffer.clone(), buffer.clone()],
@@ -14990,13 +15127,27 @@ impl BackendStorage for WgpuStorage {
 /// Never force `SHADER_F64` — browsers often lack it and wgpu panics if a
 /// required feature is missing from the adapter.
 fn wgpu_required_features(adapter_features: wgpu::Features) -> wgpu::Features {
-    let optional = wgpu::Features::SHADER_F16
-        | wgpu::Features::SUBGROUP
-        | wgpu::Features::SUBGROUP_BARRIER
-        | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
-        | wgpu::Features::IMMEDIATES
-        | wgpu::Features::SHADER_F64;
-    adapter_features & optional
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Portable WebGPU (browser): only advertise features that generic WGSL
+        // paths need. Native-oriented bits (SUBGROUP / IMMEDIATES / cooperative
+        // matrix) are validated on Vulkan/DX12/Metal desktop; enabling them in
+        // Chrome/Firefox has selected incorrect fast paths and produced wrong
+        // Whisper logits (CPU OK, desktop wgpu OK, wasm wgpu garbage).
+        // `SHADER_F16` stays — several embedded shaders declare `enable f16`.
+        let _ = adapter_features;
+        return adapter_features & wgpu::Features::SHADER_F16;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let optional = wgpu::Features::SHADER_F16
+            | wgpu::Features::SUBGROUP
+            | wgpu::Features::SUBGROUP_BARRIER
+            | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
+            | wgpu::Features::IMMEDIATES
+            | wgpu::Features::SHADER_F64;
+        adapter_features & optional
+    }
 }
 
 #[cfg(test)]
@@ -15363,9 +15514,10 @@ impl BackendDevice for WgpuDevice {
         let (dtype, count, bytes) = cpu_storage_to_bytes(storage)?;
         let buffer = self
             .register_buffer_arc(self.create_storage_buffer_arc(bytes.len(), "candle-wgpu-upload"));
-        self.inner
-            .queue
-            .write_buffer(&buffer, 0, &wgpu_padded_write_bytes(&bytes));
+        // Chunk large uploads (same 1 MiB cadence as create_zeroed_storage_buffer /
+        // llama.cpp WebGPU WriteBuffer care). Browsers can mishandle a single
+        // multi‑100MB writeBuffer from wasm.
+        self.write_storage_bytes(&buffer, &bytes)?;
         Ok(WgpuStorage {
             buffer,
             device: self.clone(),
@@ -15419,7 +15571,17 @@ impl BackendDevice for WgpuDevice {
 
     fn synchronize(&self) -> Result<()> {
         self.flush_active_batch("synchronize")?;
-        self.cleanup_pending_submissions(true)?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            // `PollType::Wait` / `wait_indefinitely` are no-ops or deadlock-prone on
+            // WebGPU. Non-blocking poll only; callers that need a host-visible
+            // completion must use async readback (`read_buffer_async`).
+            self.cleanup_pending_submissions(false)?;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.cleanup_pending_submissions(true)?;
+        }
         // Rewind hot rings; keep elem_bg_cache so (src, dst_i) pairs hit.
         self.reset_hot_rings_if_idle();
         // Safe to reuse non-hot recycled buffers only after GPU drain.

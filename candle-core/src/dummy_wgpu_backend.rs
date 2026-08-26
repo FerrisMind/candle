@@ -31,6 +31,10 @@ impl WgpuDevice {
 pub struct WgpuStorage;
 
 impl WgpuStorage {
+    pub async fn to_cpu_storage_async(&self) -> Result<CpuStorage> {
+        Err(Error::NotCompiledWithWgpuSupport)
+    }
+
     pub(crate) fn quantized_index_select_f32(
         &self,
         _: crate::quantized::GgmlDType,
