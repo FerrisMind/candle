@@ -170,3 +170,6 @@ required-features = ["buildtime-download"]
 name = "debug_vulkan"
 required-features = ["vulkan"]
 
+[[example]]
+name = "segment-anything"
+

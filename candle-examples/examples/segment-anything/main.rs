@@ -49,6 +49,11 @@ struct Args {
     /// Use the TinyViT based models from MobileSAM
     #[arg(long)]
     use_tiny: bool,
+
+    /// Dump the raw (pre-threshold) mask logits to a binary file for analysis.
+    /// Format: [u32 H][u32 W][f32 H*W].
+    #[arg(long)]
+    dump_mask: Option<String>,
 }
 
 pub fn main() -> anyhow::Result<()> {
@@ -135,14 +140,33 @@ pub fn main() -> anyhow::Result<()> {
         println!("mask:\n{mask}");
         println!("iou_predictions: {iou_predictions}");
 
-        let mask = (mask.ge(args.threshold)? * 255.)?;
+        if let Some(path) = &args.dump_mask {
+            let (_one, h, w) = mask.dims3()?;
+            let data = mask.flatten_all()?.to_vec1::<f32>()?;
+            let mut buf = Vec::with_capacity(8 + data.len() * 4);
+            buf.extend_from_slice(&(h as u32).to_le_bytes());
+            buf.extend_from_slice(&(w as u32).to_le_bytes());
+            for v in data {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(path, buf)?;
+        }
+
+        let mask = (mask.ge(args.threshold)?.to_dtype(DType::F32)? * 255.)?;
         let (_one, h, w) = mask.dims3()?;
         let mask = mask.expand((3, h, w))?;
 
         let mut img = image::ImageReader::open(&args.image)?
             .decode()
             .map_err(candle::Error::wrap)?;
-        let mask_pixels = mask.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
+        // Compute the mask pixels on CPU: some backends do not support U8 dtype for the
+        // cast/affine ops used to materialize them on-device.
+        let mask = mask.to_device(&candle::Device::Cpu)?;
+        let mask_pixels = mask
+            .permute((1, 2, 0))?
+            .flatten_all()?
+            .to_dtype(DType::U8)?
+            .to_vec1::<u8>()?;
         let mask_img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
             match image::ImageBuffer::from_raw(w as u32, h as u32, mask_pixels) {
                 Some(image) => image,
