@@ -57,6 +57,19 @@ impl Model {
         }
     }
 
+    /// Async encoder forward that yields between blocks on wasm32+wpu so the wgpu
+    /// backend drains and recycles scratch buffers (avoids the encoder VRAM spike).
+    pub async fn encoder_forward_async(
+        &mut self,
+        x: &Tensor,
+        flush: bool,
+    ) -> candle::Result<Tensor> {
+        match self {
+            Self::Normal(m) => m.encoder.forward_async(x, flush).await,
+            Self::Quantized(m) => m.encoder.forward_async(x, flush).await,
+        }
+    }
+
     pub fn decoder_forward(
         &mut self,
         x: &Tensor,
@@ -207,18 +220,7 @@ impl Decoder {
             }
         };
 
-        let audio_features = model.encoder_forward(mel, true)?;
-        // D8: drain the encoder's pending_submissions before decode begins. The
-        // encoder issues ~50+ dispatches (a few batch-limit submissions) and on
-        // WebGPU completion is UNOBSERVABLE without an event-loop yield, so the
-        // backend free pool stays empty and gpu-allocator keeps carving fresh
-        // device blocks during the synchronous chain. Yielding here (device-gated;
-        // CPU / dummy-wgpu no-op) lets wgpu service `onSubmittedWorkDone`, recycle
-        // the encoder's retained buffers into the pool, and return blocks — same
-        // pattern as the per-token boundary below.
-        if let Device::Wgpu(dev) = &self.device {
-            dev.synchronize_async().await?;
-        }
+        let audio_features = model.encoder_forward_async(mel, true).await?;
         println!("audio features: {:?}", audio_features.dims());
         let sample_len = model.config().max_target_positions / 2;
         let mut sum_logprob = 0f64;
@@ -472,7 +474,7 @@ pub async fn detect_language(model: &mut Model, tokenizer: &Tokenizer, mel: &Ten
         .collect::<Result<Vec<_>, E>>()?;
 
     let sot_token = token_id(tokenizer, m::SOT_TOKEN)?;
-    let audio_features = model.encoder_forward(&mel, true)?;
+    let audio_features = model.encoder_forward_async(&mel, true).await?;
     let tokens = Tensor::new(&[[sot_token]], device)?;
     let language_token_ids = Tensor::new(language_token_ids.as_slice(), device)?;
     let ys = model.decoder_forward(&tokens, &audio_features, true)?;

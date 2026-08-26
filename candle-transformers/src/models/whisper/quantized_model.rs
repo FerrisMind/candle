@@ -295,6 +295,36 @@ impl AudioEncoder {
         Ok(x)
     }
 
+    /// Async encoder forward: identical to [`Self::forward`] except that on
+    /// wasm32+wpu it yields to the JS event loop between attention blocks so
+    /// `synchronize_async` drains `pending_submissions` and the free pool
+    /// refills. On native/CUDA/Metal (and the dummy-wgpu backend) this is a
+    /// no-op and is behaviorally identical to `forward`.
+    pub async fn forward_async(&mut self, x: &Tensor, flush_kv_cache: bool) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let x = {
+            let _enter = self.conv1_span.enter();
+            self.conv1.forward(x)?.gelu()?
+        };
+        let x = {
+            let _enter = self.conv2_span.enter();
+            self.conv2.forward(&x)?.gelu()?
+        };
+        let x = x.transpose(1, 2)?;
+        let (_bsize, seq_len, _hidden) = x.dims3()?;
+        let positional_embedding = self.positional_embedding.narrow(0, 0, seq_len)?;
+        let mut x = x.broadcast_add(&positional_embedding)?;
+        for block in self.blocks.iter_mut() {
+            x = block.forward(&x, None, None, flush_kv_cache)?;
+            #[cfg(target_arch = "wasm32")]
+            if let Device::Wgpu(dev) = x.device() {
+                dev.synchronize_async().await?;
+            }
+        }
+        let x = self.ln_post.forward(&x)?;
+        Ok(x)
+    }
+
     pub fn reset_kv_cache(&mut self) {
         for block in self.blocks.iter_mut() {
             block.reset_kv_cache();

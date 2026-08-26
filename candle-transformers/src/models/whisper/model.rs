@@ -298,6 +298,38 @@ impl AudioEncoder {
         let x = self.ln_post.forward(&x)?;
         Ok(x)
     }
+
+    /// Async encoder forward: identical to [`Self::forward`] except that on
+    /// wasm32+wpu it yields to the JS event loop between attention blocks so
+    /// `synchronize_async` drains `pending_submissions` and the free pool
+    /// refills — letting each block reuse the previous block's scratch buffers
+    /// instead of carving fresh ones (the ~4GB encoder VRAM spike). On
+    /// native/CUDA/Metal (and the dummy-wgpu backend) this is a no-op and is
+    /// behaviorally identical to `forward`.
+    pub async fn forward_async(&mut self, x: &Tensor, flush_kv_cache: bool) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let x = {
+            let _enter = self.conv1_span.enter();
+            self.conv1.forward(x)?.gelu()?
+        };
+        let x = {
+            let _enter = self.conv2_span.enter();
+            self.conv2.forward(&x)?.gelu()?
+        };
+        let x = x.transpose(1, 2)?;
+        let (_bsize, seq_len, _hidden) = x.dims3()?;
+        let positional_embedding = self.positional_embedding.narrow(0, 0, seq_len)?;
+        let mut x = x.broadcast_add(&positional_embedding)?;
+        for block in self.blocks.iter_mut() {
+            x = block.forward(&x, None, None, flush_kv_cache)?;
+            #[cfg(target_arch = "wasm32")]
+            if let Device::Wgpu(dev) = x.device() {
+                dev.synchronize_async().await?;
+            }
+        }
+        let x = self.ln_post.forward(&x)?;
+        Ok(x)
+    }
 }
 
 // https://github.com/openai/whisper/blob/f572f2161ba831bae131364c3bffdead7af6d210/whisper/model.py#L176
