@@ -132,7 +132,7 @@ fn main(
     let res = 0.5 * src[params.offset_src + src_idx] *
               (1.0 + tanh(clamp(sqrt(2.0 / 3.14159265) *
                                (src[params.offset_src + src_idx] +
-                                0.044715 * pow(src[params.offset_src + src_idx], 3.0)),
+                                0.044715 * src[params.offset_src + src_idx] * src[params.offset_src + src_idx] * src[params.offset_src + src_idx]),
                                -9.010913, 9.010913)));
 #endif
 #ifdef GELU_QUICK
