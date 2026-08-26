@@ -25,6 +25,12 @@ impl WgpuDevice {
     pub async fn new_async(_: usize) -> Result<Self> {
         Err(Error::NotCompiledWithWgpuSupport)
     }
+
+    /// Async host/GPU synchronize. Mirrors the real wgpu backend; on the dummy
+    /// (feature `wgpu` disabled) it is a no-op so callers stay API-compatible.
+    pub async fn synchronize_async(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]

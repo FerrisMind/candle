@@ -1340,6 +1340,11 @@ impl WgpuDevice {
         // pre-fix behavior is reproducible (CANDLE_WGPU_NO_PRESSURE=1).
         if std::env::var("CANDLE_WGPU_NO_PRESSURE").is_err() {
             let _ = self.cleanup_pending_submissions(false);
+            // On wasm32, PollType::Poll cannot confirm completion, so a dropped
+            // buffer may still be in flight. Only promote pending -> free pool
+            // at a confirmed-drain point (`synchronize_async` / async readback
+            // tail). Native keeps the opportunistic recycle (blocking drain).
+            #[cfg(not(target_arch = "wasm32"))]
             self.flush_storage_pool_pending();
             if let Some(arc) = self.take_reusable_from_pool(key) {
                 return arc;
@@ -1430,6 +1435,10 @@ impl WgpuDevice {
         }
         // Poll-only: recycle completed submissions, then promote pending → free.
         let _ = self.cleanup_pending_submissions(false);
+        // On wasm32, PollType::Poll cannot confirm completion; deferred
+        // `storage_pool_pending` buffers are only promoted to the free pool at a
+        // confirmed-drain point (`synchronize_async` / async readback tail).
+        #[cfg(not(target_arch = "wasm32"))]
         self.flush_storage_pool_pending();
     }
 
@@ -1999,8 +2008,14 @@ impl WgpuDevice {
             .map_err(|e| Error::wrap(e.to_string()))?;
         if pending.len() >= MAX_IN_FLIGHT_SUBMISSIONS {
             drop(pending);
-            // On wasm Wait is a no-op; poll-only cleanup still drops submissions
-            // whose on_submitted_work_done already fired via the event loop.
+            // On wasm `PollType::Wait` is a no-op; poll-only cleanup still drops
+            // submissions whose on_submitted_work_done already fired via the
+            // event loop. A synchronous decode cannot yield here, so the in-flight
+            // cap is only a real bound when the caller awaits
+            // `synchronize_async()` at step boundaries — that await drains
+            // `pending_submissions` back to zero, capping retained-buffer VRAM.
+            // Dropping the retained buffers instead would free a buffer the GPU
+            // may still be reading, so the submissions must be kept alive.
             #[cfg(target_arch = "wasm32")]
             self.cleanup_pending_submissions(false)?;
             #[cfg(not(target_arch = "wasm32"))]
@@ -2212,6 +2227,55 @@ impl WgpuDevice {
         self.flush_storage_pool_pending();
         self.prune_buffer_registry();
         Ok(data)
+    }
+
+    /// Async host/GPU synchronization for WebGPU. On `wasm32` the blocking
+    /// `PollType::Wait` / `wait_indefinitely` are effectively no-ops: GPU
+    /// completion is only observable when the JS event loop yields so that
+    /// queued `onSubmittedWorkDone` callbacks fire. Awaiting this future (from
+    /// the wasm-bindgen async runtime used by the examples) yields to the
+    /// event loop, which lets every in-flight submission's own
+    /// `onSubmittedWorkDone` callback resolve, then drains them and only then
+    /// promotes recycled buffers back into the free pool. This is what prevents
+    /// both the unbounded `pending_submissions` growth (VRAM balloon) and the
+    /// reuse of a still-in-flight buffer (garbage output).
+    ///
+    /// On native (`not(wasm32)`) this behaves exactly like [`Self::synchronize`]
+    /// (blocking `wait_indefinitely`, then recycle). Callers must await this at
+    /// GPU step boundaries during a wasm32 decode — a long synchronous compute
+    /// chain never yields, so `onSubmittedWorkDone` never fires and buffers are
+    /// neither drained nor safely recycled.
+    pub async fn synchronize_async(&self) -> Result<()> {
+        self.flush_active_batch("synchronize_async")?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Register a completion signal for ALL work submitted so far. The
+            // wgpu WebGPU queue is FIFO, so an `onSubmittedWorkDone` callback
+            // scheduled *now* resolves only after every prior submission
+            // finishes. Awaiting the oneshot yields control back to the JS
+            // event loop — without that yield the callback would never run.
+            let _ = self.inner.device.poll(wgpu::PollType::Poll);
+            let (tx, rx) = futures_channel::oneshot::channel();
+            self.inner.queue.on_submitted_work_done(move || {
+                let _ = tx.send(());
+            });
+            rx.await
+                .map_err(|_| Error::msg("wgpu synchronize_async oneshot canceled"))?;
+            // Every pending submission has now completed (FIFO). Drain them and
+            // recycle their sole-owner buffers into `storage_pool_pending`.
+            self.cleanup_pending_submissions(false)?;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.cleanup_pending_submissions(true)?;
+        }
+        // Only promote recycled / dropped buffers back into the free pool after
+        // completion is actually observed (safe on native via the blocking
+        // drain; on wasm32 via the event-loop yield above).
+        self.reset_hot_rings_if_idle();
+        self.flush_storage_pool_pending();
+        self.prune_buffer_registry();
+        Ok(())
     }
 
     fn run_compute(
@@ -15493,6 +15557,12 @@ impl BackendDevice for WgpuDevice {
             // asking gpu-allocator for a new block per conv/groupnorm/attention
             // scratch buffer and OOMs at ~8.6 GB even though the computation
             // only needs ~1-2 GB of scratch.
+            // On wasm32, none of the submissions above may actually have
+            // completed (PollType::Poll can't confirm on WebGPU), so do NOT
+            // promote possibly in-flight buffers into the free pool here — that
+            // reuse is what causes garbage output. Only `synchronize_async` /
+            // async readback (confirmed-drain points) promote on wasm32.
+            #[cfg(not(target_arch = "wasm32"))]
             self.flush_storage_pool_pending();
         }
         let buffer = self.register_buffer_arc(
@@ -15581,11 +15651,20 @@ impl BackendDevice for WgpuDevice {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.cleanup_pending_submissions(true)?;
+            // Rewind hot rings; keep elem_bg_cache so (src, dst_i) pairs hit.
+            self.reset_hot_rings_if_idle();
+            // Safe to reuse non-hot recycled buffers only after GPU drain.
+            self.flush_storage_pool_pending();
         }
-        // Rewind hot rings; keep elem_bg_cache so (src, dst_i) pairs hit.
-        self.reset_hot_rings_if_idle();
-        // Safe to reuse non-hot recycled buffers only after GPU drain.
-        self.flush_storage_pool_pending();
+        #[cfg(target_arch = "wasm32")]
+        {
+            // On WebGPU, blocking `poll(PollType::Wait)` is a no-op, so the
+            // non-blocking poll above cannot confirm completion. Do NOT rewind
+            // hot rings or promote `storage_pool_pending` here: those buffers
+            // may still be referenced by in-flight dispatches, and reusing them
+            // is the garbage-output/VRAM-balloon bug. Callers that need a
+            // host-visible drain must await [`Self::synchronize_async`].
+        }
         if std::env::var_os("CANDLE_DEBUG_ELEM_BG").is_some() {
             let h = self
                 .inner
