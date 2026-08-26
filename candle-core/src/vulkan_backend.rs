@@ -9710,22 +9710,14 @@ impl BackendStorage for VulkanStorage {
     type Device = VulkanDevice;
 
     fn try_clone(&self, layout: &Layout) -> Result<Self> {
-        if layout.is_contiguous()
-            && layout.start_offset() == 0
-            && layout.shape().elem_count() == self.count
-        {
-            let bytes = self.device.read_buffer(&self.buffer)?;
-            let buffer = self
-                .device
-                .create_buffer(bytes.len(), "candle-vulkan-clone")?;
-            self.device.write_buffer(&buffer, &bytes)?;
-            return Ok(Self {
-                buffer,
-                device: self.device.clone(),
-                count: self.count,
-                dtype: self.dtype,
-            });
-        }
+        // Always copy on the GPU. The previous contiguous fast-path memcpy'd the
+        // buffer through the host (read_buffer + write_buffer), which cost a full
+        // GPU drain plus a host round-trip of the entire buffer on every clone.
+        // That was catastrophic for large read-only sources (e.g. the llama
+        // embedding table, ~525MB F16 / 1GB F32, cloned per token during
+        // index_select). A device-to-device copy is a pure GPU transfer with no
+        // host round-trip and no pipeline drain, and keeps the independence
+        // guarantee that the caller may write the returned storage separately.
         let mut out = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
         Self::copy_strided_src(self, &mut out, 0, layout)?;
         Ok(out)
