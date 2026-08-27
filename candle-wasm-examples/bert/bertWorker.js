@@ -10,16 +10,54 @@
 import init, { Model } from "./build/m.js";
 
 async function fetchArrayBuffer(url) {
-  const cacheName = "bert-candle-cache";
-  const cache = await caches.open(cacheName);
-  const cachedResponse = await cache.match(url);
-  if (cachedResponse) {
-    const data = await cachedResponse.arrayBuffer();
-    return new Uint8Array(data);
+  const cacheName = "bert-candle-cache-v2";
+  try {
+    const cache = await caches.open(cacheName);
+    const cachedResponse = await cache.match(url);
+    if (cachedResponse) {
+      const data = await cachedResponse.arrayBuffer();
+      return new Uint8Array(data);
+    }
+  } catch (_) {
+    /* Cache API unavailable (opaque origin / quota) — fall through to network */
   }
-  const res = await fetch(url, { cache: "force-cache" });
-  cache.put(url, res.clone());
-  return new Uint8Array(await res.arrayBuffer());
+
+  const res = await fetch(url, { cache: "force-cache", mode: "cors" });
+  if (!res.ok) {
+    throw new Error(`fetch ${url} failed: ${res.status} ${res.statusText}`);
+  }
+
+  // Read the FULL body before touching the Cache API. Cloning a large streaming
+  // response (up to ~440 MB model.safetensors) and consuming one branch via
+  // cache.put() can truncate the other branch in Firefox, yielding "incomplete
+  // metadata, file not fully covered". Verify against Content-Length to fail loud
+  // instead.
+  let buf = await res.arrayBuffer();
+  let declared = res.headers.get("content-length");
+  if (declared != null && Number(declared) !== buf.byteLength) {
+    // One retry bypassing the HTTP cache (stale/partial cached body).
+    const retry = await fetch(url, { cache: "reload", mode: "cors" });
+    if (!retry.ok) {
+      throw new Error(
+        `fetch ${url} failed on retry: ${retry.status} ${retry.statusText}`
+      );
+    }
+    buf = await retry.arrayBuffer();
+    declared = retry.headers.get("content-length");
+  }
+  if (declared != null && Number(declared) !== buf.byteLength) {
+    throw new Error(
+      `fetch ${url} truncated: got ${buf.byteLength} bytes, expected ${declared}`
+    );
+  }
+
+  try {
+    const cache = await caches.open(cacheName);
+    await cache.put(url, new Response(buf, { headers: res.headers }));
+  } catch (_) {
+    /* caching is best-effort */
+  }
+  return new Uint8Array(buf);
 }
 
 function errMessage(e) {
@@ -160,6 +198,30 @@ class Bert {
     }
     return this.instance[this.activeKey];
   }
+
+  /**
+   * Transient inference: fully unload the active model + device so the (wgpu) device
+   * is destroyed and VRAM/RAM are released after each run. `free()` is the
+   * wasm-bindgen-generated destructor on the `Model`, which drops the inner model
+   * (weights/tensors) and device, firing `Drop for WgpuInner` → `device.destroy()`.
+   * Safe to call when nothing is loaded (no-op).
+   */
+  static disposeActive() {
+    const key = this.activeKey;
+    if (key && this.instance[key]) {
+      const entry = this.instance[key];
+      if (entry.model && entry.model.free) {
+        try {
+          entry.model.free();
+        } catch (_) {
+          /* ignore */
+        }
+      }
+      delete this.instance[key];
+    }
+    this.activeKey = null;
+    this.activeDeviceMode = "auto";
+  }
 }
 
 self.addEventListener("message", async (event) => {
@@ -194,10 +256,14 @@ self.addEventListener("message", async (event) => {
 
       let output;
       try {
-        output = entry.model.get_embeddings({
+        // `get_embeddings` is an async wasm-bindgen export → returns a JS Promise.
+        // Await it so the wgpu async GPU→CPU readback can yield to the event loop.
+        // A sync CPU build or older wasm may still return the object directly.
+        let raw = entry.model.get_embeddings({
           sentences: data.sentences,
           normalize_embeddings: data.normalize ?? true,
         });
+        output = raw && typeof raw.then === "function" ? await raw : raw;
       } catch (e) {
         const msg = errMessage(e);
         const isDeviceRuntime =
@@ -234,6 +300,11 @@ self.addEventListener("message", async (event) => {
         error: errMessage(e),
         phase: "modelLoad",
       });
+    } finally {
+      // Transient inference: unload the model + device after every run so VRAM
+      // (wgpu device.destroy()) and RAM are released. `complete`/`error` above are
+      // posted BEFORE dispose so the UI still gets its result.
+      Bert.disposeActive();
     }
     return;
   }

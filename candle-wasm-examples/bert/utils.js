@@ -106,8 +106,8 @@ const MODELS = {
     document_prefix: "passage: ",
   },
   sentence_transformers_all_MiniLM_L6_v2: {
-    base_url:
-      "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/refs%2Fpr%2F21/",
+    // Local cache: G:\models\all-MiniLM-L6-v2 (junction → ./models/all-MiniLM-L6-v2)
+    base_url: "./models/all-MiniLM-L6-v2/",
     search_prefix: "",
     document_prefix: "",
   },

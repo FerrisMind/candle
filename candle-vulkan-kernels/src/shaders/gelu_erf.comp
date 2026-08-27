@@ -10,16 +10,128 @@ layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
 layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
 
-void main() {
-    // based on Abramowitz and Stegun formula 7.1.26 or similar Hastings' approximation
-    // ref: https://www.johndcook.com/blog/python_erf/
-    const float p_erf  = 0.3275911f;
-    const float a1_erf = 0.254829592f;
-    const float a2_erf = -0.284496736f;
-    const float a3_erf = 1.421413741f;
-    const float a4_erf = -1.453152027f;
-    const float a5_erf = 1.061405429f;
+// Port of libm::erff (musl / FreeBSD s_erff.c) so GELU_ERF matches the CPU
+// reference GeluErf::f32 (candle-core/src/op.rs). GLSL has no built-in erf.
+const float ERX  = 8.4506291151e-01;
+const float EFX8 = 1.0270333290e+00;
+const float PP0  = 1.2837916613e-01;
+const float PP1  = -3.2504209876e-01;
+const float PP2  = -2.8481749818e-02;
+const float PP3  = -5.7702702470e-03;
+const float PP4  = -2.3763017452e-05;
+const float QQ1  = 3.9791721106e-01;
+const float QQ2  = 6.5022252500e-02;
+const float QQ3  = 5.0813062117e-03;
+const float QQ4  = 1.3249473704e-04;
+const float QQ5  = -3.9602282413e-06;
+const float PA0  = -2.3621185683e-03;
+const float PA1  = 4.1485610604e-01;
+const float PA2  = -3.7220788002e-01;
+const float PA3  = 3.1834661961e-01;
+const float PA4  = -1.1089469492e-01;
+const float PA5  = 3.5478305072e-02;
+const float PA6  = -2.1663755178e-03;
+const float QA1  = 1.0642088205e-01;
+const float QA2  = 5.4039794207e-01;
+const float QA3  = 7.1828655899e-02;
+const float QA4  = 1.2617121637e-01;
+const float QA5  = 1.3637083583e-02;
+const float QA6  = 1.1984500103e-02;
+const float RA0  = -9.8649440333e-03;
+const float RA1  = -6.9385856390e-01;
+const float RA2  = -1.0558626175e+01;
+const float RA3  = -6.2375331879e+01;
+const float RA4  = -1.6239666748e+02;
+const float RA5  = -1.8460508728e+02;
+const float RA6  = -8.1287437439e+01;
+const float RA7  = -9.8143291473e+00;
+const float SA1  = 1.9651271820e+01;
+const float SA2  = 1.3765776062e+02;
+const float SA3  = 4.3456588745e+02;
+const float SA4  = 6.4538726807e+02;
+const float SA5  = 4.2900814819e+02;
+const float SA6  = 1.0863500214e+02;
+const float SA7  = 6.5702495575e+00;
+const float SA8  = -6.0424413532e-02;
+const float RB0  = -9.8649431020e-03;
+const float RB1  = -7.9928326607e-01;
+const float RB2  = -1.7757955551e+01;
+const float RB3  = -1.6063638306e+02;
+const float RB4  = -6.3756646729e+02;
+const float RB5  = -1.0250950928e+03;
+const float RB6  = -4.8351919556e+02;
+const float SB1  = 3.0338060379e+01;
+const float SB2  = 3.2579251099e+02;
+const float SB3  = 1.5367296143e+03;
+const float SB4  = 3.1998581543e+03;
+const float SB5  = 2.5530502930e+03;
+const float SB6  = 4.7452853394e+02;
+const float SB7  = -2.2440952301e+01;
 
+float erfc1(float x) {
+    float s = abs(x) - 1.0;
+    float p = PA0 + s * (PA1 + s * (PA2 + s * (PA3 + s * (PA4 + s * (PA5 + s * PA6)))));
+    float q = 1.0 + s * (QA1 + s * (QA2 + s * (QA3 + s * (QA4 + s * (QA5 + s * QA6)))));
+    return 1.0 - ERX - p / q;
+}
+
+float erfc2(uint ix_abs, float x) {
+    if (ix_abs < 0x3fa00000u) {
+        return erfc1(x);
+    }
+    float xa = abs(x);
+    float s = 1.0 / (xa * xa);
+    float r;
+    float big_s;
+    if (ix_abs < 0x4036db6du) {
+        r = RA0 + s * (RA1 + s * (RA2 + s * (RA3 + s * (RA4 + s * (RA5 + s * (RA6 + s * RA7))))));
+        big_s = 1.0 + s * (SA1 + s * (SA2 + s * (SA3 + s * (SA4 + s * (SA5 + s * (SA6 + s * (SA7 + s * SA8)))))));
+    } else {
+        r = RB0 + s * (RB1 + s * (RB2 + s * (RB3 + s * (RB4 + s * (RB5 + s * RB6)))));
+        big_s = 1.0 + s * (SB1 + s * (SB2 + s * (SB3 + s * (SB4 + s * (SB5 + s * (SB6 + s * SB7))))));
+    }
+    float z = uintBitsToFloat(ix_abs & 0xffffe000u);
+    return exp(-z * z - 0.5625) * exp((z - xa) * (z + xa) + r / big_s) / xa;
+}
+
+float erf(float x) {
+    uint ix = floatBitsToUint(x);
+    bool neg = (ix >> 31u) != 0u;
+    uint ix_abs = ix & 0x7fffffffu;
+    if (ix_abs >= 0x7f800000u) {
+        // erf(nan)=nan, erf(+inf)=+1, erf(-inf)=-1
+        if (neg) {
+            return -1.0 + 1.0 / x;
+        }
+        return 1.0 + 1.0 / x;
+    }
+    if (ix_abs < 0x3f580000u) {
+        // |x| < 0.84375
+        if (ix_abs < 0x31800000u) {
+            // |x| < 2**-28, avoid underflow
+            return 0.125 * (8.0 * x + EFX8 * x);
+        }
+        float z = x * x;
+        float r = PP0 + z * (PP1 + z * (PP2 + z * (PP3 + z * PP4)));
+        float s = 1.0 + z * (QQ1 + z * (QQ2 + z * (QQ3 + z * (QQ4 + z * QQ5))));
+        float y = r / s;
+        return x + x * y;
+    }
+    float y;
+    if (ix_abs < 0x40c00000u) {
+        // |x| < 6
+        y = 1.0 - erfc2(ix_abs, x);
+    } else {
+        // 1.0 - 2^-120 (== 1.0 in f32)
+        y = 1.0 - uintBitsToFloat(0x03800000u);
+    }
+    if (neg) {
+        return -y;
+    }
+    return y;
+}
+
+void main() {
     const float SQRT_2_INV = 0.70710678118654752440084436210484f;
     const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
 
@@ -28,12 +140,6 @@ void main() {
     }
 
     const float a = float(data_a[i]);
-    const float a_div_sqr2 = a * SQRT_2_INV;
-    const float sign_x = sign(a_div_sqr2);
-    const float x = abs(a_div_sqr2);
-    const float t = 1.0f / (1.0f + p_erf * x);
-    const float y = 1.0f - (((((a5_erf * t + a4_erf) * t) + a3_erf) * t + a2_erf) * t + a1_erf) * t * exp(-x * x);
-    const float erf_approx = sign_x * y;
-
-    data_d[i] = D_TYPE(0.5f * a * (1.0f + erf_approx));
+    const float erf_x = erf(a * SQRT_2_INV);
+    data_d[i] = D_TYPE(0.5f * a * (1.0f + erf_x));
 }

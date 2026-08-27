@@ -100,7 +100,7 @@ impl Model {
         self.adapter_name.clone()
     }
 
-    pub fn get_embeddings(&mut self, input: JsValue) -> Result<JsValue, JsError> {
+    pub async fn get_embeddings(&mut self, input: JsValue) -> Result<JsValue, JsError> {
         let input: Params =
             serde_wasm_bindgen::from_value(input).map_err(|m| JsError::new(&m.to_string()))?;
         let sentences = input.sentences;
@@ -152,7 +152,16 @@ impl Model {
         } else {
             embeddings
         };
-        let embeddings_data = embeddings.to_vec2()?;
+        // wasm32 + wgpu cannot use the sync `to_vec2` readback (blocking map_async
+        // deadlocks the worker event loop). Read the flat buffer back via the async
+        // path and reshape, mirroring whisper's `to_vec1_async` usage.
+        let (n_sentence, hidden_size) = embeddings.dims2()?;
+        let flat: Vec<f32> = embeddings.flatten_all()?.to_vec1_async().await?;
+        let embeddings_data: Vec<Vec<f32>> = flat
+            .chunks(hidden_size)
+            .map(|row| row.to_vec())
+            .collect();
+        debug_assert_eq!(embeddings_data.len(), n_sentence);
         Ok(serde_wasm_bindgen::to_value(&Embeddings {
             data: embeddings_data,
         })?)

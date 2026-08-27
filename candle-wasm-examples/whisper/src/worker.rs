@@ -602,19 +602,19 @@ impl yew_agent::Worker for Worker {
             }
             WorkerInput::DecodeTask { wav_bytes } => {
                 // Take the decoder out so the spawned future owns it (`'static`). The slot is
-                // left `None` for the duration of the decode and restored afterwards, so the
-                // `RefCell` is never held borrowed across an await point.
+                // left `None` for the duration of the decode and is NOT restored — the decoder
+                // is dropped when the future completes, unloading the CPU model (transient
+                // inference). The `RefCell` is never held borrowed across an await point.
                 let decoded = self.decoder.borrow_mut().take();
                 let Some(mut decoder) = decoded else {
                     self.link
                         .respond(id, Err("model has not been set".to_string()));
                     return;
                 };
-                let slot = Rc::clone(&self.decoder);
                 let link = self.link.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let result = decoder.convert_and_run(&wav_bytes).await;
-                    *slot.borrow_mut() = Some(decoder);
+                    drop(decoder);
                     let output = match result {
                         Ok(segments) => Ok(WorkerOutput::Decoded(segments)),
                         Err(e) => Err(e.to_string()),

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Candle Whisper Rust/WASM</title>
+    <title>Candle fork Whisper Rust/WASM</title>
     <style>
       @import url("https://fonts.googleapis.com/css2?family=Source+Code+Pro:wght@200;300;400&family=Source+Sans+3:wght@100;200;300;400;500;600;700;800;900&display=swap");
       html,
@@ -27,8 +27,7 @@
           size: "151 MB",
         },
         tiny_en: {
-          // Local cache: G:\models\whisper\tiny.en (junction → ./models/tiny.en)
-          base_url: "./models/tiny.en/",
+          base_url: "https://huggingface.co/openai/whisper-tiny.en/resolve/main/",
           model: "model.safetensors",
           tokenizer: "tokenizer.json",
           config: "config.json",
@@ -320,6 +319,11 @@
           document.querySelector("#output-generation").hidden = true;
           document.querySelector("#output-status").textContent =
             error.error || error.message || String(error);
+        } finally {
+          // Transient inference: the worker unloads the model after each run, so
+          // the next run must reload via setDevice. Keep the button enabled — the
+          // click handler reloads when `modelReady` is false.
+          modelReady = false;
         }
       });
 
@@ -348,16 +352,16 @@
         }
       }
 
-      // Default deviceMode: cpu for reliable local headed smoke; UI still supports wgpu/auto.
-      setDeviceRadio("cpu");
-      applyDeviceMode("cpu", { userInitiated: false }).catch(() => {});
+      // Default deviceMode: auto (WebGPU when available, else CPU fallback).
+      setDeviceRadio("auto");
+      applyDeviceMode("auto", { userInitiated: false }).catch(() => {});
     </script>
   </head>
   <body class="container max-w-4xl mx-auto p-4">
     <main class="grid grid-cols-1 gap-8 relative">
       <span class="absolute text-5xl -ml-[1em]"> 🕯️ </span>
       <div>
-        <h1 class="text-5xl font-bold">Candle Whisper</h1>
+        <h1 class="text-5xl font-bold">Candle fork Whisper</h1>
         <h2 class="text-2xl font-bold">Rust/WASM Demo</h2>
         <p class="max-w-lg">
           Transcribe audio in the browser using rust/wasm with an audio file.
@@ -370,10 +374,10 @@
           </a>
           and WASM runtime built with
           <a
-            href="https://github.com/huggingface/candle/"
+            href="https://github.com/FerrisMind/candle/"
             target="_blank"
             class="underline hover:text-blue-500 hover:no-underline"
-            >Candle
+            >Candle fork
           </a>
         </p>
       </div>

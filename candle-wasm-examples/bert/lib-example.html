@@ -1,7 +1,7 @@
 <html>
   <head>
     <meta content="text/html;charset=utf-8" http-equiv="Content-Type" />
-    <title>Candle Bert</title>
+    <title>Candle fork BERT Rust/WASM</title>
   </head>
   <body></body>
 </html>
@@ -251,10 +251,14 @@
           }
           outputStatusEl.innerText = `Error: ${err.message}`;
           outputStatusEl.classList.remove("invisible");
+        } finally {
+          // Transient inference: the worker unloads the model + device after each
+          // run, so the next run must reload via ensureDevice. Keep the flag low
+          // so the next submit/recompute triggers a fresh setDevice.
+          deviceReady = false;
+          isCalculating = false;
+          toggleInputs(false);
         }
-
-        isCalculating = false;
-        toggleInputs(false);
       });
       async function calculateEmbeddings(text) {
         isCalculating = true;
@@ -279,12 +283,16 @@
             outputStatusEl.innerText = `Calculating embeddings: sentence ${
               id + 1
             } of ${sentences.length}`;
+            // Transient inference: the worker unloads the model + device after each
+            // run, so reload via setDevice before every sentence.
+            if (!deviceReady) await ensureDevice(updateStatus);
             const embeddings = await getEmbeddings(
               bertWorker,
               modelID,
               [query],
               updateStatus
             );
+            deviceReady = false;
             allEmbeddings.push(embeddings);
           }
           sentenceEmbeddings = allEmbeddings.map((e) => e.output[0]);
@@ -299,10 +307,14 @@
             }
           }
           outputStatusEl.innerText = `Error: ${e.message}`;
+        } finally {
+          // Transient inference: the worker unloads the model + device after each
+          // run, so keep the flag low so the next recompute triggers a fresh setDevice.
+          outputStatusEl.classList.add("invisible");
+          deviceReady = false;
+          isCalculating = false;
+          toggleInputs(false);
         }
-        outputStatusEl.classList.add("invisible");
-        isCalculating = false;
-        toggleInputs(false);
       }
 
       function updateStatus(data) {
@@ -361,16 +373,16 @@
     <main class="grid grid-cols-1 gap-5 relative">
       <span class="absolute text-5xl -ml-[1em]"> 🕯️ </span>
       <div>
-        <h1 class="text-5xl font-bold">Candle BERT</h1>
+        <h1 class="text-5xl font-bold">Candle fork BERT</h1>
         <h2 class="text-2xl font-bold">Rust/WASM Demo</h2>
         <p class="max-w-lg">
           Running sentence embeddings and similarity search in the browser using
           the Bert Model written with
           <a
-            href="https://github.com/huggingface/candle/"
+            href="https://github.com/FerrisMind/candle/"
             target="_blank"
             class="underline hover:text-blue-500 hover:no-underline"
-            >Candle
+            >Candle fork
           </a>
           and compiled to Wasm. Embeddings models from are from
           <a
