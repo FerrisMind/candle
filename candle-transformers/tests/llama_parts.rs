@@ -1,20 +1,34 @@
-use candle::{Device, Result, Tensor, D};
-use candle_nn::{Module, VarBuilder};
+use candle::{Device, Result, Tensor};
+use candle_nn::Module;
 use candle_transformers::models::{llama2_c, llama2_c_weights};
 use std::fs::File;
 use std::path::PathBuf;
 
 fn maxdiff(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let va = a.to_dtype(candle::DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let vb = b.to_dtype(candle::DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    Ok(va.iter().zip(vb.iter()).map(|(x,y)| (x-y).abs()).fold(0.0f32, f32::max))
+    let va = a
+        .to_dtype(candle::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let vb = b
+        .to_dtype(candle::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok(va
+        .iter()
+        .zip(vb.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max))
 }
 
 fn find(p: &std::path::Path, name: &str) -> Option<PathBuf> {
-    if p.is_file() && p.file_name()?.to_str()? == name { return Some(p.to_path_buf()); }
+    if p.is_file() && p.file_name()?.to_str()? == name {
+        return Some(p.to_path_buf());
+    }
     if p.is_dir() {
-        for e in std::fs::read_dir(p).ok()? {
-            if let Ok(e) = e { if let Some(f) = find(&e.path(), name) { return Some(f); } }
+        for e in std::fs::read_dir(p).ok()?.flatten() {
+            if let Some(f) = find(&e.path(), name) {
+                return Some(f);
+            }
         }
     }
     None
@@ -29,10 +43,13 @@ fn llama_parts() -> Result<()> {
     let load_vb = |device: &Device| -> Result<(candle_nn::VarBuilder<'static>, llama2_c::Config)> {
         let mut file = File::open(&model_path)?;
         let config = llama2_c::Config::from_reader(&mut file)?;
-        let weights = llama2_c_weights::TransformerWeights::from_reader(&mut file, &config, device)?;
+        let weights =
+            llama2_c_weights::TransformerWeights::from_reader(&mut file, &config, device)?;
         let vb = weights.var_builder(&config, device)?;
         // leak for 'static - tests only
-        let vb = unsafe { std::mem::transmute::<_, candle_nn::VarBuilder<'static>>(vb) };
+        let vb = unsafe {
+            std::mem::transmute::<candle_nn::VarBuilder<'_>, candle_nn::VarBuilder<'static>>(vb)
+        };
         Ok((vb, config))
     };
     let (vb_c, cfg) = load_vb(&cpu)?;
@@ -55,8 +72,16 @@ fn llama_parts() -> Result<()> {
     wg.synchronize()?;
     println!("q_proj maxdiff {}", maxdiff(&q_c, &q_g)?);
     // rms
-    let rms_c = candle_nn::rms_norm(cfg.dim, cfg.norm_eps, vb_c.pp("model.layers.0.input_layernorm"))?;
-    let rms_g = candle_nn::rms_norm(cfg.dim, cfg.norm_eps, vb_g.pp("model.layers.0.input_layernorm"))?;
+    let rms_c = candle_nn::rms_norm(
+        cfg.dim,
+        cfg.norm_eps,
+        vb_c.pp("model.layers.0.input_layernorm"),
+    )?;
+    let rms_g = candle_nn::rms_norm(
+        cfg.dim,
+        cfg.norm_eps,
+        vb_g.pp("model.layers.0.input_layernorm"),
+    )?;
     let n_c = rms_c.forward(&x_c)?;
     let n_g = rms_g.forward(&x_g)?;
     wg.synchronize()?;

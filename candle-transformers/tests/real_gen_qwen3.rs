@@ -139,8 +139,14 @@ fn real_gen_qwen3_token_match() -> Result<()> {
     let max_new = 16;
 
     let (mut cpu_model, tokenizer, _) = load_model(&Device::Cpu, DType::F32)?;
-    let (cpu_text, cpu_toks) =
-        greedy_generate(&mut cpu_model, &tokenizer, &Device::Cpu, prompt, max_new, eos)?;
+    let (cpu_text, cpu_toks) = greedy_generate(
+        &mut cpu_model,
+        &tokenizer,
+        &Device::Cpu,
+        prompt,
+        max_new,
+        eos,
+    )?;
     println!("CPU tokens={cpu_toks:?} text={cpu_text:?}");
     drop(cpu_model);
 

@@ -150,8 +150,7 @@ impl Component for App {
                 self.loaded = true;
                 console_log!("loaded weights");
                 let mode = md.device_mode;
-                self.worker
-                    .send(WorkerInput::SetDevice { mode, model: md });
+                self.worker.send(WorkerInput::SetDevice { mode, model: md });
                 true
             }
             Msg::Run(sample_index) => {

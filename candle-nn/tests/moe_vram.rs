@@ -8,8 +8,6 @@
 // `index_select_rows0_f32` path that materializes `[batch*topk, n, k]` f32
 // (the +1.65 GB dedicated on Qwen3-16B-A3B). The shader is now named
 // `mul_mat_vec_id_<stem>_f32_f32` to match the generated SPIR-V.
-use candle::quantized::{GgmlDType, QTensor};
-use candle::{DType, Device, Result, Tensor};
 
 #[test]
 #[ignore = "requires a usable Vulkan compute device and driver"]

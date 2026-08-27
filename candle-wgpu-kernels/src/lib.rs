@@ -940,44 +940,47 @@ pub fn matvec_workgroup_size() -> u32 {
 }
 
 pub fn matvec_shader(dtype: DType, vectorized: bool, use_subgroups: bool) -> Option<String> {
-    cached_shader((19u8, dtype as u8, vectorized as u8, use_subgroups as u8), || {
-        let source = get("mul_mat_vec.wgsl")?.source().replace(
-            "#include \"common_decls.tmpl\"",
-            get("common_decls.tmpl")?.source(),
-        );
-        let inner_type = match dtype {
-            DType::F32 => "f32",
-            DType::F16 => "f16",
-        };
-        let mut defines = vec![
-            if vectorized {
-                "VEC".to_string()
-            } else {
-                "SCALAR".to_string()
-            },
-            if use_subgroups {
-                "USE_SUBGROUP_REDUCTION".to_string()
-            } else {
-                "USE_WORKGROUP_REDUCTION".to_string()
-            },
-            "MUL_ACC_FLOAT".to_string(),
-            "WG_SIZE".to_string(),
-            "OUTPUTS_PER_WG".to_string(),
-        ];
-        let replacements = vec![
-            ("WG_SIZE".to_string(), QUANT_MUL_MAT_VEC_WG_SIZE.to_string()),
-            (
+    cached_shader(
+        (19u8, dtype as u8, vectorized as u8, use_subgroups as u8),
+        || {
+            let source = get("mul_mat_vec.wgsl")?.source().replace(
+                "#include \"common_decls.tmpl\"",
+                get("common_decls.tmpl")?.source(),
+            );
+            let inner_type = match dtype {
+                DType::F32 => "f32",
+                DType::F16 => "f16",
+            };
+            let mut defines = vec![
+                if vectorized {
+                    "VEC".to_string()
+                } else {
+                    "SCALAR".to_string()
+                },
+                if use_subgroups {
+                    "USE_SUBGROUP_REDUCTION".to_string()
+                } else {
+                    "USE_WORKGROUP_REDUCTION".to_string()
+                },
+                "MUL_ACC_FLOAT".to_string(),
+                "WG_SIZE".to_string(),
                 "OUTPUTS_PER_WG".to_string(),
-                QUANT_MUL_MAT_VEC_FLOAT_OUTPUTS_PER_WG.to_string(),
-            ),
-            ("SRC0_INNER_TYPE".to_string(), inner_type.to_string()),
-            ("SRC1_INNER_TYPE".to_string(), inner_type.to_string()),
-        ];
-        if !matches!(dtype, DType::F16) {
-            defines.retain(|define| define != "USE_SUBGROUP_REDUCTION");
-        }
-        Some(preprocess(&source, &defines, &replacements, dtype))
-    })
+            ];
+            let replacements = vec![
+                ("WG_SIZE".to_string(), QUANT_MUL_MAT_VEC_WG_SIZE.to_string()),
+                (
+                    "OUTPUTS_PER_WG".to_string(),
+                    QUANT_MUL_MAT_VEC_FLOAT_OUTPUTS_PER_WG.to_string(),
+                ),
+                ("SRC0_INNER_TYPE".to_string(), inner_type.to_string()),
+                ("SRC1_INNER_TYPE".to_string(), inner_type.to_string()),
+            ];
+            if !matches!(dtype, DType::F16) {
+                defines.retain(|define| define != "USE_SUBGROUP_REDUCTION");
+            }
+            Some(preprocess(&source, &defines, &replacements, dtype))
+        },
+    )
 }
 
 fn quantized_shader_config(dtype: QuantizedDType) -> (Vec<String>, &'static str, &'static str) {

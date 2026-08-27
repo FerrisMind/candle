@@ -1,5 +1,5 @@
 //! Stage-by-stage llama2_c block0 trace: CPU vs WGPU.
-use candle::{Device, Result, Tensor, D, DType};
+use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::{ops, Module};
 use candle_transformers::models::{llama2_c, llama2_c_weights};
 use std::fs::File;
@@ -41,11 +41,9 @@ fn find(p: &std::path::Path, name: &str) -> Option<PathBuf> {
         return Some(p.to_path_buf());
     }
     if p.is_dir() {
-        for e in std::fs::read_dir(p).ok()? {
-            if let Ok(e) = e {
-                if let Some(f) = find(&e.path(), name) {
-                    return Some(f);
-                }
+        for e in std::fs::read_dir(p).ok()?.flatten() {
+            if let Some(f) = find(&e.path(), name) {
+                return Some(f);
             }
         }
     }
@@ -69,15 +67,16 @@ fn llama_trace_block0() -> Result<()> {
     let cpu = Device::Cpu;
     let wg = Device::new_wgpu(0)?;
 
-    let load_vb = |device: &Device| -> Result<(candle_nn::VarBuilder, llama2_c::Config, llama2_c::Cache)> {
-        let mut file = File::open(&model_path)?;
-        let config = llama2_c::Config::from_reader(&mut file)?;
-        let weights =
-            llama2_c_weights::TransformerWeights::from_reader(&mut file, &config, device)?;
-        let vb = weights.var_builder(&config, device)?;
-        let cache = llama2_c::Cache::new(false, &config, vb.pp("rot"))?;
-        Ok((vb, config, cache))
-    };
+    let load_vb =
+        |device: &Device| -> Result<(candle_nn::VarBuilder, llama2_c::Config, llama2_c::Cache)> {
+            let mut file = File::open(&model_path)?;
+            let config = llama2_c::Config::from_reader(&mut file)?;
+            let weights =
+                llama2_c_weights::TransformerWeights::from_reader(&mut file, &config, device)?;
+            let vb = weights.var_builder(&config, device)?;
+            let cache = llama2_c::Cache::new(false, &config, vb.pp("rot"))?;
+            Ok((vb, config, cache))
+        };
 
     let (vb_c, cfg, cache_c) = load_vb(&cpu)?;
     let (vb_g, _, cache_g) = load_vb(&wg)?;
@@ -94,27 +93,39 @@ fn llama_trace_block0() -> Result<()> {
     wg.synchronize()?;
     report("embed", &x_c, &x_g)?;
 
-    let rms1_c =
-        candle_nn::rms_norm(cfg.dim, cfg.norm_eps, vb_c.pp("model.layers.0.input_layernorm"))?;
-    let rms1_g =
-        candle_nn::rms_norm(cfg.dim, cfg.norm_eps, vb_g.pp("model.layers.0.input_layernorm"))?;
+    let rms1_c = candle_nn::rms_norm(
+        cfg.dim,
+        cfg.norm_eps,
+        vb_c.pp("model.layers.0.input_layernorm"),
+    )?;
+    let rms1_g = candle_nn::rms_norm(
+        cfg.dim,
+        cfg.norm_eps,
+        vb_g.pp("model.layers.0.input_layernorm"),
+    )?;
     let n_c = rms1_c.forward(&x_c)?;
     let n_g = rms1_g.forward(&x_g)?;
     wg.synchronize()?;
     report("rms1", &n_c, &n_g)?;
 
-    let q_c = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_c.pp("model.layers.0.self_attn.q_proj"))?
-        .forward(&n_c)?;
-    let q_g = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_g.pp("model.layers.0.self_attn.q_proj"))?
-        .forward(&n_g)?;
-    let k_c = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_c.pp("model.layers.0.self_attn.k_proj"))?
-        .forward(&n_c)?;
-    let k_g = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_g.pp("model.layers.0.self_attn.k_proj"))?
-        .forward(&n_g)?;
-    let v_c = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_c.pp("model.layers.0.self_attn.v_proj"))?
-        .forward(&n_c)?;
-    let v_g = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_g.pp("model.layers.0.self_attn.v_proj"))?
-        .forward(&n_g)?;
+    let q_c =
+        candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_c.pp("model.layers.0.self_attn.q_proj"))?
+            .forward(&n_c)?;
+    let q_g =
+        candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_g.pp("model.layers.0.self_attn.q_proj"))?
+            .forward(&n_g)?;
+    let k_c =
+        candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_c.pp("model.layers.0.self_attn.k_proj"))?
+            .forward(&n_c)?;
+    let k_g =
+        candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_g.pp("model.layers.0.self_attn.k_proj"))?
+            .forward(&n_g)?;
+    let v_c =
+        candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_c.pp("model.layers.0.self_attn.v_proj"))?
+            .forward(&n_c)?;
+    let v_g =
+        candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_g.pp("model.layers.0.self_attn.v_proj"))?
+            .forward(&n_g)?;
     wg.synchronize()?;
     report("q_proj", &q_c, &q_g)?;
     report("k_proj", &k_c, &k_g)?;
@@ -130,8 +141,8 @@ fn llama_trace_block0() -> Result<()> {
     let q4_g = q_g.reshape((1, seq_len, cfg.n_heads, head_dim))?;
     let k4_c = k_c.reshape((1, seq_len, cfg.n_heads, head_dim))?;
     let k4_g = k_g.reshape((1, seq_len, cfg.n_heads, head_dim))?;
-    let mut v4_c = v_c.reshape((1, seq_len, cfg.n_heads, head_dim))?;
-    let mut v4_g = v_g.reshape((1, seq_len, cfg.n_heads, head_dim))?;
+    let v4_c = v_c.reshape((1, seq_len, cfg.n_heads, head_dim))?;
+    let v4_g = v_g.reshape((1, seq_len, cfg.n_heads, head_dim))?;
 
     let rope_in = |x: &Tensor, cos: &Tensor, sin: &Tensor| -> Result<Tensor> {
         let x = x.transpose(1, 2)?.contiguous()?;
@@ -181,10 +192,12 @@ fn llama_trace_block0() -> Result<()> {
 
     let y_c = y_c.transpose(1, 2)?.reshape(&[1, seq_len, cfg.dim])?;
     let y_g = y_g.transpose(1, 2)?.reshape(&[1, seq_len, cfg.dim])?;
-    let o_c = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_c.pp("model.layers.0.self_attn.o_proj"))?
-        .forward(&y_c)?;
-    let o_g = candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_g.pp("model.layers.0.self_attn.o_proj"))?
-        .forward(&y_g)?;
+    let o_c =
+        candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_c.pp("model.layers.0.self_attn.o_proj"))?
+            .forward(&y_c)?;
+    let o_g =
+        candle_nn::linear_no_bias(cfg.dim, cfg.dim, vb_g.pp("model.layers.0.self_attn.o_proj"))?
+            .forward(&y_g)?;
     wg.synchronize()?;
     report("o_proj", &o_c, &o_g)?;
 
@@ -208,14 +221,30 @@ fn llama_trace_block0() -> Result<()> {
     wg.synchronize()?;
     report("rms2", &n2_c, &n2_g)?;
 
-    let g_c = candle_nn::linear_no_bias(cfg.dim, cfg.hidden_dim, vb_c.pp("model.layers.0.mlp.gate_proj"))?
-        .forward(&n2_c)?;
-    let g_g = candle_nn::linear_no_bias(cfg.dim, cfg.hidden_dim, vb_g.pp("model.layers.0.mlp.gate_proj"))?
-        .forward(&n2_g)?;
-    let u_c = candle_nn::linear_no_bias(cfg.dim, cfg.hidden_dim, vb_c.pp("model.layers.0.mlp.up_proj"))?
-        .forward(&n2_c)?;
-    let u_g = candle_nn::linear_no_bias(cfg.dim, cfg.hidden_dim, vb_g.pp("model.layers.0.mlp.up_proj"))?
-        .forward(&n2_g)?;
+    let g_c = candle_nn::linear_no_bias(
+        cfg.dim,
+        cfg.hidden_dim,
+        vb_c.pp("model.layers.0.mlp.gate_proj"),
+    )?
+    .forward(&n2_c)?;
+    let g_g = candle_nn::linear_no_bias(
+        cfg.dim,
+        cfg.hidden_dim,
+        vb_g.pp("model.layers.0.mlp.gate_proj"),
+    )?
+    .forward(&n2_g)?;
+    let u_c = candle_nn::linear_no_bias(
+        cfg.dim,
+        cfg.hidden_dim,
+        vb_c.pp("model.layers.0.mlp.up_proj"),
+    )?
+    .forward(&n2_c)?;
+    let u_g = candle_nn::linear_no_bias(
+        cfg.dim,
+        cfg.hidden_dim,
+        vb_g.pp("model.layers.0.mlp.up_proj"),
+    )?
+    .forward(&n2_g)?;
     wg.synchronize()?;
     report("gate", &g_c, &g_g)?;
     report("up", &u_c, &u_g)?;
@@ -225,10 +254,18 @@ fn llama_trace_block0() -> Result<()> {
     wg.synchronize()?;
     report("silu*up", &m_c, &m_g)?;
 
-    let d_c = candle_nn::linear_no_bias(cfg.hidden_dim, cfg.dim, vb_c.pp("model.layers.0.mlp.down_proj"))?
-        .forward(&m_c)?;
-    let d_g = candle_nn::linear_no_bias(cfg.hidden_dim, cfg.dim, vb_g.pp("model.layers.0.mlp.down_proj"))?
-        .forward(&m_g)?;
+    let d_c = candle_nn::linear_no_bias(
+        cfg.hidden_dim,
+        cfg.dim,
+        vb_c.pp("model.layers.0.mlp.down_proj"),
+    )?
+    .forward(&m_c)?;
+    let d_g = candle_nn::linear_no_bias(
+        cfg.hidden_dim,
+        cfg.dim,
+        vb_g.pp("model.layers.0.mlp.down_proj"),
+    )?
+    .forward(&m_g)?;
     wg.synchronize()?;
     report("down", &d_c, &d_g)?;
 

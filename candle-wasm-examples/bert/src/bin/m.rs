@@ -40,8 +40,7 @@ impl Model {
         device_mode: String,
     ) -> Result<Model, JsError> {
         console_error_panic_hook::set_once();
-        let mode =
-            DeviceMode::parse(&device_mode).map_err(|e| JsError::new(&e.to_string()))?;
+        let mode = DeviceMode::parse(&device_mode).map_err(|e| JsError::new(&e.to_string()))?;
         let resolved = mode
             .resolve()
             .await
@@ -157,10 +156,8 @@ impl Model {
         // path and reshape, mirroring whisper's `to_vec1_async` usage.
         let (n_sentence, hidden_size) = embeddings.dims2()?;
         let flat: Vec<f32> = embeddings.flatten_all()?.to_vec1_async().await?;
-        let embeddings_data: Vec<Vec<f32>> = flat
-            .chunks(hidden_size)
-            .map(|row| row.to_vec())
-            .collect();
+        let embeddings_data: Vec<Vec<f32>> =
+            flat.chunks(hidden_size).map(|row| row.to_vec()).collect();
         debug_assert_eq!(embeddings_data.len(), n_sentence);
         Ok(serde_wasm_bindgen::to_value(&Embeddings {
             data: embeddings_data,

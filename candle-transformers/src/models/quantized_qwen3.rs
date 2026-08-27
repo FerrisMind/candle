@@ -15,7 +15,9 @@ use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Result, Storage, Tensor};
 use candle_nn::attention::cpu_flash::causal::causal_decode_f32_interleaved;
 use candle_nn::attention::{flash_attn, AttnMask};
-use candle_nn::kv_cache::{ConcatKvCache, GrowableKvCache, InterleavedKvCache, RawInterleavedKvCache};
+use candle_nn::kv_cache::{
+    ConcatKvCache, GrowableKvCache, InterleavedKvCache, RawInterleavedKvCache,
+};
 use candle_nn::{Activation, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -499,7 +501,13 @@ impl AttentionWeights {
     /// live narrowed cache views (growable backing, strided by capacity) and `q`
     /// is the post-rope (1, num_heads, 1, head_dim) tensor. Returns a tensor of
     /// that same shape holding the per-head context vectors.
-    fn fused_decode_attn_wgpu(&self, q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+    fn fused_decode_attn_wgpu(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f64,
+    ) -> Result<Tensor> {
         let (q_g, q_l) = q.storage_and_layout();
         let (k_g, k_l) = k.storage_and_layout();
         let (v_g, v_l) = v.storage_and_layout();
@@ -576,7 +584,7 @@ impl LayerWeights {
         })
     }
 
-fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+    fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let h = self.ln1.forward(x)?;
         let h = self.self_attn.forward(&h, mask, offset)?;
         let x2 = (x + h)?;
@@ -711,6 +719,7 @@ impl ModelWeights {
 
 #[cfg(test)]
 mod tests {
+    #![allow(dead_code)]
     use super::*;
     use candle::quantized::gguf_file;
     use hf_hub::{api::sync::Api, Repo, RepoType};
@@ -971,20 +980,10 @@ mod tests {
         let q_proj_wgpu = wgpu_model.layers[0].self_attn.q_proj.forward(&ln1_wgpu)?;
         assert_tensor_close("q_proj", &q_proj_wgpu, &q_proj_cpu, 3e-2)?;
 
-        let mask_cpu = crate::utils::build_additive_causal_mask(
-            ids.len(),
-            0,
-            None,
-            &cpu,
-            cpu_model.dtype,
-        )?;
-        let mask_wgpu = crate::utils::build_additive_causal_mask(
-            ids.len(),
-            0,
-            None,
-            &wgpu,
-            wgpu_model.dtype,
-        )?;
+        let mask_cpu =
+            crate::utils::build_additive_causal_mask(ids.len(), 0, None, &cpu, cpu_model.dtype)?;
+        let mask_wgpu =
+            crate::utils::build_additive_causal_mask(ids.len(), 0, None, &wgpu, wgpu_model.dtype)?;
         let layer0_cpu = cpu_model.layers[0].forward(&emb_cpu, Some(&mask_cpu), 0)?;
         let layer0_wgpu = wgpu_model.layers[0].forward(&emb_wgpu, Some(&mask_wgpu), 0)?;
         assert_tensor_close("layer0", &layer0_wgpu, &layer0_cpu, 5e-2)?;
@@ -1033,20 +1032,10 @@ mod tests {
         let ids = [1u32, 2, 3, 4];
         let ids_cpu = Tensor::from_slice(&ids, (1, ids.len()), &cpu)?;
         let ids_wgpu = Tensor::from_slice(&ids, (1, ids.len()), &wgpu)?;
-        let mask_cpu = crate::utils::build_additive_causal_mask(
-            ids.len(),
-            0,
-            None,
-            &cpu,
-            cpu_model.dtype,
-        )?;
-        let mask_wgpu = crate::utils::build_additive_causal_mask(
-            ids.len(),
-            0,
-            None,
-            &wgpu,
-            wgpu_model.dtype,
-        )?;
+        let mask_cpu =
+            crate::utils::build_additive_causal_mask(ids.len(), 0, None, &cpu, cpu_model.dtype)?;
+        let mask_wgpu =
+            crate::utils::build_additive_causal_mask(ids.len(), 0, None, &wgpu, wgpu_model.dtype)?;
 
         let layer0_cpu_in = cpu_model.embed_tokens.forward(&ids_cpu)?;
         let layer0_wgpu_in = wgpu_model.embed_tokens.forward(&ids_wgpu)?;
@@ -1169,10 +1158,10 @@ mod tests {
             .map(|p| p.join("tokenizer.json"))
             .filter(|p| p.exists());
         let ids: Vec<u32> = if let Some(tp) = tok_path {
-            let tok = tokenizers::Tokenizer::from_file(&tp).map_err(|e| {
-                candle::Error::msg(format!("failed to load tokenizer: {e}"))
-            })?;
-            let prompt = "<|im_start|>user\nThe capital of France is<|im_end|>\n<|im_start|>assistant\n";
+            let tok = tokenizers::Tokenizer::from_file(&tp)
+                .map_err(|e| candle::Error::msg(format!("failed to load tokenizer: {e}")))?;
+            let prompt =
+                "<|im_start|>user\nThe capital of France is<|im_end|>\n<|im_start|>assistant\n";
             let enc = tok
                 .encode(prompt, false)
                 .map_err(|e| candle::Error::msg(format!("tokenize failed: {e}")))?;
@@ -1187,20 +1176,10 @@ mod tests {
         let emb_wgpu = wgpu_model.embed_tokens.forward(&ids_wgpu)?;
         diff_stats_ab("L0 embed", &emb_wgpu, &emb_cuda)?;
 
-        let mask_cuda = crate::utils::build_additive_causal_mask(
-            ids.len(),
-            0,
-            None,
-            &cuda,
-            cuda_model.dtype,
-        )?;
-        let mask_wgpu = crate::utils::build_additive_causal_mask(
-            ids.len(),
-            0,
-            None,
-            &wgpu,
-            wgpu_model.dtype,
-        )?;
+        let mask_cuda =
+            crate::utils::build_additive_causal_mask(ids.len(), 0, None, &cuda, cuda_model.dtype)?;
+        let mask_wgpu =
+            crate::utils::build_additive_causal_mask(ids.len(), 0, None, &wgpu, wgpu_model.dtype)?;
         diff_stats_ab("L0 mask", &mask_wgpu, &mask_cuda)?;
 
         // ---- replicate LayerWeights::forward op-by-op ----
@@ -1301,8 +1280,18 @@ mod tests {
             diff_stats_ab("L0 q_rope_slow_vs_fused_wgpu", &q_slow, &q_rope_w)?;
         }
 
-        let (k_c, v_c) = ac.self_attn.kv_cache.as_mut().unwrap().append(&k_rope_c, &v_c)?;
-        let (k_w, v_w) = aw.self_attn.kv_cache.as_mut().unwrap().append(&k_rope_w, &v_w)?;
+        let (k_c, v_c) = ac
+            .self_attn
+            .kv_cache
+            .as_mut()
+            .unwrap()
+            .append(&k_rope_c, &v_c)?;
+        let (k_w, v_w) = aw
+            .self_attn
+            .kv_cache
+            .as_mut()
+            .unwrap()
+            .append(&k_rope_w, &v_w)?;
         diff_stats_ab("L0 cache_k", &k_w, &k_c)?;
         diff_stats_ab("L0 cache_v", &v_w, &v_c)?;
 
@@ -1341,8 +1330,12 @@ mod tests {
         let ctx_w = probs_w.matmul(&v_w)?;
         diff_stats_ab("L0 ctx(p@v)", &ctx_w, &ctx_c)?;
 
-        let ctx_c = ctx_c.transpose(1, 2)?.reshape((b, l, ac.self_attn.hidden_size))?;
-        let ctx_w = ctx_w.transpose(1, 2)?.reshape((b, l, aw.self_attn.hidden_size))?;
+        let ctx_c = ctx_c
+            .transpose(1, 2)?
+            .reshape((b, l, ac.self_attn.hidden_size))?;
+        let ctx_w = ctx_w
+            .transpose(1, 2)?
+            .reshape((b, l, aw.self_attn.hidden_size))?;
         let attn_c = ac.self_attn.o_proj.forward(&ctx_c)?;
         let attn_w = aw.self_attn.o_proj.forward(&ctx_w)?;
         diff_stats_ab("L0 o_proj", &attn_w, &attn_c)?;
@@ -1543,7 +1536,10 @@ mod tests {
             // Narrow within the mlp: gate / up / silu / down individually.
             let d_gate_w = l1w.mlp.gate_proj.forward(&d_ln2_w)?;
             let d_up_w = l1w.mlp.up_proj.forward(&d_ln2_w)?;
-            let d_down_w = l1w.mlp.down_proj.forward(&(&d_gate_w.apply(&l1w.mlp.act_fn)? * &d_up_w)?)?;
+            let d_down_w = l1w
+                .mlp
+                .down_proj
+                .forward(&(&d_gate_w.apply(&l1w.mlp.act_fn)? * &d_up_w)?)?;
             diff_stats_ab("DRIFT gate wgpu early-vs-late", &d_gate_w, &gate_w)?;
             diff_stats_ab("DRIFT up wgpu early-vs-late", &d_up_w, &up_w)?;
             diff_stats_ab("DRIFT down wgpu early-vs-late", &d_down_w, &down_w)?;
@@ -1623,20 +1619,10 @@ mod tests {
                 let mut w3 = load_model(&path, &wgpu)?;
                 let ids_c3 = Tensor::from_slice(&ids, (1, ids.len()), &cuda)?;
                 let ids_w3 = Tensor::from_slice(&ids, (1, ids.len()), &wgpu)?;
-                let mask_c3 = crate::utils::build_additive_causal_mask(
-                    ids.len(),
-                    0,
-                    None,
-                    &cuda,
-                    c3.dtype,
-                )?;
-                let mask_w3 = crate::utils::build_additive_causal_mask(
-                    ids.len(),
-                    0,
-                    None,
-                    &wgpu,
-                    w3.dtype,
-                )?;
+                let mask_c3 =
+                    crate::utils::build_additive_causal_mask(ids.len(), 0, None, &cuda, c3.dtype)?;
+                let mask_w3 =
+                    crate::utils::build_additive_causal_mask(ids.len(), 0, None, &wgpu, w3.dtype)?;
                 let mut hc = c3.embed_tokens.forward(&ids_c3)?;
                 let mut hw = w3.embed_tokens.forward(&ids_w3)?;
                 hc = c3.layers[0].forward(&hc, Some(&mask_c3), 0)?;
@@ -1649,8 +1635,14 @@ mod tests {
             }
             // Locate the worst indices in the L1 full_forward divergence.
             {
-                let fw = full_w.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-                let fc = full_c.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                let fw = full_w
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let fc = full_c
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
                 let mut worst: Vec<(usize, f32)> = fw
                     .iter()
                     .zip(fc.iter())
@@ -1665,8 +1657,14 @@ mod tests {
                         fw[*idx], fc[*idx]
                     );
                 }
-                let tw = trace_w.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-                let tc = trace_c.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                let tw = trace_w
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let tc = trace_c
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
                 println!("L1 trace worst5: (index, |diff|, wgpu_val, cuda_val)");
                 let mut tworst: Vec<(usize, f32)> = tw
                     .iter()
@@ -1740,20 +1738,10 @@ mod tests {
         let v_proj_vk = vk_model.layers[0].self_attn.v_proj.forward(&ln1_vk)?;
         assert_tensor_close("v_proj", &v_proj_vk, &v_proj_cpu, 3e-2)?;
 
-        let mask_cpu = crate::utils::build_additive_causal_mask(
-            ids.len(),
-            0,
-            None,
-            &cpu,
-            cpu_model.dtype,
-        )?;
-        let mask_vk = crate::utils::build_additive_causal_mask(
-            ids.len(),
-            0,
-            None,
-            &vk,
-            vk_model.dtype,
-        )?;
+        let mask_cpu =
+            crate::utils::build_additive_causal_mask(ids.len(), 0, None, &cpu, cpu_model.dtype)?;
+        let mask_vk =
+            crate::utils::build_additive_causal_mask(ids.len(), 0, None, &vk, vk_model.dtype)?;
         let attn_cpu = &mut cpu_model.layers[0].self_attn;
         let attn_vk = &mut vk_model.layers[0].self_attn;
         let (b, l, _) = ln1_cpu.dims3()?;
@@ -1928,20 +1916,10 @@ mod tests {
         let ids = [1u32, 2, 3, 4];
         let ids_cpu = Tensor::from_slice(&ids, (1, ids.len()), &cpu)?;
         let ids_vk = Tensor::from_slice(&ids, (1, ids.len()), &vk)?;
-        let mask_cpu = crate::utils::build_additive_causal_mask(
-            ids.len(),
-            0,
-            None,
-            &cpu,
-            cpu_model.dtype,
-        )?;
-        let mask_vk = crate::utils::build_additive_causal_mask(
-            ids.len(),
-            0,
-            None,
-            &vk,
-            vk_model.dtype,
-        )?;
+        let mask_cpu =
+            crate::utils::build_additive_causal_mask(ids.len(), 0, None, &cpu, cpu_model.dtype)?;
+        let mask_vk =
+            crate::utils::build_additive_causal_mask(ids.len(), 0, None, &vk, vk_model.dtype)?;
 
         let layer0_cpu_in = cpu_model.embed_tokens.forward(&ids_cpu)?;
         let layer0_vk_in = vk_model.embed_tokens.forward(&ids_vk)?;
@@ -2046,12 +2024,16 @@ mod tests {
 
         // Chunk 1: 2 tokens, 8-head.
         let k1 = Tensor::from_vec(
-            (0..num_kv_heads * 2 * head_dim).map(|i| i as f32 + 0.5).collect(),
+            (0..num_kv_heads * 2 * head_dim)
+                .map(|i| i as f32 + 0.5)
+                .collect(),
             (1, num_kv_heads, 2, head_dim),
             &device,
         )?;
         let v1 = Tensor::from_vec(
-            (0..num_kv_heads * 2 * head_dim).map(|i| 100.0 + i as f32).collect(),
+            (0..num_kv_heads * 2 * head_dim)
+                .map(|i| 100.0 + i as f32)
+                .collect(),
             (1, num_kv_heads, 2, head_dim),
             &device,
         )?;
@@ -2093,8 +2075,14 @@ mod tests {
         let vf_c = vf.contiguous()?;
         assert_eq!(kf_c.dims(), kcat_ref.dims());
         assert_eq!(vf_c.dims(), vcat_ref.dims());
-        assert_eq!(kf_c.flatten_all()?.to_vec1::<f32>()?, kcat_ref.flatten_all()?.to_vec1::<f32>()?);
-        assert_eq!(vf_c.flatten_all()?.to_vec1::<f32>()?, vcat_ref.flatten_all()?.to_vec1::<f32>()?);
+        assert_eq!(
+            kf_c.flatten_all()?.to_vec1::<f32>()?,
+            kcat_ref.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_eq!(
+            vf_c.flatten_all()?.to_vec1::<f32>()?,
+            vcat_ref.flatten_all()?.to_vec1::<f32>()?
+        );
         Ok(())
     }
 }

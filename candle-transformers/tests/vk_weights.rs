@@ -1,27 +1,41 @@
-use candle::{Device, DType, Result, Tensor};
+use candle::{DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::whisper;
 use std::path::PathBuf;
 
 fn md(a: &Tensor, b: &Tensor) -> Result<f32> {
     let va = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let vb = b.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    Ok(va.iter().zip(vb.iter()).map(|(x,y)|(x-y).abs()).fold(0.0f32, f32::max))
+    let vb = b
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok(va
+        .iter()
+        .zip(vb.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max))
 }
 fn find(root: &std::path::Path, name: &str, hint: &str) -> PathBuf {
     fn rec(p: &std::path::Path, name: &str, hint: &str, out: &mut Option<PathBuf>) {
-        if out.is_some() { return; }
+        if out.is_some() {
+            return;
+        }
         if let Ok(rd) = std::fs::read_dir(p) {
             for e in rd.flatten() {
                 let path = e.path();
-                if path.is_dir() { rec(&path, name, hint, out); }
-                else if path.file_name().and_then(|s| s.to_str()) == Some(name) {
-                    if path.to_string_lossy().contains(hint) { *out = Some(path); }
+                if path.is_dir() {
+                    rec(&path, name, hint, out);
+                } else if path.file_name().and_then(|s| s.to_str()) == Some(name)
+                    && path.to_string_lossy().contains(hint)
+                {
+                    *out = Some(path);
                 }
             }
         }
     }
-    let mut o=None; rec(root, name, hint, &mut o); o.unwrap()
+    let mut o = None;
+    rec(root, name, hint, &mut o);
+    o.unwrap()
 }
 
 #[test]
@@ -32,7 +46,7 @@ fn w() -> Result<()> {
     let vk = Device::new_vulkan(0)?;
     let vb_c = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights], DType::F32, &cpu)? };
     let vb_v = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights], DType::F32, &vk)? };
-    for name in [
+    for _name in [
         "encoder.conv1.weight",
         "encoder.conv1.bias",
         "encoder.conv2.weight",

@@ -4,8 +4,16 @@ use std::path::PathBuf;
 
 fn maxdiff(a: &Tensor, b: &Tensor) -> Result<f32> {
     let va = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let vb = b.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    Ok(va.iter().zip(vb.iter()).map(|(x,y)|(x-y).abs()).fold(0.0f32, f32::max))
+    let vb = b
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok(va
+        .iter()
+        .zip(vb.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max))
 }
 
 #[test]
@@ -14,9 +22,11 @@ fn weights() -> Result<()> {
     let wpath = dir.join("model.safetensors");
     let cpu = Device::Cpu;
     let vk = Device::new_vulkan(0)?;
-    let vb_c = unsafe { VarBuilder::from_mmaped_safetensors(&[wpath.clone()], DType::F32, &cpu)? };
+    let vb_c = unsafe {
+        VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&wpath), DType::F32, &cpu)?
+    };
     let vb_v = unsafe { VarBuilder::from_mmaped_safetensors(&[wpath], DType::F32, &vk)? };
-    for name in [
+    for _name in [
         "model.visual.blocks.0.attn.qkv.weight",
         "model.visual.blocks.0.attn.qkv.bias",
         "model.visual.blocks.0.attn.proj.weight",

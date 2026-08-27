@@ -3,6 +3,8 @@
 //! Local: C:\Users\PC\Documents\models\unsloth\Qwen3-VL-2B-Thinking
 //! or CANDLE_QWEN3_VL_DIR.
 
+#![allow(dead_code, clippy::too_many_arguments)]
+
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::qwen3_vl::{Config, Qwen3VLVisionModel};
@@ -126,7 +128,10 @@ fn run_vision_parity(device: Device, label: &str) -> Result<()> {
     let (dev_emb, dev_deep) = {
         let t2 = Instant::now();
         let model = load_vision(&dir, &device, gpu_dtype)?;
-        println!("{label}: GPU vision load {:.2?} dtype={gpu_dtype:?}", t2.elapsed());
+        println!(
+            "{label}: GPU vision load {:.2?} dtype={gpu_dtype:?}",
+            t2.elapsed()
+        );
         let t3 = Instant::now();
         let xs = xs_dev.to_dtype(gpu_dtype)?;
         let out = model.forward(&xs, &grid_dev)?;

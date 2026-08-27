@@ -1,20 +1,33 @@
 use candle::{Device, Result, Tensor};
-use candle_nn::Module;
 use candle_transformers::models::{llama2_c, llama2_c_weights};
 use std::fs::File;
 use std::path::PathBuf;
 
 fn maxdiff(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let va = a.to_dtype(candle::DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let vb = b.to_dtype(candle::DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    Ok(va.iter().zip(vb.iter()).map(|(x,y)| (x-y).abs()).fold(0.0f32, f32::max))
+    let va = a
+        .to_dtype(candle::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let vb = b
+        .to_dtype(candle::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok(va
+        .iter()
+        .zip(vb.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max))
 }
 
 fn find(p: &std::path::Path, name: &str) -> Option<PathBuf> {
-    if p.is_file() && p.file_name()?.to_str()? == name { return Some(p.to_path_buf()); }
+    if p.is_file() && p.file_name()?.to_str()? == name {
+        return Some(p.to_path_buf());
+    }
     if p.is_dir() {
-        for e in std::fs::read_dir(p).ok()? {
-            if let Ok(e) = e { if let Some(f) = find(&e.path(), name) { return Some(f); } }
+        for e in std::fs::read_dir(p).ok()?.flatten() {
+            if let Some(f) = find(&e.path(), name) {
+                return Some(f);
+            }
         }
     }
     None

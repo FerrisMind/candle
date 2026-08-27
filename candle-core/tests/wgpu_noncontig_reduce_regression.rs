@@ -39,9 +39,7 @@ fn wgpu_noncontig_last_dim_sum_matches_cpu() -> Result<()> {
     assert_eq!(got_v.len(), ref_v.len());
     for (i, (g, r)) in got_v.iter().zip(ref_v.iter()).enumerate() {
         if (g - r).abs() > 1e-3 {
-            candle_core::bail!(
-                "non-contiguous last-dim sum mismatch at {i}: got {g}, ref {r}"
-            );
+            candle_core::bail!("non-contiguous last-dim sum mismatch at {i}: got {g}, ref {r}");
         }
     }
     Ok(())

@@ -268,4 +268,24 @@ impl Qwen3VLModel {
         )?;
         Ok(out)
     }
+
+    /// Debug helper for backend parity tests: exposes intermediate vision-tower
+    /// tensors (block 0 layer-norm input, block 0 attention output, rotary
+    /// embeddings) keyed by name.
+    pub fn forward_vision_debug_stages(
+        &self,
+        xs: &Tensor,
+        grid_thw: &Tensor,
+    ) -> Result<Vec<(String, Tensor)>> {
+        self.vision.forward_debug_stages(xs, grid_thw)
+    }
+
+    /// Runs only the vision tower, returning `(merged_embeds, deepstack_features)`.
+    pub fn forward_vision_only(
+        &self,
+        xs: &Tensor,
+        grid_thw: &Tensor,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        self.vision.forward(xs, grid_thw)
+    }
 }

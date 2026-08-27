@@ -1,4 +1,4 @@
-use candle::{Device, Result, Tensor, DType};
+use candle::{DType, Device, Result, Tensor};
 use candle_nn::Module;
 use candle_transformers::models::{llama2_c, llama2_c_weights};
 use std::fs::File;
@@ -6,22 +6,44 @@ use std::path::PathBuf;
 
 fn maxdiff(a: &Tensor, b: &Tensor) -> Result<f32> {
     let va = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let vb = b.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    Ok(va.iter().zip(vb.iter()).map(|(x,y)|(x-y).abs()).fold(0.0f32, f32::max))
+    let vb = b
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok(va
+        .iter()
+        .zip(vb.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max))
 }
 fn report(label: &str, a: &Tensor, b: &Tensor) -> Result<()> {
-    let md = maxdiff(a,b)?;
+    let md = maxdiff(a, b)?;
     let va = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let vb = b.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let vb = b
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     println!("{label:16} md={md:.4e} cpu0={} gpu0={}", va[0], vb[0]);
     Ok(())
 }
 fn find(p: &std::path::Path, name: &str) -> Option<PathBuf> {
-    if p.is_file() && p.file_name()?.to_str()? == name { return Some(p.to_path_buf()); }
-    if p.is_dir() { for e in std::fs::read_dir(p).ok()? { if let Ok(e)=e { if let Some(f)=find(&e.path(), name){return Some(f);} } } }
+    if p.is_file() && p.file_name()?.to_str()? == name {
+        return Some(p.to_path_buf());
+    }
+    if p.is_dir() {
+        for e in std::fs::read_dir(p).ok()?.flatten() {
+            if let Some(f) = find(&e.path(), name) {
+                return Some(f);
+            }
+        }
+    }
     None
 }
-fn silu(xs: &Tensor) -> Result<Tensor> { xs / (xs.neg()?.exp()? + 1.0)? }
+fn silu(xs: &Tensor) -> Result<Tensor> {
+    xs / (xs.neg()?.exp()? + 1.0)?
+}
 
 #[test]
 fn mlp() -> Result<()> {
@@ -49,11 +71,15 @@ fn mlp() -> Result<()> {
     let n_c = rms_c.forward(&x_c)?;
     let n_g = rms_g.forward(&x_g)?;
     report("rms2", &n_c, &n_g)?;
-    let g_c = candle_nn::linear_no_bias(dim, hd, vb_c.pp("model.layers.0.mlp.gate_proj"))?.forward(&n_c)?;
-    let g_g = candle_nn::linear_no_bias(dim, hd, vb_g.pp("model.layers.0.mlp.gate_proj"))?.forward(&n_g)?;
+    let g_c = candle_nn::linear_no_bias(dim, hd, vb_c.pp("model.layers.0.mlp.gate_proj"))?
+        .forward(&n_c)?;
+    let g_g = candle_nn::linear_no_bias(dim, hd, vb_g.pp("model.layers.0.mlp.gate_proj"))?
+        .forward(&n_g)?;
     report("gate", &g_c, &g_g)?;
-    let u_c = candle_nn::linear_no_bias(dim, hd, vb_c.pp("model.layers.0.mlp.up_proj"))?.forward(&n_c)?;
-    let u_g = candle_nn::linear_no_bias(dim, hd, vb_g.pp("model.layers.0.mlp.up_proj"))?.forward(&n_g)?;
+    let u_c =
+        candle_nn::linear_no_bias(dim, hd, vb_c.pp("model.layers.0.mlp.up_proj"))?.forward(&n_c)?;
+    let u_g =
+        candle_nn::linear_no_bias(dim, hd, vb_g.pp("model.layers.0.mlp.up_proj"))?.forward(&n_g)?;
     report("up", &u_c, &u_g)?;
     // silu pieces
     let neg_c = g_c.neg()?;
@@ -71,8 +97,10 @@ fn mlp() -> Result<()> {
     let m_c = (&s_c * &u_c)?;
     let m_g = (&s_g * &u_g)?;
     report("silu*up", &m_c, &m_g)?;
-    let d_c = candle_nn::linear_no_bias(hd, dim, vb_c.pp("model.layers.0.mlp.down_proj"))?.forward(&m_c)?;
-    let d_g = candle_nn::linear_no_bias(hd, dim, vb_g.pp("model.layers.0.mlp.down_proj"))?.forward(&m_g)?;
+    let d_c = candle_nn::linear_no_bias(hd, dim, vb_c.pp("model.layers.0.mlp.down_proj"))?
+        .forward(&m_c)?;
+    let d_g = candle_nn::linear_no_bias(hd, dim, vb_g.pp("model.layers.0.mlp.down_proj"))?
+        .forward(&m_g)?;
     report("down", &d_c, &d_g)?;
     // also test silu of large values
     let big = Tensor::from_vec(vec![20.0f32, -20.0, 0.0, 5.0], 4, &cpu)?;

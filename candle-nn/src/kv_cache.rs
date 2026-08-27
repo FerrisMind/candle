@@ -922,14 +922,8 @@ impl GrowableKvCache {
         let seq = k.dim(self.dim)?;
         let new_len = self.len + seq;
         self.ensure_capacity(&k, &v, new_len)?;
-        self.k
-            .as_mut()
-            .unwrap()
-            .slice_set(&k, self.dim, self.len)?;
-        self.v
-            .as_mut()
-            .unwrap()
-            .slice_set(&v, self.dim, self.len)?;
+        self.k.as_mut().unwrap().slice_set(&k, self.dim, self.len)?;
+        self.v.as_mut().unwrap().slice_set(&v, self.dim, self.len)?;
         self.len = new_len;
         let view_k = self.k.as_ref().unwrap().narrow(self.dim, 0, self.len)?;
         let view_v = self.v.as_ref().unwrap().narrow(self.dim, 0, self.len)?;

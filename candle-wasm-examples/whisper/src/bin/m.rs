@@ -57,8 +57,8 @@ impl Decoder {
         language: Option<String>,
         device_mode: String,
     ) -> Result<Decoder, JsError> {
-        let device_mode = DeviceMode::parse(&device_mode)
-            .map_err(|e| JsError::new(&e.to_string()))?;
+        let device_mode =
+            DeviceMode::parse(&device_mode).map_err(|e| JsError::new(&e.to_string()))?;
         let decoder = D::load(ModelData {
             tokenizer,
             mel_filters,

@@ -27,7 +27,7 @@ mod support;
 use candle_core::test_utils::{
     compare_f32_slices, compare_f64_slices, compare_int_slices, diff_tolerance, is_integer_dtype,
 };
-use candle_core::{DType, Device, Result, Storage, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
@@ -1600,7 +1600,7 @@ fn test_matmul(tracker: &mut SuiteTracker, gpu_backends: &[(String, Device)]) {
             |device| {
                 let live = 64usize;
                 let cap = live + 41; // grown capacity > live prefix -> strided batch
-                // Storage (batch, cap, head_head_dim); narrow to the live kv prefix.
+                                     // Storage (batch, cap, head_head_dim); narrow to the live kv prefix.
                 let b_src = Tensor::from_vec(gen_f32(&[2, cap, 100], 137), (2, cap, 100), device)?
                     .to_dtype(dtype)?;
                 let b = b_src.narrow(1, 0, live)?; // (2, live, 100) strided batch
@@ -2250,9 +2250,7 @@ fn test_fused_decode_attn(tracker: &mut SuiteTracker, gpu_backends: &[(String, D
         // Candle's `repeat_kv` (quantized_qwen3): cat the same kv tensor n_rep
         // times along the seq dim (2) then reshape so head j reads kv head j/n_rep
         // — the exact GQA ordering the fused kernel implements in-kernel.
-        let copies: Vec<Tensor> = (0..(num_heads / num_kv_heads))
-            .map(|_| x.clone())
-            .collect();
+        let copies: Vec<Tensor> = (0..(num_heads / num_kv_heads)).map(|_| x.clone()).collect();
         let stacked = Tensor::cat(&copies, 2)?;
         stacked.reshape((1, num_heads, kv_len, head_dim))
     };
@@ -2353,8 +2351,8 @@ fn test_ctx_gemv_natural(tracker: &mut SuiteTracker, gpu_backends: &[(String, De
     let probs_shape = vec![1, heads, 1, kv_len];
     let v_shape = vec![1, heads, kv_cap, head_dim];
 
-    let probs_cpu = Tensor::from_vec(gen_f32(&probs_shape, 91), probs_shape.clone(), cpu_dev)
-        .unwrap();
+    let probs_cpu =
+        Tensor::from_vec(gen_f32(&probs_shape, 91), probs_shape.clone(), cpu_dev).unwrap();
     let probs_wgpu = Tensor::from_vec(gen_f32(&probs_shape, 91), probs_shape, wgpu_dev).unwrap();
     let v_cpu = Tensor::from_vec(gen_f32(&v_shape, 515), v_shape.clone(), cpu_dev).unwrap();
     let v_wgpu = Tensor::from_vec(gen_f32(&v_shape, 515), v_shape.clone(), wgpu_dev).unwrap();

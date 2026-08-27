@@ -1,18 +1,5 @@
 mod support;
 
-use candle::{quantized::gguf_file, DType, Device, Result, Tensor};
-use candle_nn::{Module, VarBuilder};
-use candle_transformers::models::{
-    bert, convmixer, llama2_c, llama2_c_weights, quantized_qwen3, qwen3, whisper,
-};
-use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::time::Instant;
-use support::{
-    assert_close_tensors, deterministic_f32_data, download_model_artifact, mean_pool,
-    native_required, TestBackend,
-};
-
 #[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 const CASE_FILTER_ENV: &str = "CANDLE_GPU_MODEL_CASE_FILTER";
 
@@ -65,7 +52,10 @@ fn run_public_model_matrix(device: &Device) -> Result<()> {
         ("dense_causal_decoder_case", dense_causal_decoder_case),
         ("dense_qwen3_safetensors_case", dense_qwen3_safetensors_case),
         ("quantized_causal_gguf_case", quantized_causal_gguf_case),
-        ("quantized_qwen3_multi_quant_case", quantized_qwen3_multi_quant_case),
+        (
+            "quantized_qwen3_multi_quant_case",
+            quantized_qwen3_multi_quant_case,
+        ),
         ("encoder_only_text_case", encoder_only_text_case),
         ("audio_seq2seq_case", audio_seq2seq_case),
         ("vision_convmixer_case", vision_convmixer_case),
@@ -385,8 +375,6 @@ fn quantized_qwen3_multi_quant_case(device: &Device) -> Result<()> {
     }
     Ok(())
 }
-
-
 
 #[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn audio_seq2seq_case(device: &Device) -> Result<()> {

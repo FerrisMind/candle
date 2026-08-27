@@ -582,4 +582,41 @@ impl Qwen3VLVisionModel {
         let hidden_states = self.merger.forward(&hidden_states)?;
         Ok((hidden_states, deepstack_features))
     }
+
+    /// Debug helper exposing intermediate vision-tower tensors for backend parity
+    /// tests: block 0 layer-norm input (`b0_norm1`), block 0 attention output
+    /// (`b0_attn`), and the rotary embeddings (`rope_cos`, `rope_sin`).
+    pub fn forward_debug_stages(
+        &self,
+        xs: &Tensor,
+        grid_thw: &Tensor,
+    ) -> Result<Vec<(String, Tensor)>> {
+        let dtype = self.pos_embed.embeddings().dtype();
+        let xs = self.patch_embed.forward(&xs.to_dtype(dtype)?)?;
+        let pos_embeds = self.fast_pos_embed_interpolate(grid_thw)?;
+        let hidden_states = xs.add(&pos_embeds)?;
+
+        let rotary_pos_emb = self.rot_pos_emb(grid_thw)?;
+        let seq_len = hidden_states.dim(0)?;
+        let rotary_pos_emb = rotary_pos_emb.reshape((seq_len, ()))?;
+        let emb = Tensor::cat(&[&rotary_pos_emb, &rotary_pos_emb], D::Minus1)?;
+        let cos = emb.cos()?.to_dtype(DType::F32)?;
+        let sin = emb.sin()?.to_dtype(DType::F32)?;
+
+        let cu_seqlens = self.build_cu_seqlens(grid_thw)?;
+
+        let block0 = self
+            .blocks
+            .first()
+            .ok_or_else(|| candle::Error::msg("vision tower has no blocks"))?;
+        let b0_norm1 = block0.norm1.forward(&hidden_states)?;
+        let b0_attn = block0.attn.forward(&b0_norm1, &cu_seqlens, &cos, &sin)?;
+
+        Ok(vec![
+            ("b0_norm1".to_string(), b0_norm1),
+            ("b0_attn".to_string(), b0_attn),
+            ("rope_cos".to_string(), cos),
+            ("rope_sin".to_string(), sin),
+        ])
+    }
 }

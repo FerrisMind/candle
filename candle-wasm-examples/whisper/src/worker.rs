@@ -258,7 +258,8 @@ impl Decoder {
                 let logits = model.decoder_final_linear(&ys.i(..1)?)?.i(0)?.i(0)?;
                 no_speech_prob = softmax(&logits, 0)?
                     .i(self.no_speech_token as usize)?
-                    .to_scalar_async::<f32>().await? as f64;
+                    .to_scalar_async::<f32>()
+                    .await? as f64;
             }
 
             let (_, seq_len, _) = ys.dims3()?;
@@ -291,7 +292,8 @@ impl Decoder {
             tokens.push(next_token);
             let prob = softmax(&logits, candle::D::Minus1)?
                 .i(next_token as usize)?
-                .to_scalar_async::<f32>().await? as f64;
+                .to_scalar_async::<f32>()
+                .await? as f64;
             if next_token == self.eot_token || tokens.len() > model.config().max_target_positions {
                 break;
             }
@@ -421,7 +423,12 @@ impl Decoder {
             .resolve()
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Self::load_on_device(md, resolved.device, resolved.resolved, resolved.adapter_name)
+        Self::load_on_device(
+            md,
+            resolved.device,
+            resolved.resolved,
+            resolved.adapter_name,
+        )
     }
 
     /// Synchronous CPU-only load for the Yew agent (cannot await wgpu init).
@@ -457,7 +464,11 @@ impl Decoder {
 }
 
 /// Returns the token id for the selected language.
-pub async fn detect_language(model: &mut Model, tokenizer: &Tokenizer, mel: &Tensor) -> Result<u32, E> {
+pub async fn detect_language(
+    model: &mut Model,
+    tokenizer: &Tokenizer,
+    mel: &Tensor,
+) -> Result<u32, E> {
     console_log!("detecting language");
     let (_bsize, _, seq_len) = mel.dims3()?;
     let mel = mel.narrow(

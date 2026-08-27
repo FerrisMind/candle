@@ -1,9 +1,5 @@
 mod support;
 
-use candle_core::{DType, Result, Tensor};
-use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestRunner};
-use support::{assert_tensors_close, deterministic_f32_data, native_required, TestBackend};
-
 #[cfg(feature = "wgpu")]
 #[test]
 #[ignore = "heavy property suite; requires WGPU runtime/device"]

@@ -624,6 +624,7 @@ impl BertForMaskedLM {
 
 #[cfg(test)]
 mod tests {
+    #![allow(dead_code)]
     use super::*;
     use candle::Device;
     use candle_nn::VarBuilder;
@@ -676,8 +677,9 @@ mod tests {
     fn bert_stage_debug(device: &Device) -> Result<()> {
         let (config, weights_path) = minilm_fixture()?;
         let cpu = Device::Cpu;
-        let cpu_vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&weights_path), DTYPE, &cpu)? };
+        let cpu_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&weights_path), DTYPE, &cpu)?
+        };
         let dev_vb =
             unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, device)? };
         let cpu_model = BertModel::load(cpu_vb.clone(), &config)?;

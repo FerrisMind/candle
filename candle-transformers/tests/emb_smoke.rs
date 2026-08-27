@@ -1,4 +1,4 @@
-use candle::{Device, DType, Result, Tensor};
+use candle::{Device, Result, Tensor};
 
 #[test]
 fn emb_smoke() -> Result<()> {
@@ -17,27 +17,34 @@ fn emb_smoke() -> Result<()> {
     // matmul
     let a = Tensor::randn(0f32, 1.0, (6, 16), &cpu)?;
     let b = Tensor::randn(0f32, 1.0, (16, 8), &cpu)?;
-    let a_g = a.to_device(&wg)?; let b_g = b.to_device(&wg)?;
+    let a_g = a.to_device(&wg)?;
+    let b_g = b.to_device(&wg)?;
     let yc = a.matmul(&b)?;
     let yg = a_g.matmul(&b_g)?;
     wg.synchronize()?;
     let vc = yc.flatten_all()?.to_vec1::<f32>()?;
     let vg = yg.flatten_all()?.to_vec1::<f32>()?;
-    let mut md=0f32;
-    for (x,y) in vc.iter().zip(vg.iter()) { md=md.max((x-y).abs()); }
+    let mut md = 0f32;
+    for (x, y) in vc.iter().zip(vg.iter()) {
+        md = md.max((x - y).abs());
+    }
     println!("matmul maxdiff {md}");
     // rope_slow path
     let x = Tensor::randn(0f32, 1.0, (1, 4, 6, 8), &cpu)?;
     let cos = Tensor::randn(0f32, 1.0, (6, 4), &cpu)?;
     let sin = Tensor::randn(0f32, 1.0, (6, 4), &cpu)?;
-    let xg = x.to_device(&wg)?; let cg = cos.to_device(&wg)?; let sg = sin.to_device(&wg)?;
+    let xg = x.to_device(&wg)?;
+    let cg = cos.to_device(&wg)?;
+    let sg = sin.to_device(&wg)?;
     let rc = candle_nn::rotary_emb::rope(&x, &cos, &sin)?;
     let rg = candle_nn::rotary_emb::rope(&xg, &cg, &sg)?;
     wg.synchronize()?;
     let vc = rc.flatten_all()?.to_vec1::<f32>()?;
     let vg = rg.flatten_all()?.to_vec1::<f32>()?;
-    md=0.0;
-    for (x,y) in vc.iter().zip(vg.iter()) { md=md.max((x-y).abs()); }
+    md = 0.0;
+    for (x, y) in vc.iter().zip(vg.iter()) {
+        md = md.max((x - y).abs());
+    }
     println!("rope maxdiff {md}");
     Ok(())
 }

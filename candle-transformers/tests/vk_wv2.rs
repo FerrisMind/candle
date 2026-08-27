@@ -1,9 +1,13 @@
-use candle::{Device, Result, Tensor, D};
+use candle::{Device, Result, Tensor};
 
 fn md(a: &Tensor, b: &Tensor) -> Result<f32> {
     let va = a.flatten_all()?.to_vec1::<f32>()?;
     let vb = b.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
-    Ok(va.iter().zip(vb.iter()).map(|(x,y)|(x-y).abs()).fold(0.0f32, f32::max))
+    Ok(va
+        .iter()
+        .zip(vb.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max))
 }
 
 #[test]
@@ -14,7 +18,9 @@ fn shapes() -> Result<()> {
     let q = Tensor::randn(0f32, 0.1, (1, 6, 1500, 64), &cpu)?;
     let k = q.clone();
     let v = Tensor::randn(0f32, 0.1, (1, 6, 1500, 64), &cpu)?;
-    let qv=q.to_device(&vk)?; let kv=k.to_device(&vk)?; let vv=v.to_device(&vk)?;
+    let qv = q.to_device(&vk)?;
+    let kv = k.to_device(&vk)?;
+    let vv = v.to_device(&vk)?;
     let att_c = (q.matmul(&k.t()?)? / 8.0)?;
     let att_v = (qv.matmul(&kv.t()?)? / 8.0)?;
     let s_c = candle_nn::ops::softmax_last_dim(&att_c)?;
@@ -40,7 +46,9 @@ fn shapes() -> Result<()> {
     let q = Tensor::randn(0f32, 1.0, (1, 6, 1500, 64), &cpu)?;
     let k2 = Tensor::randn(0f32, 1.0, (1, 6, 64, 1500), &cpu)?;
     let v = Tensor::randn(0f32, 1.0, (1, 6, 1500, 64), &cpu)?;
-    let qv=q.to_device(&vk)?; let k2v=k2.to_device(&vk)?; let vv=v.to_device(&vk)?;
+    let qv = q.to_device(&vk)?;
+    let k2v = k2.to_device(&vk)?;
+    let vv = v.to_device(&vk)?;
     let att_c = q.matmul(&k2)?;
     let att_v = qv.matmul(&k2v)?;
     let s_c = candle_nn::ops::softmax_last_dim(&att_c)?;

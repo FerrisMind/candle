@@ -15,8 +15,11 @@ mod bench {
 
     fn bench_sdpa(
         dev: &Device,
-        q: &Tensor, k: &Tensor, v: &Tensor,
-        scale: f32, causal: bool,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f32,
+        causal: bool,
         iterations: usize,
     ) -> Result<(f64, Tensor)> {
         for _ in 0..3 {
@@ -33,8 +36,11 @@ mod bench {
 
     fn bench_unfused(
         dev: &Device,
-        q: &Tensor, k: &Tensor, v: &Tensor,
-        scale: f32, causal: bool,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f32,
+        causal: bool,
         iterations: usize,
     ) -> Result<(f64, Tensor)> {
         for _ in 0..3 {
@@ -51,8 +57,11 @@ mod bench {
 
     fn unfused_sdpa(
         dev: &Device,
-        q: &Tensor, k: &Tensor, v: &Tensor,
-        scale: f32, causal: bool,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f32,
+        causal: bool,
     ) -> Result<Tensor> {
         let q = q.to_dtype(DType::F32)?;
         let k = k.to_dtype(DType::F32)?;
@@ -127,22 +136,89 @@ mod bench {
 
         struct Case {
             name: &'static str,
-            b: usize, h: usize, sq: usize, skv: usize, hd: usize, causal: bool,
+            b: usize,
+            h: usize,
+            sq: usize,
+            skv: usize,
+            hd: usize,
+            causal: bool,
         }
 
         let cases = vec![
-            Case { name: "tiny_32x64",    b: 1, h: 2, sq: 32,  skv: 64,  hd: 64, causal: true },
-            Case { name: "small_128x128",  b: 1, h: 8, sq: 128, skv: 128, hd: 64, causal: true },
-            Case { name: "mid_256x256",    b: 1, h: 8, sq: 256, skv: 256, hd: 64, causal: true },
-            Case { name: "long_512x512",   b: 1, h: 8, sq: 512, skv: 512, hd: 64, causal: true },
-            Case { name: "cross_64x256",   b: 1, h: 8, sq: 64,  skv: 256, hd: 64, causal: false },
-            Case { name: "batch4_128",     b: 4, h: 8, sq: 128, skv: 128, hd: 64, causal: true },
-            Case { name: "wide_128x128",   b: 1, h: 4, sq: 128, skv: 128, hd: 128, causal: true },
+            Case {
+                name: "tiny_32x64",
+                b: 1,
+                h: 2,
+                sq: 32,
+                skv: 64,
+                hd: 64,
+                causal: true,
+            },
+            Case {
+                name: "small_128x128",
+                b: 1,
+                h: 8,
+                sq: 128,
+                skv: 128,
+                hd: 64,
+                causal: true,
+            },
+            Case {
+                name: "mid_256x256",
+                b: 1,
+                h: 8,
+                sq: 256,
+                skv: 256,
+                hd: 64,
+                causal: true,
+            },
+            Case {
+                name: "long_512x512",
+                b: 1,
+                h: 8,
+                sq: 512,
+                skv: 512,
+                hd: 64,
+                causal: true,
+            },
+            Case {
+                name: "cross_64x256",
+                b: 1,
+                h: 8,
+                sq: 64,
+                skv: 256,
+                hd: 64,
+                causal: false,
+            },
+            Case {
+                name: "batch4_128",
+                b: 4,
+                h: 8,
+                sq: 128,
+                skv: 128,
+                hd: 64,
+                causal: true,
+            },
+            Case {
+                name: "wide_128x128",
+                b: 1,
+                h: 4,
+                sq: 128,
+                skv: 128,
+                hd: 128,
+                causal: true,
+            },
         ];
 
-        println!("\n=== {} SDPA: fused vs unfused ({} iters each) ===", backend.to_uppercase(), iters);
-        println!("{:<18} {:>10} {:>10} {:>8} {:>14} {:>8}",
-            "Config", "Fused(ms)", "Unfused(ms)", "Speedup", "MaxDiff", "OK?");
+        println!(
+            "\n=== {} SDPA: fused vs unfused ({} iters each) ===",
+            backend.to_uppercase(),
+            iters
+        );
+        println!(
+            "{:<18} {:>10} {:>10} {:>8} {:>14} {:>8}",
+            "Config", "Fused(ms)", "Unfused(ms)", "Speedup", "MaxDiff", "OK?"
+        );
         println!("{}", "-".repeat(78));
 
         for c in &cases {
@@ -153,13 +229,23 @@ mod bench {
             let (fused_ms, fused_out) = bench_sdpa(dev, &q, &k, &v, scale, c.causal, iters)?;
             let (unfused_ms, unfused_out) = bench_unfused(dev, &q, &k, &v, scale, c.causal, iters)?;
 
-            let speedup = if fused_ms > 0.0001 { unfused_ms / fused_ms } else { 0.0 };
+            let speedup = if fused_ms > 0.0001 {
+                unfused_ms / fused_ms
+            } else {
+                0.0
+            };
             let max_diff = compare(c.name, &fused_out, &unfused_out)?;
             let ok = max_diff < 0.01;
 
-            println!("{:<18} {:>10.2} {:>10.2} {:>7.2}x {:>14.6e} {:>8}",
-                c.name, fused_ms * 1000.0, unfused_ms * 1000.0, speedup, max_diff,
-                if ok { "OK" } else { "FAIL" });
+            println!(
+                "{:<18} {:>10.2} {:>10.2} {:>7.2}x {:>14.6e} {:>8}",
+                c.name,
+                fused_ms * 1000.0,
+                unfused_ms * 1000.0,
+                speedup,
+                max_diff,
+                if ok { "OK" } else { "FAIL" }
+            );
         }
         println!();
         Ok(())

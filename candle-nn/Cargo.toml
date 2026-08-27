@@ -1,6 +1,6 @@
 [package]
 name = "candle-nn"
-version = "0.0.174"
+version = "0.1.0"
 edition.workspace = true
 description.workspace = true
 repository.workspace = true
