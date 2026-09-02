@@ -1,4 +1,5 @@
 use crate::backend::BackendStorage;
+use crate::custom_op::{all_distinct, InplaceOpN, Src};
 use crate::op::{self, CmpOp, ReduceOp};
 use crate::scalar::Scalar;
 use crate::{
@@ -103,6 +104,9 @@ pub enum Storage {
     Wgpu(WgpuStorage),
     Vulkan(VulkanStorage),
 }
+
+pub type StorageRef<'a> = RwLockReadGuard<'a, Storage>;
+pub type StorageMutRef<'a> = RwLockWriteGuard<'a, Storage>;
 
 impl Storage {
     pub fn try_clone(&self, layout: &Layout) -> Result<Self> {
@@ -523,10 +527,9 @@ impl Storage {
 
     pub(crate) fn inplace_op2(
         &mut self,
-        l1: &Layout,
-        t2: &Self,
-        l2: &Layout,
-        c: &dyn InplaceOp2,
+        dst_l: &Layout,
+        srcs: [(Src<'_, Storage>, &Layout); N],
+        c: &C,
     ) -> Result<()> {
         self.same_device(t2, c.name())?;
         match (self, t2) {

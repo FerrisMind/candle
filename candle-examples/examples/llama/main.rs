@@ -16,9 +16,9 @@ use anyhow::{bail, Error as E, Result};
 use clap::{Parser, ValueEnum};
 
 use candle::{DType, Tensor};
+use candle_examples::hub::Api;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::io::Write;
 
 use candle_transformers::models::llama as model;

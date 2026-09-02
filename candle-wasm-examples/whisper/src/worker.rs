@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use tokenizers::Tokenizer;
 use wasm_bindgen::prelude::*;
-use yew_agent::{HandlerId, Public, WorkerLink};
+use yew_agent::worker::{HandlerId, WorkerScope};
 
 #[wasm_bindgen]
 extern "C" {
@@ -555,11 +555,10 @@ fn resolved_label(kind: ResolvedKind) -> String {
     }
 }
 
-impl yew_agent::Worker for Worker {
+impl yew_agent::worker::Worker for Worker {
     type Input = WorkerInput;
     type Message = ();
     type Output = Result<WorkerOutput, String>;
-    type Reach = Public<Self>;
 
     fn create(link: WorkerLink<Self>) -> Self {
         Self {
@@ -568,7 +567,7 @@ impl yew_agent::Worker for Worker {
         }
     }
 
-    fn update(&mut self, _msg: Self::Message) {
+    fn update(&mut self, _scope: &WorkerScope<Self>, _msg: Self::Message) {
         // no messaging
     }
 
