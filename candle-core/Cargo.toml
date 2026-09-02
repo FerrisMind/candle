@@ -19,6 +19,7 @@ candle-vulkan-kernels = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
 objc2-foundation = { workspace = true, optional = true }
 cudarc = { workspace = true, optional = true }
+cutile = { workspace = true, optional = true }
 ash = { workspace = true, optional = true }
 gpu-allocator = { workspace = true, optional = true }
 gemm = { workspace = true }
@@ -99,6 +100,10 @@ required-features = ["metal"]
 [[example]]
 name = "cuda_basics"
 required-features = ["cuda"]
+
+[[example]]
+name = "cutile"
+required-features = ["cutile"]
 
 [[example]]
 name = "backend_parity_microbench"

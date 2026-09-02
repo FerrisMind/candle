@@ -2,8 +2,8 @@ use crate::layout::LayoutRelation;
 use crate::op::{BackpropOp, Op};
 use crate::tensor::from_storage;
 use crate::{
-    CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor, VulkanStorage,
-    WgpuStorage,
+    bail, CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Storage, Tensor,
+    VulkanStorage, WgpuStorage,
 };
 use std::sync::Arc;
 
@@ -436,6 +436,46 @@ pub trait InplaceOpN<const N: usize> {
         let _ = (dst, dst_l, srcs);
         bail!("no aliased metal implementation for {}", self.name())
     }
+
+    fn wgpu_fwd(
+        &self,
+        dst: &mut WgpuStorage,
+        dst_l: &Layout,
+        srcs: [(&WgpuStorage, &Layout); N],
+    ) -> Result<()> {
+        let _ = (dst, dst_l, srcs);
+        bail!("no wgpu implementation for {}", self.name())
+    }
+
+    fn wgpu_fwd_aliased(
+        &self,
+        dst: &mut WgpuStorage,
+        dst_l: &Layout,
+        srcs: [(Src<'_, WgpuStorage>, &Layout); N],
+    ) -> Result<()> {
+        let _ = (dst, dst_l, srcs);
+        bail!("no aliased wgpu implementation for {}", self.name())
+    }
+
+    fn vulkan_fwd(
+        &self,
+        dst: &mut VulkanStorage,
+        dst_l: &Layout,
+        srcs: [(&VulkanStorage, &Layout); N],
+    ) -> Result<()> {
+        let _ = (dst, dst_l, srcs);
+        bail!("no vulkan implementation for {}", self.name())
+    }
+
+    fn vulkan_fwd_aliased(
+        &self,
+        dst: &mut VulkanStorage,
+        dst_l: &Layout,
+        srcs: [(Src<'_, VulkanStorage>, &Layout); N],
+    ) -> Result<()> {
+        let _ = (dst, dst_l, srcs);
+        bail!("no aliased vulkan implementation for {}", self.name())
+    }
 }
 
 #[derive(Debug)]
@@ -521,6 +561,8 @@ impl<C: InplaceOp1> InplaceOpN<0> for C {
     forward_op1!(cpu_fwd, cpu_fwd_aliased, CpuStorage);
     forward_op1!(cuda_fwd, cuda_fwd_aliased, CudaStorage);
     forward_op1!(metal_fwd, metal_fwd_aliased, MetalStorage);
+    forward_op1!(wgpu_fwd, wgpu_fwd_aliased, WgpuStorage);
+    forward_op1!(vulkan_fwd, vulkan_fwd_aliased, VulkanStorage);
 }
 
 macro_rules! forward_op2 {
@@ -560,6 +602,8 @@ impl<C: InplaceOp2> InplaceOpN<1> for C {
     forward_op2!(cpu_fwd, cpu_fwd_aliased, CpuStorage);
     forward_op2!(cuda_fwd, cuda_fwd_aliased, CudaStorage);
     forward_op2!(metal_fwd, metal_fwd_aliased, MetalStorage);
+    forward_op2!(wgpu_fwd, wgpu_fwd_aliased, WgpuStorage);
+    forward_op2!(vulkan_fwd, vulkan_fwd_aliased, VulkanStorage);
 }
 
 pub trait InplaceOp2 {
@@ -662,6 +706,8 @@ impl<C: InplaceOp3> InplaceOpN<2> for C {
     forward_op3!(cpu_fwd, cpu_fwd_aliased, CpuStorage);
     forward_op3!(cuda_fwd, cuda_fwd_aliased, CudaStorage);
     forward_op3!(metal_fwd, metal_fwd_aliased, MetalStorage);
+    forward_op3!(wgpu_fwd, wgpu_fwd_aliased, WgpuStorage);
+    forward_op3!(vulkan_fwd, vulkan_fwd_aliased, VulkanStorage);
 }
 
 pub trait InplaceOp3 {

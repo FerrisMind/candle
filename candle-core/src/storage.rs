@@ -6,7 +6,8 @@ use crate::{
     CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, Result, Shape,
     VulkanStorage, WgpuStorage,
 };
-use crate::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
+use crate::{CustomOp1, CustomOp2, CustomOp3};
+use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static WGPU_CPU_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -515,55 +516,46 @@ impl Storage {
         }
     }
 
-    pub(crate) fn inplace_op1(&mut self, l: &Layout, c: &dyn InplaceOp1) -> Result<()> {
-        match self {
-            Self::Cpu(storage) => c.cpu_fwd(storage, l),
-            Self::Cuda(storage) => c.cuda_fwd(storage, l),
-            Self::Metal(storage) => c.metal_fwd(storage, l),
-            Self::Wgpu(storage) => c.wgpu_fwd(storage, l),
-            Self::Vulkan(storage) => c.vulkan_fwd(storage, l),
-        }
-    }
-
-    pub(crate) fn inplace_op2(
+    pub(crate) fn inplace_op<const N: usize, C: InplaceOpN<N>>(
         &mut self,
         dst_l: &Layout,
         srcs: [(Src<'_, Storage>, &Layout); N],
         c: &C,
     ) -> Result<()> {
-        self.same_device(t2, c.name())?;
-        match (self, t2) {
-            (Self::Cpu(s1), Self::Cpu(s2)) => c.cpu_fwd(s1, l1, s2, l2),
-            (Self::Cuda(s1), Self::Cuda(s2)) => c.cuda_fwd(s1, l1, s2, l2),
-            (Self::Metal(s1), Self::Metal(s2)) => c.metal_fwd(s1, l1, s2, l2),
-            (Self::Wgpu(s1), Self::Wgpu(s2)) => c.wgpu_fwd(s1, l1, s2, l2),
-            (Self::Vulkan(s1), Self::Vulkan(s2)) => c.vulkan_fwd(s1, l1, s2, l2),
-            _ => unreachable!(),
+        // Aliased sources are `self`. Only distinct needs checking.
+        for (s, _) in srcs.iter() {
+            if let Src::Distinct(s) = s {
+                self.same_device(s, c.name())?;
+            }
         }
-    }
+        macro_rules! inplace_dispatch {
+            ($dst:expr, $variant:ident, $fwd:ident, $fwd_aliased:ident) => {{
+                // Extract underlying storage variant on same device
+                let operands: [(Src<'_, _>, &Layout); N] = std::array::from_fn(|i| {
+                    let (s, l) = srcs[i];
+                    let s = match s {
+                        Src::Distinct(Storage::$variant(s)) => Src::Distinct(s),
+                        Src::Aliased(rel) => Src::Aliased(rel),
+                        Src::Distinct(_) => {
+                            unreachable!("same_device above rejects mismatched backends")
+                        }
+                    };
+                    (s, l)
+                });
 
-    pub(crate) fn inplace_op3(
-        &mut self,
-        l1: &Layout,
-        t2: &Self,
-        l2: &Layout,
-        t3: &Self,
-        l3: &Layout,
-        c: &dyn InplaceOp3,
-    ) -> Result<()> {
-        self.same_device(t2, c.name())?;
-        self.same_device(t3, c.name())?;
-        match (self, t2, t3) {
-            (Self::Cpu(s1), Self::Cpu(s2), Self::Cpu(s3)) => c.cpu_fwd(s1, l1, s2, l2, s3, l3),
-            (Self::Cuda(s1), Self::Cuda(s2), Self::Cuda(s3)) => c.cuda_fwd(s1, l1, s2, l2, s3, l3),
-            (Self::Metal(s1), Self::Metal(s2), Self::Metal(s3)) => {
-                c.metal_fwd(s1, l1, s2, l2, s3, l3)
-            }
-            (Self::Wgpu(s1), Self::Wgpu(s2), Self::Wgpu(s3)) => c.wgpu_fwd(s1, l1, s2, l2, s3, l3),
-            (Self::Vulkan(s1), Self::Vulkan(s2), Self::Vulkan(s3)) => {
-                c.vulkan_fwd(s1, l1, s2, l2, s3, l3)
-            }
-            _ => unreachable!(),
+                match all_distinct(&operands) {
+                    Some(distinct) => c.$fwd($dst, dst_l, distinct),
+                    None => c.$fwd_aliased($dst, dst_l, operands),
+                }
+            }};
+        }
+
+        match self {
+            Storage::Cpu(dst) => inplace_dispatch!(dst, Cpu, cpu_fwd, cpu_fwd_aliased),
+            Storage::Cuda(dst) => inplace_dispatch!(dst, Cuda, cuda_fwd, cuda_fwd_aliased),
+            Storage::Metal(dst) => inplace_dispatch!(dst, Metal, metal_fwd, metal_fwd_aliased),
+            Storage::Wgpu(dst) => inplace_dispatch!(dst, Wgpu, wgpu_fwd, wgpu_fwd_aliased),
+            Storage::Vulkan(dst) => inplace_dispatch!(dst, Vulkan, vulkan_fwd, vulkan_fwd_aliased),
         }
     }
 
