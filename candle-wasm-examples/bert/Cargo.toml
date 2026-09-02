@@ -8,10 +8,15 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 
+[features]
+default = []
+wgpu = ["candle-wasm-device-select/wgpu", "candle/wgpu", "candle-nn/wgpu", "candle-transformers/wgpu"]
+
 [dependencies]
 candle = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
+candle-wasm-device-select = { path = "../device-select" }
 num-traits = { workspace = true }
 tokenizers = { workspace = true, features = ["unstable_wasm"] }
 
@@ -30,4 +35,5 @@ getrandom = { version = "0.2", features = ["js"] }
 gloo = "0.12"
 js-sys = "0.3.64"
 wasm-bindgen = "0.2.87"
+wasm-bindgen-futures = "0.4.37"
 serde-wasm-bindgen = "0.6.0"

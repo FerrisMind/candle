@@ -4,6 +4,8 @@ mod wgsl {
     include!(concat!(env!("OUT_DIR"), "/wgsl.rs"));
 }
 
+use std::collections::HashMap;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Module {
     name: &'static str,
@@ -27,6 +29,34 @@ pub fn get(name: &str) -> Option<Module> {
         .iter()
         .copied()
         .find(|module| module.name == name)
+}
+
+/// Memoize a preprocessed shader by its public inputs. Runtime `preprocess`
+/// (multi-round string expansion) costs ~800µs for the quantized matvec shaders
+/// and runs on EVERY dispatch (`quantized_matvec` regenerates the WGSL source
+/// per call). The shaders are pure functions of their params, so caching the
+/// finished String is exact. Key is a deterministic per-parameter tuple; the
+/// `tag` usize distinguishes different shader families with the same params.
+fn cached_shader<Tag: Copy + std::hash::Hash>(
+    tag: Tag,
+    build: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+    let key = {
+        use std::hash::Hasher;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        tag.hash(&mut h);
+        h.finish()
+    };
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = cache.lock().unwrap();
+    if let Some(shader) = g.get(&key) {
+        return Some(shader.clone());
+    }
+    let built = build()?;
+    g.insert(key, built.clone());
+    Some(built)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -240,46 +270,52 @@ pub fn rand_normal_shader(dtype: DType, workgroup_size: u32) -> Option<String> {
 }
 
 pub fn argmax_shader(workgroup_size: u32) -> Option<String> {
-    let source = get("argmax.wgsl")?.source();
-    let defines = vec!["WG_SIZE".to_string()];
-    let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
-    Some(preprocess(source, &defines, &replacements, DType::F32))
+    cached_shader((14u8, workgroup_size), || {
+        let source = get("argmax.wgsl")?.source();
+        let defines = vec!["WG_SIZE".to_string()];
+        let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+        Some(preprocess(source, &defines, &replacements, DType::F32))
+    })
 }
 
 pub fn rope_shader(dtype: DType, workgroup_size: u32) -> Option<String> {
-    let source = get("rope.wgsl")?.source();
-    let mut defines = vec!["WG_SIZE".to_string()];
-    let mut replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
-    match dtype {
-        DType::F32 => {
-            defines.push("TYPE_F32".to_string());
-            replacements.push(("DataType".to_string(), "f32".to_string()));
+    cached_shader((15u8, dtype as u8, workgroup_size), || {
+        let source = get("rope.wgsl")?.source();
+        let mut defines = vec!["WG_SIZE".to_string()];
+        let mut replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+        match dtype {
+            DType::F32 => {
+                defines.push("TYPE_F32".to_string());
+                replacements.push(("DataType".to_string(), "f32".to_string()));
+            }
+            DType::F16 => {
+                defines.push("TYPE_F16".to_string());
+                replacements.push(("DataType".to_string(), "f16".to_string()));
+            }
         }
-        DType::F16 => {
-            defines.push("TYPE_F16".to_string());
-            replacements.push(("DataType".to_string(), "f16".to_string()));
-        }
-    }
-    Some(preprocess(source, &defines, &replacements, dtype))
+        Some(preprocess(source, &defines, &replacements, dtype))
+    })
 }
 
 /// Fused RoPE with precomputed cos/sin tables (used by the wgpu device-gated rope
 /// path for F32/F16; mirrors `rope_shader` but reads two separate cos/sin buffers).
 pub fn rope_cs_shader(dtype: DType, workgroup_size: u32) -> Option<String> {
-    let source = get("rope_cs.wgsl")?.source();
-    let mut defines = vec!["WG_SIZE".to_string()];
-    let mut replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
-    match dtype {
-        DType::F32 => {
-            defines.push("TYPE_F32".to_string());
-            replacements.push(("DataType".to_string(), "f32".to_string()));
+    cached_shader((16u8, dtype as u8, workgroup_size), || {
+        let source = get("rope_cs.wgsl")?.source();
+        let mut defines = vec!["WG_SIZE".to_string()];
+        let mut replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+        match dtype {
+            DType::F32 => {
+                defines.push("TYPE_F32".to_string());
+                replacements.push(("DataType".to_string(), "f32".to_string()));
+            }
+            DType::F16 => {
+                defines.push("TYPE_F16".to_string());
+                replacements.push(("DataType".to_string(), "f16".to_string()));
+            }
         }
-        DType::F16 => {
-            defines.push("TYPE_F16".to_string());
-            replacements.push(("DataType".to_string(), "f16".to_string()));
-        }
-    }
-    Some(preprocess(source, &defines, &replacements, dtype))
+        Some(preprocess(source, &defines, &replacements, dtype))
+    })
 }
 
 fn argsort_shader_for_type(workgroup_size: u32, asc: bool, src_type: &str) -> Option<String> {
@@ -499,54 +535,64 @@ pub fn argsort_i32_merge_shader(workgroup_size: u32, asc: bool) -> Option<String
 }
 
 pub fn cumsum_shader(workgroup_size: u32) -> Option<String> {
-    let source = get("cumsum.wgsl")?.source();
-    let defines = vec!["WG_SIZE".to_string()];
-    let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
-    Some(preprocess(source, &defines, &replacements, DType::F32))
+    cached_shader((10u8, workgroup_size), || {
+        let source = get("cumsum.wgsl")?.source();
+        let defines = vec!["WG_SIZE".to_string()];
+        let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+        Some(preprocess(source, &defines, &replacements, DType::F32))
+    })
 }
 
 pub fn softmax_shader(workgroup_size: u32) -> Option<String> {
-    let source = get("soft_max.wgsl")?.source();
-    let defines = vec!["WG_SIZE".to_string()];
-    let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
-    Some(preprocess(source, &defines, &replacements, DType::F32))
+    cached_shader((11u8, workgroup_size), || {
+        let source = get("soft_max.wgsl")?.source();
+        let defines = vec!["WG_SIZE".to_string()];
+        let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+        Some(preprocess(source, &defines, &replacements, DType::F32))
+    })
 }
 
 pub fn rms_norm_mul_shader(workgroup_size: u32) -> Option<String> {
-    let source = get("rms_norm_mul.wgsl")?.source();
-    let defines = vec!["WG_SIZE".to_string()];
-    let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
-    Some(preprocess(source, &defines, &replacements, DType::F32))
+    cached_shader((12u8, workgroup_size), || {
+        let source = get("rms_norm_mul.wgsl")?.source();
+        let defines = vec!["WG_SIZE".to_string()];
+        let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+        Some(preprocess(source, &defines, &replacements, DType::F32))
+    })
 }
 
 pub fn get_rows_f32_shader(workgroup_size: u32) -> Option<String> {
-    let source = get("get_rows.wgsl")?.source().replace(
-        "#include \"common_decls.tmpl\"",
-        get("common_decls.tmpl")?.source(),
-    );
-    let defines = vec!["F32".to_string()];
-    let replacements = vec![
-        ("WG_SIZE".to_string(), workgroup_size.to_string()),
-        ("BLOCK_SIZE".to_string(), "1".to_string()),
-        ("SRC_TYPE".to_string(), "f32".to_string()),
-        ("DST_TYPE".to_string(), "f32".to_string()),
-    ];
-    Some(preprocess(&source, &defines, &replacements, DType::F32))
+    cached_shader((13u8, workgroup_size), || {
+        let source = get("get_rows.wgsl")?.source().replace(
+            "#include \"common_decls.tmpl\"",
+            get("common_decls.tmpl")?.source(),
+        );
+        let defines = vec!["F32".to_string()];
+        let replacements = vec![
+            ("WG_SIZE".to_string(), workgroup_size.to_string()),
+            ("BLOCK_SIZE".to_string(), "1".to_string()),
+            ("SRC_TYPE".to_string(), "f32".to_string()),
+            ("DST_TYPE".to_string(), "f32".to_string()),
+        ];
+        Some(preprocess(&source, &defines, &replacements, DType::F32))
+    })
 }
 
 pub fn get_rows_f16_shader(workgroup_size: u32) -> Option<String> {
-    let source = get("get_rows.wgsl")?.source().replace(
-        "#include \"common_decls.tmpl\"",
-        get("common_decls.tmpl")?.source(),
-    );
-    let defines = vec!["F16".to_string()];
-    let replacements = vec![
-        ("WG_SIZE".to_string(), workgroup_size.to_string()),
-        ("BLOCK_SIZE".to_string(), "1".to_string()),
-        ("SRC_TYPE".to_string(), "f16".to_string()),
-        ("DST_TYPE".to_string(), "f32".to_string()),
-    ];
-    Some(preprocess(&source, &defines, &replacements, DType::F16))
+    cached_shader((17u8, workgroup_size), || {
+        let source = get("get_rows.wgsl")?.source().replace(
+            "#include \"common_decls.tmpl\"",
+            get("common_decls.tmpl")?.source(),
+        );
+        let defines = vec!["F16".to_string()];
+        let replacements = vec![
+            ("WG_SIZE".to_string(), workgroup_size.to_string()),
+            ("BLOCK_SIZE".to_string(), "1".to_string()),
+            ("SRC_TYPE".to_string(), "f16".to_string()),
+            ("DST_TYPE".to_string(), "f32".to_string()),
+        ];
+        Some(preprocess(&source, &defines, &replacements, DType::F16))
+    })
 }
 
 pub fn get_rows_u32_shader(workgroup_size: u32) -> Option<String> {
@@ -716,6 +762,33 @@ pub fn matmul_f64_shader() -> Option<&'static str> {
     get("mul_mat_f64.wgsl").map(|module| module.source())
 }
 
+/// Dense m == 1 GEMV (decode-weight matmul fast path). Reads a contiguous [k, n]
+/// RHS with unit column stride and a contiguous [1, k] LHS; one thread per output
+/// column, f32 accumulation. `dtype` controls SRC_TYPE and whether `enable f16;`
+/// is injected (preprocess strips it for F32).
+pub fn gemv_shader(dtype: DType) -> Option<String> {
+    let src_type = match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+    };
+    let source = get("gemv.wgsl")?.source();
+    let replacements = vec![("SRC_TYPE".to_string(), src_type.to_string())];
+    Some(preprocess(source, &[], &replacements, dtype))
+}
+
+/// Compacted index-select (gather) for dense F32/F16 sources that exceed a single
+/// storage binding (index_select_map.wgsl). Reads explicit (relative-src-row,
+/// dst-offset) per output row; `dtype` controls SRC_TYPE and f16 gating.
+pub fn index_select_map_shader(dtype: DType) -> Option<String> {
+    let src_type = match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+    };
+    let source = get("index_select_map.wgsl")?.source();
+    let replacements = vec![("SRC_TYPE".to_string(), src_type.to_string())];
+    Some(preprocess(source, &[], &replacements, dtype))
+}
+
 pub fn matmul_fast_tile_shape() -> (u32, u32, u32, u32, u32) {
     (
         MUL_MAT_TILE_M,
@@ -794,66 +867,68 @@ pub const BATCHED_GEMV_F32_WG_SIZE: u32 = 128;
 pub const BATCHED_GEMV_F32_OUTPUTS_PER_WG: u32 = 4;
 
 pub fn matmul_fast_shader(dtype: DType, vectorized: bool) -> Option<String> {
-    let source = get("mul_mat_reg_tile.wgsl")?
-        .source()
-        .replace(
-            "#include \"common_decls.tmpl\"",
-            get("common_decls.tmpl")?.source(),
-        )
-        .replace(
-            "#include \"mul_mat_decls.tmpl\"",
-            get("mul_mat_decls.tmpl")?.source(),
-        );
-    let (inner_type, need_f16_enable) = match dtype {
-        // Dense F32 uses f32 workgroup memory for full precision (FLOAT_ACC_SHMEM).
-        DType::F32 => ("f32", false),
-        // F16 path keeps the historical f16 shmem staging.
-        DType::F16 => ("f16", true),
-    };
-    let mut defines = vec![
-        if vectorized {
-            "VEC".to_string()
-        } else {
-            "SCALAR".to_string()
-        },
-        "INIT_SRC0_SHMEM_FLOAT".to_string(),
-        "INIT_SRC1_SHMEM_FLOAT".to_string(),
-        "TILE_M".to_string(),
-        "TILE_N".to_string(),
-        "WORKGROUP_SIZE_M".to_string(),
-        "WORKGROUP_SIZE_N".to_string(),
-        "TILE_K".to_string(),
-    ];
-    if matches!(dtype, DType::F32) {
-        defines.push("FLOAT_ACC_SHMEM".to_string());
-    }
-    let replacements = vec![
-        ("SRC0_INNER_TYPE".to_string(), inner_type.to_string()),
-        ("SRC1_INNER_TYPE".to_string(), inner_type.to_string()),
-        ("TILE_M".to_string(), format!("{MUL_MAT_TILE_M}u")),
-        ("TILE_N".to_string(), format!("{MUL_MAT_TILE_N}u")),
-        (
+    cached_shader((18u8, dtype as u8, vectorized as u8), || {
+        let source = get("mul_mat_reg_tile.wgsl")?
+            .source()
+            .replace(
+                "#include \"common_decls.tmpl\"",
+                get("common_decls.tmpl")?.source(),
+            )
+            .replace(
+                "#include \"mul_mat_decls.tmpl\"",
+                get("mul_mat_decls.tmpl")?.source(),
+            );
+        let (inner_type, need_f16_enable) = match dtype {
+            // Dense F32 uses f32 workgroup memory for full precision (FLOAT_ACC_SHMEM).
+            DType::F32 => ("f32", false),
+            // F16 path keeps the historical f16 shmem staging.
+            DType::F16 => ("f16", true),
+        };
+        let mut defines = vec![
+            if vectorized {
+                "VEC".to_string()
+            } else {
+                "SCALAR".to_string()
+            },
+            "INIT_SRC0_SHMEM_FLOAT".to_string(),
+            "INIT_SRC1_SHMEM_FLOAT".to_string(),
+            "TILE_M".to_string(),
+            "TILE_N".to_string(),
             "WORKGROUP_SIZE_M".to_string(),
-            format!("{MUL_MAT_WG_SIZE_M}u"),
-        ),
-        (
             "WORKGROUP_SIZE_N".to_string(),
-            format!("{MUL_MAT_WG_SIZE_N}u"),
-        ),
-        ("TILE_K".to_string(), format!("{MUL_MAT_REG_TILE_K_FLOAT}u")),
-    ];
-    defines.push("TILE_M".to_string());
-    defines.push("TILE_N".to_string());
-    defines.push("WORKGROUP_SIZE_M".to_string());
-    defines.push("WORKGROUP_SIZE_N".to_string());
-    defines.push("TILE_K".to_string());
-    // preprocess's dtype controls whether `enable f16;` is injected.
-    let pre_dtype = if need_f16_enable {
-        DType::F16
-    } else {
-        DType::F32
-    };
-    Some(preprocess(&source, &defines, &replacements, pre_dtype))
+            "TILE_K".to_string(),
+        ];
+        if matches!(dtype, DType::F32) {
+            defines.push("FLOAT_ACC_SHMEM".to_string());
+        }
+        let replacements = vec![
+            ("SRC0_INNER_TYPE".to_string(), inner_type.to_string()),
+            ("SRC1_INNER_TYPE".to_string(), inner_type.to_string()),
+            ("TILE_M".to_string(), format!("{MUL_MAT_TILE_M}u")),
+            ("TILE_N".to_string(), format!("{MUL_MAT_TILE_N}u")),
+            (
+                "WORKGROUP_SIZE_M".to_string(),
+                format!("{MUL_MAT_WG_SIZE_M}u"),
+            ),
+            (
+                "WORKGROUP_SIZE_N".to_string(),
+                format!("{MUL_MAT_WG_SIZE_N}u"),
+            ),
+            ("TILE_K".to_string(), format!("{MUL_MAT_REG_TILE_K_FLOAT}u")),
+        ];
+        defines.push("TILE_M".to_string());
+        defines.push("TILE_N".to_string());
+        defines.push("WORKGROUP_SIZE_M".to_string());
+        defines.push("WORKGROUP_SIZE_N".to_string());
+        defines.push("TILE_K".to_string());
+        // preprocess's dtype controls whether `enable f16;` is injected.
+        let pre_dtype = if need_f16_enable {
+            DType::F16
+        } else {
+            DType::F32
+        };
+        Some(preprocess(&source, &defines, &replacements, pre_dtype))
+    })
 }
 
 pub fn matvec_outputs_per_wg() -> u32 {
@@ -865,42 +940,44 @@ pub fn matvec_workgroup_size() -> u32 {
 }
 
 pub fn matvec_shader(dtype: DType, vectorized: bool, use_subgroups: bool) -> Option<String> {
-    let source = get("mul_mat_vec.wgsl")?.source().replace(
-        "#include \"common_decls.tmpl\"",
-        get("common_decls.tmpl")?.source(),
-    );
-    let inner_type = match dtype {
-        DType::F32 => "f32",
-        DType::F16 => "f16",
-    };
-    let mut defines = vec![
-        if vectorized {
-            "VEC".to_string()
-        } else {
-            "SCALAR".to_string()
-        },
-        if use_subgroups {
-            "USE_SUBGROUP_REDUCTION".to_string()
-        } else {
-            "USE_WORKGROUP_REDUCTION".to_string()
-        },
-        "MUL_ACC_FLOAT".to_string(),
-        "WG_SIZE".to_string(),
-        "OUTPUTS_PER_WG".to_string(),
-    ];
-    let replacements = vec![
-        ("WG_SIZE".to_string(), QUANT_MUL_MAT_VEC_WG_SIZE.to_string()),
-        (
+    cached_shader((19u8, dtype as u8, vectorized as u8, use_subgroups as u8), || {
+        let source = get("mul_mat_vec.wgsl")?.source().replace(
+            "#include \"common_decls.tmpl\"",
+            get("common_decls.tmpl")?.source(),
+        );
+        let inner_type = match dtype {
+            DType::F32 => "f32",
+            DType::F16 => "f16",
+        };
+        let mut defines = vec![
+            if vectorized {
+                "VEC".to_string()
+            } else {
+                "SCALAR".to_string()
+            },
+            if use_subgroups {
+                "USE_SUBGROUP_REDUCTION".to_string()
+            } else {
+                "USE_WORKGROUP_REDUCTION".to_string()
+            },
+            "MUL_ACC_FLOAT".to_string(),
+            "WG_SIZE".to_string(),
             "OUTPUTS_PER_WG".to_string(),
-            QUANT_MUL_MAT_VEC_FLOAT_OUTPUTS_PER_WG.to_string(),
-        ),
-        ("SRC0_INNER_TYPE".to_string(), inner_type.to_string()),
-        ("SRC1_INNER_TYPE".to_string(), inner_type.to_string()),
-    ];
-    if !matches!(dtype, DType::F16) {
-        defines.retain(|define| define != "USE_SUBGROUP_REDUCTION");
-    }
-    Some(preprocess(&source, &defines, &replacements, dtype))
+        ];
+        let replacements = vec![
+            ("WG_SIZE".to_string(), QUANT_MUL_MAT_VEC_WG_SIZE.to_string()),
+            (
+                "OUTPUTS_PER_WG".to_string(),
+                QUANT_MUL_MAT_VEC_FLOAT_OUTPUTS_PER_WG.to_string(),
+            ),
+            ("SRC0_INNER_TYPE".to_string(), inner_type.to_string()),
+            ("SRC1_INNER_TYPE".to_string(), inner_type.to_string()),
+        ];
+        if !matches!(dtype, DType::F16) {
+            defines.retain(|define| define != "USE_SUBGROUP_REDUCTION");
+        }
+        Some(preprocess(&source, &defines, &replacements, dtype))
+    })
 }
 
 fn quantized_shader_config(dtype: QuantizedDType) -> (Vec<String>, &'static str, &'static str) {
@@ -1080,116 +1157,122 @@ pub fn quantized_matmul_shader(dtype: QuantizedDType, rhs_dtype: DType) -> Optio
 }
 
 pub fn quantized_matvec_shader(dtype: QuantizedDType, rhs_dtype: DType) -> Option<String> {
-    let source = get("mul_mat_vec.wgsl")?.source().replace(
-        "#include \"common_decls.tmpl\"",
-        get("common_decls.tmpl")?.source(),
-    );
-    let outputs_per_wg = quantized_matvec_outputs_per_wg(dtype);
-    let mut defines = vec![
-        "SCALAR".to_string(),
-        // Naga (wgpu 29) does not implement `enable subgroups;`, and the
-        // `enable -extension` validation rejects any shader declaring it, so the
-        // subgroup-reduction branch (USE_SUBGROUP_REDUCTION) below cannot be used
-        // on this backend. Use the portable 8-barrier workgroup tree instead (the
-        // llama.cpp / wgpu-llm subgroup option is unavailable here).
-        "USE_WORKGROUP_REDUCTION".to_string(),
-        "BYTE_HELPERS".to_string(),
-        "U32_DEQUANT_HELPERS".to_string(),
-        "DECLARE_BYTE_LOADERS_SRC0".to_string(),
-        quantized_mul_acc_define(dtype).to_string(),
-    ];
-    let src1_type = match rhs_dtype {
-        DType::F32 => "f32",
-        DType::F16 => "f16",
-    };
-    let replacements = vec![
-        ("WG_SIZE".to_string(), QUANT_MUL_MAT_VEC_WG_SIZE.to_string()),
-        ("OUTPUTS_PER_WG".to_string(), outputs_per_wg.to_string()),
-        ("SRC0_TYPE".to_string(), "u32".to_string()),
-        ("SRC1_TYPE".to_string(), src1_type.to_string()),
-        ("SRC0_INNER_TYPE".to_string(), "u32".to_string()),
-        ("SRC1_INNER_TYPE".to_string(), src1_type.to_string()),
-    ];
-    defines.push("WG_SIZE".to_string());
-    defines.push("OUTPUTS_PER_WG".to_string());
-    Some(preprocess(&source, &defines, &replacements, DType::F16))
+    cached_shader((2u8, dtype as u8, rhs_dtype as u8), || {
+        let source = get("mul_mat_vec.wgsl")?.source().replace(
+            "#include \"common_decls.tmpl\"",
+            get("common_decls.tmpl")?.source(),
+        );
+        let outputs_per_wg = quantized_matvec_outputs_per_wg(dtype);
+        let mut defines = vec![
+            "SCALAR".to_string(),
+            // Naga (wgpu 29) does not implement `enable subgroups;`, and the
+            // `enable -extension` validation rejects any shader declaring it, so the
+            // subgroup-reduction branch (USE_SUBGROUP_REDUCTION) below cannot be used
+            // on this backend. Use the portable 8-barrier workgroup tree instead (the
+            // llama.cpp / wgpu-llm subgroup option is unavailable here).
+            "USE_WORKGROUP_REDUCTION".to_string(),
+            "BYTE_HELPERS".to_string(),
+            "U32_DEQUANT_HELPERS".to_string(),
+            "DECLARE_BYTE_LOADERS_SRC0".to_string(),
+            quantized_mul_acc_define(dtype).to_string(),
+        ];
+        let src1_type = match rhs_dtype {
+            DType::F32 => "f32",
+            DType::F16 => "f16",
+        };
+        let replacements = vec![
+            ("WG_SIZE".to_string(), QUANT_MUL_MAT_VEC_WG_SIZE.to_string()),
+            ("OUTPUTS_PER_WG".to_string(), outputs_per_wg.to_string()),
+            ("SRC0_TYPE".to_string(), "u32".to_string()),
+            ("SRC1_TYPE".to_string(), src1_type.to_string()),
+            ("SRC0_INNER_TYPE".to_string(), "u32".to_string()),
+            ("SRC1_INNER_TYPE".to_string(), src1_type.to_string()),
+        ];
+        defines.push("WG_SIZE".to_string());
+        defines.push("OUTPUTS_PER_WG".to_string());
+        Some(preprocess(&source, &defines, &replacements, DType::F16))
+    })
 }
 
 pub fn quantized_matmul_fast_shader(dtype: QuantizedDType, rhs_dtype: DType) -> Option<String> {
-    let source = get("mul_mat_reg_tile.wgsl")?
-        .source()
-        .replace(
-            "#include \"common_decls.tmpl\"",
-            get("common_decls.tmpl")?.source(),
-        )
-        .replace(
-            "#include \"mul_mat_decls.tmpl\"",
-            get("mul_mat_decls.tmpl")?.source(),
-        );
-    let mut defines = vec![
-        "SCALAR".to_string(),
-        "BYTE_HELPERS".to_string(),
-        "U32_DEQUANT_HELPERS".to_string(),
-        "DECLARE_BYTE_LOADERS_SRC0".to_string(),
-        quantized_mul_acc_define(dtype).to_string(),
-        quantized_mul_mat_id_init_define(dtype).to_string(),
-        "INIT_SRC1_SHMEM_FLOAT".to_string(),
-        // Full-precision f32 workgroup cache for the dequantized weights. The
-        // CPU/CUDA/llama.cpp reference dequantizes K-quants at f32 precision
-        // (int nibble * f32 d, endpoint-scaled per 64-wide group); demoting the
-        // dequantized weights to f16 shmem rounds `d * sc` per element, which is
-        // a FIXED (weight-only) perturbation that compounds through the residual
-        // stream across layers. Q8_1 already used FLOAT_ACC_SHMEM (67e07ec5
-        // mirror); extend the same path to every quantized dtype.
-        "FLOAT_ACC_SHMEM".to_string(),
-    ];
-    let src1_type = match rhs_dtype {
-        DType::F32 => "f32",
-        DType::F16 => "f16",
-    };
-    let replacements = vec![
-        ("SRC0_TYPE".to_string(), "u32".to_string()),
-        ("SRC1_TYPE".to_string(), src1_type.to_string()),
-        ("DST_TYPE".to_string(), "f32".to_string()),
-        ("SRC0_INNER_TYPE".to_string(), "u32".to_string()),
-        ("SRC1_INNER_TYPE".to_string(), src1_type.to_string()),
-        ("TILE_M".to_string(), format!("{QUANT_MUL_MAT_TILE_M}u")),
-        ("TILE_N".to_string(), format!("{QUANT_MUL_MAT_TILE_N}u")),
-        (
-            "WORKGROUP_SIZE_M".to_string(),
-            format!("{QUANT_MUL_MAT_WG_SIZE_M}u"),
-        ),
-        (
-            "WORKGROUP_SIZE_N".to_string(),
-            format!("{QUANT_MUL_MAT_WG_SIZE_N}u"),
-        ),
-        (
-            "TILE_K".to_string(),
-            format!("{QUANT_MUL_MAT_REG_TILE_K_QUANT}u"),
-        ),
-    ];
-    defines.push("TILE_M".to_string());
-    defines.push("TILE_N".to_string());
-    defines.push("WORKGROUP_SIZE_M".to_string());
-    defines.push("WORKGROUP_SIZE_N".to_string());
-    defines.push("TILE_K".to_string());
-    Some(preprocess(&source, &defines, &replacements, DType::F16))
+    cached_shader((3u8, dtype as u8, rhs_dtype as u8), || {
+        let source = get("mul_mat_reg_tile.wgsl")?
+            .source()
+            .replace(
+                "#include \"common_decls.tmpl\"",
+                get("common_decls.tmpl")?.source(),
+            )
+            .replace(
+                "#include \"mul_mat_decls.tmpl\"",
+                get("mul_mat_decls.tmpl")?.source(),
+            );
+        let mut defines = vec![
+            "SCALAR".to_string(),
+            "BYTE_HELPERS".to_string(),
+            "U32_DEQUANT_HELPERS".to_string(),
+            "DECLARE_BYTE_LOADERS_SRC0".to_string(),
+            quantized_mul_acc_define(dtype).to_string(),
+            quantized_mul_mat_id_init_define(dtype).to_string(),
+            "INIT_SRC1_SHMEM_FLOAT".to_string(),
+            // Full-precision f32 workgroup cache for the dequantized weights. The
+            // CPU/CUDA/llama.cpp reference dequantizes K-quants at f32 precision
+            // (int nibble * f32 d, endpoint-scaled per 64-wide group); demoting the
+            // dequantized weights to f16 shmem rounds `d * sc` per element, which is
+            // a FIXED (weight-only) perturbation that compounds through the residual
+            // stream across layers. Q8_1 already used FLOAT_ACC_SHMEM (67e07ec5
+            // mirror); extend the same path to every quantized dtype.
+            "FLOAT_ACC_SHMEM".to_string(),
+        ];
+        let src1_type = match rhs_dtype {
+            DType::F32 => "f32",
+            DType::F16 => "f16",
+        };
+        let replacements = vec![
+            ("SRC0_TYPE".to_string(), "u32".to_string()),
+            ("SRC1_TYPE".to_string(), src1_type.to_string()),
+            ("DST_TYPE".to_string(), "f32".to_string()),
+            ("SRC0_INNER_TYPE".to_string(), "u32".to_string()),
+            ("SRC1_INNER_TYPE".to_string(), src1_type.to_string()),
+            ("TILE_M".to_string(), format!("{QUANT_MUL_MAT_TILE_M}u")),
+            ("TILE_N".to_string(), format!("{QUANT_MUL_MAT_TILE_N}u")),
+            (
+                "WORKGROUP_SIZE_M".to_string(),
+                format!("{QUANT_MUL_MAT_WG_SIZE_M}u"),
+            ),
+            (
+                "WORKGROUP_SIZE_N".to_string(),
+                format!("{QUANT_MUL_MAT_WG_SIZE_N}u"),
+            ),
+            (
+                "TILE_K".to_string(),
+                format!("{QUANT_MUL_MAT_REG_TILE_K_QUANT}u"),
+            ),
+        ];
+        defines.push("TILE_M".to_string());
+        defines.push("TILE_N".to_string());
+        defines.push("WORKGROUP_SIZE_M".to_string());
+        defines.push("WORKGROUP_SIZE_N".to_string());
+        defines.push("TILE_K".to_string());
+        Some(preprocess(&source, &defines, &replacements, DType::F16))
+    })
 }
 
 pub fn quantized_get_rows_f32_shader(dtype: QuantizedDType, workgroup_size: u32) -> Option<String> {
-    let source = get("get_rows.wgsl")?.source().replace(
-        "#include \"common_decls.tmpl\"",
-        get("common_decls.tmpl")?.source(),
-    );
-    let (mut defines, src_type, block_size) = quantized_shader_config(dtype);
-    defines.push("DECLARE_BYTE_LOADERS_SRC".to_string());
-    let replacements = vec![
-        ("WG_SIZE".to_string(), workgroup_size.to_string()),
-        ("BLOCK_SIZE".to_string(), block_size.to_string()),
-        ("SRC_TYPE".to_string(), src_type.to_string()),
-        ("DST_TYPE".to_string(), "f32".to_string()),
-    ];
-    Some(preprocess(&source, &defines, &replacements, DType::F16))
+    cached_shader((20u8, dtype as u8, workgroup_size), || {
+        let source = get("get_rows.wgsl")?.source().replace(
+            "#include \"common_decls.tmpl\"",
+            get("common_decls.tmpl")?.source(),
+        );
+        let (mut defines, src_type, block_size) = quantized_shader_config(dtype);
+        defines.push("DECLARE_BYTE_LOADERS_SRC".to_string());
+        let replacements = vec![
+            ("WG_SIZE".to_string(), workgroup_size.to_string()),
+            ("BLOCK_SIZE".to_string(), block_size.to_string()),
+            ("SRC_TYPE".to_string(), src_type.to_string()),
+            ("DST_TYPE".to_string(), "f32".to_string()),
+        ];
+        Some(preprocess(&source, &defines, &replacements, DType::F16))
+    })
 }
 
 fn quantized_mul_mat_id_init_define(dtype: QuantizedDType) -> &'static str {
@@ -1210,54 +1293,64 @@ fn quantized_mul_mat_id_init_define(dtype: QuantizedDType) -> &'static str {
 }
 
 pub fn quantized_mul_mat_id_gather_shader(workgroup_size: u32) -> Option<String> {
-    let source = get("mul_mat_id_gather.wgsl")?.source();
-    let defines = Vec::new();
-    let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
-    Some(preprocess(source, &defines, &replacements, DType::F32))
+    cached_shader((21u8, workgroup_size), || {
+        let source = get("mul_mat_id_gather.wgsl")?.source();
+        let defines = Vec::new();
+        let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+        Some(preprocess(source, &defines, &replacements, DType::F32))
+    })
 }
 
 pub fn quantized_mul_mat_id_shader(dtype: QuantizedDType, rhs_dtype: DType) -> Option<String> {
-    let source = get("mul_mat_id.wgsl")?
-        .source()
-        .replace(
-            "#include \"common_decls.tmpl\"",
-            get("common_decls.tmpl")?.source(),
-        )
-        .replace(
-            "#include \"mul_mat_decls.tmpl\"",
-            get("mul_mat_decls.tmpl")?.source(),
-        );
-    let (mut defines, _, _) = quantized_shader_config(dtype);
-    defines.push("MUL_MAT_ID".to_string());
-    defines.push("SCALAR".to_string());
-    defines.push("BYTE_HELPERS".to_string());
-    defines.push("DECLARE_BYTE_LOADERS_SRC0".to_string());
-    defines.push("INIT_SRC1_SHMEM_FLOAT".to_string());
-    defines.push("U32_DEQUANT_HELPERS".to_string());
-    defines.push(quantized_mul_mat_id_init_define(dtype).to_string());
-    defines.push("TILE_M".to_string());
-    defines.push("TILE_N".to_string());
-    defines.push("WORKGROUP_SIZE_M".to_string());
-    defines.push("WORKGROUP_SIZE_N".to_string());
-    defines.push("TILE_K".to_string());
+    cached_shader((22u8, dtype as u8, rhs_dtype as u8), || {
+        let source = get("mul_mat_id.wgsl")?
+            .source()
+            .replace(
+                "#include \"common_decls.tmpl\"",
+                get("common_decls.tmpl")?.source(),
+            )
+            .replace(
+                "#include \"mul_mat_decls.tmpl\"",
+                get("mul_mat_decls.tmpl")?.source(),
+            );
+        let (mut defines, _, _) = quantized_shader_config(dtype);
+        defines.push("MUL_MAT_ID".to_string());
+        defines.push("SCALAR".to_string());
+        defines.push("BYTE_HELPERS".to_string());
+        defines.push("DECLARE_BYTE_LOADERS_SRC0".to_string());
+        defines.push("INIT_SRC1_SHMEM_FLOAT".to_string());
+        defines.push("U32_DEQUANT_HELPERS".to_string());
+        defines.push(quantized_mul_mat_id_init_define(dtype).to_string());
+        // Full f32 shmem + accumulator for the routed-expert GEMM. The legacy
+        // f16 accumulator drops ~7% relative at k=1024 (f16 mantissa over a
+        // long reduction), which compounds over 48 MoE layers and drives greedy
+        // decode into degenerate repetition. f32 matches the dense/CUDA
+        // reference accumulation precision and restores coherent output.
+        defines.push("FLOAT_ACC_SHMEM".to_string());
+        defines.push("TILE_M".to_string());
+        defines.push("TILE_N".to_string());
+        defines.push("WORKGROUP_SIZE_M".to_string());
+        defines.push("WORKGROUP_SIZE_N".to_string());
+        defines.push("TILE_K".to_string());
 
-    let src1_type = match rhs_dtype {
-        DType::F32 => "f32",
-        DType::F16 => "f16",
-    };
-    let replacements = vec![
-        ("SRC0_TYPE".to_string(), "u32".to_string()),
-        ("SRC1_TYPE".to_string(), src1_type.to_string()),
-        ("SRC0_INNER_TYPE".to_string(), "u32".to_string()),
-        ("SRC1_INNER_TYPE".to_string(), src1_type.to_string()),
-        ("DST_TYPE".to_string(), "f32".to_string()),
-        ("TILE_M".to_string(), "4u".to_string()),
-        ("TILE_N".to_string(), "4u".to_string()),
-        ("TILE_K".to_string(), "32u".to_string()),
-        ("WORKGROUP_SIZE_M".to_string(), "8u".to_string()),
-        ("WORKGROUP_SIZE_N".to_string(), "8u".to_string()),
-    ];
-    Some(preprocess(&source, &defines, &replacements, DType::F16))
+        let src1_type = match rhs_dtype {
+            DType::F32 => "f32",
+            DType::F16 => "f16",
+        };
+        let replacements = vec![
+            ("SRC0_TYPE".to_string(), "u32".to_string()),
+            ("SRC1_TYPE".to_string(), src1_type.to_string()),
+            ("SRC0_INNER_TYPE".to_string(), "u32".to_string()),
+            ("SRC1_INNER_TYPE".to_string(), src1_type.to_string()),
+            ("DST_TYPE".to_string(), "f32".to_string()),
+            ("TILE_M".to_string(), "4u".to_string()),
+            ("TILE_N".to_string(), "4u".to_string()),
+            ("TILE_K".to_string(), "32u".to_string()),
+            ("WORKGROUP_SIZE_M".to_string(), "8u".to_string()),
+            ("WORKGROUP_SIZE_N".to_string(), "8u".to_string()),
+        ];
+        Some(preprocess(&source, &defines, &replacements, DType::F16))
+    })
 }
 
 pub fn conv2d_f32_shader(workgroup_size: u32) -> Option<String> {

@@ -9,12 +9,38 @@ impl WgpuDevice {
     pub fn transfer_to_device(&self, _: &WgpuStorage) -> Result<WgpuStorage> {
         Err(Error::NotCompiledWithWgpuSupport)
     }
+
+    pub fn adapter_name(&self) -> &str {
+        ""
+    }
+
+    pub fn take_runtime_error(&self) -> Option<String> {
+        None
+    }
+
+    pub fn is_lost(&self) -> bool {
+        false
+    }
+
+    pub async fn new_async(_: usize) -> Result<Self> {
+        Err(Error::NotCompiledWithWgpuSupport)
+    }
+
+    /// Async host/GPU synchronize. Mirrors the real wgpu backend; on the dummy
+    /// (feature `wgpu` disabled) it is a no-op so callers stay API-compatible.
+    pub async fn synchronize_async(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 pub struct WgpuStorage;
 
 impl WgpuStorage {
+    pub async fn to_cpu_storage_async(&self) -> Result<CpuStorage> {
+        Err(Error::NotCompiledWithWgpuSupport)
+    }
+
     pub(crate) fn quantized_index_select_f32(
         &self,
         _: crate::quantized::GgmlDType,

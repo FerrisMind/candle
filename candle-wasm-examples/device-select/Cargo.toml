@@ -1,0 +1,20 @@
+[package]
+name = "candle-wasm-device-select"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+wgpu = ["candle/wgpu"]
+
+[dependencies]
+candle = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+# Matches `.cargo/config.toml` wasm32 `getrandom_backend="wasm_js"` and
+# candle-wasm-tests: getrandom 0.3 on wasm32-unknown-unknown requires this feature.
+getrandom = { version = "0.3", features = ["wasm_js"] }

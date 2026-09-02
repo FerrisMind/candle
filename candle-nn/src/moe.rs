@@ -112,6 +112,89 @@ fn moe_gemm_fallback(
     Ok(out)
 }
 
+// GPU (Vulkan/Wgpu): dequantize ONLY the routed experts, keeping the per-layer
+// QTensor weights quantized on-device. This is the memory-efficient equivalent
+// of the CUDA `moe_gemm_gguf[_prefill]` kernel. The dense fallback (used by
+// cpu/metal and any non-gpu device) fully dequantizes [num_experts, n, k] every
+// forward, which on a 9.75GB 12GB-card MoE pushes prefill past the VRAM budget
+// even with an otherwise-recycling allocator (verified: peak, not accumulation,
+// because the pool recycles with deferred/pending empty yet OOMs). The body is
+// device-generic: `QTensor::indexed_moe_forward` dispatches internally to the
+// backend-specific fused kernel (VegaQuant / wgpu `quantized_indexed_moe_f32`),
+// so this single function serves both the vulkan and wgpu devices. Gating on
+// `feature = "wgpu"`/`"vulkan"` keeps the branch out of cpu/cuda/metal builds.
+#[cfg(any(feature = "vulkan", feature = "wgpu"))]
+#[allow(clippy::too_many_arguments)]
+fn moe_gemm_gguf_fused(
+    input: &Tensor,
+    weights: &QTensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+) -> Result<Tensor> {
+    if topk == 0 {
+        candle::bail!("moe_gemm_gguf_fused topk must be > 0")
+    }
+    let (num_experts, size_n, _size_k) = weights.shape().dims3()?;
+    let assignments = sorted_token_ids.dim(0)?;
+    if assignments != experts_ids.dim(0)? {
+        candle::bail!(
+            "moe_gemm_gguf_fused id length mismatch: {} vs {}",
+            assignments,
+            experts_ids.dim(0)?
+        );
+    }
+    if assignments % topk != 0 {
+        candle::bail!(
+            "moe_gemm_gguf_fused assignments ({assignments}) must be divisible by topk ({topk})"
+        )
+    }
+    let batch = assignments / topk;
+
+    // Reconstruct the token-aligned [batch, topk] expert-id matrix in ORIGINAL
+    // token-major order. `sorted_token_ids`/`experts_ids` are the sorted form
+    // (permutation pairs); `indexed_moe_forward` consumes ids aligned with the
+    // input rows, so scatter the sort's inverse (matching moe_gemm_fallback).
+    let sorted_token_ids = if sorted_token_ids.dtype() == DType::U32 {
+        sorted_token_ids.clone()
+    } else {
+        sorted_token_ids.to_dtype(DType::U32)?
+    };
+    let experts_ids = if experts_ids.dtype() == DType::U32 {
+        experts_ids.clone()
+    } else {
+        experts_ids.to_dtype(DType::U32)?
+    };
+    let pos_to_expert = Tensor::zeros((assignments,), DType::U32, input.device())?;
+    pos_to_expert.scatter_set(&sorted_token_ids, &experts_ids, 0)?;
+    let max_expert_id = pos_to_expert.max_all()?.to_scalar::<u32>()? as usize;
+    if max_expert_id >= num_experts {
+        candle::bail!(
+            "moe_gemm_gguf_fused expert id {max_expert_id} out of range for {num_experts} experts"
+        );
+    }
+    let ids = pos_to_expert.reshape((batch, topk))?;
+
+    // Fused quantized indexed-MoE: keeps weights quantized and dequantizes only
+    // the routed experts on-device, so no [num_experts, n, k] buffer is
+    // materialized (the transient that OOM'd the dense fallback).
+    let x = input.to_dtype(DType::F32)?;
+    let mut out = weights.indexed_moe_forward(&x, &ids)?;
+
+    if let Some(topk_weights) = topk_weights {
+        let gating = topk_weights.to_dtype(DType::F32)?.unsqueeze(2)?;
+        out = out.broadcast_mul(&gating)?;
+    }
+    if out.rank() != 3 || out.shape() != &candle::Shape::from((batch, topk, size_n)) {
+        candle::bail!(
+            "moe_gemm_gguf_fused produced unexpected output shape {:?}, expected ({batch}, {topk}, {size_n})",
+            out.shape()
+        );
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn moe_gemm_gguf_fallback(
     input: &Tensor,
@@ -123,6 +206,22 @@ fn moe_gemm_gguf_fallback(
     is_prefill: bool,
     dtype: DType,
 ) -> Result<Tensor> {
+    #[cfg(any(feature = "vulkan", feature = "wgpu"))]
+    {
+        // Route GPU devices (Vulkan/Wgpu) through the fused, memory-efficient
+        // selected-expert path. cpu/metal (and any other device) keep the dense
+        // fallback below.
+        if input.device().is_vulkan() || input.device().is_wgpu() {
+            return moe_gemm_gguf_fused(
+                input,
+                weights,
+                topk_weights,
+                sorted_token_ids,
+                experts_ids,
+                topk,
+            );
+        }
+    }
     let deq_weights = if is_prefill && matches!(dtype, DType::F16 | DType::BF16) {
         weights.dequantize_f16(input.device())?
     } else {

@@ -688,6 +688,38 @@ impl Tensor {
         }
     }
 
+    /// Async variant of [`Self::to_scalar`]. Use on `wasm32` + wgpu — sync GPU readback deadlocks.
+    pub async fn to_scalar_async<S: crate::WithDType>(&self) -> Result<S> {
+        if self.rank() != 0 {
+            Err(Error::UnexpectedNumberOfDims {
+                expected: 0,
+                got: self.rank(),
+                shape: self.shape().clone(),
+            }
+            .bt())?
+        }
+        let from_cpu_storage = |cpu_storage: &crate::CpuStorage| {
+            let data = S::cpu_storage_as_slice(cpu_storage)?;
+            Ok::<_, Error>(data[self.layout().start_offset()])
+        };
+        match &*self.storage() {
+            Storage::Cpu(cpu_storage) => from_cpu_storage(cpu_storage),
+            Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Wgpu(storage) => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    from_cpu_storage(&storage.to_cpu_storage_async().await?)
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    from_cpu_storage(&storage.to_cpu_storage()?)
+                }
+            }
+            Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+        }
+    }
+
     /// An alias for `to_scalar`.
     pub fn to_vec0<S: crate::WithDType>(&self) -> Result<S> {
         self.to_scalar::<S>()
@@ -2156,6 +2188,42 @@ impl Tensor {
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Wgpu(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+        }
+    }
+
+    /// Async variant of [`Self::to_vec1`]. Use on `wasm32` + wgpu — sync GPU readback deadlocks.
+    pub async fn to_vec1_async<S: crate::WithDType>(&self) -> Result<Vec<S>> {
+        if self.rank() != 1 {
+            Err(Error::UnexpectedNumberOfDims {
+                expected: 1,
+                got: self.rank(),
+                shape: self.shape().clone(),
+            }
+            .bt())?
+        }
+        let from_cpu_storage = |cpu_storage: &crate::CpuStorage| {
+            let data = S::cpu_storage_as_slice(cpu_storage)?;
+            let data = match self.layout.contiguous_offsets() {
+                Some((o1, o2)) => data[o1..o2].to_vec(),
+                None => self.strided_index().map(|i| data[i]).collect(),
+            };
+            Ok::<Vec<_>, Error>(data)
+        };
+        match &*self.storage() {
+            Storage::Cpu(storage) => from_cpu_storage(storage),
+            Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Wgpu(storage) => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    from_cpu_storage(&storage.to_cpu_storage_async().await?)
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    from_cpu_storage(&storage.to_cpu_storage()?)
+                }
+            }
             Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }

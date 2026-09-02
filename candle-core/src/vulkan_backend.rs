@@ -519,6 +519,12 @@ pub struct VulkanDevice {
     inner: Arc<VulkanInner>,
 }
 
+// Same wgpu/ash auto-trait recursion overflow (E0275) as WgpuDevice: fields are
+// genuinely Send+Sync (ash::Entry/Instance and vk handles are Send+Sync), but
+// rustc's solver recurses too deep. Short-circuit explicitly.
+unsafe impl Send for VulkanDevice {}
+unsafe impl Sync for VulkanDevice {}
+
 struct VulkanInner {
     ordinal: usize,
     physical_device_name: String,
@@ -541,6 +547,7 @@ struct VulkanInner {
     max_workgroup_size_log2: u32,
     max_workgroup_count_x: u32,
     max_workgroup_count_y: u32,
+    max_workgroup_count_z: u32,
     max_push_constants_size: u32,
     robust_buffer_access: bool,
     vulkan_memory_model: bool,
@@ -570,6 +577,12 @@ struct VulkanInner {
     /// Staging buffers whose GPU references have been released and are pending
     /// return to the pool (drained during cleanup).
     staging_pending_return: Mutex<Vec<Arc<VulkanBuffer>>>,
+    /// Pool of reusable non-staging GPU compute buffers, keyed by exact byte
+    /// size. MoE per-layer dequant buffers are allocated with identical sizes
+    /// every layer; recycling them here (analogous to the staging pool) stops
+    /// the allocator from accumulating transient buffers across layers, which
+    /// otherwise surfaces as monotonic VRAM growth and OOM on 12GB cards.
+    gpu_buffer_pool: Mutex<HashMap<usize, Vec<Arc<VulkanBuffer>>>>,
 }
 
 impl VulkanDevice {
@@ -883,6 +896,11 @@ pub struct VulkanStorage {
     count: usize,
     dtype: DType,
 }
+
+// Fields are genuinely Send+Sync (Arc<VulkanBuffer> + VulkanDevice). See the
+// note on `unsafe impl Send/Sync for VulkanDevice` for the recursion reason.
+unsafe impl Send for VulkanStorage {}
+unsafe impl Sync for VulkanStorage {}
 
 fn unsupported(op: &'static str) -> Error {
     Error::Msg(format!("vulkan backend op {op} not implemented")).bt()
@@ -1586,9 +1604,47 @@ impl VulkanDevice {
     /// cascade over this many hot-path ops (alloc/copy/dispatch). Kept small so fences
     /// still get polled and deferred buffers/caps still get drained promptly, but large
     /// enough to remove ~all of the per-op host overhead from the decode loop.
-    const CLEANUP_DEBT_THRESHOLD: u32 = 32;
+    ///
+    /// D5: raised 32 -> 128. The qwen3-0.6B prefill/decode loop is host/dispatch-bound
+    /// (~hundreds of tiny dependent ops per token), and every hot-path op previously ran
+    /// a real `cleanup_pending_submissions(false)` fence-poll + multi-lock cascade every
+    /// 32 ops (~17x/token). Batching fewer, larger amortized cleanups (~4x/token) removes
+    /// most of that host overhead from the common path. Correctness is preserved: the
+    /// deferred-buffer force-drain boundary is still guarded by the independent
+    /// `deferred_buffer_frees` cap check (the `deferred_near_cap` guard in
+    /// `cleanup_pending_submissions_amortized` and the `> MAX_DEFERRED_BUFFER_FREES`
+    /// force-drain in `cleanup_pending_submissions_impl`), and explicit sync points
+    /// (`synchronize`/`read_buffer`/`wait_for_transfer_dependencies`) still poll fences.
+    const CLEANUP_DEBT_THRESHOLD: u32 = 128;
     /// Maximum number of staging buffers per size class in the pool.
     const MAX_STAGING_PER_SIZE_CLASS: usize = 32;
+    // Large upload staging buffers (weight uploads during model load) are
+    // one-shot: holding them in the power-of-two pool hoards host-visible
+    // memory (observed ~0.7GB shared spill on the 16B MoE load). Pool only
+    // small staging; defer-free larger ones so the host memory is returned
+    // instead of retained across the whole process.
+    const MAX_POOLED_STAGING_BYTES: usize = 4 * 1024 * 1024;
+    /// Maximum number of reusable non-staging GPU buffers retained per size
+    /// class in `gpu_buffer_pool` before overflowing to the deferred-free
+    /// list. Kept small: MoE reuses a handful of distinct sizes, and larger
+    /// values only hoard memory that could otherwise return to the allocator.
+    const MAX_GPU_POOL_PER_SIZE_CLASS: usize = 4;
+
+    /// Total byte ceiling for `gpu_buffer_pool` residency. Decode of GQA models
+    /// reallocates the KV-cache into a new distinct size every step (cat +
+    /// contiguous), so over a long generation the pool otherwise accumulates a
+    /// buffer per distinct seq-dependent size and the parent device blocks never
+    /// empty — the llama decode VRAM floor (observed ~8-10 GB vs ~3 GB of live
+    /// activations). Once the ceiling is exceeded, a recycled buffer falls through
+    /// to the deferred-free path so its device block can actually be released.
+    const MAX_GPU_POOL_TOTAL_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
+
+    /// Weight buffers at or above this size are allocated as dedicated exact-sized
+    /// blocks instead of sub-allocation into shared blocks. Large enough that the
+    /// per-buffer dedicated overhead is negligible, small enough that the dominant
+    /// weight tensors (the 16B MoE gate/down/up projections, ~16-255MB) are all
+    /// dedicated and stop leaving intra-block slack in 256MB gpu-allocator blocks.
+    const WEIGHT_DEDICATED_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
 
     fn copy_queue_and_family(
         &self,
@@ -1997,6 +2053,7 @@ impl VulkanDevice {
         self.inner.vendor_id
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_buffer_with_location(
         &self,
         size: usize,
@@ -2005,6 +2062,7 @@ impl VulkanDevice {
         location: MemoryLocation,
         is_staging: bool,
         staging_kind: StagingKind,
+        dedicated_allocation: bool,
     ) -> Result<Arc<VulkanBuffer>> {
         self.cleanup_pending_submissions_amortized()?;
         let mut info = vk::BufferCreateInfo::default()
@@ -2025,6 +2083,14 @@ impl VulkanDevice {
         let buffer =
             unsafe { self.inner.device.create_buffer(&info, None) }.map_err(Error::wrap)?;
         let requirements = unsafe { self.inner.device.get_buffer_memory_requirements(buffer) };
+        let alloc_scheme = if dedicated_allocation {
+            // Dedicated, exact-sized block per weight tensor: avoids the intra-block
+            // slack from sub-allocating many mid-size weights into shared 256MB
+            // blocks (measured ~754MB slack on the 16B MoE). Load-time only.
+            AllocationScheme::DedicatedBuffer(buffer)
+        } else {
+            AllocationScheme::GpuAllocatorManaged
+        };
         let allocate_once = || -> Result<Allocation> {
             let mut allocator = self
                 .inner
@@ -2040,7 +2106,7 @@ impl VulkanDevice {
                     requirements,
                     location,
                     linear: true,
-                    allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+                    allocation_scheme: alloc_scheme,
                 })
                 .map_err(Error::wrap)
         };
@@ -2082,6 +2148,22 @@ impl VulkanDevice {
     }
 
     fn create_buffer(&self, size: usize, name: &'static str) -> Result<Arc<VulkanBuffer>> {
+        // Reuse a pooled non-staging buffer of the exact requested size before
+        // allocating a fresh one. Pooled buffers are only returned to the pool
+        // after every submission referencing them completes (they are retained
+        // via `batch.retained_buffers` Arc clones), so reusing them is safe and
+        // skips the allocator's deferred-free round-trip — which otherwise
+        // accumulates per-layer dequant buffers on MoE prefill and grows VRAM
+        // monotonically (the reported vulkan OOM). Mirror of the staging pool.
+        if size > 0 {
+            if let Some(buf) = self.take_pooled_gpu_buffer(size)? {
+                // Pool hit: still advance the amortized cleanup counter so fence
+                // polling and deferred-drain cadence are maintained even though
+                // we skip the allocation path below.
+                self.cleanup_pending_submissions_amortized()?;
+                return Ok(buf);
+            }
+        }
         self.create_buffer_with_location(
             size,
             name,
@@ -2092,7 +2174,37 @@ impl VulkanDevice {
             MemoryLocation::GpuOnly,
             false,
             StagingKind::None,
+            false,
         )
+    }
+
+    /// Create a dedicated, exact-sized device-local buffer. Used for weight-load
+    /// buffers whose sizes are large enough that sub-allocating them into shared
+    /// blocks leaves significant intra-block slack (see create_buffer_with_location).
+    fn create_dedicated_buffer(&self, size: usize, name: &'static str) -> Result<Arc<VulkanBuffer>> {
+        self.create_buffer_with_location(
+            size,
+            name,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::UNIFORM_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuOnly,
+            false,
+            StagingKind::None,
+            true,
+        )
+    }
+
+    /// Pop a reusable non-staging compute buffer of the exact byte `size` from
+    /// the recycle pool, if one is available.
+    fn take_pooled_gpu_buffer(&self, size: usize) -> Result<Option<Arc<VulkanBuffer>>> {
+        let mut pool = self
+            .inner
+            .gpu_buffer_pool
+            .lock()
+            .map_err(|e| Error::wrap(e.to_string()))?;
+        Ok(pool.get_mut(&size).and_then(|entry| entry.pop()))
     }
 
     /// Power-of-two size class for staging buffer pooling.
@@ -2124,6 +2236,7 @@ impl VulkanDevice {
                     location,
                     false,
                     StagingKind::None,
+                    false,
                 );
             }
         };
@@ -2152,7 +2265,7 @@ impl VulkanDevice {
         }
         // Pool miss: create a new buffer with the requested size (not size_class)
         // to avoid allocating more than needed.
-        self.create_buffer_with_location(size, name, usage, location, true, staging_kind)
+        self.create_buffer_with_location(size, name, usage, location, true, staging_kind, false)
     }
 
     /// Drain the staging pending return list into the free pools.
@@ -2190,7 +2303,24 @@ impl VulkanDevice {
             };
             let mut pool = pool.lock().map_err(|e| Error::wrap(e.to_string()))?;
             let entry = pool.entry(size_class).or_default();
-            if entry.len() < Self::MAX_STAGING_PER_SIZE_CLASS {
+            if buf.size > Self::MAX_POOLED_STAGING_BYTES {
+                // Large one-shot staging (weight uploads during model load):
+                // defer-free instead of pooling to bound the host-visible
+                // (shared) memory that otherwise stays reserved across the whole
+                // process. Small staging is pooled for the many small transfer
+                // cycles.
+                drop(pool);
+                if let Ok(mut alloc) = buf.allocation.lock() {
+                    if let Some(allocation) = alloc.take() {
+                        if let Ok(mut deferred) = self.inner.deferred_buffer_frees.lock() {
+                            deferred.push(VulkanDeferredBuffer {
+                                buffer: buf.buffer,
+                                allocation,
+                            });
+                        }
+                    }
+                }
+            } else if entry.len() < Self::MAX_STAGING_PER_SIZE_CLASS {
                 entry.push(buf);
             } else {
                 // Pool full: defer free instead
@@ -3792,6 +3922,75 @@ impl VulkanStorage {
             workgroups,
         )?;
         Ok(dst)
+    }
+
+    /// m == 1 GEMV on F16 weights (decode weight matmuls: qkv/o/gate/up/down/lm_head).
+    /// Mirrors `run_batched_gemv_f32` but binds the F16 LHS activation and the F16 [n, k]
+    /// weight directly (float16_t reads) and accumulates in F32. The generic F16 tile
+    /// kernel wastes M-tiles on m == 1; this routes those to a dedicated coalesced GEMV.
+    /// Accumulation order matches `batched_gemv_f32` (32-lane K split + shared reduction).
+    #[allow(clippy::too_many_arguments)]
+    fn run_batched_gemv_f16(
+        &self,
+        rhs_t: &Self,
+        lhs_layout: &Layout,
+        rhs_t_layout: &Layout,
+        b: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        debug_assert_eq!(m, 1);
+        // Output is F32 to match the current `matmul_f16_fp32` decode path (f32 accum).
+        let dst_shape = Shape::from(vec![b, 1, n]);
+        let dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::F32)? };
+        let rank = rhs_t_layout.dims().len();
+        let batch_stride_a = if lhs_layout.dims().len() >= 3 {
+            lhs_layout.stride()[lhs_layout.dims().len() - 3]
+        } else {
+            m * k
+        };
+        let batch_stride_b = if rank >= 3 {
+            rhs_t_layout.stride()[rank - 3]
+        } else {
+            n * k
+        };
+        let params = VulkanBatchedGemvParams {
+            k_dim: k.try_into()?,
+            n_dim: n.try_into()?,
+            batch: b.try_into()?,
+            offset_a: lhs_layout.start_offset().try_into()?,
+            offset_b: rhs_t_layout.start_offset().try_into()?,
+            offset_d: 0,
+            batch_stride_a: batch_stride_a.try_into()?,
+            batch_stride_b: batch_stride_b.try_into()?,
+            batch_stride_d: n.try_into()?,
+        };
+        // LHS activation (F16) on 0, F16 weight [n, k] on 1, F32 output on 2.
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&rhs_t.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        let spirv = candle_vulkan_kernels::spirv("batched_gemv_f16")
+            .ok_or_else(|| Error::Msg("vulkan shader batched_gemv_f16 not generated".into()).bt())?;
+        let workgroups = (n.div_ceil(4).try_into()?, b.try_into()?, 1u32);
+        self.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            workgroups,
+        )?;
+        // Accumulate in F32 then round back to the F16 activation dtype, matching the
+        // `matmul_f16_fp32` decode path (f32 accum, f16 result) so downstream ops see
+        // the same dtype as before (fixes dtype mismatch in the MLP silu*up chain).
+        if self.dtype != DType::F32 {
+            let out_l = Layout::contiguous(dst_shape);
+            let out = dst.to_dtype(&out_l, self.dtype)?;
+            Ok(out)
+        } else {
+            Ok(dst)
+        }
     }
 
     /// Context-attention GEMV for the m == 1 case, reading V in its NATURAL
@@ -6974,8 +7173,17 @@ impl VulkanStorage {
     }
 
     pub fn sigmoid(&self, layout: &Layout) -> Result<Self> {
-        if self.dtype != DType::F32 && self.dtype != DType::F16 {
+        if self.dtype != DType::F32 && self.dtype != DType::F16 && self.dtype != DType::BF16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan sigmoid").bt());
+        }
+        if self.dtype == DType::BF16 {
+            // CUDA parity: emulate via an F32 hub so the BF16 result is computed
+            // in f32 precision rather than a dedicated BF16 shader.
+            let src_f32 = self.to_dtype(layout, DType::F32)?;
+            let src_f32_l = Layout::contiguous(layout.shape().clone());
+            let out_f32 = src_f32.sigmoid(&src_f32_l)?;
+            let out_l = Layout::contiguous(layout.shape().clone());
+            return out_f32.to_dtype(&out_l, DType::BF16);
         }
         let (spirv, kind) = unary_spirv("sigmoid", self.dtype)?;
         match kind {
@@ -7523,16 +7731,11 @@ impl VulkanStorage {
             let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
             return out_f32.to_dtype(&out_l, DType::BF16);
         }
-        // ponytail: F16 — upconvert to F32 for matmul, matching wgpu fix.
-        if self.dtype == DType::F16 {
-            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
-            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
-            let lhs_f32_l = Layout::contiguous(lhs_l.shape().clone());
-            let rhs_f32_l = Layout::contiguous(rhs_l.shape().clone());
-            let out_f32 = lhs_f32.run_matmul_f32(&rhs_f32, (b, m, n, k), &lhs_f32_l, &rhs_f32_l)?;
-            let out_l = Layout::contiguous(Shape::from(vec![b, m, n]));
-            return out_f32.to_dtype(&out_l, DType::F16);
-        }
+        // F16: dispatch directly to the `matmul_f16_fp32` kernel, which binds the
+        // ORIGINAL F16 weights and accumulates in f32. Previously the whole weight
+        // was upconverted to F32 via `to_dtype` (an f32 copy of e.g. lm_head
+        // [128256, 2048] ~1 GiB on EVERY decode step) which ballooned VRAM. Keep
+        // f32 accumulation for numeric parity with the cpu/wgpu reference.
         if self.dtype != DType::F32
             && self.dtype != DType::F16
             && self.dtype != DType::BF16
@@ -7718,6 +7921,21 @@ impl VulkanStorage {
                 use_dmmv_subgroups,
                 required_subgroup_size,
             )?;
+            drop(lhs_contiguous);
+            return Ok(dst);
+        }
+        if rank == 2
+            && self.dtype == DType::F16
+            && m == 1
+            && b == 1
+            && lhs_layout.is_contiguous()
+            && rhs_t_layout.is_contiguous()
+        {
+            // Decode weight matmuls (qkv/o/gate/up/down/lm_head) are m == 1 on F16
+            // activations with F16 [n, k] weights. The generic F16 tile kernel wastes
+            // M-tiles on m == 1, so route to the dedicated coalesced GEMV. Accumulates
+            // in F32 (matches the `matmul_f16_fp32` output dtype).
+            let dst = lhs.run_batched_gemv_f16(rhs_t, &lhs_layout, &rhs_t_layout, b, m, n, k)?;
             drop(lhs_contiguous);
             return Ok(dst);
         }
@@ -8048,14 +8266,21 @@ impl VulkanStorage {
         ];
         let spirv = candle_vulkan_kernels::spirv("im2col_f32")
             .ok_or_else(|| Error::Msg("vulkan shader im2col_f32 not generated".into()).bt())?;
+        // Clamp each dispatch dimension to the device limit. The im2col kernel
+        // grid-strides over any remainder (ow += gl_NumWorkGroups.y etc), so a
+        // clamped count stays correct even when l_out/w_out exceeds the common
+        // maxComputeWorkGroupCount of 65535.
+        let gx: u32 = chw.div_ceil(512).try_into()?;
+        let gy: u32 = l_out.try_into()?;
+        let gz: u32 = params.b_size.try_into()?;
         self.device.run_compute_specialized(
             spirv,
             &bindings,
             Some(any_as_bytes(&push)),
             (
-                chw.div_ceil(512).try_into()?,
-                l_out.try_into()?,
-                params.b_size.try_into()?,
+                gx.min(self.device.inner.max_workgroup_count_x).max(1),
+                gy.min(self.device.inner.max_workgroup_count_y).max(1),
+                gz.min(self.device.inner.max_workgroup_count_z).max(1),
             ),
             Some(&[(0, 32)]),
         )?;
@@ -8155,14 +8380,17 @@ impl VulkanStorage {
         ];
         let spirv = candle_vulkan_kernels::spirv("im2col_f32")
             .ok_or_else(|| Error::Msg("vulkan shader im2col_f32 not generated".into()).bt())?;
+        let gx: u32 = chw.div_ceil(512).try_into()?;
+        let gy: u32 = w_out.try_into()?;
+        let gz: u32 = (params.b_size * h_out).try_into()?;
         self.device.run_compute_specialized(
             spirv,
             &bindings,
             Some(any_as_bytes(&push)),
             (
-                chw.div_ceil(512).try_into()?,
-                w_out.try_into()?,
-                (params.b_size * h_out).try_into()?,
+                gx.min(self.device.inner.max_workgroup_count_x).max(1),
+                gy.min(self.device.inner.max_workgroup_count_y).max(1),
+                gz.min(self.device.inner.max_workgroup_count_z).max(1),
             ),
             Some(&[(0, 32)]),
         )?;
@@ -9235,7 +9463,7 @@ impl VulkanStorage {
                 vulkan_dmmv_shader_name(
                     &self.device,
                     qdtype,
-                    format!("mul_mat_vec_id_{}_f32", vulkan_quantized_stem(qdtype)?),
+                    format!("mul_mat_vec_id_{}_f32_f32", vulkan_quantized_stem(qdtype)?),
                     dmmv_workgroup,
                 ),
                 vulkan_quantized_vec_rows(qdtype)?,
@@ -9299,7 +9527,35 @@ impl Drop for VulkanBuffer {
                         return;
                     }
                 }
-                // Non-staging buffers always route through the device-level
+                // Non-staging GPU compute buffers: recycle into the exact-size
+                // reuse pool before falling back to the deferred-free list.
+                // Pooled buffers are retained via `retained_buffers` until every
+                // referencing submission completes, so a buffer reaching this
+                // point is confirmed free of in-flight GPU work — making reuse
+                // safe. This is what lets per-layer MoE dequant buffers (fixed
+                // per-layer sizes) be recycled instead of re-allocated, which is
+                // the allocator accumulation that caused the vulkan prefill OOM.
+                if self.size > 0 {
+                    if let Ok(mut pool) = self.device.inner.gpu_buffer_pool.lock() {
+                        let total_bytes: usize =
+                            pool.values().flatten().map(|b| b.size).sum();
+                        let entry = pool.entry(self.size).or_default();
+                        if entry.len() < VulkanDevice::MAX_GPU_POOL_PER_SIZE_CLASS
+                            && total_bytes + self.size <= VulkanDevice::MAX_GPU_POOL_TOTAL_BYTES
+                        {
+                            entry.push(Arc::new(VulkanBuffer {
+                                device: self.device.clone(),
+                                buffer: self.buffer,
+                                allocation: Mutex::new(Some(allocation)),
+                                size: self.size,
+                                is_staging: self.is_staging,
+                                staging_kind: self.staging_kind,
+                            }));
+                            return;
+                        }
+                    }
+                }
+                // Pool full (or 0-byte buffer): route through the device-level
                 // deferred-free list: the actual `allocator.free` runs in
                 // `destroy_deferred_buffers` under the allocator lock (never
                 // here — VulkanBuffer::drop can run while that lock is held).
@@ -9428,7 +9684,11 @@ impl Drop for VulkanInner {
                             }
                         }
                     }
-                    for pool in [&self.upload_staging_pool, &self.readback_staging_pool] {
+                    for pool in [
+                        &self.upload_staging_pool,
+                        &self.readback_staging_pool,
+                        &self.gpu_buffer_pool,
+                    ] {
                         if let Ok(mut pool) = pool.lock() {
                             for (_, bufs) in pool.drain() {
                                 for buf in bufs {
@@ -9461,22 +9721,14 @@ impl BackendStorage for VulkanStorage {
     type Device = VulkanDevice;
 
     fn try_clone(&self, layout: &Layout) -> Result<Self> {
-        if layout.is_contiguous()
-            && layout.start_offset() == 0
-            && layout.shape().elem_count() == self.count
-        {
-            let bytes = self.device.read_buffer(&self.buffer)?;
-            let buffer = self
-                .device
-                .create_buffer(bytes.len(), "candle-vulkan-clone")?;
-            self.device.write_buffer(&buffer, &bytes)?;
-            return Ok(Self {
-                buffer,
-                device: self.device.clone(),
-                count: self.count,
-                dtype: self.dtype,
-            });
-        }
+        // Always copy on the GPU. The previous contiguous fast-path memcpy'd the
+        // buffer through the host (read_buffer + write_buffer), which cost a full
+        // GPU drain plus a host round-trip of the entire buffer on every clone.
+        // That was catastrophic for large read-only sources (e.g. the llama
+        // embedding table, ~525MB F16 / 1GB F32, cloned per token during
+        // index_select). A device-to-device copy is a pure GPU transfer with no
+        // host round-trip and no pipeline drain, and keeps the independence
+        // guarantee that the caller may write the returned storage separately.
         let mut out = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
         Self::copy_strided_src(self, &mut out, 0, layout)?;
         Ok(out)
@@ -9666,6 +9918,14 @@ impl BackendStorage for VulkanStorage {
             return self.run_reduce_multi_dim(op, layout, reduce_dims);
         }
         let dim = reduce_dims[0];
+        // The last-dim kernels (sum_rows / extrema) index src assuming UNIT stride
+        // along the reduced dim. A non-contiguous view (reduced-dim stride != 1,
+        // e.g. reshape((b,c,l))->transpose(1,2) feeds layer_norm) would read
+        // consecutive memory instead of strided elements -> silently wrong on GPU.
+        // Materialize via run_reduce_non_last_dim (strides-aware copy) instead.
+        if layout.stride()[rank - 1] != 1 {
+            return self.run_reduce_non_last_dim(op, layout, dim);
+        }
         if dim != rank - 1 {
             return self.run_reduce_non_last_dim(op, layout, dim);
         }
@@ -10511,6 +10771,11 @@ impl BackendDevice for VulkanDevice {
             .limits
             .max_compute_work_group_count[1]
             .max(1);
+        let max_workgroup_count_z = physical_device_properties
+            .properties
+            .limits
+            .max_compute_work_group_count[2]
+            .max(1);
         let max_push_constants_size = physical_device_properties
             .properties
             .limits
@@ -10740,6 +11005,7 @@ impl BackendDevice for VulkanDevice {
             max_workgroup_size_log2,
             max_workgroup_count_x,
             max_workgroup_count_y,
+            max_workgroup_count_z,
             max_push_constants_size,
             robust_buffer_access,
             vulkan_memory_model,
@@ -10763,6 +11029,7 @@ impl BackendDevice for VulkanDevice {
             upload_staging_pool: Mutex::new(HashMap::default()),
             readback_staging_pool: Mutex::new(HashMap::default()),
             staging_pending_return: Mutex::new(Vec::new()),
+            gpu_buffer_pool: Mutex::new(HashMap::default()),
         });
         // Device cache: `Device::new_vulkan(ordinal)` is called per test /
         // per component in the wild, but VulkanInner holds GPU resources that
@@ -10833,7 +11100,16 @@ impl BackendDevice for VulkanDevice {
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
         let (dtype, count, bytes) = cpu_storage_to_bytes(storage)?;
-        let buffer = self.create_buffer(bytes.len(), "candle-vulkan-upload")?;
+        // Weights at/above this size are given a dedicated exact-sized block so
+        // they do not leave intra-block slack when sub-allocated into shared
+        // 256MB blocks (measured ~754MB slack on the 16B MoE). Small weights
+        // stay sub-allocated (they pack tightly with negligible slack and avoid
+        // per-dedicated tiny-allocation driver overhead).
+        let buffer = if bytes.len() >= Self::WEIGHT_DEDICATED_THRESHOLD_BYTES {
+            self.create_dedicated_buffer(bytes.len(), "candle-vulkan-upload")?
+        } else {
+            self.create_buffer(bytes.len(), "candle-vulkan-upload")?
+        };
         self.write_buffer(&buffer, &bytes)?;
         Ok(VulkanStorage {
             buffer,

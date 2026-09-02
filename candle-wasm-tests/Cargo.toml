@@ -6,10 +6,17 @@ description = "WASM tests for candle"
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+# Opt-in portable WebGPU resolve path via candle-wasm-device-select.
+wgpu = ["candle-wasm-device-select/wgpu", "candle/wgpu"]
+
 [dependencies]
 candle = { workspace = true }
+candle-wasm-device-select = { path = "../candle-wasm-examples/device-select" }
 rand = { workspace = true }
-getrandom = { version = "0.2", features = ["js"] }
+# Matches `.cargo/config.toml` wasm32 `getrandom_backend="wasm_js"`.
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.0"

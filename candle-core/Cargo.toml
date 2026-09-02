@@ -1,6 +1,6 @@
 [package]
 name = "candle-core"
-version.workspace = true
+version = "0.0.174"
 edition.workspace = true
 description.workspace = true
 repository.workspace = true
@@ -31,6 +31,7 @@ memmap2 = { workspace = true }
 num-traits = { workspace = true }
 num_cpus = { workspace = true }
 pollster = { workspace = true, optional = true }
+futures-channel = { version = "0.3", optional = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 rayon = { workspace = true }
@@ -39,12 +40,22 @@ safetensors = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-wgpu = { workspace = true, optional = true }
 yoke = { workspace = true }
 zerocopy = { workspace = true }
 zip = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokenizers = { workspace = true, features = ["onig"] }
+# Native wgpu: Vulkan / DX12 / Metal / GLES + WGSL (workspace features).
+wgpu = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Portable WebGPU in the browser — no native GPU backends.
+wgpu = { version = "29", default-features = false, features = ["std", "webgpu", "wgsl"], optional = true }
+# getrandom 0.3 on wasm32-unknown-unknown requires the `wasm_js` feature (the
+# `.cargo/config.toml` `getrandom_backend` cfg was a getrandom 0.2 mechanism).
+# `rand` pulls getrandom transitively; declaring it here unifies the feature so
+# candle-core's own wasm32 build doesn't hit getrandom's compile_error.
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))'.dependencies]
 candle-ug = { workspace = true, optional = true }
@@ -71,7 +82,7 @@ metal = [
     "candle-ug?/metal",
 ]
 metal-debug-labels = ["metal", "candle-metal-kernels/debug-labels"]
-wgpu = ["dep:wgpu", "dep:pollster", "dep:candle-wgpu-kernels"]
+wgpu = ["dep:wgpu", "dep:pollster", "dep:candle-wgpu-kernels", "dep:futures-channel"]
 vulkan = ["dep:ash", "dep:gpu-allocator", "dep:candle-vulkan-kernels", "dep:rustc-hash"]
 ug = ["dep:candle-ug"]
 
