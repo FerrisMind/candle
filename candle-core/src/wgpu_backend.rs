@@ -11,6 +11,17 @@ const WG_SIZE: u32 = 256;
 /// wgpu validates dispatch dims <= 65535 even when the adapter reports 65536.
 const WGPU_DISPATCH_WG_CAP: u32 = 65535;
 
+/// Budget (bytes) of retained in-flight submission buffers before
+/// `flush_active_batch` drains the queue. The 32-submission count cap alone
+/// lets 10+ GiB of chunky attention-score buffers (325-604 MB each) pile up
+/// and exhaust a 12 GiB card. Override via `CANDLE_WGPU_INFLIGHT_MAX_BYTES`.
+fn wgpu_inflight_byte_budget() -> u64 {
+    std::env::var("CANDLE_WGPU_INFLIGHT_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2 * 1024 * 1024 * 1024)
+}
+
 fn wgpu_dispatch_wg_cap(device: &WgpuDevice) -> u32 {
     device
         .inner
@@ -819,6 +830,10 @@ impl std::fmt::Debug for WgpuActiveBatch {
 
 struct WgpuPendingSubmission {
     retained_buffers: Vec<Arc<wgpu::Buffer>>,
+    /// Total device bytes of `retained_buffers`, used to bound in-flight VRAM
+    /// by bytes (the 32-submission cap alone permits 10+ GiB of chunky
+    /// attention-score buffers to pile up and exhaust the card).
+    retained_bytes: u64,
     completed: Arc<AtomicBool>,
 }
 
@@ -2084,6 +2099,8 @@ impl WgpuDevice {
             .queue
             .on_submitted_work_done(move || done.store(true, Ordering::Release));
         const MAX_IN_FLIGHT_SUBMISSIONS: usize = 32;
+        // Retained device bytes of this submission (before the move below).
+        let retained_bytes: u64 = batch.retained_buffers.iter().map(|b| b.size()).sum();
         let mut pending = self
             .inner
             .pending_submissions
@@ -2111,8 +2128,25 @@ impl WgpuDevice {
         }
         pending.push(WgpuPendingSubmission {
             retained_buffers: batch.retained_buffers,
+            retained_bytes,
             completed,
         });
+        // Byte-budget drain: the 32-submission cap above only bounds the
+        // COUNT, but a naive multi-head attention holds one or two 325-604 MB
+        // score matrices per submission, so 32 in flight is 10+ GiB — enough
+        // to exhaust a 12 GiB card before the count cap ever trips (observed
+        // OOM on pi3x/triposr decode). When the retained bytes exceed the
+        // budget, drain (wait for completion) so chunky buffers return to the
+        // pool / driver instead of piling up. Overridable for tuning.
+        let in_flight_bytes: u64 = pending.iter().map(|s| s.retained_bytes).sum();
+        if in_flight_bytes > wgpu_inflight_byte_budget() {
+            drop(pending);
+            // wasm: poll-only (blocking Wait is a no-op); native: blocking drain.
+            #[cfg(target_arch = "wasm32")]
+            self.cleanup_pending_submissions(false)?;
+            #[cfg(not(target_arch = "wasm32"))]
+            self.cleanup_pending_submissions(true)?;
+        }
         let _ = reason;
         Ok(true)
     }
@@ -2598,7 +2632,20 @@ impl WgpuDevice {
         // an address-keyed stale cache hit would make the dispatch read/write
         // the WRONG buffer (observed wrong argmax/argmin indices in the wgpu
         // smoke suite under allocation churn).
-        let cacheable = use_immediates || (!dynamic_offsets.is_empty() && bindings.len() >= 3);
+        //
+        // Bounded by bytes, not just entries: wgpu-core bind groups hold strong
+        // references to their storage buffers, and the LRU eviction below only
+        // fires at 256 entries. A naive multi-head attention pins one or two
+        // multi-hundred-MB score matrices per op (triposr 604MB scores at
+        // seq=3072, pi3 325MB at 1301 tokens), and a mere handful of such
+        // entries exhausts a 12 GiB card before any eviction runs — the device
+        // then OOMs, buffers become invalid, submit validation burns indexes
+        // and the readback aborts. Keep the small hot elementwise bind groups
+        // cached (that is where reuse pays) and allocate large ones per
+        // dispatch instead: their buffers then release once the submission
+        // completes. Threshold is the total referenced storage bytes.
+        let cacheable = (use_immediates || (!dynamic_offsets.is_empty() && bindings.len() >= 3))
+            && !bindings_exceed_cache_bytes(bindings);
         let bind_group = if cacheable {
             let ptrs: Vec<(usize, u64)> = bindings
                 .iter()
@@ -5784,6 +5831,29 @@ fn uniform_binding_dyn<'a>(
             size: Some(size),
         }),
     })
+}
+
+/// Whether a dispatch's bindings reference more storage bytes than the bind
+/// group cache should pin. Cached bind groups keep their buffers alive (wgpu
+/// holds strong refs) until LRU eviction, so huge attention-score matrices
+/// must NOT be cached — allocate those bind groups per dispatch instead.
+fn bindings_exceed_cache_bytes(bindings: &[wgpu::BindGroupEntry<'_>]) -> bool {
+    let max = std::env::var("CANDLE_WGPU_BG_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(16 * 1024 * 1024);
+    let total: u64 = bindings
+        .iter()
+        .filter_map(|e| match &e.resource {
+            wgpu::BindingResource::Buffer(bb) => Some(
+                bb.size
+                    .map(|s| s.get())
+                    .unwrap_or_else(|| bb.buffer.size()),
+            ),
+            _ => None,
+        })
+        .sum();
+    total > max
 }
 
 fn buffer_binding_range<'a>(
@@ -11156,14 +11226,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             || rhs_bytes > max_binding_bytes;
         if needs_batch_chunk {
             if b <= 1 {
-                return Err(Error::Msg(format!(
+                let mut msg = format!(
                     "wgpu matmul binding exceeds max_storage_buffer_binding_size (dst={dst_bytes}, lhs={lhs_bytes}, rhs={rhs_bytes}, max={max_binding_bytes}, shape=({b},{m},{n},{k}), lhs_dims={:?}, rhs_dims={:?}, lhs_contig={}, rhs_contig={})",
                     lhs_layout.dims(),
                     rhs_t_layout.dims(),
                     lhs_layout.is_contiguous(),
                     rhs_t_layout.is_contiguous(),
-                ))
-                .bt());
+                );
+                if std::env::var_os("CANDLE_DEBUG_MATMUL_SHAPE").is_some() {
+                    msg.push_str("\n");
+                    msg.push_str(&std::backtrace::Backtrace::force_capture().to_string());
+                }
+                return Err(Error::Msg(msg).bt());
             }
             if matrix_bytes > max_binding_bytes
                 || lhs_matrix_bytes > max_binding_bytes
@@ -13993,8 +14067,11 @@ impl BackendStorage for WgpuStorage {
                 .queue
                 .on_submitted_work_done(move || done.store(true, Ordering::Release));
             if let Ok(mut pending) = self.device.inner.pending_submissions.lock() {
+                let retained = vec![self.buffer.clone(), buffer.clone()];
+                let retained_bytes: u64 = retained.iter().map(|b| b.size()).sum();
                 pending.push(WgpuPendingSubmission {
-                    retained_buffers: vec![self.buffer.clone(), buffer.clone()],
+                    retained_buffers: retained,
+                    retained_bytes,
                     completed,
                 });
             }
@@ -15416,8 +15493,16 @@ fn wgpu_install_runtime_handlers(
     let err_slot = Arc::clone(runtime_error);
     device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
         let msg = format!("wgpu uncaptured error: {error}");
+        // Keep the FIRST error: later uncaptured errors are almost always
+        // symptoms of the first one (e.g. a bind group created against an
+        // invalid buffer), and the tail overwrite made the root cause
+        // invisible. Log every occurrence immediately so the first one is
+        // on record even if it is never drained.
+        eprintln!("[candle-wgpu] uncaptured error: {msg}");
         if let Ok(mut guard) = err_slot.lock() {
-            *guard = Some(msg);
+            if guard.is_none() {
+                *guard = Some(msg);
+            }
         }
     }));
     let err_slot = Arc::clone(runtime_error);
@@ -15717,6 +15802,15 @@ impl BackendDevice for WgpuDevice {
         let size = byte_len(dtype, count, "wgpu alloc_uninit")?;
         // wgpu can't allocate 0-byte buffers; use a 1-byte dummy for empty shapes.
         let alloc_size = size.max(1);
+        if alloc_size >= 256 * 1024 * 1024
+            && std::env::var_os("CANDLE_DEBUG_LARGE_ALLOC").is_some()
+        {
+            eprintln!(
+                "[candle-wgpu] large alloc_uninit: shape={shape:?} dtype={dtype:?} count={count} bytes={alloc_size}"
+            );
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("{bt}");
+        }
         // 1024² f32 = 4 MiB — common matmul dst size. Waiting here forced a
         // full GPU stall on every GEMM. Only block for truly large buffers, and
         // only if there is actually in-flight work.
