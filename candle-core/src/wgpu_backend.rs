@@ -940,6 +940,20 @@ impl WgpuDevice {
             .and_then(|mut guard| guard.take())
     }
 
+    /// Drain a wgpu uncaptured / device-lost error (if any) that
+    /// `on_uncaptured_error` captured into `runtime_error`, returning its
+    /// message. Runs one non-blocking poll first so the handler has delivered
+    /// the error (wgpu reports validation failures asynchronously). A burned
+    /// submission index almost always has such an error behind it; surfacing
+    /// it here is what makes the real root cause visible instead of a bare
+    /// `WrongSubmissionIndex` failure.
+    fn surface_runtime_error(&self) -> Option<String> {
+        let _ = self.inner.device.poll(wgpu::PollType::Poll);
+        self.take_runtime_error().inspect(|msg| {
+            eprintln!("[candle-wgpu] validation error: {msg}");
+        })
+    }
+
     /// Whether the underlying `wgpu::Device` has reported a device-lost event.
     pub fn is_lost(&self) -> bool {
         self.inner.device_lost.load(Ordering::SeqCst)
@@ -2202,18 +2216,65 @@ impl WgpuDevice {
             });
             // Wait only for this (last) submission; all earlier queue work is
             // already complete by FIFO. Map callbacks fire on completion.
-            self.inner
-                .device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(sub_idx),
-                    timeout: None,
-                })
-                .map_err(Error::wrap)?;
+            //
+            // wgpu-core consumes a submission index BEFORE encoder validation
+            // (device/queue.rs: active_submission_index += 1; a failed submit
+            // never advances `last_successful_submission_index`), so if any
+            // earlier encoder failed validation, the indexes in between are
+            // burned and `Wait { Some(sub_idx) }` fails with
+            // WrongSubmissionIndex even though the queue is otherwise fine.
+            // Fall back to waiting on the most recent submission — always
+            // valid — and let the surfaced validation error below gate the
+            // read.
+            if let Err(poll_err) = self.inner.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(sub_idx),
+                timeout: None,
+            }) {
+                if let wgpu::PollError::WrongSubmissionIndex(requested, successful) = poll_err {
+                    eprintln!(
+                        "[candle-wgpu] readback wait burned submission index (requested={requested}, last successful={successful}); waiting on last successful submission"
+                    );
+                    self.inner
+                        .device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: None,
+                            timeout: None,
+                        })
+                        .map_err(|e| {
+                            Error::Msg(format!("wgpu readback fallback wait failed: {e}")).bt()
+                        })?;
+                } else {
+                    let runtime = self.surface_runtime_error();
+                    return Err(Error::Msg(format!(
+                        "wgpu readback poll failed: {poll_err}{}",
+                        runtime
+                            .as_deref()
+                            .map(|m| format!("; validation error: {m}"))
+                            .unwrap_or_default()
+                    ))
+                    .bt());
+                }
+            }
+            let runtime_msg = self.surface_runtime_error();
+            if let Some(msg) = &runtime_msg {
+                // The copy submit's index was burned, so its data cannot be
+                // trusted (a map callback on an idle staging buffer would fire
+                // with Ok and yield garbage). Surface the real validation error
+                // and let the caller's retry path re-run the readback.
+                return Err(Error::Msg(format!("wgpu readback aborted: {msg}")).bt());
+            }
             rx.recv()
                 .map_err(Error::wrap)?
                 .map_err(Error::wrap)
                 .map_err(|e| {
-                    Error::Msg(format!("wgpu readback map_async failed (size={size}): {e}")).bt()
+                    Error::Msg(format!(
+                        "wgpu readback map_async failed (size={size}): {e}{}",
+                        runtime_msg
+                            .as_deref()
+                            .map(|m| format!("; validation error: {m}"))
+                            .unwrap_or_default()
+                    ))
+                    .bt()
                 })?;
             let mut data = slice.get_mapped_range().to_vec();
             data.truncate(size);
@@ -2267,13 +2328,40 @@ impl WgpuDevice {
         });
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.inner
-                .device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(sub_idx),
-                    timeout: None,
-                })
-                .map_err(Error::wrap)?;
+            // Same burned-index fallback as the sync path: wait for this copy
+            // submission, but if an earlier submit failed validation, its index
+            // is burned and the wait fails with WrongSubmissionIndex — fall back
+            // to the most recent submission (always valid). The surfaced
+            // validation error below then gates the read.
+            if let Err(poll_err) = self.inner.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(sub_idx),
+                timeout: None,
+            }) {
+                if let wgpu::PollError::WrongSubmissionIndex(requested, successful) = poll_err {
+                    eprintln!(
+                        "[candle-wgpu] async readback wait burned submission index (requested={requested}, last successful={successful}); waiting on last successful submission"
+                    );
+                    self.inner
+                        .device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: None,
+                            timeout: None,
+                        })
+                        .map_err(|e| {
+                            Error::Msg(format!("wgpu readback fallback wait failed: {e}")).bt()
+                        })?;
+                } else {
+                    let runtime = self.surface_runtime_error();
+                    return Err(Error::Msg(format!(
+                        "wgpu readback poll failed: {poll_err}{}",
+                        runtime
+                            .as_deref()
+                            .map(|m| format!("; validation error: {m}"))
+                            .unwrap_or_default()
+                    ))
+                    .bt());
+                }
+            }
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -2281,11 +2369,22 @@ impl WgpuDevice {
             let _ = sub_idx;
             let _ = self.inner.device.poll(wgpu::PollType::Poll);
         }
+        let runtime_msg = self.surface_runtime_error();
+        if let Some(msg) = &runtime_msg {
+            return Err(Error::Msg(format!("wgpu readback aborted: {msg}")).bt());
+        }
         rx.await
             .map_err(|_| Error::msg("wgpu readback oneshot canceled"))?
             .map_err(Error::wrap)
             .map_err(|e| {
-                Error::Msg(format!("wgpu readback map_async failed (size={size}): {e}")).bt()
+                Error::Msg(format!(
+                    "wgpu readback map_async failed (size={size}): {e}{}",
+                    runtime_msg
+                        .as_deref()
+                        .map(|m| format!("; validation error: {m}"))
+                        .unwrap_or_default()
+                ))
+                .bt()
             })?;
         let mut data = slice.get_mapped_range().to_vec();
         data.truncate(size);
@@ -11058,7 +11157,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if needs_batch_chunk {
             if b <= 1 {
                 return Err(Error::Msg(format!(
-                    "wgpu matmul binding exceeds max_storage_buffer_binding_size (dst={dst_bytes}, lhs={lhs_bytes}, rhs={rhs_bytes}, max={max_binding_bytes})"
+                    "wgpu matmul binding exceeds max_storage_buffer_binding_size (dst={dst_bytes}, lhs={lhs_bytes}, rhs={rhs_bytes}, max={max_binding_bytes}, shape=({b},{m},{n},{k}), lhs_dims={:?}, rhs_dims={:?}, lhs_contig={}, rhs_contig={})",
+                    lhs_layout.dims(),
+                    rhs_t_layout.dims(),
+                    lhs_layout.is_contiguous(),
+                    rhs_t_layout.is_contiguous(),
                 ))
                 .bt());
             }
