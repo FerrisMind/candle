@@ -834,7 +834,7 @@ pub struct VulkanCpuProfilePhase {
 }
 
 pub static VULKAN_CPU_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
-pub static VULKAN_CPU_PROFILE_PHASES: [VulkanCpuProfilePhase; 10] = [
+pub static VULKAN_CPU_PROFILE_PHASES: [VulkanCpuProfilePhase; 13] = [
     VulkanCpuProfilePhase { name: "transfer_deps", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
     VulkanCpuProfilePhase { name: "cleanup_amortized", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
     VulkanCpuProfilePhase { name: "pipeline_lookup", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
@@ -845,6 +845,9 @@ pub static VULKAN_CPU_PROFILE_PHASES: [VulkanCpuProfilePhase; 10] = [
     VulkanCpuProfilePhase { name: "alloc_pool_hit", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
     VulkanCpuProfilePhase { name: "alloc_allocator", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
     VulkanCpuProfilePhase { name: "dispatch_total", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
+    VulkanCpuProfilePhase { name: "flush_submit", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
+    VulkanCpuProfilePhase { name: "flush_drain", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
+    VulkanCpuProfilePhase { name: "flush_rest", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
 ];
 
 fn cpu_phase_index(name: &str) -> usize {
@@ -899,10 +902,30 @@ fn vulkan_inflight_byte_budget() -> u64 {
     std::env::var("CANDLE_VULKAN_INFLIGHT_MAX_BYTES")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        // 512 MiB measured best across pi3/pi3x/triposr on a WDDM system
-        // (1 GiB within noise on pi3/triposr; 2 GiB and up cost 15-40% in
-        // fence-wait stalls when big attention/conv intermediates pile up).
-        .unwrap_or(512 * 1024 * 1024)
+        // 256 MiB measured best across pi3/pi3x/triposr on a WDDM system once
+        // the drain is grace-gated (see `vulkan_inflight_grace_multiplier`);
+        // with an always-blocking drain 512 MiB was optimal, 2 GiB+ cost 15-40%.
+        .unwrap_or(256 * 1024 * 1024)
+}
+
+/// How far the retained in-flight byte total may exceed
+/// `vulkan_inflight_byte_budget` before `flush_active_batch` blocks on the
+/// oldest fence.
+///
+/// On Windows WDDM the driver defers execution until a wait forces a queue
+/// flush, so every inline fence wait costs ~5-10ms of pipeline stall even
+/// when the GPU is otherwise idle (measured: 718 drains x 8.9ms = 6.4s of
+/// 13.7s wall for pi3x while total GPU kernel time was 0.6s). Tolerating a
+/// grace band lets submissions retire through the non-blocking poll; the
+/// blocking wait only fires under real memory pressure. Override via
+/// `CANDLE_VK_INFLIGHT_GRACE`.
+fn vulkan_inflight_grace_multiplier() -> f64 {
+    std::env::var("CANDLE_VK_INFLIGHT_GRACE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        // 8: pi3x infer 13.5s (grace 2) -> 12.4s; wider bands only approach the
+        // same stall total while risking more VRAM on 12 GiB cards.
+        .unwrap_or(8.0)
 }
 
 fn gpu_profile_enabled() -> bool {
@@ -1918,7 +1941,16 @@ impl VulkanDevice {
     /// class in `gpu_buffer_pool` before overflowing to the deferred-free
     /// list. Kept small: MoE reuses a handful of distinct sizes, and larger
     /// values only hoard memory that could otherwise return to the allocator.
-    const MAX_GPU_POOL_PER_SIZE_CLASS: usize = 4;
+    /// Override via `CANDLE_VK_POOL_PER_CLASS`.
+    fn max_gpu_pool_per_size_class() -> usize {
+        static PER_CLASS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *PER_CLASS.get_or_init(|| {
+            std::env::var("CANDLE_VK_POOL_PER_CLASS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4)
+        })
+    }
 
     /// Total byte ceiling for `gpu_buffer_pool` residency. Decode of GQA models
     /// reallocates the KV-cache into a new distinct size every step (cat +
@@ -1927,7 +1959,28 @@ impl VulkanDevice {
     /// empty — the llama decode VRAM floor (observed ~8-10 GB vs ~3 GB of live
     /// activations). Once the ceiling is exceeded, a recycled buffer falls through
     /// to the deferred-free path so its device block can actually be released.
-    const MAX_GPU_POOL_TOTAL_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
+    ///
+    /// Dense vision models (pi3/pi3x) allocate thousands of distinct
+    /// intermediate sizes per step; with a 512 MiB ceiling ~70% of allocations
+    /// miss the pool, every miss is a fresh buffer retained by its in-flight
+    /// submission, and the inflight byte budget then forces blocking fence
+    /// drains (WDDM pump stalls). A larger pool keeps the working set resident
+    /// and reused. Override via `CANDLE_VK_POOL_MAX_BYTES`.
+    fn max_gpu_pool_total_bytes() -> usize {
+        static TOTAL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *TOTAL.get_or_init(|| {
+            std::env::var("CANDLE_VK_POOL_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                // 2 GiB: dense vision models (pi3x) allocate thousands of
+                // distinct intermediate sizes per step; 2 GiB keeps that set
+                // resident and reused (pi3x infer 12.3s -> 11.7s vs a 512 MiB
+                // pool). LLM decode still falls through to the deferred-free
+                // path for each distinct KV size, so the llama VRAM-floor
+                // concern does not grow with this ceiling.
+                .unwrap_or(2 * 1024 * 1024 * 1024)
+        })
+    }
 
     /// Weight buffers at or above this size are allocated as dedicated exact-sized
     /// blocks instead of sub-allocation into shared blocks. Large enough that the
@@ -2308,14 +2361,17 @@ impl VulkanDevice {
             )
         };
         unsafe {
-            self.inner
-                .device
-                .queue_submit(
-                    queue,
-                    std::slice::from_ref(&submit_info),
-                    batch.resources.fence,
-                )
-                .map_err(Error::wrap)?;
+            cpu_phase!(
+                "flush_submit",
+                self.inner
+                    .device
+                    .queue_submit(
+                        queue,
+                        std::slice::from_ref(&submit_info),
+                        batch.resources.fence,
+                    )
+                    .map_err(Error::wrap)?
+            );
         }
         let retained_bytes: u64 = batch
             .retained_buffers
@@ -2339,6 +2395,10 @@ impl VulkanDevice {
             });
         // Byte-budget drain (see `vulkan_inflight_byte_budget`): bound the
         // retained-buffer VRAM so big transients recycle instead of piling up.
+        // The blocking fence wait only fires once the total exceeds budget x
+        // grace (see `vulkan_inflight_grace_multiplier`); inside the grace
+        // band `cleanup_pending_submissions_impl`'s non-blocking poll still
+        // retires whatever the GPU already finished.
         let in_flight_bytes: u64 = self
             .inner
             .pending_submissions
@@ -2347,8 +2407,19 @@ impl VulkanDevice {
             .iter()
             .map(|submission| submission.retained_bytes)
             .sum();
-        if in_flight_bytes > vulkan_inflight_byte_budget() {
-            self.cleanup_pending_submissions_byte_budget(vulkan_inflight_byte_budget())?;
+        let budget = vulkan_inflight_byte_budget();
+        let blocking_threshold = (budget as f64 * vulkan_inflight_grace_multiplier()) as u64;
+        if in_flight_bytes > blocking_threshold {
+            cpu_phase!(
+                "flush_drain",
+                self.cleanup_pending_submissions_byte_budget(budget)?
+            );
+        } else if in_flight_bytes > budget {
+            // Grace band: retire completed submissions without blocking.
+            cpu_phase!(
+                "flush_poll",
+                self.cleanup_pending_submissions_impl(false, None)?
+            );
         }
         Ok(true)
     }
@@ -10062,8 +10133,8 @@ impl Drop for VulkanBuffer {
                         let total_bytes: usize =
                             pool.values().flatten().map(|b| b.size).sum();
                         let entry = pool.entry(self.size).or_default();
-                        if entry.len() < VulkanDevice::MAX_GPU_POOL_PER_SIZE_CLASS
-                            && total_bytes + self.size <= VulkanDevice::MAX_GPU_POOL_TOTAL_BYTES
+                        if entry.len() < VulkanDevice::max_gpu_pool_per_size_class()
+                            && total_bytes + self.size <= VulkanDevice::max_gpu_pool_total_bytes()
                         {
                             entry.push(Arc::new(VulkanBuffer {
                                 device: self.device.clone(),
