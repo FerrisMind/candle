@@ -8889,17 +8889,50 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             buffer_binding(5, &alibi_ref.buffer),
         ];
 
-        let shader_source = candle_wgpu_kernels::get("flash_attn_simple.wgsl")
-            .ok_or_else(|| Error::Msg("wgpu flash_attn_simple shader not found".into()).bt())?
-            .source();
+        // Tiled FA2 (flash_attn_tiled.wgsl): one 64-lane workgroup per
+        // 64-row Q block, K/V streamed through shared tiles — reads each
+        // K/V element once per 64 rows instead of once per row. The naive
+        // kernel re-reads all of K/V per row, which dominated pi3x decode.
+        // Fallbacks: head dims over the 64-wide shared tiles or adapters
+        // without 16 KiB of workgroup storage use the simple kernel.
+        let tiled_ok = head_dim <= 64
+            && head_dim_v <= 64
+            && q.device
+                .inner
+                .limits
+                .max_compute_workgroup_storage_size
+                >= 16384;
         let total_q_rows = (b * h * seq_q) as u32;
-        q.device.run_compute_linear(
-            shader_source,
-            &entries,
-            &bindings,
-            total_q_rows,
-            "candle-wgpu-flash-attn",
-        )?;
+        if tiled_ok {
+            let shader_source = candle_wgpu_kernels::get("flash_attn_tiled.wgsl")
+                .ok_or_else(|| {
+                    Error::Msg("wgpu flash_attn_tiled shader not found".into()).bt()
+                })?
+                .source();
+            let q_tiles = ((seq_q as u32) + 63) / 64;
+            q.device.run_compute_xyz(
+                shader_source,
+                &entries,
+                &bindings,
+                (q_tiles, h as u32, b as u32),
+                &[],
+                None,
+                "candle-wgpu-flash-attn-tiled",
+            )?;
+        } else {
+            let shader_source = candle_wgpu_kernels::get("flash_attn_simple.wgsl")
+                .ok_or_else(|| {
+                    Error::Msg("wgpu flash_attn_simple shader not found".into()).bt()
+                })?
+                .source();
+            q.device.run_compute_linear(
+                shader_source,
+                &entries,
+                &bindings,
+                total_q_rows,
+                "candle-wgpu-flash-attn",
+            )?;
+        }
 
         Ok(dst)
     }
