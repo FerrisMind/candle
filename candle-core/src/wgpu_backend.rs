@@ -1979,7 +1979,23 @@ impl WgpuDevice {
         Ok(())
     }
 
-    const MAX_BATCH_DISPATCHES: u32 = 32;
+    /// Dispatches per command batch. 32 (the old fixed cap) split pi3x into
+    /// ~300+ submissions; on Windows WDDM/DX12 every flush that triggers a
+    /// blocking drain costs ~10+ ms of fence-signal latency, so fewer, bigger
+    /// batches directly cut wall time. Override via
+    /// `CANDLE_WGPU_MAX_BATCH_DISPATCHES`.
+    fn max_batch_dispatches() -> u32 {
+        static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("CANDLE_WGPU_MAX_BATCH_DISPATCHES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                // 64 measured 6x WORSE than 32 on pi3 (430 s vs 75 s): the
+                // uniform ring is sized for a few in-flight batches, and
+                // bigger batches wrap it into reuse-waits. Keep 32.
+                .unwrap_or(32)
+        })
+    }
 
     fn begin_active_batch(&self) -> Result<WgpuActiveBatch> {
         let encoder = self
@@ -2179,8 +2195,28 @@ impl WgpuDevice {
             .lock()
             .map(|backlog| backlog.iter().map(|b| b.size()).sum())
             .unwrap_or(0);
+        // Grace band (ported from the vulkan backend): blocking drains cost
+        // ~10+ ms of WDDM fence-signal latency each, so only drain when
+        // in-flight bytes exceed budget x grace; inside the band the
+        // submission-completed poll (run by the next cleanup) retires work
+        // without waiting. Override via `CANDLE_WGPU_INFLIGHT_GRACE`.
+        fn wgpu_inflight_grace_multiplier() -> f64 {
+            static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+            *V.get_or_init(|| {
+                std::env::var("CANDLE_WGPU_INFLIGHT_GRACE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    // 1.0 = always drain at the budget (the measured-best
+                    // wgpu behavior): unlike vulkan, wgpu's non-blocking
+                    // retirement only advances inside device.poll, so a grace
+                    // band lets in-flight pile up and made pi3 75 s -> 112 s.
+                    // Override via CANDLE_WGPU_INFLIGHT_GRACE.
+                    .unwrap_or(1.0)
+            })
+        }
         let budget = wgpu_inflight_byte_budget();
-        if in_flight_bytes > budget {
+        let blocking_threshold = (budget as f64 * wgpu_inflight_grace_multiplier()) as u64;
+        if in_flight_bytes > blocking_threshold {
             drop(pending);
             // wasm: poll-only (blocking Wait is a no-op); native: blocking drain.
             #[cfg(target_arch = "wasm32")]
@@ -2804,7 +2840,7 @@ impl WgpuDevice {
                 .lock()
                 .map_err(|e| Error::wrap(e.to_string()))?;
             slot.as_ref()
-                .map(|batch| batch.dispatch_count + 1 > Self::MAX_BATCH_DISPATCHES)
+                .map(|batch| batch.dispatch_count + 1 > Self::max_batch_dispatches())
                 .unwrap_or(false)
         };
         if batch_limit {

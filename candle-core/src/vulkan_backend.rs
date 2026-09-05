@@ -876,6 +876,34 @@ macro_rules! cpu_phase {
 }
 
 /// Aggregated CPU-phase report; None when profiling was never enabled.
+/// Counts of `flush_active_batch` invocations per reason string. Reveals
+/// which code path closes batches (and thus pays the WDDM fence-signal tax).
+static FLUSH_REASONS: std::sync::Mutex<Vec<(&'static str, std::sync::atomic::AtomicU64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn count_flush_reason(reason: &'static str) {
+    if let Ok(mut map) = FLUSH_REASONS.lock() {
+        if let Some(entry) = map.iter().find(|(name, _)| *name == reason) {
+            entry.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            map.push((reason, std::sync::atomic::AtomicU64::new(1)));
+        }
+    }
+}
+
+pub fn vulkan_flush_reason_report() -> Option<Vec<(&'static str, u64)>> {
+    if !VULKAN_CPU_PROFILE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let map = FLUSH_REASONS.lock().ok()?;
+    let mut rows: Vec<(&'static str, u64)> = map
+        .iter()
+        .map(|(name, count)| (*name, count.load(std::sync::atomic::Ordering::Relaxed)))
+        .collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    Some(rows)
+}
+
 pub fn vulkan_cpu_profile_report() -> Option<Vec<(&'static str, u64, f64)>> {
     if !VULKAN_CPU_PROFILE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
@@ -1884,7 +1912,13 @@ impl VulkanDevice {
     }
 
     fn max_batch_descriptor_sets() -> u32 {
-        Self::max_batch_dispatches()
+        // A dense-model dispatch consumes ~2-8 descriptor sets (inputs, dst,
+        // params/uniform); capping sets at 1x dispatches closed batches after
+        // ~9 dispatches (pi3x: 1095 batch_limit flushes for 9477 dispatches),
+        // each paying the ~4-9 ms WDDM fence-signal tax. Descriptor pool
+        // allocation derives from the same dispatch cap x
+        // DESCRIPTOR_SET_ALLOC_CHUNK, which already covers 8 sets/dispatch.
+        Self::max_batch_dispatches() * 8
     }
 
     fn max_batch_storage_descriptors() -> u32 {
@@ -1899,7 +1933,24 @@ impl VulkanDevice {
         Self::max_allocated_descriptor_sets_per_batch() * Self::SUBMISSION_DESCRIPTOR_CAPACITY
     }
     const DESCRIPTOR_SET_ALLOC_CHUNK: u32 = 8;
-    const MAX_BATCH_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
+    /// Transfer bytes accumulate on the compute batch when no dedicated
+    /// transfer queue exists; at the old fixed 64 MiB, dense vision models
+    /// (pi3x: 100-700 MB activation copies) closed the batch on nearly every
+    /// op — 9477 dispatches split into 1318 submissions, and each WDDM
+    /// submission costs ~4-9 ms of fence-signal latency, ~5 s per infer.
+    /// Override via `CANDLE_VK_MAX_BATCH_TRANSFER_BYTES`.
+    fn max_batch_transfer_bytes() -> usize {
+        static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("CANDLE_VK_MAX_BATCH_TRANSFER_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                // 512 MiB: pi3x activation copies closed the compute batch on
+                // nearly every op at 64 MiB; 512 MiB measured 11.7 s vs 12.97 s
+                // (in-flight VRAM peak stays ~10.5 GiB on a 12 GiB card).
+                .unwrap_or(512 * 1024 * 1024)
+        })
+    }
     const MAX_BATCH_COMPUTE_BYTES: usize = 512 * 1024 * 1024;
 
     fn max_batch_compute_bytes() -> usize {
@@ -2229,17 +2280,34 @@ impl VulkanDevice {
                     .lock()
                     .map_err(|e| Error::wrap(e.to_string()))?;
                 if let Some(batch) = slot.as_ref() {
-                    should_flush = batch.dispatch_count + dispatches_to_add
-                        > Self::max_batch_dispatches()
-                        || batch.copy_count + copies_to_add > Self::max_batch_copies()
-                        || batch.descriptor_set_count + descriptor_sets_to_add
-                            > Self::max_batch_descriptor_sets()
-                        || batch.storage_descriptor_count + storage_descriptors_to_add
-                            > Self::max_batch_storage_descriptors()
-                        || batch.transfer_bytes + transfer_bytes_to_add
-                            > Self::MAX_BATCH_TRANSFER_BYTES
-                        || batch.compute_bytes + compute_bytes_to_add
-                            > Self::max_batch_compute_bytes();
+                    let d = batch.dispatch_count + dispatches_to_add
+                        > Self::max_batch_dispatches();
+                    let c = batch.copy_count + copies_to_add > Self::max_batch_copies();
+                    let ds = batch.descriptor_set_count + descriptor_sets_to_add
+                        > Self::max_batch_descriptor_sets();
+                    let sd = batch.storage_descriptor_count + storage_descriptors_to_add
+                        > Self::max_batch_storage_descriptors();
+                    let tb = batch.transfer_bytes + transfer_bytes_to_add
+                        > Self::max_batch_transfer_bytes();
+                    let cb = batch.compute_bytes + compute_bytes_to_add
+                        > Self::max_batch_compute_bytes();
+                    should_flush = d || c || ds || sd || tb || cb;
+                    if should_flush {
+                        let reason = if d {
+                            "cap_dispatches"
+                        } else if c {
+                            "cap_copies"
+                        } else if ds {
+                            "cap_descriptor_sets"
+                        } else if sd {
+                            "cap_storage_descriptors"
+                        } else if tb {
+                            "cap_transfer_bytes"
+                        } else {
+                            "cap_compute_bytes"
+                        };
+                        count_flush_reason(reason);
+                    }
                 } else {
                     should_create = true;
                 }
@@ -2281,6 +2349,7 @@ impl VulkanDevice {
             self.recycle_submission_resources(queue_kind, batch.resources)?;
             return Ok(false);
         }
+        count_flush_reason(reason);
         // Snapshot the profiler results into host-visible memory while the
         // command buffer is still recordable; they are read out (aggregated)
         // once this batch's submission is retired.
