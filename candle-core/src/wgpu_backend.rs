@@ -14,12 +14,13 @@ const WGPU_DISPATCH_WG_CAP: u32 = 65535;
 /// Budget (bytes) of retained in-flight submission buffers before
 /// `flush_active_batch` drains the queue. The 32-submission count cap alone
 /// lets 10+ GiB of chunky attention-score buffers (325-604 MB each) pile up
-/// and exhaust a 12 GiB card. Override via `CANDLE_WGPU_INFLIGHT_MAX_BYTES`.
+/// and exhaust a 12 GiB card. 512 MiB matches the measured-optimal vulkan
+/// value on the same WDDM system. Override via `CANDLE_WGPU_INFLIGHT_MAX_BYTES`.
 fn wgpu_inflight_byte_budget() -> u64 {
     std::env::var("CANDLE_WGPU_INFLIGHT_MAX_BYTES")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(2 * 1024 * 1024 * 1024)
+        .unwrap_or(512 * 1024 * 1024)
 }
 
 fn wgpu_dispatch_wg_cap(device: &WgpuDevice) -> u32 {
@@ -1572,7 +1573,13 @@ impl WgpuDevice {
             }
         }
         if let Ok(mut pending) = self.inner.storage_pool_pending.lock() {
-            if pending.len() < 512 {
+            // Byte-cap the backlog: between pool flushes a dense forward can
+            // recycle hundreds of chunky intermediates, and 512 count-only
+            // entries of 300-700 MB attention-score buffers hold multiple GiB
+            // of VRAM invisibly. Mirror the free-pool ceiling.
+            const BACKLOG_MAX_BYTES: usize = 512 * 1024 * 1024;
+            let bytes: usize = pending.iter().map(|b| b.size() as usize).sum();
+            if pending.len() < 512 && bytes + buffer.size() as usize <= BACKLOG_MAX_BYTES {
                 pending.push(Arc::clone(buffer));
             }
         }
@@ -1588,16 +1595,31 @@ impl WgpuDevice {
         // OOM'd at ~456 MiB reason regardless of reuse. Once the byte cap is
         // exceeded we DROP the Arc so the wgpu buffer is destroyed and its
         // sub-allocation returns to gpu-allocator, instead of recycling it.
-        const BUCKET_CAP: usize = 8;
-        // F6 (native): raise the pooled-bytes ceiling. The D2.3 1 GiB cap was
-        // sized for the KV-cat monotonic-growth case, but it made SD-512 drop
-        // the ~1 GiB f32 attention-score intermediate every time it was recycled
-        // (total_bytes + 1 GiB > cap), forcing a fresh carve and a fresh
-        // gpu-allocator block on each forward -> the peak compounded to ~11.8 GiB.
-        // The larger ceiling lets that big intermediate survive in the free pool
-        // and be reused across steps, avoiding the re-carve. Keep 3 GiB on native.
+        // BUCKET_CAP 4 / MAX_BYTES 512 MiB (native): dense vision models
+        // (pi3/pi3x) allocate thousands of distinct intermediate sizes per
+        // forward, so a bigger pool mostly hoards one-shot sizes — the D2.3
+        // comment below is the extreme case. The cap must stay well under the
+        // card budget because pool residency is invisible to the inflight
+        // byte budget (which now counts it — see flush_active_batch). The F6
+        // SD-512 re-carve compounding applies to single ~1 GiB intermediates;
+        // those exceed the cap by design and get destroyed + re-carved, which
+        // is bounded because the inflight budget drains them each step.
+        // Override via CANDLE_WGPU_POOL_MAX_BYTES.
+        fn pool_max_bytes() -> usize {
+            static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *CAP.get_or_init(|| {
+                std::env::var("CANDLE_WGPU_POOL_MAX_BYTES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(512 * 1024 * 1024)
+            })
+        }
         #[cfg(not(target_arch = "wasm32"))]
-        const MAX_BYTES: usize = 3 * 1024 * 1024 * 1024; // 3 GiB of pooled buffers
+        const BUCKET_CAP: usize = 4;
+        #[cfg(target_arch = "wasm32")]
+        const BUCKET_CAP: usize = 8;
+        #[cfg(not(target_arch = "wasm32"))]
+        let max_bytes = pool_max_bytes();
         // D8 (wasm): the recycled free pool is the largest *persistent* holder on
         // WebGPU and never auto-shrinks, so a 3 GiB cap lets it retain ~700 MiB+
         // of whisper scratch while the GPU delta is ~4x that in gpu-allocator
@@ -1606,7 +1628,7 @@ impl WgpuDevice {
         // dropping the over-cap Arc (wgpu destroys the buffer, its block returns
         // to gpu-allocator) is safe at a confirmed-drain point.
         #[cfg(target_arch = "wasm32")]
-        const MAX_BYTES: usize = 512 * 1024 * 1024; // 512 MiB on wasm (WebGPU)
+        let max_bytes = 512 * 1024 * 1024; // 512 MiB on wasm (WebGPU)
         let pending = match self.inner.storage_pool_pending.lock() {
             Ok(mut g) => std::mem::take(&mut *g),
             Err(_) => return,
@@ -1623,7 +1645,7 @@ impl WgpuDevice {
             for buffer in pending {
                 let size = buffer.size() as usize;
                 let bucket = pool.entry(size as u64).or_default();
-                if bucket.len() < BUCKET_CAP && total_bytes + size <= MAX_BYTES {
+                if bucket.len() < BUCKET_CAP && total_bytes + size <= max_bytes {
                     total_bytes += size;
                     bucket.push(buffer);
                 }
@@ -2138,14 +2160,42 @@ impl WgpuDevice {
         // OOM on pi3x/triposr decode). When the retained bytes exceed the
         // budget, drain (wait for completion) so chunky buffers return to the
         // pool / driver instead of piling up. Overridable for tuning.
+        //
+        // The pool and recycle backlog are each already byte-capped at
+        // 512 MiB, so total deliberate retention is bounded; when in-flight
+        // alone is under budget but the total is over, a pool flush
+        // (promotes backlog → pool, drops over-cap Arcs to the allocator)
+        // brings the total down without any GPU wait.
         let in_flight_bytes: u64 = pending.iter().map(|s| s.retained_bytes).sum();
-        if in_flight_bytes > wgpu_inflight_byte_budget() {
+        let pool_bytes: u64 = self
+            .inner
+            .storage_buffer_pool
+            .lock()
+            .map(|pool| pool.values().flatten().map(|b| b.size()).sum())
+            .unwrap_or(0);
+        let backlog_bytes: u64 = self
+            .inner
+            .storage_pool_pending
+            .lock()
+            .map(|backlog| backlog.iter().map(|b| b.size()).sum())
+            .unwrap_or(0);
+        let budget = wgpu_inflight_byte_budget();
+        if in_flight_bytes > budget {
             drop(pending);
             // wasm: poll-only (blocking Wait is a no-op); native: blocking drain.
             #[cfg(target_arch = "wasm32")]
             self.cleanup_pending_submissions(false)?;
             #[cfg(not(target_arch = "wasm32"))]
             self.cleanup_pending_submissions(true)?;
+        } else if in_flight_bytes + pool_bytes + backlog_bytes > budget {
+            drop(pending);
+            #[cfg(target_arch = "wasm32")]
+            self.flush_storage_pool_pending();
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.cleanup_pending_submissions(false)?;
+                self.flush_storage_pool_pending();
+            }
         }
         let _ = reason;
         Ok(true)
