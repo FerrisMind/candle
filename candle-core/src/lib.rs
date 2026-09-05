@@ -143,7 +143,9 @@ pub use wgpu_backend::{WgpuDevice, WgpuError, WgpuStorage};
 pub use dummy_wgpu_backend::{WgpuDevice, WgpuError, WgpuStorage};
 
 #[cfg(feature = "vulkan")]
-pub use vulkan_backend::{VulkanDevice, VulkanError, VulkanStorage};
+pub use vulkan_backend::{
+    vulkan_cpu_profile_report, vulkan_gpu_profile_report, VulkanDevice, VulkanError, VulkanStorage,
+};
 
 #[cfg(not(feature = "vulkan"))]
 pub use dummy_vulkan_backend::{VulkanDevice, VulkanError, VulkanStorage};

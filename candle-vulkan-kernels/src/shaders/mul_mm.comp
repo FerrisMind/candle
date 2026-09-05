@@ -50,9 +50,14 @@
 #endif
 // Virtual B^T keeps A unaligned/strided but B (candle LHS) is K-contiguous;
 // force BATCH_B=1 so wide LOAD_VEC_B indexing matches the aligned GEMM path.
+// With scalar LOAD_VEC_B=1 the batched-pair branch is required instead: its
+// `row * 2` addressing doubles the K step, so BATCH_B=1 there would read K
+// twice past the panel and overflow the BK/2 shared-memory stride.
 #ifdef VIRTUAL_BT
+#if LOAD_VEC_B > 1
 #undef LOAD_VEC_BATCH_B
 #define LOAD_VEC_BATCH_B 1
+#endif
 #endif
 
 #if !defined(TO_FLOAT_TYPE)

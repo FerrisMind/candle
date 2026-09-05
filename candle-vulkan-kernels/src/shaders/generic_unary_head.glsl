@@ -15,6 +15,10 @@ layout (push_constant) uniform parameter
     uint ne1_012mp; uint ne1_012L;
     uint ne1_01mp;  uint ne1_01L;
     uint ne1_0mp;   uint ne1_0L;
+    // Full 32-bit element offsets. The low 16 bits of each still live in
+    // misalign_offsets for backward compatibility with callers that predate
+    // the extension fields.
+    uint aoffset_ext; uint doffset_ext;
 } p;
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
@@ -31,8 +35,8 @@ uint get_idx() {
     return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
 }
 
-uint get_aoffset() { return p.misalign_offsets >> 16; }
-uint get_doffset() { return p.misalign_offsets & 0xFFFF; }
+uint get_aoffset() { return (p.misalign_offsets >> 16) | (p.aoffset_ext << 16); }
+uint get_doffset() { return (p.misalign_offsets & 0xFFFF) | (p.doffset_ext << 16); }
 
 // see init_fastdiv_values in ggml-vulkan.cpp
 uint fastdiv(uint n, uint mp, uint L) {
