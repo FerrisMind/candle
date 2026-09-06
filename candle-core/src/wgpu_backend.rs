@@ -16306,10 +16306,36 @@ fn wgpu_select_native_adapter(ordinal: usize) -> Result<wgpu::Adapter> {
     Ok(adapters.swap_remove(selected_index))
 }
 
+/// Same rationale as the vulkan test serial slot: all tests share the cached
+/// adapter/device and the submission pipeline assumes single-threaded
+/// driving; serialize whole tests via the thread-local lock (each libtest
+/// test owns one thread).
+#[cfg(test)]
+fn wgpu_acquire_test_serial_slot() {
+    use std::cell::RefCell;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+    thread_local! {
+        static HELD: RefCell<Option<MutexGuard<'static, ()>>> =
+            const { RefCell::new(None) };
+    }
+    HELD.with(|held| {
+        if held.borrow().is_none() {
+            let guard = SERIAL
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *held.borrow_mut() = Some(guard);
+        }
+    });
+}
+
 impl BackendDevice for WgpuDevice {
     type Storage = WgpuStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
+        #[cfg(test)]
+        wgpu_acquire_test_serial_slot();
         #[cfg(target_arch = "wasm32")]
         {
             let _ = ordinal;

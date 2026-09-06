@@ -53,6 +53,10 @@ fn probe_backends() -> BackendSet {
     let mut devices: Vec<(String, Device)> = Vec::new();
     let mut skips: Vec<String> = Vec::new();
 
+    // Hold the GPU test serial slot for this thread: parallel libtest threads
+    // corrupt in-flight batches on the shared batching backends.
+    support::acquire_gpu_test_serial_slot();
+
     // CPU is always available and serves as reference.
     devices.push(("cpu".to_string(), Device::Cpu));
 

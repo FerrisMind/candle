@@ -71,6 +71,16 @@ fn vulkan_dense_gemm_prefers_tiled(m: usize, n: usize, k: usize) -> bool {
     m > VULKAN_DENSE_MUL_MAT_VEC_MAX_ROWS
 }
 
+/// Opt-in for the unaligned F32 coopmat GEMM (TF32-class reduced precision).
+/// Read once and cached: this sits on the per-dispatch matmul path.
+fn vulkan_unaligned_f32_coopmat_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CANDLE_VULKAN_F32_UNALIGNED_COOPMAT")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GgmlBinaryParams {
@@ -8910,11 +8920,21 @@ impl VulkanStorage {
             // keeps the tensor-core MMA for shapes like the attention GEMMs
             // (M=1025) that defeat the 64-alignment gate, which otherwise fall
             // to the scalar fp32 tile kernel and run several times slower.
+            //
+            // OPT-IN: the f32 coopmat MMA executes at reduced (TF32-class,
+            // ~10-bit mantissa) input precision — measured ~1e-3 relative error
+            // on the backend_smoke sweep, far above the fp32-accumulation
+            // tolerance. Plain DType::F32 matmul therefore defaults to the
+            // exact fp32 scalar tile; CANDLE_VULKAN_F32_UNALIGNED_COOPMAT=1
+            // restores the fast path for callers that accept the precision
+            // tradeoff (measured 1.9× attention / 2.5× linear shapes on
+            // RTX 5080). Mirrors the wgpu CANDLE_WGPU_COOP_MATMUL opt-in.
             DType::F32
                 if self.device.inner.cooperative_matrix
                     && (m >= 128 || n >= 128)
                     && k >= 64
-                    && vulkan_spirv_exists("matmul_f32_f32_cm1") =>
+                    && vulkan_spirv_exists("matmul_f32_f32_cm1")
+                    && vulkan_unaligned_f32_coopmat_enabled() =>
             {
                 "matmul_f32_f32_cm1"
             }
@@ -11513,10 +11533,38 @@ impl BackendStorage for VulkanStorage {
     }
 }
 
+/// Serialize GPU tests: all tests share the cached VulkanInner and the
+/// batching backend assumes single-threaded submission; interleaved test
+/// threads corrupt each other's batches (wrong outputs, spurious init
+/// failures). Every libtest test runs on its own thread, so parking the
+/// serial lock in a thread-local held for the thread's lifetime serializes
+/// whole tests without touching the 50+ device call sites.
+#[cfg(test)]
+fn vulkan_acquire_test_serial_slot() {
+    use std::cell::RefCell;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+    thread_local! {
+        static HELD: RefCell<Option<MutexGuard<'static, ()>>> =
+            const { RefCell::new(None) };
+    }
+    HELD.with(|held| {
+        if held.borrow().is_none() {
+            let guard = SERIAL
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *held.borrow_mut() = Some(guard);
+        }
+    });
+}
+
 impl BackendDevice for VulkanDevice {
     type Storage = VulkanStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
+        #[cfg(test)]
+        vulkan_acquire_test_serial_slot();
         let entry = unsafe { ash::Entry::load() }.map_err(Error::wrap)?;
         let app_name = CString::new("candle-vulkan").map_err(Error::wrap)?;
         let subgroup_size_control_ext = c"VK_EXT_subgroup_size_control";
