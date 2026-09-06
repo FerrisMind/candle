@@ -645,6 +645,18 @@ struct Args {
     /// Print the full DecodingResult structure rather than just the text.
     #[arg(long)]
     verbose: bool,
+
+    /// Local path to the model config.json (skips the hub download).
+    #[arg(long)]
+    config_file: Option<String>,
+
+    /// Local path to the model tokenizer.json (skips the hub download).
+    #[arg(long)]
+    tokenizer_file: Option<String>,
+
+    /// Local path to the model weights, safetensors or gguf (skips the hub download).
+    #[arg(long)]
+    weight_file: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -688,7 +700,21 @@ fn main() -> Result<()> {
             println!("No audio file submitted: Downloading https://huggingface.co/datasets/Narsil/candle_demo/blob/main/samples_jfk.wav");
             dataset.get("samples_jfk.wav")?
         };
-        let (config, tokenizer, model) = if args.quantized {
+        let (config, tokenizer, model) = if let (
+            Some(config_file),
+            Some(tokenizer_file),
+            Some(weight_file),
+        ) = (
+            args.config_file.as_deref(),
+            args.tokenizer_file.as_deref(),
+            args.weight_file.as_deref(),
+        ) {
+            (
+                std::path::PathBuf::from(config_file),
+                std::path::PathBuf::from(tokenizer_file),
+                std::path::PathBuf::from(weight_file),
+            )
+        } else if args.quantized {
             let ext = match args.model {
                 WhichModel::TinyEn => "tiny-en",
                 WhichModel::Tiny => "tiny",

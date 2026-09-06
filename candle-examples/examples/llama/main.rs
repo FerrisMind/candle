@@ -206,8 +206,10 @@ fn main() -> Result<()> {
                 str.to_string()
             });
             println!("loading the model weights from {model_id}");
-            let revision = args.revision.unwrap_or("main".to_string());
-            let api = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
+            let api = match args.revision.as_deref() {
+                Some(revision) => api.model(model_id).with_revision(revision),
+                None => api.model(model_id),
+            };
 
             let tokenizer_filename = api.get("tokenizer.json")?;
             let config_filename = api.get("config.json")?;

@@ -114,7 +114,7 @@ pub(crate) fn setup_output_stream() -> Result<(cpal::Stream, AudioOutputData)> {
     let channels = config.channels as usize;
     println!(
         "cpal device: {} {} {config:?}",
-        device.name().unwrap_or_else(|_| "unk".to_string()),
+        device.to_string(),
         config.sample_rate
     );
     let audio_data = Arc::new(Mutex::new(AudioOutputData_::new(
@@ -123,7 +123,7 @@ pub(crate) fn setup_output_stream() -> Result<(cpal::Stream, AudioOutputData)> {
     )?));
     let ad = audio_data.clone();
     let stream = device.build_output_stream(
-        &config,
+        config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             data.fill(0.);
             let mut ad = ad.lock().unwrap();
@@ -168,7 +168,7 @@ pub(crate) fn setup_input_stream() -> Result<(cpal::Stream, AudioOutputData)> {
     let config: cpal::StreamConfig = config_range.with_sample_rate(sample_rate).into();
     println!(
         "cpal device: {} {} {config:?}",
-        device.name().unwrap_or_else(|_| "unk".to_string()),
+        device.to_string(),
         config.sample_rate
     );
     let audio_data = Arc::new(Mutex::new(AudioOutputData_::new(
@@ -177,7 +177,7 @@ pub(crate) fn setup_input_stream() -> Result<(cpal::Stream, AudioOutputData)> {
     )?));
     let ad = audio_data.clone();
     let stream = device.build_input_stream(
-        &config,
+        config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
             let mut ad = ad.lock().unwrap();
             if let Err(err) = ad.push_samples(data) {
