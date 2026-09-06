@@ -459,8 +459,13 @@ fn model_path() -> String {
 // Preprocessed real input (same form the candle-examples yolo main.rs builds):
 // resized to 640x{416}, NHWC->NCHW, /255, f32, contiguous [1,3,416,640]. Written
 // with python+PIL (BICUBIC). Read as raw f32 (IEEE little-endian).
+fn input_path() -> String {
+    std::env::var("CANDLE_YOLO_IMG_BIN")
+        .unwrap_or_else(|_| "/tmp/t1/bike_raw_nchw_f32.bin".to_string())
+}
+
 fn read_real_input() -> Result<(Vec<f32>, Vec<usize>)> {
-    let path = std::env::var("CANDLE_YOLO_IMG_BIN").unwrap_or_else(|_| "/tmp/t1/bike_raw_nchw_f32.bin".to_string());
+    let path = input_path();
     let bytes = std::fs::read(&path).map_err(candle::Error::wrap)?;
     let n = (bytes.len() / 4) as usize;
     let mut v = Vec::with_capacity(n);
@@ -482,7 +487,15 @@ fn yolo_real_model_cpu_vs_wgpu_bisect() -> Result<()> {
     let mp = model_path();
     if std::path::Path::new(&mp).exists() {
         // Full real-model bisect (needs the safetensors + a preprocessed input).
-        run_real_model_bisect(&cpu, &wgpu)
+        let ip = input_path();
+        if std::path::Path::new(&ip).exists() {
+            run_real_model_bisect(&cpu, &wgpu)
+        } else {
+            eprintln!(
+                "[bisect] preprocessed input dump not found at {ip} (set CANDLE_YOLO_IMG_BIN); skipping real-model bisect"
+            );
+            Ok(())
+        }
     } else {
         eprintln!("[bisect] model file not found at {mp}; skipping real-model bisect");
         Ok(())

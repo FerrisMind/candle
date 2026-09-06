@@ -99,7 +99,6 @@ impl Args {
                 (None, None) => (default_model, default_revision),
             };
 
-            let repo = Repo::with_revision(model_id, RepoType::Model, revision);
             let api = Api::new()?;
             let api = api.model(model_id).with_revision(revision);
             let config = api.get("config.json")?;

@@ -138,7 +138,7 @@ impl T5ModelBuilder {
 
     fn get_local_or_remote_file(
         filename: &str,
-        api: &Repo<hf_hub::RepoTypeModel>,
+        api: &Repo,
     ) -> Result<PathBuf> {
         let local_filename = std::path::PathBuf::from(filename);
         if local_filename.exists() {

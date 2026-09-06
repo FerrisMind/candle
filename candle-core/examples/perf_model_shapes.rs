@@ -95,6 +95,7 @@ fn main() -> Result<()> {
 
 #[allow(dead_code)]
 fn print_vulkan_profile() {
+    #[cfg(feature = "vulkan")]
     if let Some((wall, rows)) = candle_core::vulkan_gpu_profile_report() {
         println!("== vulkan gpu profile (aggregation wall {wall:.2}s)");
         for (name, count, total_ms) in rows.iter().take(20) {

@@ -161,8 +161,8 @@ pub fn save_image_resize<P: AsRef<std::path::Path>>(
 }
 
 /// Loads the safetensors files for a model from the hub based on a json index file.
-pub fn hub_load_safetensors<T: hf_hub::RepoType>(
-    repo: &crate::hub::Repo<T>,
+pub fn hub_load_safetensors(
+    repo: &crate::hub::Repo,
     json_file: &str,
 ) -> Result<Vec<std::path::PathBuf>> {
     let json_file = repo.get(json_file).map_err(candle::Error::wrap)?;
