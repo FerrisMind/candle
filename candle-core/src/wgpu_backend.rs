@@ -1304,6 +1304,25 @@ fn any_as_bytes<T>(value: &T) -> &[u8] {
     }
 }
 
+/// Params for the fused LayerNorm->RoPE kernel (rope_layernorm.wgsl). All
+/// scalars, so the WGSL struct layout matches the C repr with no padding.
+#[repr(C)]
+struct RopeLayerNormParams {
+    offset_src: u32,
+    stride_s0: u32,
+    stride_s1: u32,
+    stride_s2: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
+    ne3: u32,
+    quarter: u32,
+    apply_norm: u32,
+    eps: f32,
+    _pad: u32,
+}
+
+
 fn bytes_to_vec<T: Copy>(bytes: &[u8], count: usize) -> Result<Vec<T>> {
     let byte_len = count * std::mem::size_of::<T>();
     if bytes.len() != byte_len {
@@ -9254,6 +9273,89 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             )?;
         }
 
+        Ok(dst)
+    }
+
+    /// Fused LayerNorm(+affine) -> RoPE kernel (rope_layernorm.wgsl): one
+    /// 64-lane workgroup per row of the (b, heads, n, head_dim) view. `self`
+    /// may be a strided qkv-projection view as long as the last dim is
+    /// contiguous; `gamma_beta` is [gamma, beta] contiguous F32 (head_dim
+    /// elements each); `cos`/`sin` are contiguous (b, 1, n, head_dim) tables
+    /// with the rotate-half negation already folded into sin. Returns a
+    /// contiguous F32 (b, heads, n, head_dim) storage, so the caller needs no
+    /// follow-up .contiguous() copy.
+    pub fn rope_layernorm(
+        &self,
+        layout: &Layout,
+        gamma_beta: &Self,
+        cos: &Self,
+        sin: &Self,
+        apply_norm: bool,
+        eps: f32,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32
+            || gamma_beta.dtype != DType::F32
+            || cos.dtype != DType::F32
+            || sin.dtype != DType::F32
+        {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu rope_layernorm").bt());
+        }
+        if layout.dims().len() != 4 {
+            return Err(Error::Msg("wgpu rope_layernorm expects rank-4 input".into()).bt());
+        }
+        let dims = layout.dims();
+        let strides = layout.stride();
+        let (b, heads, n, ne0) = (dims[0], dims[1], dims[2], dims[3]);
+        if ne0 != 64 || strides[3] != 1 {
+            return Err(Error::Msg(format!(
+                "wgpu rope_layernorm requires contiguous head_dim==64 rows, got ne0={ne0} stride={}",
+                strides[3]
+            ))
+            .bt());
+        }
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        let params = RopeLayerNormParams {
+            offset_src: layout.start_offset().try_into()?,
+            stride_s0: strides[0].try_into()?,
+            stride_s1: strides[1].try_into()?,
+            stride_s2: strides[2].try_into()?,
+            ne0: ne0.try_into()?,
+            ne1: heads.try_into()?,
+            ne2: n.try_into()?,
+            ne3: b.try_into()?,
+            quarter: (ne0 / 4).try_into()?,
+            apply_norm: u32::from(apply_norm),
+            eps,
+            _pad: 0,
+        };
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, true),
+            storage_entry(4, false),
+            uniform_entry(5),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &gamma_beta.buffer),
+            buffer_binding(2, &cos.buffer),
+            buffer_binding(3, &sin.buffer),
+            buffer_binding(4, &dst.buffer),
+            buffer_binding(5, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::get("rope_layernorm.wgsl")
+            .ok_or_else(|| Error::Msg("wgpu rope_layernorm shader not found".into()).bt())?
+            .source();
+        let rows = b * heads * n;
+        self.device.run_compute(
+            shader,
+            &entries,
+            &bindings,
+            rows.try_into()?,
+            "candle-wgpu-rope-layernorm",
+        )?;
         Ok(dst)
     }
 

@@ -1,0 +1,86 @@
+#version 450
+
+// Fused LayerNorm(+affine) -> RoPE for 2D-pair rope on head rows.
+// One workgroup (64 lanes) per row of the (b, heads, n, head_dim) view; the
+// input may be a strided qkv-projection view (last dim must be contiguous).
+// Companion of rope_layernorm.wgsl on the wgpu side: same math, same params.
+//
+//   norm:  y = (x - mean(x)) / sqrt(var(x) + eps) * gamma + beta   (biased var)
+//   rope:  out[j] = y[j] * cos[j] + y[j ^ quarter] * sin_alt[j]
+//
+// sin_alt carries the rotate-half negation baked in, and the partner index is
+// j ^ quarter because quarter is a power of two (host-gated ne0 == 64).
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer SRC { float data_src[]; };
+layout(binding = 1) readonly buffer GB { float data_gb[]; };  // [gamma, beta]
+layout(binding = 2) readonly buffer COSB { float data_cos[]; };
+layout(binding = 3) readonly buffer SINB { float data_sin[]; };
+layout(binding = 4) writeonly buffer DST { float data_dst[]; };
+
+layout(push_constant) uniform PushParams {
+    uint offset_src;
+    uint stride_s0;
+    uint stride_s1;
+    uint stride_s2;
+    uint ne0; // head_dim (== 64)
+    uint ne1; // heads
+    uint ne2; // n
+    uint ne3; // batch
+    uint quarter;
+    uint apply_norm;
+    float eps;
+    uint _pad;
+} p;
+
+shared float red[64];
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    const uint rows = p.ne3 * p.ne1 * p.ne2;
+    if (row >= rows) {
+        return; // uniform across the workgroup: no barrier divergence
+    }
+    const uint heads_n = p.ne1 * p.ne2;
+    const uint i3 = row / heads_n;
+    const uint rem = row % heads_n;
+    const uint i1 = rem / p.ne2;
+    const uint i2 = rem % p.ne2;
+
+    const uint base = p.offset_src + i3 * p.stride_s0 + i1 * p.stride_s1 + i2 * p.stride_s2;
+    float x = data_src[base + lane];
+
+    if (p.apply_norm == 1u) {
+        red[lane] = x;
+        barrier();
+        for (uint off = 32u; off >= 1u; off >>= 1u) {
+            if (lane < off) {
+                red[lane] = red[lane] + red[lane + off];
+            }
+            barrier();
+        }
+        float mean = red[0] / 64.0;
+        barrier();
+        float xc = x - mean;
+        red[lane] = xc * xc;
+        barrier();
+        for (uint off = 32u; off >= 1u; off >>= 1u) {
+            if (lane < off) {
+                red[lane] = red[lane] + red[lane + off];
+            }
+            barrier();
+        }
+        float variance = red[0] / 64.0;
+        barrier();
+        float rstd = 1.0 / sqrt(variance + p.eps);
+        x = xc * rstd * data_gb[lane] + data_gb[p.ne0 + lane];
+    }
+
+    red[lane] = x;
+    barrier();
+    float partner = red[lane ^ p.quarter];
+    uint trow = (i3 * p.ne2 + i2) * p.ne0 + lane;
+    data_dst[row * p.ne0 + lane] = x * data_cos[trow] + partner * data_sin[trow];
+}

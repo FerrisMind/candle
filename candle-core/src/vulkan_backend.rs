@@ -181,6 +181,27 @@ struct VulkanRandNormalParams {
     std: f32,
 }
 
+/// Push-constant params for the fused LayerNorm->RoPE kernel
+/// (rope_layernorm_f32). Mirrors the push_constant block in
+/// rope_layernorm.comp field for field.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RopeLayerNormParams {
+    offset_src: u32,
+    stride_s0: u32,
+    stride_s1: u32,
+    stride_s2: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
+    ne3: u32,
+    quarter: u32,
+    apply_norm: u32,
+    eps: f32,
+    _pad: u32,
+}
+
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VulkanWhereU8Params {
@@ -8345,6 +8366,82 @@ impl VulkanStorage {
     ) -> Result<Self> {
         self.run_matmul_f32_bias(rhs, bias, bmnk, lhs_l, rhs_l)
     }
+
+    /// Fused LayerNorm(+affine) -> RoPE kernel (rope_layernorm_f32 SPIR-V):
+    /// one 64-lane workgroup per row of the (b, heads, n, head_dim) view.
+    /// `self` may be a strided qkv-projection view as long as the last dim is
+    /// contiguous; `gamma_beta` is [gamma, beta] contiguous F32 (head_dim
+    /// elements each); `cos`/`sin` are contiguous (b, 1, n, head_dim) tables
+    /// with the rotate-half negation already folded into sin. Returns a
+    /// contiguous F32 (b, heads, n, head_dim) storage, so the caller needs no
+    /// follow-up .contiguous() copy. Params travel as push constants.
+    pub fn rope_layernorm(
+        &self,
+        layout: &Layout,
+        gamma_beta: &Self,
+        cos: &Self,
+        sin: &Self,
+        apply_norm: bool,
+        eps: f32,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32
+            || gamma_beta.dtype != DType::F32
+            || cos.dtype != DType::F32
+            || sin.dtype != DType::F32
+        {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan rope_layernorm").bt());
+        }
+        if layout.dims().len() != 4 {
+            return Err(Error::Msg("vulkan rope_layernorm expects rank-4 input".into()).bt());
+        }
+        let dims = layout.dims();
+        let strides = layout.stride();
+        let (b, heads, n, ne0) = (dims[0], dims[1], dims[2], dims[3]);
+        if ne0 != 64 || strides[3] != 1 {
+            return Err(Error::Msg(format!(
+                "vulkan rope_layernorm requires contiguous head_dim==64 rows, got ne0={ne0} stride={}",
+                strides[3]
+            ))
+            .bt());
+        }
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        let params = RopeLayerNormParams {
+            offset_src: layout.start_offset() as u32,
+            stride_s0: strides[0] as u32,
+            stride_s1: strides[1] as u32,
+            stride_s2: strides[2] as u32,
+            ne0: ne0 as u32,
+            ne1: heads as u32,
+            ne2: n as u32,
+            ne3: b as u32,
+            quarter: (ne0 / 4) as u32,
+            apply_norm: apply_norm as u32,
+            eps,
+            _pad: 0,
+        };
+        let spirv = candle_vulkan_kernels::spirv("rope_layernorm_f32")
+            .ok_or_else(|| Error::Msg("vulkan shader rope_layernorm_f32 not generated".into()))?;
+        let bindings = [
+            VulkanBinding::Storage(&self.buffer),
+            VulkanBinding::Storage(&gamma_beta.buffer),
+            VulkanBinding::Storage(&cos.buffer),
+            VulkanBinding::Storage(&sin.buffer),
+            VulkanBinding::Storage(&dst.buffer),
+        ];
+        // One workgroup (64 lanes) per row; split the linear row index across
+        // x/y to stay under the 65535 per-dimension workgroup limit (the
+        // shader reconstructs row = wid.x + wid.y * num_wg.x).
+        let rows = (b * heads * n) as u32;
+        if rows == 0 {
+            return Ok(dst);
+        }
+        let wg_x = rows.min(65535);
+        let wg_y = rows.div_ceil(wg_x);
+        self.device
+            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), (wg_x, wg_y, 1))?;
+        Ok(dst)
+    }
+
 
     fn run_matmul_f32(
         &self,

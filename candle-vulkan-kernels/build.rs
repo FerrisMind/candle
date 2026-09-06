@@ -881,6 +881,11 @@ fn generate_candle_spirv_modules(
             candle_shaders_dir.join("batched_gemv_f16.comp"),
             &[],
         ),
+        (
+            "rope_layernorm_f32",
+            candle_shaders_dir.join("rope_layernorm.comp"),
+            &[],
+        ),
     ];
     for (name, source, defines) in modules {
         let output = spv_dir.join(format!("{name}.spv"));
