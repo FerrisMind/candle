@@ -1106,26 +1106,18 @@ impl Module for Identity {
 /// other backend uses the plain unfused form.
 pub fn mul_mat_add(x: &Tensor, w_t: &Tensor, bias: &Tensor) -> Result<Tensor> {
     let x_rank = x.rank();
-    // Verified-correct coverage: the aligned coopmat bias kernel
-    // (matmul_f32_f32_aligned_cm1_bias). The unaligned cm1 staged-store
-    // epilogue writes bias without the matmul contribution on some tiles
-    // (llama.cpp upstream does not fuse bias into coopmat either), so those
-    // shapes keep the unfused path.
-    let batch = x.dim(0)?;
+    // The weight must reach the kernel as a stride-0 broadcast view over the
+    // batch (see below): presenting it with a single real batch made the
+    // kernel's batch_idx_a walk past the 1-batch weight buffer for batch > 1
+    // (zero matmul contribution, bias-only output). With the broadcast view
+    // the bias epilogue is exact for aligned AND unaligned cm1 shapes —
+    // covered by the shape-matrix unit test. m <= 8 routes to the matvec
+    // path, which has no bias.
     let m = x.dim(1)?;
     let n = w_t.dim(1)?;
-    let k = x.dim(2)?;
-    // batch == 1: with batch > 1 the forced staged epilogue wrote bias
-    // without the matmul contribution on some tiles (RTX 3060 / recent
-    // driver) — the direct coopMatStore path the unfused kernel uses has no
-    // such hazard, so multi-batch stays unfused until that is root-caused.
     let fused_ok = x_rank == 3
         && w_t.rank() == 2
-        && batch == 1
-        && m > 8 // m <= 8 routes to the matvec path, which has no bias
-        && m % 64 == 0
-        && n % 64 == 0
-        && k % 32 == 0
+        && m > 8
         && x.dtype() == DType::F32
         && w_t.dtype() == DType::F32
         && bias.dtype() == DType::F32
@@ -1135,7 +1127,23 @@ pub fn mul_mat_add(x: &Tensor, w_t: &Tensor, bias: &Tensor) -> Result<Tensor> {
     if !fused_ok {
         return x.broadcast_matmul(w_t).and_then(|t| t.broadcast_add(bias));
     }
-    let w_t = w_t.unsqueeze(0)?; // (1, k, n): broadcast over the batch
+    let batch = x.dim(0)?;
+    let (k, n) = (w_t.dim(0)?, w_t.dim(1)?);
+    let w_t = w_t
+        .unsqueeze(0)?
+        .broadcast_as(Shape::from((batch, k, n)))?;
+    x.apply_op3_no_bwd(&w_t, bias, &MulMatAdd)
+}
+
+/// Diagnostic: bypasses the verified-shape gate so the fused kernel itself
+/// can be probed on any shape (used by mul_mat_add_tests).
+#[doc(hidden)]
+pub fn mul_mat_add_forced(x: &Tensor, w_t: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    let batch = x.dim(0)?;
+    let (k, n) = (w_t.dim(0)?, w_t.dim(1)?);
+    let w_t = w_t
+        .unsqueeze(0)?
+        .broadcast_as(Shape::from((batch, k, n)))?;
     x.apply_op3_no_bwd(&w_t, bias, &MulMatAdd)
 }
 
@@ -1756,7 +1764,7 @@ pub fn flash_attn(
 
 #[cfg(all(test, feature = "vulkan"))]
 mod mul_mat_add_tests {
-    use super::mul_mat_add;
+    use super::mul_mat_add_forced;
     use candle::{DType, Device, Tensor};
 
     #[test]
@@ -1792,7 +1800,7 @@ mod mul_mat_add_tests {
                 .broadcast_add(&b_v)?
                 .to_device(&dev_cpu)?
                 .to_dtype(DType::F32)?;
-            let fused = mul_mat_add(&xs_v, &w_v, &b_v)?;
+            let fused = mul_mat_add_forced(&xs_v, &w_v, &b_v)?;
             let fused_cpu = fused.to_device(&dev_cpu)?.to_dtype(DType::F32)?;
 
             let a = fused_cpu.flatten_all()?.to_vec1::<f32>()?;
@@ -1820,6 +1828,28 @@ mod mul_mat_add_tests {
                 }
             }
             println!("SHAPE batch={batch} m={m} k={k} n={n}: max diff {diff:.6} {}", if diff < 2e-3 {"OK"} else {"FAIL"});
+            // Full map of bias-only positions (got == bias[col] exactly):
+            // reveals which tile/batch/row/col region lost its matmul part.
+            let mut bias_only = 0usize;
+            let mut first: Option<(usize, usize, usize)> = None;
+            let mut last: Option<(usize, usize, usize)> = None;
+            for (bt_i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                let flat_b = bt_i / (m * n);
+                let rem_b = bt_i % (m * n);
+                let col_b = rem_b % n;
+                if (*x - *y).abs() > 1e-3 && (*x - (col_b % 11) as f32 * 0.21 + 0.9).abs() < 1e-4 {
+                    bias_only += 1;
+                    if first.is_none() {
+                        first = Some((flat_b, rem_b / n, col_b));
+                    }
+                    last = Some((flat_b, rem_b / n, col_b));
+                }
+            }
+            if bias_only > 0 {
+                println!(
+                    "bias-only count={bias_only} first={first:?} last={last:?}"
+                );
+            }
             worst = worst.max(diff);
         }
         assert!(worst < 2e-3, "worst shape diff {worst}");
