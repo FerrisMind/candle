@@ -940,6 +940,10 @@ thread_local! {
 struct WgpuPendingDispatch {
     pipeline: Arc<WgpuCachedPipeline>,
     label: &'static str,
+    /// wgpu_buffer_key of every STORAGE buffer bound by this dispatch —
+    /// the dependency set for pass folding (uniform params excluded: they
+    /// are written before submission, never by dispatches).
+    buffer_keys: smallvec::SmallVec<[usize; 8]>,
     bind_group: wgpu::BindGroup,
     workgroups: (u32, u32, u32),
     /// Pre-resolved dynamic offsets (storage + uniform). Empty when using
@@ -2281,40 +2285,94 @@ impl WgpuDevice {
         } else {
             None
         };
-        for d in &batch.pending_dispatches {
-            let ts_write = profiler.as_ref().and_then(|p| {
-                p.next_indices().map(|(b, e)| {
-                    wgpu::ComputePassTimestampWrites {
-                        query_set: &p.query_set,
-                        beginning_of_pass_write_index: Some(b),
-                        end_of_pass_write_index: Some(e),
-                    }
-                })
-            });
-            if let (Some(p), Some(tw)) = (&profiler, &ts_write) {
-                if let Ok(mut pending) = p.pending.lock() {
-                    pending.push((
-                        tw.beginning_of_pass_write_index.unwrap_or(0),
-                        tw.end_of_pass_write_index.unwrap_or(0),
-                        d.label,
-                    ));
-                }
-            }
-            let mut pass = batch
-                .encoder
-                .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("candle-wgpu-batch-pass"),
-                    timestamp_writes: ts_write,
+        // Pass folding: consecutive dispatches whose storage-buffer sets are
+        // pairwise disjoint run in ONE compute pass — WebGPU provides no
+        // barriers inside a pass, but disjoint buffer sets make the order
+        // irrelevant, and one pass instead of N removes N-1 WDDM pass
+        // boundaries. Dependent dispatches (dst of N is src of N+1) start a
+        // new group exactly as before. Disabled while the timestamp profiler
+        // is active (it keys on per-dispatch passes) and by
+        // CANDLE_WGPU_PASS_FOLDING=0.
+        let folding = profiler.is_none()
+            && std::env::var("CANDLE_WGPU_PASS_FOLDING").as_deref() != Ok(&"0");
+        if !folding {
+            for d in &batch.pending_dispatches {
+                let ts_write = profiler.as_ref().and_then(|p| {
+                    p.next_indices().map(|(b, e)| {
+                        wgpu::ComputePassTimestampWrites {
+                            query_set: &p.query_set,
+                            beginning_of_pass_write_index: Some(b),
+                            end_of_pass_write_index: Some(e),
+                        }
+                    })
                 });
-            pass.set_pipeline(&d.pipeline.pipeline);
-            if d.use_immediates && d.deferred_uniform_len > 0 {
-                let n = d.deferred_uniform_len as usize;
-                pass.set_immediates(0, &d.deferred_uniform[..n]);
-                pass.set_bind_group(0, &d.bind_group, &[]);
-            } else {
-                pass.set_bind_group(0, &d.bind_group, &d.dynamic_offsets);
+                if let (Some(p), Some(tw)) = (&profiler, &ts_write) {
+                    if let Ok(mut pending) = p.pending.lock() {
+                        pending.push((
+                            tw.beginning_of_pass_write_index.unwrap_or(0),
+                            tw.end_of_pass_write_index.unwrap_or(0),
+                            d.label,
+                        ));
+                    }
+                }
+                let mut pass = batch
+                    .encoder
+                    .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("candle-wgpu-batch-pass"),
+                        timestamp_writes: ts_write,
+                    });
+                pass.set_pipeline(&d.pipeline.pipeline);
+                if d.use_immediates && d.deferred_uniform_len > 0 {
+                    let n = d.deferred_uniform_len as usize;
+                    pass.set_immediates(0, &d.deferred_uniform[..n]);
+                    pass.set_bind_group(0, &d.bind_group, &[]);
+                } else {
+                    pass.set_bind_group(0, &d.bind_group, &d.dynamic_offsets);
+                }
+                pass.dispatch_workgroups(d.workgroups.0, d.workgroups.1, d.workgroups.2);
             }
-            pass.dispatch_workgroups(d.workgroups.0, d.workgroups.1, d.workgroups.2);
+        } else {
+            const PASS_DESC: fn() -> wgpu::ComputePassDescriptor<'static> =
+                || wgpu::ComputePassDescriptor {
+                    label: Some("candle-wgpu-batch-pass"),
+                    timestamp_writes: None,
+                };
+            let dispatches = std::mem::take(&mut batch.pending_dispatches);
+            let mut group_start = 0usize;
+            let mut group_buffers: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            let mut emit_group = |batch: &mut WgpuActiveBatch,
+                                  dispatches: &[WgpuPendingDispatch],
+                                  range: std::ops::Range<usize>| {
+                if range.start >= range.end {
+                    return;
+                }
+                let mut pass = batch
+                    .encoder
+                    .begin_compute_pass(&PASS_DESC());
+                for d in &dispatches[range.clone()] {
+                    pass.set_pipeline(&d.pipeline.pipeline);
+                    if d.use_immediates && d.deferred_uniform_len > 0 {
+                        let n = d.deferred_uniform_len as usize;
+                        pass.set_immediates(0, &d.deferred_uniform[..n]);
+                        pass.set_bind_group(0, &d.bind_group, &[]);
+                    } else {
+                        pass.set_bind_group(0, &d.bind_group, &d.dynamic_offsets);
+                    }
+                    pass.dispatch_workgroups(d.workgroups.0, d.workgroups.1, d.workgroups.2);
+                }
+            };
+            for (idx, d) in dispatches.iter().enumerate() {
+                let conflict = d.buffer_keys.iter().any(|k| group_buffers.contains(k));
+                if conflict && idx > group_start {
+                    emit_group(batch, &dispatches, group_start..idx);
+                    group_buffers.clear();
+                    group_start = idx;
+                }
+                group_buffers.extend(d.buffer_keys.iter().copied());
+            }
+            emit_group(batch, &dispatches, group_start..dispatches.len());
+            batch.pending_dispatches = dispatches;
         }
         batch.pending_dispatches.clear();
     }
@@ -3121,9 +3179,24 @@ impl WgpuDevice {
             // BindGroup holds buffer refs until encode; CommandBuffer after.
             // Defer into one compute pass at encode/flush time — fewer
             // begin_compute_pass calls on elementwise batches.
+            let buffer_keys: smallvec::SmallVec<[usize; 8]> = bindings
+                .iter()
+                .enumerate()
+                .filter_map(|(i, be)| match (&be.resource, entries.get(i).map(|e| &e.ty)) {
+                    (
+                        wgpu::BindingResource::Buffer(bb),
+                        Some(wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { .. },
+                            ..
+                        }),
+                    ) => Some(wgpu_buffer_key(bb.buffer)),
+                    _ => None,
+                })
+                .collect();
             batch.pending_dispatches.push(WgpuPendingDispatch {
                 pipeline: cached.clone(),
                 label: cached.label,
+                buffer_keys,
                 bind_group,
                 workgroups,
                 dynamic_offsets: dynamic_offsets.iter().copied().collect(),
