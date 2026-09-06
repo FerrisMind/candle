@@ -59,7 +59,7 @@ fn main(
 
     // All lanes reach every workgroupBarrier; rows past seq_q stay idle but
     // must not diverge around the barriers.
-    let active = s < params.seq_q && b < params.batch_size && h_q < params.num_heads;
+    let tile_active = s < params.seq_q && b < params.batch_size && h_q < params.num_heads;
 
     let gqa_factor = max(1u, params.num_heads / params.num_kv_heads);
     let h_kv = h_q / gqa_factor;
@@ -73,7 +73,7 @@ fn main(
     var l: f32 = 0.0;
     var q_reg = array<f32, DIM_MAX>();
     var o_acc = array<f32, DIM_MAX>();
-    if (active) {
+    if (tile_active) {
         for (var d: u32 = 0u; d < D; d++) {
             q_reg[d] = Q[q_base + s * D + d];
             o_acc[d] = 0.0;
@@ -94,7 +94,7 @@ fn main(
         }
         workgroupBarrier();
 
-        if (active) {
+        if (tile_active) {
             // Phase 1: scores for this tile, per-row block max.
             var scores = array<f32, KV_TILE>();
             var block_max: f32 = NEG_BIG;
@@ -150,7 +150,7 @@ fn main(
         workgroupBarrier();
     }
 
-    if (active) {
+    if (tile_active) {
         for (var d: u32 = 0u; d < Dv; d++) {
             let norm = select(0.0, o_acc[d] / l, l > 0.0);
             O[o_base + s * Dv + d] = norm;

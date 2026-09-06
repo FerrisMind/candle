@@ -692,7 +692,8 @@ struct WgpuInner {
     queue: wgpu::Queue,
     features: wgpu::Features,
     limits: wgpu::Limits,
-    /// Cached `CANDLE_WGPU_COOP_MATMUL` (default true when hardware allows).
+    /// Cached `CANDLE_WGPU_COOP_MATMUL` (default false — f16 MMA breaks the
+    /// DType::F32 accuracy contract; opt in explicitly).
     coop_matmul_enabled: bool,
     gpu_profile: std::sync::Mutex<Option<std::sync::Arc<WgpuGpuProfile>>>,
     /// Last uncaptured / device-lost error message (worker-safe; no panic).
@@ -16073,9 +16074,16 @@ fn wgpu_finish_device(
     let device_lost = Arc::new(AtomicBool::new(false));
     wgpu_install_runtime_handlers(&device, &runtime_error, &device_lost);
     // Cache env once — env::var on every matmul was measurable host cost.
+    // OPT-IN: the coop GEMM executes f16 tensor-core MMA (10-bit mantissa on
+    // f32 inputs) — ~1e-3 relative error, far above the fp32-accumulation
+    // tolerance of plain DType::F32 matmul (backend_smoke shape sweep).
+    // Default off so DType::F32 keeps exact-fp32 semantics; callers that
+    // accept the tradeoff set CANDLE_WGPU_COOP_MATMUL=1 (measured 1.9–2.5×
+    // on attention/linear shapes). Mirrors the vulkan
+    // CANDLE_VULKAN_F32_UNALIGNED_COOPMAT opt-in.
     let coop_matmul_enabled = std::env::var("CANDLE_WGPU_COOP_MATMUL")
-        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-        .unwrap_or(true);
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     WGPU_GPU_PROFILE_ENABLED.store(
         std::env::var("CANDLE_WGPU_GPU_PROFILE")
             .map(|v| v != "0")
