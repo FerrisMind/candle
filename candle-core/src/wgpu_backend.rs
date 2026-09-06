@@ -694,6 +694,7 @@ struct WgpuInner {
     limits: wgpu::Limits,
     /// Cached `CANDLE_WGPU_COOP_MATMUL` (default true when hardware allows).
     coop_matmul_enabled: bool,
+    gpu_profile: std::sync::Mutex<Option<std::sync::Arc<WgpuGpuProfile>>>,
     /// Last uncaptured / device-lost error message (worker-safe; no panic).
     runtime_error: Arc<Mutex<Option<String>>>,
     /// Set by `set_device_lost_callback` when the GPU device is lost.
@@ -793,8 +794,152 @@ struct WgpuElemBgKey {
     storage_sizes: Vec<u64>,
 }
 
+
+/// GPU-timestamp profiler (CANDLE_WGPU_GPU_PROFILE=1): every batched
+/// dispatch runs in its own compute pass, so a per-pass begin/end timestamp
+/// pair gives exact per-kernel GPU time. Resolved asynchronously after each
+/// submission completes and aggregated by kernel label.
+const WGPU_GPU_PROFILE_QUERY_COUNT: u32 = 4096;
+/// Drain the pool once this many queries are handed out.
+const WGPU_GPU_PROFILE_DRAIN_AT: u32 = 2048;
+const WGPU_GPU_PROFILE_READ_SLOTS: usize = 32;
+
+struct WgpuGpuProfile {
+
+    // (uses fully-qualified atomics)
+    query_set: wgpu::QuerySet,
+    resolve: Vec<Arc<wgpu::Buffer>>,
+    readback: Vec<Arc<wgpu::Buffer>>,
+    cursor: std::sync::atomic::AtomicU32,
+    read_slot: std::sync::atomic::AtomicU32,
+    timestamp_period_ns: f64,
+    agg: std::sync::Mutex<HashMap<&'static str, (u64, u64)>>,
+    /// Pass ranges handed out since the last drain.
+    pending: std::sync::Mutex<Vec<(u32, u32, &'static str)>>,
+}
+
+impl std::fmt::Debug for WgpuGpuProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WgpuGpuProfile")
+    }
+}
+
+impl WgpuGpuProfile {
+    fn next_indices(&self) -> Option<(u32, u32)> {
+        let q0 = self
+            .cursor
+            .fetch_add(2, std::sync::atomic::Ordering::AcqRel);
+        if q0 + 1 >= WGPU_GPU_PROFILE_QUERY_COUNT {
+            return None; // pool exhausted; remaining passes run unprofiled
+        }
+        Some((q0, q0 + 1))
+    }
+
+    fn drain(&self, device: &wgpu::Device, queue: &wgpu::Queue, cursor: u32) {
+        let mut ranges = match self.pending.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(e) => std::mem::take(&mut *e.into_inner()),
+        };
+        if ranges.is_empty() {
+            return;
+        }
+        ranges.sort_by_key(|(q0, _, _)| *q0);
+        let first = ranges.first().unwrap().0;
+        let last = ranges.last().unwrap().1;
+        let count = last - first + 1;
+        self.cursor.store(0, std::sync::atomic::Ordering::Release);
+        let slot = (self.read_slot.fetch_add(1, std::sync::atomic::Ordering::AcqRel) % WGPU_GPU_PROFILE_READ_SLOTS as u32) as usize;
+        let resolve = self.resolve[slot].clone();
+        let readback = self.readback[slot].clone();
+        let labels: Vec<(u32, u32, &'static str)> = ranges.to_vec();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("candle-wgpu-gpu-profile-readout"),
+        });
+        encoder.resolve_query_set(&self.query_set, first..(first + count), &resolve, 0);
+        encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, count as u64 * 8);
+        queue.submit([encoder.finish()]);
+        let period = self.timestamp_period_ns;
+        let byte_len = count as u64 * 8;
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        readback
+            .slice(0..byte_len)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = result;
+                let _ = tx.send(());
+            });
+        device.poll(wgpu::PollType::wait_indefinitely());
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+        {
+            let data = readback.get_mapped_range(0..byte_len);
+            let mut agg = match self.agg.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            for (q0, _q1, label) in &labels {
+                let i0 = (*q0 - first) as usize;
+                let begin =
+                    u64::from_le_bytes(data[i0 * 8..i0 * 8 + 8].try_into().unwrap_or([0; 8]));
+                let end = u64::from_le_bytes(
+                    data[(i0 + 1) * 8..(i0 + 1) * 8 + 8]
+                        .try_into()
+                        .unwrap_or([0; 8]),
+                );
+                let ticks = end.saturating_sub(begin);
+                let entry = agg.entry(label).or_insert((0u64, 0u64));
+                entry.0 += 1;
+                entry.1 += (ticks as f64 * period) as u64;
+            }
+        }
+        readback.unmap();
+        // Mirror into the thread-local report table (same thread: all wgpu
+        // calls run on the dispatching thread).
+        WGPU_GPU_PROFILE_AGG.with(|tl| {
+            let mut tl = match tl.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            let mut agg = match self.agg.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            for (name, (count, nanos)) in agg.iter_mut() {
+                let e = tl.entry(*name).or_insert((0u64, 0u64));
+                e.0 += *count;
+                e.1 += *nanos;
+                *count = 0;
+                *nanos = 0;
+            }
+        });
+    }
+}
+
+/// Aggregated GPU kernel report (label, dispatch count, total ms), hottest
+/// first. None unless CANDLE_WGPU_GPU_PROFILE=1 and the adapter supports
+/// timestamp queries.
+pub fn wgpu_gpu_profile_report() -> Option<Vec<(&'static str, u64, f64)>> {
+    WGPU_GPU_PROFILE_ENABLED
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(|| ())?;
+    WGPU_GPU_PROFILE_AGG.with(|agg| {
+        let agg = agg.lock().ok()?;
+        let mut rows: Vec<(&'static str, u64, f64)> = agg
+            .iter()
+            .map(|(name, (count, nanos))| (*name, *count, *nanos as f64 / 1e6))
+            .collect();
+        rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        Some(rows)
+    })
+}
+
+static WGPU_GPU_PROFILE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static WGPU_GPU_PROFILE_AGG: std::sync::Mutex<HashMap<&'static str, (u64, u64)>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
 struct WgpuPendingDispatch {
     pipeline: Arc<WgpuCachedPipeline>,
+    label: &'static str,
     bind_group: wgpu::BindGroup,
     workgroups: (u32, u32, u32),
     /// Pre-resolved dynamic offsets (storage + uniform). Empty when using
@@ -808,6 +953,9 @@ struct WgpuPendingDispatch {
 }
 
 struct WgpuActiveBatch {
+    /// (begin_ts_index, end_ts_index, kernel label) per encoded pass —
+    /// filled only when the GPU-timestamp profiler is active.
+    profile_ranges: Vec<(u32, u32, &'static str)>,
     encoder: wgpu::CommandEncoder,
     retained_buffers: Vec<Arc<wgpu::Buffer>>,
     /// Compute dispatches held until encode_pending_dispatches (one pass).
@@ -892,6 +1040,8 @@ fn wgpu_shader_cache_key(shader: &str) -> (u64, usize) {
 struct WgpuCachedPipeline {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
+    /// Kernel name for the GPU-timestamp profiler.
+    label: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -2006,6 +2156,7 @@ impl WgpuDevice {
             });
         Ok(WgpuActiveBatch {
             encoder,
+            profile_ranges: Vec::new(),
             retained_buffers: Vec::new(),
             pending_dispatches: Vec::new(),
             dispatch_count: 0,
@@ -2062,12 +2213,98 @@ impl WgpuDevice {
         // write→read ordering required by BatchNorm-style broadcast chains and
         // multi-layer models (ConvMixer). Independent microbench batches still
         // share one encoder/submit.
+        // Lazily create the GPU-timestamp profiler on first batch encode.
+        let profiler: Option<std::sync::Arc<WgpuGpuProfile>> = if WGPU_GPU_PROFILE_ENABLED
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let mut guard = match device.inner.gpu_profile.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            if guard.is_none()
+                && !device
+                    .inner
+                    .features
+                    .contains(wgpu::Features::TIMESTAMP_QUERY)
+            {
+                eprintln!("[candle-wgpu] gpu-profile: TIMESTAMP_QUERY feature missing (features={:?})", device.inner.features);
+            }
+            if guard.is_none()
+                && device
+                    .inner
+                    .features
+                    .contains(wgpu::Features::TIMESTAMP_QUERY)
+            {
+                let query_set = device.inner.device.create_query_set(&wgpu::QuerySetDescriptor {
+                    ty: wgpu::QueryType::Timestamp,
+                    count: WGPU_GPU_PROFILE_QUERY_COUNT,
+                    label: Some("candle-wgpu-gpu-profile"),
+                });
+                let mk = |label: String, usage: wgpu::BufferUsages| {
+                    std::sync::Arc::new(device.inner.device.create_buffer(
+                        &wgpu::BufferDescriptor {
+                            label: Some(&label),
+                            size: WGPU_GPU_PROFILE_QUERY_COUNT as u64 * 8,
+                            usage,
+                            mapped_at_creation: false,
+                        },
+                    ))
+                };
+                let resolve = (0..WGPU_GPU_PROFILE_READ_SLOTS)
+                    .map(|i| {
+                        mk(
+                            format!("candle-wgpu-gpu-profile-resolve-{i}"),
+                            wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                        )
+                    })
+                    .collect();
+                let readback = (0..WGPU_GPU_PROFILE_READ_SLOTS)
+                    .map(|i| {
+                        mk(
+                            format!("candle-wgpu-gpu-profile-readback-{i}"),
+                            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        )
+                    })
+                    .collect();
+                *guard = Some(std::sync::Arc::new(WgpuGpuProfile {
+                    query_set,
+                    resolve,
+                    readback,
+                    cursor: std::sync::atomic::AtomicU32::new(0),
+                    read_slot: std::sync::atomic::AtomicU32::new(0),
+                    timestamp_period_ns: f64::from(device.inner.queue.get_timestamp_period()),
+                    agg: std::sync::Mutex::new(HashMap::new()),
+                    pending: std::sync::Mutex::new(Vec::new()),
+                }));
+            }
+            guard.as_ref().map(std::sync::Arc::clone)
+        } else {
+            None
+        };
         for d in &batch.pending_dispatches {
+            let ts_write = profiler.as_ref().and_then(|p| {
+                p.next_indices().map(|(b, e)| {
+                    wgpu::ComputePassTimestampWrites {
+                        query_set: &p.query_set,
+                        beginning_of_pass_write_index: Some(b),
+                        end_of_pass_write_index: Some(e),
+                    }
+                })
+            });
+            if let (Some(p), Some(tw)) = (&profiler, &ts_write) {
+                if let Ok(mut pending) = p.pending.lock() {
+                    pending.push((
+                        tw.beginning_of_pass_write_index.unwrap_or(0),
+                        tw.end_of_pass_write_index.unwrap_or(0),
+                        d.label,
+                    ));
+                }
+            }
             let mut pass = batch
                 .encoder
                 .begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("candle-wgpu-batch-pass"),
-                    timestamp_writes: None,
+                    timestamp_writes: ts_write,
                 });
             pass.set_pipeline(&d.pipeline.pipeline);
             if d.use_immediates && d.deferred_uniform_len > 0 {
@@ -2136,6 +2373,14 @@ impl WgpuDevice {
         self.inner
             .queue
             .on_submitted_work_done(move || done.store(true, Ordering::Release));
+        if let Ok(profiler) = self.inner.gpu_profile.lock() {
+            if let Some(profiler) = profiler.as_ref() {
+                let cursor = profiler.cursor.load(std::sync::atomic::Ordering::Acquire);
+                if cursor >= WGPU_GPU_PROFILE_DRAIN_AT {
+                    profiler.drain(&self.inner.device, &self.inner.queue, cursor);
+                }
+            }
+        }
         const MAX_IN_FLIGHT_SUBMISSIONS: usize = 32;
         // Retained device bytes of this submission (before the move below).
         let retained_bytes: u64 = batch.retained_buffers.iter().map(|b| b.size()).sum();
@@ -2706,6 +2951,7 @@ impl WgpuDevice {
                     let cached = Arc::new(WgpuCachedPipeline {
                         bind_group_layout,
                         pipeline,
+                        label,
                     });
                     cache.insert(cache_key, cached.clone());
                     cached
@@ -2876,7 +3122,8 @@ impl WgpuDevice {
             // Defer into one compute pass at encode/flush time — fewer
             // begin_compute_pass calls on elementwise batches.
             batch.pending_dispatches.push(WgpuPendingDispatch {
-                pipeline: cached,
+                pipeline: cached.clone(),
+                label: cached.label,
                 bind_group,
                 workgroups,
                 dynamic_offsets: dynamic_offsets.iter().copied().collect(),
@@ -11225,14 +11472,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                         .inner
                         .features
                         .contains(wgpu::Features::SHADER_F16)
-                    && m.is_multiple_of(16)
-                    && n.is_multiple_of(16)
-                    && k.is_multiple_of(16)
                     && m >= 64
                     && n >= 64
                     && k >= 64
                     // Exclude small square smokes (64³) where f16 error exceeds
                     // tight abs tols; allow tall/wide (e.g. 64×4096) and ≥128².
+                    // The 16-alignment checks were REMOVED: mul_mat_coop_64.wgsl
+                    // already zero-fills out-of-range shared-tile loads and
+                    // clips stores (kernel handles ragged m/n/k), and pi3x
+                    // linears are m=3903/1301 — unaligned m forced ~515 GEMMs
+                    // per model onto the scalar warptile at 40ms/ea (20.8s GPU
+                    // of the 87s wall).
                     && (m >= 128 || n >= 128)
                     && params.stride_1k == 1;
                 if coop_ok {
@@ -15586,6 +15836,7 @@ fn wgpu_required_features(adapter_features: wgpu::Features) -> wgpu::Features {
             | wgpu::Features::SUBGROUP_BARRIER
             | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
             | wgpu::Features::IMMEDIATES
+            | wgpu::Features::TIMESTAMP_QUERY
             | wgpu::Features::SHADER_F64;
         adapter_features & optional
     }
@@ -15650,6 +15901,12 @@ fn wgpu_finish_device(
     let coop_matmul_enabled = std::env::var("CANDLE_WGPU_COOP_MATMUL")
         .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
         .unwrap_or(true);
+    WGPU_GPU_PROFILE_ENABLED.store(
+        std::env::var("CANDLE_WGPU_GPU_PROFILE")
+            .map(|v| v != "0")
+            .unwrap_or(false),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // WebGPU requires dynamic uniform offsets multiple of this alignment.
     let uniform_dyn_slot =
         u64::from(adapter_limits.min_uniform_buffer_offset_alignment).max(256);
@@ -15666,6 +15923,7 @@ fn wgpu_finish_device(
             features: required_features,
             limits: adapter_limits,
             coop_matmul_enabled,
+            gpu_profile: std::sync::Mutex::new(None),
             runtime_error,
             device_lost,
             seed_value: RwLock::new(299_792_458),
