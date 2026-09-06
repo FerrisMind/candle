@@ -137,7 +137,7 @@ pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
 
 #[cfg(feature = "wgpu")]
-pub use wgpu_backend::{WgpuDevice, WgpuError, WgpuStorage};
+pub use wgpu_backend::{wgpu_gpu_profile_report, WgpuDevice, WgpuError, WgpuStorage};
 
 #[cfg(not(feature = "wgpu"))]
 pub use dummy_wgpu_backend::{WgpuDevice, WgpuError, WgpuStorage};
