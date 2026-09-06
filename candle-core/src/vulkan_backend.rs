@@ -8331,12 +8331,65 @@ impl VulkanStorage {
         Ok(())
     }
 
+    /// Dense f32 GEMM with fused bias epilogue (MUL_MAT_ADD). `bias` must be
+    /// a contiguous F32 VulkanStorage with `n` elements (one per output
+    /// column); the bias-epilogue shader variant adds it at the store site,
+    /// removing the separate broadcast-add dispatch per Linear.
+    pub fn matmul_bias(
+        &self,
+        rhs: &Self,
+        bias: &Self,
+        bmnk: (usize, usize, usize, usize),
+        lhs_l: &Layout,
+        rhs_l: &Layout,
+    ) -> Result<Self> {
+        self.run_matmul_f32_bias(rhs, bias, bmnk, lhs_l, rhs_l)
+    }
+
     fn run_matmul_f32(
         &self,
         rhs: &Self,
         (b, m, n, k): (usize, usize, usize, usize),
         lhs_l: &Layout,
         rhs_l: &Layout,
+    ) -> Result<Self> {
+        self.run_matmul_f32_inner(rhs, (b, m, n, k), lhs_l, rhs_l, None)
+    }
+
+    /// Dense f32 GEMM with fused bias epilogue (MUL_MAT_ADD): bias[n] is added
+    /// to every output column inside the matmul kernel, removing the separate
+    /// broadcast-add dispatch and its activation-sized round trip after each
+    /// Linear. Falls back to the unfused path whenever the bias kernel variant
+    /// is unavailable or the promotion/early-exit paths would trigger.
+    fn run_matmul_f32_bias(
+        &self,
+        rhs: &Self,
+        bias: &Self,
+        (b, m, n, k): (usize, usize, usize, usize),
+        lhs_l: &Layout,
+        rhs_l: &Layout,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32
+            || rhs.dtype != DType::F32
+            || bias.dtype != DType::F32
+            || bias.count != n
+        {
+            crate::bail!(
+                "matmul_bias requires F32 bias with n elements (got n={n}, count={}, dtype={:?})",
+                bias.count,
+                bias.dtype
+            );
+        }
+        self.run_matmul_f32_inner(rhs, (b, m, n, k), lhs_l, rhs_l, Some(bias))
+    }
+
+    fn run_matmul_f32_inner(
+        &self,
+        rhs: &Self,
+        (b, m, n, k): (usize, usize, usize, usize),
+        lhs_l: &Layout,
+        rhs_l: &Layout,
+        bias: Option<&Self>,
     ) -> Result<Self> {
         if self.dtype != rhs.dtype {
             let promote_to = if self.dtype == DType::F64 || rhs.dtype == DType::F64 {
@@ -8718,12 +8771,14 @@ impl VulkanStorage {
             broadcast3: 1,
             padded_n: m.try_into()?,
         };
-        let bindings = [
+                let mut bindings = vec![
             VulkanBinding::Storage(&rhs_t.buffer),
             VulkanBinding::Storage(&lhs.buffer),
             VulkanBinding::Storage(&dst.buffer),
         ];
-        // Prefer the aligned tiled variant when M/N are multiples of the 64x64
+        if let Some(bias) = bias {
+            bindings.push(VulkanBinding::Storage(&bias.buffer));
+        } // Prefer the aligned tiled variant when M/N are multiples of the 64x64
         // tile and K is a multiple of 32 — this matches ggml-vulkan's aligned
         // GEMM path and avoids residual edge handling overhead.
         // Virtual BT forces the unaligned virtual kernel (strided-K A loads).
@@ -8774,7 +8829,14 @@ impl VulkanStorage {
                 return Err(Error::UnsupportedDTypeForOp(other, "vulkan matmul").bt());
             }
         };
-        let spirv = candle_vulkan_kernels::spirv(spirv_name)
+                // Bias epilogue: swap in the BIAS_ADD variant and bind the bias
+        // vector (length = candle N) as binding 3 (4th slice entry).
+        let bias_name = bias.and_then(|_| {
+            let name = format!("{spirv_name}_bias");
+            vulkan_spirv_exists(&name).then_some(name)
+        });
+        let spirv_name = bias_name.as_deref().unwrap_or(spirv_name);
+let spirv = candle_vulkan_kernels::spirv(spirv_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         // ggml `m_warptile` layout: {BLOCK_SIZE, BM, BN, (BK), WM, WN, WMITER,
         // TM, TN, (TK), WARP}. The thread count must satisfy
@@ -11215,6 +11277,7 @@ impl BackendStorage for VulkanStorage {
     ) -> Result<Self> {
         self.run_matmul_f32(rhs, bmnk, lhs_l, rhs_l)
     }
+
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
         if self.dtype != dst.dtype {

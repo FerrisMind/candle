@@ -3,6 +3,7 @@
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use candle::backend::BackendStorage;
+use candle::backend::BackendDevice;
 use candle::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
 use rayon::prelude::*;
 
@@ -1099,6 +1100,80 @@ impl Module for Identity {
 }
 
 #[allow(dead_code)]
+
+/// Fused Linear forward (MUL_MAT_ADD): `x @ w_t + bias` in one dispatch.
+/// Only the vulkan backend fuses it (bias-epilogue matmul kernel); every
+/// other backend uses the plain unfused form.
+pub fn mul_mat_add(x: &Tensor, w_t: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    let x_rank = x.rank();
+    // Verified-correct coverage: the aligned coopmat bias kernel
+    // (matmul_f32_f32_aligned_cm1_bias). The unaligned cm1 staged-store
+    // epilogue writes bias without the matmul contribution on some tiles
+    // (llama.cpp upstream does not fuse bias into coopmat either), so those
+    // shapes keep the unfused path.
+    let m = x.dim(1)?;
+    let n = w_t.dim(1)?;
+    let k = x.dim(2)?;
+    let fused_ok = x_rank == 3
+        && w_t.rank() == 2
+        && m > 8 // m <= 8 routes to the matvec path, which has no bias
+        && m % 64 == 0
+        && n % 64 == 0
+        && k % 32 == 0
+        && x.dtype() == DType::F32
+        && w_t.dtype() == DType::F32
+        && bias.dtype() == DType::F32
+        && bias.rank() == 1
+        && n == bias.dim(0)?
+        && x.device().is_vulkan();
+    if !fused_ok {
+        return x.broadcast_matmul(w_t).and_then(|t| t.broadcast_add(bias));
+    }
+    let w_t = w_t.unsqueeze(0)?; // (1, k, n): broadcast over the batch
+    x.apply_op3_no_bwd(&w_t, bias, &MulMatAdd)
+}
+
+struct MulMatAdd;
+
+impl candle::CustomOp3 for MulMatAdd {
+    fn name(&self) -> &'static str {
+        "mul_mat_add"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        // Never routed on cpu (see mul_mat_add gate); kept as an error.
+        candle::bail!("mul_mat_add cpu fallback is not used")
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        x: &candle::VulkanStorage,
+        x_l: &Layout,
+        w: &candle::VulkanStorage,
+        w_l: &Layout,
+        b: &candle::VulkanStorage,
+        b_l: &Layout,
+    ) -> Result<(candle::VulkanStorage, Shape)> {
+        let x_dims = x_l.dims();
+        let (batch, m, k) = (x_dims[0], x_dims[1], x_dims[2]);
+        let n = w_l.dim(2)?;
+        // Layouts are passed straight through: run_matmul_f32 reads strided
+        // A/B in-kernel (the transposed-weight (0,2,1) view pays no copy, same
+        // as the unfused path). Only the tiny bias vector must be contiguous.
+        let out = x.matmul_bias(w, b, (batch, m, n, k), x_l, w_l)?;
+        Ok((out, Shape::from(vec![batch, m, n])))
+    }
+}
+
 struct Sdpa {
     scale: f32,
     softcapping: f32,
@@ -1671,4 +1746,68 @@ pub fn flash_attn(
     let v_t = v.transpose(1, 2)?;
     let out = sdpa_unfused(&q_t, &k_t, &v_t, None, causal, softmax_scale, 1.0)?;
     out.transpose(1, 2)
+}
+
+#[cfg(all(test, feature = "vulkan"))]
+mod mul_mat_add_tests {
+    use super::mul_mat_add;
+    use candle::{DType, Device, Tensor};
+
+    #[test]
+    fn mul_mat_add_matches_unfused_vulkan() -> anyhow::Result<()> {
+        let dev = Device::new_vulkan(0)?;
+        let dev_cpu = Device::Cpu;
+        for (batch, m, k, n) in [(1usize, 64usize, 128usize, 256usize), (3, 40, 96, 130)] {
+            let xs = (0..batch * m * k)
+                .map(|v| (v % 17) as f32 * 0.13 - 1.0)
+                .collect::<Vec<_>>();
+            let w = (0..k * n).map(|v| (v % 23) as f32 * 0.07 - 0.8).collect::<Vec<_>>();
+            let bias = (0..n).map(|v| (v % 11) as f32 * 0.21 - 0.9).collect::<Vec<_>>();
+            let xs_t = Tensor::from_vec(xs.clone(), (batch, m, k), &dev_cpu)?;
+            let w_t = Tensor::from_vec(w.clone(), (k, n), &dev_cpu)?;
+            let b_t = Tensor::from_vec(bias.clone(), (n,), &dev_cpu)?;
+            let xs_v = xs_t.to_device(&dev)?;
+            let w_v = w_t.to_device(&dev)?;
+            let b_v = b_t.to_device(&dev)?;
+            // Reference: the unfused path on the SAME vulkan device, so the
+            // comparison isolates the bias epilogue from GPU-vs-CPU noise.
+            let reference = xs_v
+                .broadcast_matmul(&w_v)?
+                .broadcast_add(&b_v)?
+                .to_device(&dev_cpu)?
+                .to_dtype(DType::F32)?;
+            let fused = mul_mat_add(&xs_v, &w_v, &b_v)?;
+            let fused_cpu = fused.to_device(&dev_cpu)?.to_dtype(DType::F32)?;
+
+            let a = fused_cpu.flatten_all()?.to_vec1::<f32>()?;
+            let b = reference.flatten_all()?.to_vec1::<f32>()?;
+            let diff = a
+                .iter()
+                .zip(b.iter())
+                .map(|(x, y)| (*x as f64 - *y as f64).abs())
+                .fold(0.0f64, f64::max);
+            let mut shown = 0;
+            for (bi, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                if (x - y).abs() > 1e-3 && shown < 8 {
+                    let flat = bi;
+                    let bt = flat / (m * n);
+                    let rem = flat % (m * n);
+                    let row = rem / n;
+                    let col = rem % n;
+                    println!(
+                        "mismatch batch={bt} row={row} col={col}: got {x} want {y} delta={:.6} bias[col]={} bias[row]={}",
+                        x - y,
+                        (col % 11) as f32 * 0.21 - 0.9,
+                        (row % 11) as f32 * 0.21 - 0.9
+                    );
+                    shown += 1;
+                }
+            }
+            assert!(
+                diff.abs() < 1e-3,
+                "batch={batch} m={m} k={k} n={n}: max diff {diff}"
+            );
+        }
+        Ok(())
+    }
 }
