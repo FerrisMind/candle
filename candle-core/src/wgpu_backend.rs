@@ -5545,12 +5545,24 @@ fn main(
 }
 
 fn bf16_scale_shader() -> String {
+    // Params MUST mirror ScaleParams exactly: the dispatch uploads ScaleParams
+    // bytes, so a shorter struct would misread `ne` from `stride_src1` and the
+    // kernel would silently write nothing (WebGPU buffers are zero-initialised).
     inject_wg_size(format!(
         r#"{BF16_WGSL_HELPERS}
 struct Params {{
     offset_src: u32,
     offset_dst: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    stride_dst1: u32,
+    stride_dst2: u32,
+    stride_dst3: u32,
     ne: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
     scale: f32,
     bias: f32,
 }};
@@ -6625,42 +6637,11 @@ impl WgpuStorage {
             storage_entry(1, false),
             uniform_entry(2),
         ];
-        if self.dtype == DType::BF16 && layout.is_contiguous() && bias == 0.0 {
-            // ponytail: in-place pair-write — saves one full attn-scores buffer at long prefill.
-            let mut inplace_params = params;
-            inplace_params.offset_src = 0;
-            inplace_params.offset_dst = 0;
-            let param_buffer = self
-                .device
-                .write_uniform_params(any_as_bytes(&inplace_params))?;
-            let bindings = [
-                storage_layout_binding(self, layout, 0)?,
-                storage_layout_binding(self, layout, 1)?,
-                buffer_binding(2, &param_buffer),
-            ];
-            let pairs = count.div_ceil(2) as u32;
-            self.device.run_compute_linear(
-                &bf16_scale_shader(),
-                &entries,
-                &bindings,
-                pairs,
-                "candle-wgpu-scale-bf16-inplace",
-            )?;
-            return Ok(WgpuStorage {
-                buffer: self.buffer.clone(),
-                device: self.device.clone(),
-                count,
-                dtype: self.dtype,
-            });
-        }
         let dst = if self.dtype == DType::BF16 {
-            if !layout.is_contiguous() {
-                let mut materialized =
-                    unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
-                <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
-                let mat_layout = Layout::contiguous(layout.shape());
-                return materialized.run_scale(&mat_layout, scale, bias);
-            }
+            // Packed u32-pair bf16 scale (decode -> f32 math -> RNE encode):
+            // one pass. The earlier in-place variant here mutated the input
+            // storage and returned it, which is invalid for general callers
+            // (affine must not alias its input).
             unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? }
         } else {
             let (dims, strides) = dims4(layout)?;
@@ -14863,14 +14844,10 @@ impl BackendStorage for WgpuStorage {
                 scaled.to_dtype(&src_f32_layout, DType::F16)
             }
             DType::BF16 => {
-                let src_f32 = self.materialize_to_f32(layout)?;
-                let src_f32_layout = if layout.dims().len() > 4 {
-                    Layout::contiguous(Self::compact_rank_gt4_shape(layout))
-                } else {
-                    Layout::contiguous(layout.shape())
-                };
-                let scaled = src_f32.run_scale(&src_f32_layout, mul as f32, add as f32)?;
-                scaled.to_dtype(&src_f32_layout, DType::BF16)
+                // Packed bf16 scale kernel (u32 pairs, decode -> f32 math ->
+                // RNE encode): one pass instead of the f32 hub's three
+                // (bf16->f32 materialize, f32 scale, f32->bf16 convert).
+                self.run_scale(layout, mul as f32, add as f32)
             }
             DType::F8E4M3 => self.f8e4m3_unary_via_f32(layout, |src, src_l| {
                 src.run_scale(src_l, mul as f32, add as f32)
