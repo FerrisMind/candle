@@ -1358,10 +1358,13 @@ fn bytes_to_vec<T: Copy>(bytes: &[u8], count: usize) -> Result<Vec<T>> {
     Ok(out)
 }
 
-fn cpu_storage_to_bytes(storage: &CpuStorage) -> Result<(DType, usize, Vec<u8>)> {
+fn cpu_storage_to_bytes(storage: &CpuStorage) -> Result<(DType, usize, &[u8])> {
     macro_rules! typed {
         ($storage:expr, $dtype:expr) => {{
-            let bytes = typed_as_bytes($storage).to_vec();
+            // Borrowed reinterpret: queue.write_buffer copies the bytes into
+            // wgpu's internal staging anyway, so an owned copy here (an extra
+            // allocation plus full-size memcpy per upload) is unnecessary.
+            let bytes = typed_as_bytes($storage);
             Ok(($dtype, $storage.len(), bytes))
         }};
     }
@@ -1449,10 +1452,16 @@ fn scalar_raw_words(
     Ok(words)
 }
 
-fn wgpu_padded_write_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut padded = bytes.to_vec();
-    padded.resize(wgpu_copy_size(bytes.len()), 0);
-    padded
+fn wgpu_padded_write_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let padded_len = wgpu_copy_size(bytes.len());
+    if padded_len == bytes.len() {
+        // Common case: already 4-byte aligned, no padding allocation.
+        std::borrow::Cow::Borrowed(bytes)
+    } else {
+        let mut padded = bytes.to_vec();
+        padded.resize(padded_len, 0);
+        std::borrow::Cow::Owned(padded)
+    }
 }
 
 impl WgpuDevice {
@@ -2027,7 +2036,7 @@ impl WgpuDevice {
     /// Chunked to avoid oversized single `queue.write_buffer` calls on browsers.
     fn write_storage_bytes(&self, buffer: &wgpu::Buffer, bytes: &[u8]) -> Result<()> {
         const UPLOAD_CHUNK: usize = 1024 * 1024;
-        let padded = wgpu_padded_write_bytes(bytes);
+        let padded: std::borrow::Cow<'_, [u8]> = wgpu_padded_write_bytes(bytes);
         let mut off = 0usize;
         while off < padded.len() {
             let end = (off + UPLOAD_CHUNK).min(padded.len());
@@ -16692,7 +16701,23 @@ impl BackendDevice for WgpuDevice {
     }
 
     fn storage_from_slice<T: WithDType>(&self, data: &[T]) -> Result<Self::Storage> {
-        self.storage_from_cpu_storage(&T::to_cpu_storage(data))
+        if data.is_empty() {
+            return self.storage_from_cpu_storage(&T::to_cpu_storage(data));
+        }
+        // Upload straight from the caller's slice: building an owned CpuStorage
+        // first would add a full-size host copy of the data per upload.
+        let bytes = typed_as_bytes(data);
+        let buffer = self.register_buffer_arc(self.create_storage_buffer_arc(
+            bytes.len(),
+            "candle-wgpu-upload",
+        ));
+        self.write_storage_bytes(&buffer, bytes)?;
+        Ok(WgpuStorage {
+            buffer,
+            device: self.clone(),
+            count: data.len(),
+            dtype: T::DTYPE,
+        })
     }
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
