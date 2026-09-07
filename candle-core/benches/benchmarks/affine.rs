@@ -38,8 +38,13 @@ fn criterion_benchmark(c: &mut Criterion) {
         run_affine_benchmark(c, &device, DType::F32, "affine_f32");
         run_affine_benchmark(c, &device, DType::F16, "affine_f16");
         run_affine_benchmark(c, &device, DType::BF16, "affine_bf16");
+        // The CUDA PTX guards the fp8 kernels behind __CUDA_ARCH__ >= 890, so on
+        // pre-Ada GPUs (e.g. sm_86) the kernel symbol does not exist and the
+        // bench would panic. Skip fp8 on CUDA; vulkan/wgpu compile fp8 in unconditionally.
         #[cfg(not(feature = "metal"))]
-        run_affine_benchmark(c, &device, DType::F8E4M3, "affine_fp8");
+        if !device.is_cuda() {
+            run_affine_benchmark(c, &device, DType::F8E4M3, "affine_fp8");
+        }
     }
 }
 
