@@ -162,6 +162,27 @@ struct SumRowsParams {
 }
 const _: () = assert!(size_of::<SumRowsParams>() <= 256);
 
+/// Params for `reduce_rows_strided.wgsl` / `arg_reduce_rows_strided.wgsl`:
+/// last-dim reduce where the reduced dim may carry a non-unit stride.
+/// Outer dims are stored innermost-first (ne1 = nearest to the reduced dim).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StridedReduceParams {
+    offset_src: u32,
+    offset_dst: u32,
+    stride_src0: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
+    row_begin: u32,
+    mode: u32,
+    _pad0: u32,
+}
+const _: () = assert!(size_of::<StridedReduceParams>() <= 256);
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ArgMaxParams {
@@ -8549,6 +8570,159 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
     }
 
+    /// Strided last-dim reduce for f32 without a materialize pass: the reduce
+    /// kernels read the reduced-dim stride from the params, so a transposed or
+    /// sliced view is reduced in one dispatch instead of copy-then-reduce.
+    /// Returns `None` when the shape does not fit the kernel (rank > 4, dims
+    /// outside u32, empty rows) and the caller must use the general path.
+    fn try_reduce_rows_strided(
+        &self,
+        op: ReduceOp,
+        layout: &Layout,
+        dim: usize,
+    ) -> Result<Option<Self>> {
+        let rank = layout.dims().len();
+        if rank == 0 || rank > 4 || dim >= rank {
+            return Ok(None);
+        }
+        let ne0: u32 = match layout.dims()[dim].try_into() {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let stride_src0: u32 = match layout.stride()[dim].try_into() {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        if ne0 == 0 || ne0 < 2 {
+            // ne0 == 1 is handled by the identity path in reduce_op; a
+            // workgroup-per-row kernel would spend more on launches than on
+            // the reduction itself.
+            return Ok(None);
+        }
+        // Outer dims innermost-first, padded to the kernel's 3-slot layout.
+        // A padded slot keeps len 1 / stride 0: its index is always 0, so the
+        // stride never contributes.
+        let mut outer_dims = [1u32; 3];
+        let mut outer_strides = [0u32; 3];
+        let mut rows: u64 = 1;
+        let mut slots = 0;
+        for i in (0..rank).rev() {
+            if i == dim {
+                continue;
+            }
+            if slots >= 3 {
+                return Ok(None);
+            }
+            let d: u32 = match layout.dims()[i].try_into() {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            let s: u32 = match layout.stride()[i].try_into() {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            outer_dims[slots] = d;
+            outer_strides[slots] = s;
+            rows *= d as u64;
+            slots += 1;
+        }
+        if rows == 0 || rows > u32::MAX as u64 {
+            return Ok(None);
+        }
+        let offset_src: u32 = match layout.start_offset().try_into() {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let (is_arg, mode, shader) = match op {
+            ReduceOp::Sum => (
+                false,
+                0u32,
+                candle_wgpu_kernels::reduce_rows_strided_shader(WG_SIZE).ok_or_else(|| {
+                    Error::Msg("wgpu shader reduce_rows_strided.wgsl not embedded".into()).bt()
+                })?,
+            ),
+            ReduceOp::Max => (
+                false,
+                1u32,
+                candle_wgpu_kernels::reduce_rows_strided_shader(WG_SIZE).ok_or_else(|| {
+                    Error::Msg("wgpu shader reduce_rows_strided.wgsl not embedded".into()).bt()
+                })?,
+            ),
+            ReduceOp::Min => (
+                false,
+                2u32,
+                candle_wgpu_kernels::reduce_rows_strided_shader(WG_SIZE).ok_or_else(|| {
+                    Error::Msg("wgpu shader reduce_rows_strided.wgsl not embedded".into()).bt()
+                })?,
+            ),
+            ReduceOp::ArgMax => (
+                true,
+                0u32,
+                candle_wgpu_kernels::arg_reduce_rows_strided_shader(WG_SIZE).ok_or_else(|| {
+                    Error::Msg("wgpu shader arg_reduce_rows_strided.wgsl not embedded".into())
+                        .bt()
+                })?,
+            ),
+            ReduceOp::ArgMin => (
+                true,
+                1u32,
+                candle_wgpu_kernels::arg_reduce_rows_strided_shader(WG_SIZE).ok_or_else(|| {
+                    Error::Msg("wgpu shader arg_reduce_rows_strided.wgsl not embedded".into())
+                        .bt()
+                })?,
+            ),
+            _ => return Ok(None),
+        };
+        let mut dst_dims = layout.dims().to_vec();
+        dst_dims[dim] = 1;
+        let dst = unsafe {
+            self.device
+                .alloc_uninit(&Shape::from(dst_dims), if is_arg { DType::U32 } else { DType::F32 })?
+        };
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let max_workgroups = wgpu_dispatch_wg_cap(&self.device) as u32;
+        let mut row_begin: u32 = 0;
+        while row_begin < rows as u32 {
+            let chunk_rows = ((rows as u32) - row_begin).min(max_workgroups);
+            let params = StridedReduceParams {
+                offset_src,
+                offset_dst: 0,
+                stride_src0,
+                stride_src1: outer_strides[0],
+                stride_src2: outer_strides[1],
+                stride_src3: outer_strides[2],
+                ne0,
+                ne1: outer_dims[0],
+                ne2: outer_dims[1],
+                row_begin,
+                mode,
+                _pad0: 0,
+            };
+            const _: () = assert!(size_of::<StridedReduceParams>() <= 256);
+            // Fresh uniform ring slot per chunk so deferred multi-dispatch
+            // never shares one uniform's last write.
+            let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
+            let bindings = [
+                buffer_binding(0, &self.buffer),
+                buffer_binding(1, &dst.buffer),
+                buffer_binding(2, &param_buffer),
+            ];
+            self.device.run_compute(
+                &shader,
+                &entries,
+                &bindings,
+                chunk_rows,
+                "candle-wgpu-reduce-strided",
+            )?;
+            row_begin += chunk_rows;
+        }
+        Ok(Some(dst))
+    }
+
     fn run_reduce_non_last_dim(&self, op: ReduceOp, layout: &Layout, dim: usize) -> Result<Self> {
         let rank = layout.dims().len();
         let perm = (0..rank).filter(|&i| i != dim).chain(std::iter::once(dim));
@@ -14842,6 +15016,35 @@ impl BackendStorage for WgpuStorage {
             return self.run_reduce_multi_dim(op, layout, reduce_dims);
         }
         let dim = reduce_dims[0];
+        // Reducing a length-1 dim is an identity on the values (sum/max/min
+        // return the elements; argmax/argmin are all-zero indices) — a naive
+        // per-row reduce kernel would launch one near-empty workgroup per
+        // outer element and spend milliseconds on launch overhead.
+        if layout.dims()[dim] == 1 && layout.dims().iter().product::<usize>() > 0 {
+            match op {
+                ReduceOp::Sum | ReduceOp::Max | ReduceOp::Min => return self.try_clone(layout),
+                ReduceOp::ArgMax | ReduceOp::ArgMin => {
+                    let mut dst_dims = layout.dims().to_vec();
+                    dst_dims[dim] = 1;
+                    let dst_shape = Shape::from(dst_dims);
+                    let mut dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::U32)? };
+                    dst.const_set(crate::scalar::Scalar::U32(0), &Layout::contiguous(dst_shape))?;
+                    return Ok(dst);
+                }
+                _ => {}
+            }
+        }
+        // Strided-aware single-dispatch reduce (no materialize pass) for the
+        // common value/arg reductions; falls back to the copy-based paths when
+        // the shape does not fit the strided kernels.
+        match op {
+            ReduceOp::Sum | ReduceOp::Max | ReduceOp::Min | ReduceOp::ArgMax | ReduceOp::ArgMin => {
+                if let Some(reduced) = self.try_reduce_rows_strided(op, layout, dim)? {
+                    return Ok(reduced);
+                }
+            }
+            _ => {}
+        }
         // The last-dim kernels (sum_rows / extrema) index src assuming UNIT stride
         // along the reduced dim. A non-contiguous view (reduced-dim stride != 1,
         // e.g. reshape((b,c,l))->transpose(1,2) feeds layer_norm) would read

@@ -278,6 +278,24 @@ pub fn argmax_shader(workgroup_size: u32) -> Option<String> {
     })
 }
 
+pub fn reduce_rows_strided_shader(workgroup_size: u32) -> Option<String> {
+    cached_shader((22u8, workgroup_size), || {
+        let source = get("reduce_rows_strided.wgsl")?.source();
+        let defines = vec!["WG_SIZE".to_string()];
+        let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+        Some(preprocess(source, &defines, &replacements, DType::F32))
+    })
+}
+
+pub fn arg_reduce_rows_strided_shader(workgroup_size: u32) -> Option<String> {
+    cached_shader((23u8, workgroup_size), || {
+        let source = get("arg_reduce_rows_strided.wgsl")?.source();
+        let defines = vec!["WG_SIZE".to_string()];
+        let replacements = vec![("WG_SIZE".to_string(), workgroup_size.to_string())];
+        Some(preprocess(source, &defines, &replacements, DType::F32))
+    })
+}
+
 pub fn rope_shader(dtype: DType, workgroup_size: u32) -> Option<String> {
     cached_shader((15u8, dtype as u8, workgroup_size), || {
         let source = get("rope.wgsl")?.source();
