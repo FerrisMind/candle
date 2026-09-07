@@ -1494,6 +1494,62 @@ pub fn pool_avg_bf16_shader(workgroup_size: u32) -> Option<String> {
     pool_bf16_shader(workgroup_size, true)
 }
 
+/// Native gather conv_transpose2d: one thread per output element, f32
+/// accumulation, native dtype in/out. `dtype` selects SRC/DST types (BF16 is
+/// packed u32 with CAS stores) and whether `enable f16;` survives preprocess.
+fn conv_transpose2d_shader(workgroup_size: u32, dtype: DType) -> Option<String> {
+    let source = get("conv_transpose2d.wgsl")?.source();
+    let (src_type, src_define) = match dtype {
+        DType::F32 => ("f32", "SRC_F32"),
+        DType::F16 => ("f16", "SRC_F16"),
+    };
+    let tag = (match src_define {
+        "SRC_F32" => 24u8,
+        _ => 25u8,
+    }, workgroup_size);
+    cached_shader(tag, || {
+        let defines = vec![
+            "WG_SIZE".to_string(),
+            src_define.to_string(),
+            src_define.replace("SRC_", "DST_"),
+        ];
+        let replacements = vec![
+            ("WG_SIZE".to_string(), workgroup_size.to_string()),
+            ("SRC_TYPE".to_string(), src_type.to_string()),
+            ("DST_TYPE".to_string(), src_type.to_string()),
+        ];
+        Some(preprocess(source, &defines, &replacements, dtype))
+    })
+}
+
+pub fn conv_transpose2d_f32_shader(workgroup_size: u32) -> Option<String> {
+    conv_transpose2d_shader(workgroup_size, DType::F32)
+}
+
+pub fn conv_transpose2d_f16_shader(workgroup_size: u32) -> Option<String> {
+    conv_transpose2d_shader(workgroup_size, DType::F16)
+}
+
+pub fn conv_transpose2d_bf16_shader(workgroup_size: u32) -> Option<String> {
+    let tag = (26u8, workgroup_size);
+    cached_shader(tag, || {
+        let source = get("conv_transpose2d.wgsl")?.source();
+        let defines = vec![
+            "WG_SIZE".to_string(),
+            "SRC_BF16".to_string(),
+            "DST_BF16".to_string(),
+        ];
+        let replacements = vec![
+            ("WG_SIZE".to_string(), workgroup_size.to_string()),
+            ("SRC_TYPE".to_string(), "u32".to_string()),
+            ("DST_TYPE".to_string(), "u32".to_string()),
+        ];
+        // Only u32 bit-twiddling, no f16 scalar types: strip the f16 enable so
+        // the shader compiles on adapters without SHADER_F16.
+        Some(preprocess(source, &defines, &replacements, DType::F32))
+    })
+}
+
 /// Shared native-dtype upsample variant: `mode` is one of NEAREST1D/NEAREST2D/
 /// BILINEAR2D, `src_type` is the WGSL storage element type ("f32"/"f16"/"u32"
 /// for bf16). `SRC_TYPE` is replaced token-wise and the matching SRC_F32/

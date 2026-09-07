@@ -194,6 +194,37 @@ struct ArgMaxParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct ConvTransposeParams {
+    ne: u32, // total output elements (b * c_out * out_h * out_w)
+    offset_src: u32, // in elements
+    offset_w: u32,   // in elements
+    offset_dst: u32, // in elements
+    // Input strides (in elements), innermost-first from dims4: [w, h, c, b].
+    st_in_b: u32,
+    st_in_c: u32,
+    st_in_h: u32,
+    st_in_w: u32,
+    // Kernel strides (in elements), innermost-first: [kw, kh, c_out, c_in].
+    st_k_ci: u32,
+    st_k_co: u32,
+    st_k_h: u32,
+    st_k_w: u32,
+    out_h: u32,
+    out_w: u32,
+    c_out: u32,
+    c_in: u32,
+    i_h: u32,
+    i_w: u32,
+    k_h: u32,
+    k_w: u32,
+    stride: u32,
+    dilation: u32,
+    padding: u32,
+    _pad0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct PoolParams {
     offset_src: u32, // in elements
     offset_dst: u32, // in elements
@@ -12420,6 +12451,111 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
     }
 
+    /// Direct gather conv_transpose2d: one thread per output element reads
+    /// the input taps straight out of the (strided) source and kernel and
+    /// accumulates in f32 — no host-built ids/mask, no scatter chain. Runs as
+    /// a single dispatch for F32/F16/BF16; returns None to fall back to the
+    /// im2col-scatter path when a dimension or stride overflows u32.
+    fn run_conv_transpose2d_gather(
+        &self,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose2D,
+    ) -> Result<Option<Self>> {
+        if self.dtype != kernel.dtype
+            || !matches!(self.dtype, DType::F32 | DType::F16 | DType::BF16)
+            || params.stride == 0
+        {
+            return Ok(None);
+        }
+        let (_, src_strides) = dims4(layout)?;
+        let (_, k_strides) = dims4(kernel_l)?;
+        let out_h = params.out_h();
+        let out_w = params.out_w();
+        let ne = params
+            .b_size
+            .checked_mul(params.c_out)
+            .and_then(|v| v.checked_mul(out_h))
+            .and_then(|v| v.checked_mul(out_w));
+        let fits = |v: usize| v <= u32::MAX as usize;
+        // dims4 strides are already u32; only dims/strides beyond u32 (offsets
+        // are usize) need the fallback path.
+        if ne.map(|v| v > u32::MAX as usize).unwrap_or(true)
+            || !fits(out_h)
+            || !fits(out_w)
+            || !fits(params.i_h)
+            || !fits(params.i_w)
+            || !fits(params.k_h)
+            || !fits(params.k_w)
+            || !fits(params.stride)
+            || !fits(params.dilation)
+            || !fits(params.padding)
+        {
+            return Ok(None);
+        }
+        let src_strides: [u32; 4] = src_strides;
+        let k_strides: [u32; 4] = k_strides;
+        let wg_params = ConvTransposeParams {
+            ne: ne.unwrap() as u32,
+            offset_src: layout.start_offset().try_into()?,
+            offset_w: kernel_l.start_offset().try_into()?,
+            offset_dst: 0,
+            st_in_b: src_strides[3],
+            st_in_c: src_strides[2],
+            st_in_h: src_strides[1],
+            st_in_w: src_strides[0],
+            st_k_ci: k_strides[3],
+            st_k_co: k_strides[2],
+            st_k_h: k_strides[1],
+            st_k_w: k_strides[0],
+            out_h: out_h as u32,
+            out_w: out_w as u32,
+            c_out: params.c_out as u32,
+            c_in: params.c_in as u32,
+            i_h: params.i_h as u32,
+            i_w: params.i_w as u32,
+            k_h: params.k_h as u32,
+            k_w: params.k_w as u32,
+            stride: params.stride as u32,
+            dilation: params.dilation as u32,
+            padding: params.padding as u32,
+            _pad0: 0,
+        };
+        const _: () = assert!(size_of::<ConvTransposeParams>() <= 256);
+        let shader = match self.dtype {
+            DType::F32 => candle_wgpu_kernels::conv_transpose2d_f32_shader(WG_SIZE),
+            DType::F16 => candle_wgpu_kernels::conv_transpose2d_f16_shader(WG_SIZE),
+            DType::BF16 => candle_wgpu_kernels::conv_transpose2d_bf16_shader(WG_SIZE),
+            _ => unreachable!(),
+        }
+        .ok_or_else(|| Error::Msg("wgpu shader conv_transpose2d.wgsl not embedded".into()).bt())?;
+        let final_shape = Shape::from(params.out_dims());
+        let dst = unsafe { self.device.alloc_uninit(&final_shape, self.dtype)? };
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&wg_params))?;
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &kernel.buffer),
+            buffer_binding(2, &dst.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let workgroups = (ne.unwrap() as u32).div_ceil(WG_SIZE);
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-conv-transpose2d",
+        )?;
+        Ok(Some(dst))
+    }
+
     /// Native conv_transpose2d (CUDA parity: f16/bf16 in, f32 accumulate via
     /// native sub-ops, native dtype out). The im2col-free scatter chain —
     /// matmul, mask-mul, index_add, zeros — keeps the source dtype end to end
@@ -15593,6 +15729,9 @@ impl BackendStorage for WgpuStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self> {
+        if let Some(out) = self.run_conv_transpose2d_gather(layout, kernel, kernel_l, params)? {
+            return Ok(out);
+        }
         self.run_conv_transpose2d_f32(layout, kernel, kernel_l, params)
     }
     fn avg_pool2d(
