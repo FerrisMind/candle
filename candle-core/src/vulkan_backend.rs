@@ -8892,6 +8892,50 @@ impl VulkanStorage {
         let dst = unsafe { self.device.alloc_uninit(&dst_shape, dst_compute_dtype)? };
         // Contiguous B^T: stride_a = K. Virtual BT from physical (K,N): stride_a = N.
         let stride_a_val = if rhs_virtual_bt { n } else { k };
+        // Padded-B tall GEMM: candle M is not a 64-tile multiple but the A
+        // side is fully tiled (candle N % 128 == 0) and K is BK-aligned. Pad
+        // the candle-LHS (ggml B, indexed [n * stride_b + k] with
+        // stride_b = K) row COUNT up to the next BN=64 multiple so the whole
+        // GEMM runs as the ALIGNED fp32 kernel — unguarded vec4 A and B
+        // loads, exact scalar FFMA (the guarded-B variant loses the win, and
+        // the TF32 coopmat MMA is precision-reduced). The pad is junk rows
+        // past M: each output column reads only its own B row, and store
+        // guards (p.N = real M) never write their outputs — the dense (n, m)
+        // dst needs no tail copy and no zero-fill. The pad copy itself is
+        // one contiguous region. Measured 24.1ms -> ~14.5ms on linear_large
+        // (17424x768x3072, RTX 3060).
+        let f32_aligned = m.is_multiple_of(64) && n.is_multiple_of(64) && k.is_multiple_of(32);
+        let pad_lhs_to_64 = rank == 2
+            && self.dtype == DType::F32
+            && !f32_aligned
+            && !rhs_virtual_bt
+            && k.is_multiple_of(32)
+            && n.is_multiple_of(128)
+            && m >= 512
+            && n >= 512
+            && k >= 512
+            && !m.is_multiple_of(64);
+        let mut padded_lhs = None;
+        let padded_m = if pad_lhs_to_64 {
+            let m_pad = m.div_ceil(64) * 64;
+            let mut tmp = unsafe {
+                self.device
+                    .alloc_uninit(&Shape::from((m_pad, k)), self.dtype)?
+            };
+            lhs.copy2d(
+                &mut tmp,
+                m,
+                k,
+                lhs_stride[rank - 2],
+                k,
+                lhs_layout.start_offset(),
+                0,
+            )?;
+            padded_lhs = Some(tmp);
+            m_pad
+        } else {
+            m
+        };
         let params = VulkanMatmulParams {
             m: n.try_into()?,
             n: m.try_into()?,
@@ -8909,11 +8953,15 @@ impl VulkanStorage {
             ne12: bs02.try_into()?,
             broadcast2: 1,
             broadcast3: 1,
-            padded_n: m.try_into()?,
+            padded_n: padded_m.try_into()?,
         };
                 let mut bindings = vec![
             VulkanBinding::Storage(&rhs_t.buffer),
-            VulkanBinding::Storage(&lhs.buffer),
+            VulkanBinding::Storage(
+                padded_lhs
+                    .as_ref()
+                    .map_or(&lhs.buffer, |p| &p.buffer),
+            ),
             VulkanBinding::Storage(&dst.buffer),
         ];
         if let Some(bias) = bias {
@@ -8922,7 +8970,6 @@ impl VulkanStorage {
         // tile and K is a multiple of 32 — this matches ggml-vulkan's aligned
         // GEMM path and avoids residual edge handling overhead.
         // Virtual BT forces the unaligned virtual kernel (strided-K A loads).
-        let f32_aligned = m.is_multiple_of(64) && n.is_multiple_of(64) && k.is_multiple_of(32);
         let spirv_name = match self.dtype {
             // Tall-skinny virtual B^T: prefer coopmat when available.
             DType::F32
@@ -8971,6 +9018,14 @@ impl VulkanStorage {
             {
                 "matmul_f32_f32_cm1"
             }
+            // Padded-B tall GEMM (see pad_lhs_to_64): every load is in
+            // bounds by construction, so the fully ALIGNED exact-fp32 kernel
+            // applies even when candle M is not tile-aligned.
+            DType::F32
+                if pad_lhs_to_64 && vulkan_spirv_exists("matmul_f32_f32_aligned_fp32") =>
+            {
+                "matmul_f32_f32_aligned_fp32"
+            }
             DType::F32 => "matmul_f32_f32_fp32",
             DType::BF16 if dst_compute_dtype == DType::BF16 => "matmul_bf16",
             DType::BF16 => "matmul_bf16_fp32",
@@ -9010,7 +9065,8 @@ let spirv = candle_vulkan_kernels::spirv(spirv_name)
         // Coopmat (ggml m_warptile style for NVIDIA): BLOCK=128, BM=BN=64,
         // WM=WN=32, WMITER=2, TM=TN=TK=16, WARP=32 — matches 16×16 f16 MMA.
         // Warptile (non-cm1): TM=4, TN=2 scalar register tiles.
-        let wide_n = n >= 512 && k >= 512 && m >= 64 && (f32_aligned || rhs_virtual_bt);
+        let wide_n =
+            n >= 512 && k >= 512 && m >= 64 && (f32_aligned || rhs_virtual_bt || pad_lhs_to_64);
         // Medium coopmat tile (ggml m_warptile / coopmat 16×16). Virtual-BT and
         // aligned cm1 share 64×64 BLOCK=128 after vectorized tall loads.
         let (bm, bn, wm, wn, wmiter, tm, tn, tk, block_size) = if use_cm1 {
@@ -9036,7 +9092,7 @@ let spirv = candle_vulkan_kernels::spirv(spirv_name)
         };
         // x covers params.M (candle N) with BM; y covers params.N (candle M) with BN.
         let dispatch_x = n.div_ceil(bm as usize);
-        let dispatch_y = m.div_ceil(bn as usize);
+        let dispatch_y = padded_m.div_ceil(bn as usize);
         let mut spec = vec![
             (0, block_size),
             (1, bm),
@@ -9072,6 +9128,7 @@ let spirv = candle_vulkan_kernels::spirv(spirv_name)
             req_sg,
         )?;
         drop(lhs_contiguous);
+        drop(padded_lhs);
         if dst_compute_dtype != self.dtype {
             let out_l = Layout::contiguous(dst_shape);
             let out = dst.to_dtype(&out_l, self.dtype)?;
