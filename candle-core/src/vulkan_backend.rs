@@ -4021,6 +4021,7 @@ fn unary_spirv(op: &str, dtype: DType) -> Result<(&'static [u32], VulkanUnaryKin
     let suffix = match dtype {
         DType::F32 => "f32",
         DType::F16 => "f16",
+        DType::BF16 => "bf16",
         _ => return Err(Error::UnsupportedDTypeForOp(dtype, "vulkan unary").bt()),
     };
     let stem = match op {
@@ -4045,7 +4046,8 @@ fn unary_spirv(op: &str, dtype: DType) -> Result<(&'static [u32], VulkanUnaryKin
         "silu" => "silu",
         "sin" if dtype == DType::F32 => "sin",
         "sqr" if dtype == DType::F32 => "sqr",
-        "sqrt" if dtype == DType::F32 => "sqrt",
+        // sqrt has native f16/bf16 variants; the rest stay f32-only for now.
+        "sqrt" => "sqrt",
         "tanh" => "tanh",
         _ => return Err(unsupported("unary")),
     };
@@ -10611,17 +10613,16 @@ impl BackendStorage for VulkanStorage {
                 return self.f8e4m3_unary_via_f32(layout, |src, src_l| src.affine(src_l, mul, add));
             }
             if self.dtype == DType::BF16 {
-                return self.bf16_unary_via_f32(layout, |src, src_l| src.affine(src_l, mul, add));
+                // Native bf16 affine: one pass, no f32 round-trip copies.
+                let spirv = candle_vulkan_kernels::spirv("scale_bf16")
+                    .ok_or_else(|| Error::Msg("vulkan shader scale_bf16 not generated".into()).bt())?;
+                return self.run_unary_generic_with_params(layout, spirv, mul as f32, add as f32);
             }
             if self.dtype == DType::F16 {
-                let src_f32 = self.materialize_to_f32(layout)?;
-                let contiguous = if layout.dims().len() > 4 {
-                    Layout::contiguous(Self::compact_rank_gt4_shape(layout))
-                } else {
-                    Layout::contiguous(layout.shape())
-                };
-                let out_f32 = src_f32.affine(&contiguous, mul, add)?;
-                return out_f32.to_dtype(&contiguous, DType::F16);
+                // Native f16 affine: one pass, no f32 round-trip copies.
+                let spirv = candle_vulkan_kernels::spirv("scale_f16")
+                    .ok_or_else(|| Error::Msg("vulkan shader scale_f16 not generated".into()).bt())?;
+                return self.run_unary_generic_with_params(layout, spirv, mul as f32, add as f32);
             }
             if self.dtype != DType::F32 {
                 return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan affine").bt());
@@ -10916,6 +10917,13 @@ impl BackendStorage for VulkanStorage {
             return self.f8e4m3_unary_via_f32(layout, |src, src_l| src.unary_impl::<B>(src_l));
         }
         if self.dtype == DType::BF16 {
+            // Native bf16 sqrt exists; other bf16 unaries still go through an
+            // f32 materialize round-trip.
+            if B::NAME == "sqrt" {
+                let spirv = candle_vulkan_kernels::spirv("sqrt_bf16")
+                    .ok_or_else(|| Error::Msg("vulkan shader sqrt_bf16 not generated".into()).bt())?;
+                return self.run_unary_generic(layout, spirv);
+            }
             return self.bf16_unary_via_f32(layout, |src, src_l| src.unary_impl::<B>(src_l));
         }
         if self.dtype == DType::F64 {
@@ -10934,8 +10942,10 @@ impl BackendStorage for VulkanStorage {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan unary").bt());
         }
         if self.dtype == DType::F16
-            && matches!(B::NAME, "sin" | "cos" | "sqr" | "sqrt" | "erf" | "recip")
+            && matches!(B::NAME, "sin" | "cos" | "sqr" | "erf" | "recip")
         {
+            // sqrt is excluded: native sqrt_f16 exists, the rest still go
+            // through an f32 materialize round-trip.
             let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), DType::F16)? };
             <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
             let contiguous_layout = Layout::contiguous(layout.shape());
