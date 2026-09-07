@@ -1813,10 +1813,13 @@ fn bytes_to_vec<T: Copy>(bytes: &[u8], count: usize) -> Result<Vec<T>> {
     Ok(out)
 }
 
-fn cpu_storage_to_bytes(storage: &CpuStorage) -> Result<(DType, usize, Vec<u8>)> {
+fn cpu_storage_to_bytes(storage: &CpuStorage) -> Result<(DType, usize, &[u8])> {
     macro_rules! typed {
         ($storage:expr, $dtype:expr) => {{
-            let bytes = typed_as_bytes($storage).to_vec();
+            // Borrowed reinterpret: the staging memcpy in write_buffer reads
+            // the bytes directly, so an owned copy here (an extra allocation
+            // plus full-size memcpy per upload) is unnecessary.
+            let bytes = typed_as_bytes($storage);
             Ok(($dtype, $storage.len(), bytes))
         }};
     }
@@ -2883,11 +2886,17 @@ impl VulkanDevice {
     }
 
     fn create_upload_staging_buffer(&self, size: usize) -> Result<Arc<VulkanBuffer>> {
+        // Upload staging must live in HOST_CACHED system RAM (GpuToCpu), not
+        // CpuToGpu. On discrete GPUs CpuToGpu resolves to DEVICE_LOCAL BAR1
+        // memory whose write-combined mapping memcpy's at only a few GB/s,
+        // while cached host memory memcpy's an order of magnitude faster. The
+        // staging -> device copy is a deferred PCIe DMA that does not stall
+        // the host, so the total upload path is strictly faster.
         self.acquire_staging_buffer(
             size,
             "candle-vulkan-upload-staging",
             vk::BufferUsageFlags::TRANSFER_SRC,
-            MemoryLocation::CpuToGpu,
+            MemoryLocation::GpuToCpu,
             StagingKind::Upload,
         )
     }
@@ -3219,19 +3228,10 @@ impl VulkanDevice {
             if bytes.len() < buffer.size {
                 std::ptr::write_bytes(mapped_ptr.add(bytes.len()), 0, buffer.size - bytes.len());
             }
-            let atom = self.inner.non_coherent_atom_size.max(1);
-            let atom_mask = atom - 1;
-            let flush_offset = allocation.offset() & !atom_mask;
-            let flush_end = (allocation.offset() + buffer.size as u64 + atom_mask) & !atom_mask;
-            let flush_size = flush_end.saturating_sub(flush_offset);
-            let range = vk::MappedMemoryRange::default()
-                .memory(allocation.memory())
-                .offset(flush_offset)
-                .size(flush_size);
-            self.inner
-                .device
-                .flush_mapped_memory_ranges(&[range])
-                .map_err(Error::wrap)?;
+            // Staging buffers come from gpu-allocator with HOST_VISIBLE |
+            // HOST_COHERENT guaranteed (its CpuToGpu required-bits include
+            // HOST_COHERENT), so per the Vulkan spec no flush is needed and
+            // the explicit flush call only cost a driver transition.
             if allocation.mapped_ptr().is_none() {
                 self.inner.device.unmap_memory(allocation.memory());
             }
@@ -3248,19 +3248,8 @@ impl VulkanDevice {
             .as_ref()
             .ok_or_else(|| Error::msg("freed vulkan allocation"))?;
         unsafe {
-            let atom = self.inner.non_coherent_atom_size.max(1);
-            let atom_mask = atom - 1;
-            let flush_offset = allocation.offset() & !atom_mask;
-            let flush_end = (allocation.offset() + buffer.size as u64 + atom_mask) & !atom_mask;
-            let flush_size = flush_end.saturating_sub(flush_offset);
-            let range = vk::MappedMemoryRange::default()
-                .memory(allocation.memory())
-                .offset(flush_offset)
-                .size(flush_size);
-            self.inner
-                .device
-                .invalidate_mapped_memory_ranges(&[range])
-                .map_err(Error::wrap)?;
+            // Readback staging is HOST_VISIBLE | HOST_COHERENT (gpu-allocator
+            // GpuToCpu required bits), so no invalidate is needed.
             let mapped_ptr = if let Some(ptr) = allocation.mapped_ptr() {
                 ptr.cast::<u8>().as_ptr()
             } else {
@@ -3375,6 +3364,48 @@ impl VulkanDevice {
         prefer_transfer: bool,
     ) -> Result<()> {
         self.submit_copy_region_and_track(src, dst, 0, 0, size, prefer_transfer)
+    }
+
+    /// Record a whole-buffer `vkCmdFillBuffer(0)` into the active copy batch.
+    /// Mirrors `submit_copy_regions_and_track` but moves no host bytes, so the
+    /// byte-budget counters are left untouched. Used by `zeros_impl` instead of
+    /// uploading a zero slab through staging, which cost a full host memcpy
+    /// plus a PCIe copy per zeroed tensor.
+    fn submit_fill_zero_and_track(&self, dst: &Arc<VulkanBuffer>) -> Result<()> {
+        self.cleanup_pending_submissions_amortized()?;
+        let (queue, queue_family_index, queue_kind) = self.copy_queue_and_family(true);
+        if queue_kind == SubmissionQueueKind::Compute {
+            self.wait_for_transfer_dependencies()?;
+        } else {
+            self.flush_active_batch(SubmissionQueueKind::Compute, "transfer_fill_dependency")?;
+            self.cleanup_pending_submissions_for_queue(SubmissionQueueKind::Compute, true)?;
+        }
+        self.ensure_active_batch_capacity(queue_kind, queue_family_index, 0, 1, 0, 0, 0, 0)?;
+        {
+            let mut slot = self
+                .active_batch_slot(queue_kind)
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            let batch = slot
+                .as_mut()
+                .ok_or_else(|| Error::msg("vulkan active batch missing after ensure"))?;
+            unsafe {
+                self.inner.device.cmd_fill_buffer(
+                    batch.resources.command_buffer,
+                    dst.buffer,
+                    0,
+                    vk::WHOLE_SIZE,
+                    0,
+                );
+            }
+            if queue_kind == SubmissionQueueKind::Compute {
+                self.cmd_batch_memory_barrier(batch.resources.command_buffer);
+            }
+            batch.copy_count += 1;
+            batch.retained_buffers.push(dst.clone());
+        }
+        let _ = queue;
+        Ok(())
     }
 
     fn write_buffer(&self, buffer: &Arc<VulkanBuffer>, bytes: &[u8]) -> Result<()> {
@@ -12015,7 +12046,13 @@ impl BackendDevice for VulkanDevice {
         // Vulkan can't allocate 0-byte buffers; use a 1-byte dummy for empty shapes.
         let alloc_size = size.max(1);
         let buffer = self.create_buffer(alloc_size, "candle-vulkan-zeros")?;
-        self.write_buffer(&buffer, &vec![0u8; alloc_size])?;
+        // vkCmdFillBuffer needs a 4-byte-aligned whole fill; WHOLE_SIZE satisfies
+        // that for any buffer, so only the odd-size dummy falls back to upload.
+        if alloc_size % 4 == 0 {
+            self.submit_fill_zero_and_track(&buffer)?;
+        } else {
+            self.write_buffer(&buffer, &vec![0u8; alloc_size])?;
+        }
         Ok(VulkanStorage {
             buffer,
             device: self.clone(),
@@ -12041,7 +12078,24 @@ impl BackendDevice for VulkanDevice {
     }
 
     fn storage_from_slice<T: WithDType>(&self, data: &[T]) -> Result<Self::Storage> {
-        self.storage_from_cpu_storage(&T::to_cpu_storage(data))
+        if data.is_empty() {
+            return self.storage_from_cpu_storage(&T::to_cpu_storage(data));
+        }
+        // Upload straight from the caller's slice: building an owned CpuStorage
+        // first would add a full-size host copy of the data per upload.
+        let bytes = typed_as_bytes(data);
+        let buffer = if bytes.len() >= Self::WEIGHT_DEDICATED_THRESHOLD_BYTES {
+            self.create_dedicated_buffer(bytes.len(), "candle-vulkan-upload")?
+        } else {
+            self.create_buffer(bytes.len(), "candle-vulkan-upload")?
+        };
+        self.write_buffer(&buffer, bytes)?;
+        Ok(VulkanStorage {
+            buffer,
+            device: self.clone(),
+            count: data.len(),
+            dtype: T::DTYPE,
+        })
     }
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
