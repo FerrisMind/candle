@@ -8343,6 +8343,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         dst_offset: usize,
         shader: &str,
     ) -> Result<()> {
+        self.run_copy_into_with_dst_strides(layout, dst, dst_offset, None, shader)
+    }
+
+    /// Like `run_copy_into` but allows a non-contiguous destination: the copy
+    /// shader reads `stride_dst*` from the params, so a strided destination
+    /// (e.g. `copy2d` rows landing inside a wider cat output) is expressed as
+    /// innermost-first strides instead of `d1 * d1` separate
+    /// `copy_buffer_to_buffer` commands.
+    fn run_copy_into_with_dst_strides(
+        &self,
+        layout: &Layout,
+        dst: &Self,
+        dst_offset: usize,
+        dst_strides_override: Option<[u32; 4]>,
+        shader: &str,
+    ) -> Result<()> {
         let count = layout.shape().elem_count();
         if count == 0 {
             return Ok(());
@@ -8350,10 +8366,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
         let max_workgroups = wgpu_dispatch_wg_cap(&self.device) as usize;
         let max_elems_per_dispatch = max_workgroups * WG_SIZE as usize;
-        let chunk_linear = count > max_elems_per_dispatch && layout.is_contiguous();
+        // Linear chunking assumes a flat contiguous destination; a strided
+        // destination override must take the decomposed-strides path.
+        let chunk_linear = dst_strides_override.is_none()
+            && count > max_elems_per_dispatch
+            && layout.is_contiguous();
 
         let (src_dims, src_strides) = dims4(layout)?;
-        let dst_strides = contiguous_strides(src_dims);
+        let dst_strides = dst_strides_override.unwrap_or_else(|| contiguous_strides(src_dims));
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -15932,6 +15952,37 @@ impl BackendStorage for WgpuStorage {
         let elem_size = self.dtype.size_in_bytes();
         if elem_size == 0 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu copy2d").bt());
+        }
+        // Fast path: one strided gather dispatch instead of `d1` separate
+        // `copy_buffer_to_buffer` commands. wgpu command recording/validation
+        // costs ~2us per command, which dominates `cat` along a non-zeroth dim
+        // (a 256-row cat was paying 512 recorded copies per call). The copy
+        // shader takes the row strides from the params, so the same gather
+        // covers both contiguous and row-strided sources.
+        let d1_gather = d1 >= 8 && d2 > 0
+            && matches!(self.dtype, DType::F32 | DType::F16 | DType::U32 | DType::I32);
+        if d1_gather {
+            let src_layout = Layout::new(
+                Shape::from((d1, d2)),
+                vec![src_stride1, 1],
+                src_offset,
+            );
+            let dst_strides = [1u32, dst_stride1.try_into()?, 0, 0];
+            let shader = copy_shader(self.dtype, self.dtype)?;
+            match self.run_copy_into_with_dst_strides(
+                &src_layout,
+                dst,
+                dst_offset,
+                Some(dst_strides),
+                &shader,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    // Unsupported shapes (u32 overflow on huge dims) fall back
+                    // to the command path below.
+                    tracing::debug!("wgpu copy2d gather fallback: {err}");
+                }
+            }
         }
         self.device.ensure_active_batch()?;
         {
