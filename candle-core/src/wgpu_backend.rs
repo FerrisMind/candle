@@ -11613,15 +11613,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // gate_up/down/lm_head): route to a purpose-built GEMV instead of the generic
         // tiled GEMM, which is catastrophic for m == 1 (one thread per output element
         // with strided transposed-RHS reads; measured ~5-12 GFLOP/s). Guard requires a
-        // contiguous (k, n) RHS with unit column stride (coalesced warp reads) and a
-        // contiguous (1, k) LHS; anything else keeps the generic dispatch.
+        // contiguous (k, n) RHS with unit column stride (coalesced warp reads), or a
+        // K-major RHS (stride[0] == 1, e.g. dense QMatMul weights stored as (n, k)
+        // and viewed transposed) where each thread streams its output row from
+        // contiguous memory. Anything else keeps the generic dispatch.
         if b == 1
             && m == 1
             && rank == 2
             && (self.dtype == DType::F16 || self.dtype == DType::F32)
             && lhs_l.is_contiguous()
-            && rhs_l.is_contiguous()
-            && rhs_l.stride()[1] == 1
+            && ((rhs_l.is_contiguous() && rhs_l.stride()[1] == 1) || rhs_l.stride()[0] == 1)
         {
             let dst = self.run_m1_gemv(rhs, lhs_l, rhs_l, b, m, n, k)?;
             // F32: `run_m1_gemv` writes f32 directly (native_dst_dtype == F32), so
