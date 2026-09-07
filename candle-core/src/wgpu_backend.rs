@@ -6021,7 +6021,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     );
     let (ty, main) = match dtype {
         DType::U8 => ("u32", u8_main),
-        DType::I16 => ("u32", i16_main),
+        // BF16 has the same 16-bit layout as I16: the selection is done on
+        // raw bit patterns (u32 pairs), so no decode/encode pass is needed.
+        DType::I16 | DType::BF16 => ("u32", i16_main),
         DType::I64 => ("u32", i64_main),
         _ => (wgpu_scalar_type(dtype)?, standard_main),
     };
@@ -6904,7 +6906,14 @@ impl WgpuStorage {
         }
         if !matches!(
             t.dtype,
-            DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I16 | DType::I32 | DType::I64
+            DType::F32
+                | DType::F16
+                | DType::U8
+                | DType::U32
+                | DType::I16
+                | DType::I32
+                | DType::I64
+                | DType::BF16
         ) {
             return Err(Error::UnsupportedDTypeForOp(t.dtype, "wgpu where_cond").bt());
         }
@@ -7882,42 +7891,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             Layout::contiguous(rhs_layout.shape())
         };
         lhs_f32.run_cmp_u8(&rhs_f32, &lhs_contiguous, &rhs_contiguous, op)
-    }
-
-    fn bf16_where_via_f32(
-        &self,
-        layout: &Layout,
-        t: &Self,
-        t_l: &Layout,
-        f: &Self,
-        f_l: &Layout,
-    ) -> Result<Self> {
-        if t.dtype != DType::BF16 {
-            return Err(Error::UnsupportedDTypeForOp(t.dtype, "wgpu bf16 where_cond").bt());
-        }
-        if f.dtype != DType::BF16 {
-            return Err(Error::UnsupportedDTypeForOp(f.dtype, "wgpu bf16 where_cond").bt());
-        }
-        let t_f32 = t.materialize_to_f32(t_l)?;
-        let f_f32 = f.materialize_to_f32(f_l)?;
-        let t_contiguous = if t_l.dims().len() > 4 {
-            Layout::contiguous(Self::compact_rank_gt4_shape(t_l))
-        } else {
-            Layout::contiguous(t_l.shape())
-        };
-        let f_contiguous = if f_l.dims().len() > 4 {
-            Layout::contiguous(Self::compact_rank_gt4_shape(f_l))
-        } else {
-            Layout::contiguous(f_l.shape())
-        };
-        let out_f32 =
-            self.run_where_u8_cond(layout, &t_f32, &t_contiguous, &f_f32, &f_contiguous)?;
-        let out_layout = if layout.dims().len() > 4 {
-            Layout::contiguous(Self::compact_rank_gt4_shape(layout))
-        } else {
-            Layout::contiguous(layout.shape())
-        };
-        out_f32.to_dtype(&out_layout, DType::BF16)
     }
 
     fn gpu_resident_via_f32(
@@ -15531,9 +15504,6 @@ impl BackendStorage for WgpuStorage {
         f: &Self,
         f_l: &Layout,
     ) -> Result<Self> {
-        if t.dtype == DType::BF16 {
-            return self.bf16_where_via_f32(layout, t, t_l, f, f_l);
-        }
         if wgpu_f16_emulates_f32(&t.device, t.dtype) {
             let t_f32 = t.materialize_to_f32(t_l)?;
             let f_f32 = f.materialize_to_f32(f_l)?;
