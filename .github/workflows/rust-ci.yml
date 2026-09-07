@@ -30,7 +30,7 @@ jobs:
 
       - name: Run normal cpu
         if: matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest'
-        run: cargo check --workspace
+        run: cargo check --workspace --all-targets
 
       - name: Check workspace with wgpu
         if: matrix.os == 'ubuntu-latest'
@@ -101,5 +101,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --tests --examples --benches -- -D warnings
- 

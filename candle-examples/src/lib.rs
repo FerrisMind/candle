@@ -6,66 +6,28 @@ pub mod hub;
 pub mod imagenet;
 pub mod token_output_stream;
 pub mod wav;
-use candle::utils::{
-    cuda_is_available, metal_is_available, vulkan_is_available, wgpu_is_available,
-};
+use candle::utils::{cuda_is_available, metal_is_available};
 use candle::{Device, Result, Tensor};
-use std::env;
-
-/// Repeat a short fragment until the tokenizer emits at least `n` tokens, then truncate.
-pub fn bench_prompt_token_ids(tokenizer: &tokenizers::Tokenizer, n: usize) -> Result<Vec<u32>> {
-    if n == 0 {
-        return Ok(vec![]);
-    }
-    let mut text = String::new();
-    while tokenizer
-        .encode(text.as_str(), false)
-        .map_err(candle::Error::wrap)?
-        .get_ids()
-        .len()
-        < n
-    {
-        text.push_str("the ");
-    }
-    let mut ids = tokenizer
-        .encode(text.as_str(), false)
-        .map_err(candle::Error::wrap)?
-        .get_ids()
-        .to_vec();
-    ids.truncate(n);
-    Ok(ids)
-}
 
 pub fn device(cpu: bool) -> Result<Device> {
-    if cpu || matches!(env::var("CANDLE_DEVICE").ok().as_deref(), Some("cpu")) {
+    if cpu {
         Ok(Device::Cpu)
+    } else if cuda_is_available() {
+        Ok(Device::new_cuda(0)?)
+    } else if metal_is_available() {
+        Ok(Device::new_metal(0)?)
     } else {
-        match env::var("CANDLE_DEVICE").ok().as_deref() {
-            Some("cuda") => Ok(Device::new_cuda(0)?),
-            Some("wgpu") => Ok(Device::new_wgpu(0)?),
-            Some("vulkan") => Ok(Device::new_vulkan(0)?),
-            Some("metal") => Ok(Device::new_metal(0)?),
-            Some(device) => candle::bail!("unsupported CANDLE_DEVICE value: {device}"),
-            None if cuda_is_available() => Ok(Device::new_cuda(0)?),
-            None if wgpu_is_available() => Ok(Device::new_wgpu(0)?),
-            None if vulkan_is_available() => Ok(Device::new_vulkan(0)?),
-            None if metal_is_available() => Ok(Device::new_metal(0)?),
-            None => {
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                {
-                    println!(
-                        "Running on CPU, to run on GPU(metal), build this example with `--features metal`, `wgpu`, or `vulkan`"
-                    );
-                }
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                {
-                    println!(
-                        "Running on CPU, to run on GPU, build this example with `--features cuda`, `wgpu`, or `vulkan`"
-                    );
-                }
-                Ok(Device::Cpu)
-            }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            println!(
+                "Running on CPU, to run on GPU(metal), build this example with `--features metal`"
+            );
         }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            println!("Running on CPU, to run on GPU, build this example with `--features cuda`");
+        }
+        Ok(Device::Cpu)
     }
 }
 
@@ -161,8 +123,8 @@ pub fn save_image_resize<P: AsRef<std::path::Path>>(
 }
 
 /// Loads the safetensors files for a model from the hub based on a json index file.
-pub fn hub_load_safetensors(
-    repo: &crate::hub::Repo,
+pub fn hub_load_safetensors<T: hf_hub::RepoType>(
+    repo: &crate::hub::Repo<T>,
     json_file: &str,
 ) -> Result<Vec<std::path::PathBuf>> {
     let json_file = repo.get(json_file).map_err(candle::Error::wrap)?;

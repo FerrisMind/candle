@@ -186,10 +186,6 @@ pub enum Error {
     #[error("Vulkan error {0}")]
     Vulkan(#[from] VulkanError),
 
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios"), feature = "ug"))]
-    #[error(transparent)]
-    Ug(#[from] candle_ug::Error),
-
     #[error(transparent)]
     TryFromIntError(#[from] core::num::TryFromIntError),
 
