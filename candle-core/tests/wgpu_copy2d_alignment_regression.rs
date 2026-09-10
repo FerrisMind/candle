@@ -92,3 +92,30 @@ fn wgpu_cat_u8_rank3_strided_rows_matches_cpu() -> Result<()> {
     assert_u8_eq(&updated, &ref_updated)?;
     Ok(())
 }
+
+/// Stage0 `slice_assign` dim-0 pad shape (batch row 1): cat along dim 1 of U8
+/// (16,20)+(16,94) -> (16,114). The row BYTE SIZE (20) is 4-aligned and the
+/// base offsets are aligned, but the destination ROW STRIDE (114) is not, so
+/// rows i1 >= 1 landed at byte offset 114*i1 — unaligned encoder copies wgpu
+/// dropped ("Buffer offset 114 is not aligned") — the second half of the
+/// OmniVoice stage0 corruption. The guard must therefore check the row strides
+/// as well as the row size and base offsets.
+#[test]
+fn wgpu_cat_u8_dim1_row_stride_matches_cpu() -> Result<()> {
+    let device = match Device::new_wgpu(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("wgpu unavailable: {e}; skipping");
+            return Ok(());
+        }
+    };
+    let a = Tensor::from_slice(&test_values_u8(16 * 20, 7), (16, 20), &device)?;
+    let b = Tensor::from_slice(&test_values_u8(16 * 94, 8), (16, 94), &device)?;
+    let got = Tensor::cat(&[&a, &b], 1)?;
+
+    let ref_a = Tensor::from_slice(&test_values_u8(16 * 20, 7), (16, 20), &Device::Cpu)?;
+    let ref_b = Tensor::from_slice(&test_values_u8(16 * 94, 8), (16, 94), &Device::Cpu)?;
+    let want = Tensor::cat(&[&ref_a, &ref_b], 1)?;
+    assert_u8_eq(&got, &want)?;
+    Ok(())
+}

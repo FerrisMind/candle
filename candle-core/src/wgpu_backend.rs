@@ -1163,6 +1163,22 @@ impl WgpuDevice {
             .and_then(|mut guard| guard.take())
     }
 
+    /// Peek (without draining) the pending runtime error message, if any.
+    ///
+    /// Used by `flush_active_batch`: the error must stay visible for the next
+    /// propagating path (readback / synchronize) even when the immediate caller
+    /// of the flush discards its `Result` (the large-alloc and zeroed-buffer
+    /// paths return buffers, not `Result`s, so they `let _` the flush error —
+    /// draining there would silently swallow the failure again, which is
+    /// exactly the L6.0 §2 corruption mechanism this check exists to break).
+    pub fn pending_runtime_error_msg(&self) -> Option<String> {
+        self.inner
+            .runtime_error
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|msg| msg.clone()))
+    }
+
     /// Drain a wgpu uncaptured / device-lost error (if any) that
     /// `on_uncaptured_error` captured into `runtime_error`, returning its
     /// message. Runs one non-blocking poll first so the handler has delivered
@@ -2522,9 +2538,12 @@ impl WgpuDevice {
         // buffer bytes when commands were dropped by validation (L6.0 §2: the
         // unaligned copy2d failures were silently returning wrong cat/slice_assign
         // data). Failing the flush turns every silently-dropped command into a
-        // hard error at the op that caused it.
+        // hard error at the op that caused it. The error is PEEKED, not drained:
+        // some flush callers (large-alloc / zeroed-buffer paths) discard this
+        // `Result`, and keeping the slot set lets the next propagating flush or
+        // the readback surface it instead of losing it.
         let _ = self.inner.device.poll(wgpu::PollType::Poll);
-        if let Some(msg) = self.take_runtime_error() {
+        if let Some(msg) = self.pending_runtime_error_msg() {
             return Err(Error::Msg(format!("wgpu batch failed validation: {msg}")).bt());
         }
         if let Ok(profiler) = self.inner.gpu_profile.lock() {
@@ -2811,15 +2830,21 @@ impl WgpuDevice {
                 self.prune_buffer_registry();
                 Ok(data)
             }
-            Err(_) => {
+            Err(first_err) => {
+                let first_msg = first_err.to_string();
+                if first_msg.contains("wgpu readback aborted") {
+                    // The first read aborted because a DRAINED validation error
+                    // was pending: earlier dropped commands leave STALE bytes,
+                    // and a successful retry would silently return that garbage
+                    // (L6.0 §2 — the single mechanism by which dropped copies
+                    // became silent corruption). Propagate the real error
+                    // instead of retrying; retry only transient failures
+                    // (burned submission index, map hiccups) with no pending
+                    // validation error.
+                    return Err(first_err);
+                }
                 self.synchronize()?;
                 let _ = self.trim_pipeline_cache();
-                // Do not blindly trust a retry that follows a drained validation
-                // error: the staging copy may be fine but earlier DROPPED
-                // commands leave stale bytes, and a successful second read would
-                // silently return garbage (L6.0 §2). Batch submissions now fail
-                // loudly (flush_active_batch), so this retry only runs for
-                // transient read failures with no pending validation error.
                 try_read()
             }
         }
@@ -16456,6 +16481,10 @@ impl BackendStorage for WgpuStorage {
         // this is the raw element count, so odd mask lengths (e.g. 94/114 bytes)
         // emit unaligned commands that wgpu VALIDATES AND DROPS, silently
         // corrupting cat/slice_assign results with stale recycled buffer bytes.
+        // Row i1 lands at (offset + i1*stride) * elem_size, so the row STRIDES
+        // must be checked too: a dim-1 cat of U8 (16,20)+(16,94) has 4-aligned
+        // row bytes (20) but an unaligned destination row stride (114), so row
+        // 1 landed at byte offset 114 (OmniVoice stage0 slice_assign pad).
         // Mirror the guard copy_strided_src already has: route the whole call
         // through per-row copy_strided_src, which keeps aligned rows on the fast
         // record_buffer_copy path and sends unaligned rows through the existing
@@ -16463,7 +16492,9 @@ impl BackendStorage for WgpuStorage {
         let row_bytes = d2 * elem_size;
         let aligned = row_bytes % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
             && (src_offset * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
-            && (dst_offset * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0;
+            && (dst_offset * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
+            && (src_stride1 * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
+            && (dst_stride1 * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0;
         if !aligned {
             if self.dtype == DType::U8 {
                 // 1-byte dtypes cannot use the per-row copy_strided_src fallback:
