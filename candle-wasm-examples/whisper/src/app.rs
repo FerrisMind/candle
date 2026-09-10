@@ -1,11 +1,11 @@
 use crate::console_log;
 use crate::worker::{ModelData, Segment, Worker, WorkerInput, WorkerOutput};
-use candle_wasm_device_select::DeviceMode;
 use js_sys::Date;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use yew::{html, Component, Context, Html};
-use yew_agent::{Bridge, Bridged};
+use yew_agent::worker::WorkerBridge;
+use yew_agent::Spawnable;
 
 const SAMPLE_NAMES: [&str; 6] = [
     "audios/samples_jfk.wav",
@@ -54,7 +54,7 @@ pub struct App {
     loaded: bool,
     segments: Vec<Segment>,
     current_decode: Option<CurrentDecode>,
-    worker: Box<dyn Bridge<Worker>>,
+    worker: WorkerBridge<Worker>,
 }
 
 async fn model_data_load() -> Result<ModelData, JsValue> {
@@ -98,8 +98,6 @@ async fn model_data_load() -> Result<ModelData, JsValue> {
         task: None,
         is_multilingual,
         language: None,
-        // Yew agent is CPU-only in slice 1 (sync worker cannot await WebGPU).
-        device_mode: DeviceMode::Cpu,
     })
 }
 
@@ -119,7 +117,7 @@ impl Component for App {
             let link = ctx.link().clone();
             move |e| link.send_message(Self::Message::WorkerOut(e))
         };
-        let worker = Worker::bridge(std::rc::Rc::new(cb));
+        let worker = Worker::spawner().callback(cb).spawn("./worker.js");
         Self {
             status,
             segments: vec![],
@@ -149,8 +147,7 @@ impl Component for App {
                 self.status = "weights loaded successfully!".to_string();
                 self.loaded = true;
                 console_log!("loaded weights");
-                let mode = md.device_mode;
-                self.worker.send(WorkerInput::SetDevice { mode, model: md });
+                self.worker.send(WorkerInput::ModelData(md));
                 true
             }
             Msg::Run(sample_index) => {
@@ -184,24 +181,13 @@ impl Component for App {
                 });
                 self.current_decode = None;
                 match output {
-                    Ok(WorkerOutput::WeightsLoaded {
-                        resolved,
-                        adapter_name,
-                    }) => {
-                        self.status = match adapter_name {
-                            Some(name) => format!("weights loaded on {resolved} ({name})"),
-                            None => format!("weights loaded on {resolved}"),
-                        };
-                    }
+                    Ok(WorkerOutput::WeightsLoaded) => self.status = "weights loaded!".to_string(),
                     Ok(WorkerOutput::Decoded(segments)) => {
                         self.status = match dt {
                             None => "decoding succeeded!".to_string(),
                             Some(dt) => format!("decoding succeeded in {dt:.2}s"),
                         };
                         self.segments = segments;
-                    }
-                    Ok(WorkerOutput::DeviceError { message, requested }) => {
-                        self.status = format!("device error ({requested:?}): {message}");
                     }
                     Err(err) => {
                         self.status = format!("decoding error {err:?}");

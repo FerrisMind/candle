@@ -3,6 +3,7 @@
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use candle::backend::BackendStorage;
+use candle::backend::BackendDevice;
 use candle::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
 use rayon::prelude::*;
 
@@ -1099,6 +1100,229 @@ impl Module for Identity {
 }
 
 #[allow(dead_code)]
+
+/// Fused Linear forward (MUL_MAT_ADD): `x @ w_t + bias` in one dispatch.
+/// Only the vulkan backend fuses it (bias-epilogue matmul kernel); every
+/// other backend uses the plain unfused form.
+pub fn mul_mat_add(x: &Tensor, w_t: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    let x_rank = x.rank();
+    // The weight must reach the kernel as a stride-0 broadcast view over the
+    // batch (see below): presenting it with a single real batch made the
+    // kernel's batch_idx_a walk past the 1-batch weight buffer for batch > 1
+    // (zero matmul contribution, bias-only output). With the broadcast view
+    // the bias epilogue is exact for aligned AND unaligned cm1 shapes —
+    // covered by the shape-matrix unit test. m <= 8 routes to the matvec
+    // path, which has no bias.
+    let m = x.dim(1)?;
+    let n = w_t.dim(1)?;
+    let fused_ok = x_rank == 3
+        && w_t.rank() == 2
+        && m > 8
+        && x.dtype() == DType::F32
+        && w_t.dtype() == DType::F32
+        && bias.dtype() == DType::F32
+        && bias.rank() == 1
+        && n == bias.dim(0)?
+        && x.device().is_vulkan();
+    if !fused_ok {
+        return x.broadcast_matmul(w_t).and_then(|t| t.broadcast_add(bias));
+    }
+    let batch = x.dim(0)?;
+    let (k, n) = (w_t.dim(0)?, w_t.dim(1)?);
+    let w_t = w_t
+        .unsqueeze(0)?
+        .broadcast_as(Shape::from((batch, k, n)))?;
+    x.apply_op3_no_bwd(&w_t, bias, &MulMatAdd)
+}
+
+/// Diagnostic: bypasses the verified-shape gate so the fused kernel itself
+/// can be probed on any shape (used by mul_mat_add_tests).
+#[doc(hidden)]
+pub fn mul_mat_add_forced(x: &Tensor, w_t: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    let batch = x.dim(0)?;
+    let (k, n) = (w_t.dim(0)?, w_t.dim(1)?);
+    let w_t = w_t
+        .unsqueeze(0)?
+        .broadcast_as(Shape::from((batch, k, n)))?;
+    x.apply_op3_no_bwd(&w_t, bias, &MulMatAdd)
+}
+
+struct MulMatAdd;
+
+impl candle::CustomOp3 for MulMatAdd {
+    fn name(&self) -> &'static str {
+        "mul_mat_add"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        // Never routed on cpu (see mul_mat_add gate); kept as an error.
+        candle::bail!("mul_mat_add cpu fallback is not used")
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        x: &candle::VulkanStorage,
+        x_l: &Layout,
+        w: &candle::VulkanStorage,
+        w_l: &Layout,
+        b: &candle::VulkanStorage,
+        b_l: &Layout,
+    ) -> Result<(candle::VulkanStorage, Shape)> {
+        let x_dims = x_l.dims();
+        let (batch, m, k) = (x_dims[0], x_dims[1], x_dims[2]);
+        let n = w_l.dim(2)?;
+        // Layouts are passed straight through: run_matmul_f32 reads strided
+        // A/B in-kernel (the transposed-weight (0,2,1) view pays no copy, same
+        // as the unfused path). Only the tiny bias vector must be contiguous.
+        let out = x.matmul_bias(w, b, (batch, m, n, k), x_l, w_l)?;
+        Ok((out, Shape::from(vec![batch, m, n])))
+    }
+}
+
+/// Fused LayerNorm(+affine) -> RoPE in one dispatch (`rope_layernorm`
+/// kernels): the qkv views feeding per-head norms are non-contiguous, which
+/// forces candle's slow tensor-op LayerNorm path (~8 dispatches), and the
+/// surrounding `.contiguous()` copies plus the 8-op rope chain push that to
+/// ~12 dispatches per q/k. The kernel reads the strided view directly.
+/// Tables follow the lux3d RopeEmbeddings convention: cos/sin are contiguous
+/// (b, 1, n, head_dim) with the rotate-half negation baked into sin, so
+/// out[j] = y[j] * cos[j] + y[j ^ head_dim/4] * sin[j].
+pub fn layernorm_rope_fused(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    eps: f32,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> Result<Tensor> {
+    let head_dim = if x.rank() == 4 { x.dim(3)? } else { 0 };
+    let shape_ok = x.rank() == 4
+        && head_dim == 64
+        && x.stride()[3] == 1
+        && x.dtype() == DType::F32
+        && weight.rank() == 1
+        && bias.rank() == 1
+        && weight.dim(0)? == head_dim
+        && bias.dim(0)? == head_dim
+        && weight.dtype() == DType::F32
+        && bias.dtype() == DType::F32
+        && weight.is_contiguous()
+        && bias.is_contiguous()
+        && tables_match(x, cos, sin, head_dim)?;
+    if !shape_ok || !(x.device().is_vulkan() || x.device().is_wgpu()) {
+        candle::bail!("layernorm_rope_fused: unsupported layout/device for the fused kernel");
+    }
+    let gamma_beta = Tensor::cat(&[weight, bias], 0)?;
+    x.apply_op3_no_bwd(cos, sin, &LayerNormRope {
+        gamma_beta,
+        eps,
+        apply_norm: true,
+    })
+}
+
+/// RoPE-only variant of the fused kernel (no norm), for sites that rope an
+/// already-normalized tensor. Same single dispatch, `apply_norm = 0`.
+pub fn rope_fused(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let head_dim = if x.rank() == 4 { x.dim(3)? } else { 0 };
+    let shape_ok = x.rank() == 4
+        && head_dim == 64
+        && x.stride()[3] == 1
+        && x.dtype() == DType::F32
+        && tables_match(x, cos, sin, head_dim)?;
+    if !shape_ok || !(x.device().is_vulkan() || x.device().is_wgpu()) {
+        candle::bail!("rope_fused: unsupported layout/device for the fused kernel");
+    }
+    // The kernel never reads the gamma/beta binding when apply_norm == 0;
+    // bind the (always-present, correctly typed) cos table in its place.
+    x.apply_op3_no_bwd(cos, sin, &LayerNormRope {
+        gamma_beta: cos.clone(),
+        eps: 0.0,
+        apply_norm: false,
+    })
+}
+
+fn tables_match(x: &Tensor, cos: &Tensor, sin: &Tensor, head_dim: usize) -> Result<bool> {
+    Ok(cos.dtype() == DType::F32
+        && sin.dtype() == DType::F32
+        && cos.is_contiguous()
+        && sin.is_contiguous()
+        && cos.rank() == 4
+        && cos.dims() == [x.dim(0)?, 1, x.dim(2)?, head_dim]
+        && sin.dims() == cos.dims())
+}
+
+struct LayerNormRope {
+    gamma_beta: Tensor,
+    eps: f32,
+    apply_norm: bool,
+}
+
+impl candle::CustomOp3 for LayerNormRope {
+    fn name(&self) -> &'static str {
+        "layernorm_rope"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        // Never routed on cpu (the callers gate on device); kept as an error.
+        candle::bail!("layernorm_rope cpu fallback is not used")
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        x: &candle::VulkanStorage,
+        x_l: &Layout,
+        cos: &candle::VulkanStorage,
+        cos_l: &Layout,
+        sin: &candle::VulkanStorage,
+        sin_l: &Layout,
+    ) -> Result<(candle::VulkanStorage, Shape)> {
+        let (gb_storage, _gb_layout) = self.gamma_beta.storage_and_layout();
+        let gb = match &*gb_storage {
+            candle::Storage::Vulkan(v) => v,
+            _ => candle::bail!("layernorm_rope: gamma/beta storage is not on the vulkan device"),
+        };
+        let out = x.rope_layernorm(x_l, gb, cos, sin, self.apply_norm, self.eps)?;
+        Ok((out, Shape::from(x_l.dims().to_vec())))
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        x: &candle::WgpuStorage,
+        x_l: &Layout,
+        cos: &candle::WgpuStorage,
+        cos_l: &Layout,
+        sin: &candle::WgpuStorage,
+        sin_l: &Layout,
+    ) -> Result<(candle::WgpuStorage, Shape)> {
+        let (gb_storage, _gb_layout) = self.gamma_beta.storage_and_layout();
+        let gb = match &*gb_storage {
+            candle::Storage::Wgpu(v) => v,
+            _ => candle::bail!("layernorm_rope: gamma/beta storage is not on the wgpu device"),
+        };
+        let out = x.rope_layernorm(x_l, gb, cos, sin, self.apply_norm, self.eps)?;
+        Ok((out, Shape::from(x_l.dims().to_vec())))
+    }
+}
+
 struct Sdpa {
     scale: f32,
     softcapping: f32,
@@ -1673,4 +1897,215 @@ pub fn flash_attn(
     let v_t = v.transpose(1, 2)?;
     let out = sdpa_unfused(&q_t, &k_t, &v_t, None, causal, softmax_scale, 1.0)?;
     out.transpose(1, 2)
+}
+
+#[cfg(all(test, feature = "vulkan"))]
+mod mul_mat_add_tests {
+    use super::mul_mat_add_forced;
+    use candle::{DType, Device, Tensor};
+
+    #[test]
+    fn mul_mat_add_matches_unfused_vulkan() -> anyhow::Result<()> {
+        let dev = Device::new_vulkan(0)?;
+        let dev_cpu = Device::Cpu;
+        let mut worst = 0.0f64;
+        // Shape matrix: isolate which edge (batch, candle-M, k, candle-N)
+        // breaks the unaligned cm1 bias epilogue.
+        for (batch, m, k, n) in [
+            (1usize, 64usize, 128usize, 256usize), // all aligned (was green)
+            (1, 40, 96, 130), // all unaligned
+            (1, 64, 128, 130), // n-edge only (candle M unaligned)
+            (1, 40, 128, 256), // m-edge only (candle N unaligned)
+            (1, 64, 96, 256), // k-edge only
+            (3, 64, 128, 256), // batch only
+        ] {
+            let xs = (0..batch * m * k)
+                .map(|v| (v % 17) as f32 * 0.13 - 1.0)
+                .collect::<Vec<_>>();
+            let w = (0..k * n).map(|v| (v % 23) as f32 * 0.07 - 0.8).collect::<Vec<_>>();
+            let bias = (0..n).map(|v| (v % 11) as f32 * 0.21 - 0.9).collect::<Vec<_>>();
+            let xs_t = Tensor::from_vec(xs.clone(), (batch, m, k), &dev_cpu)?;
+            let w_t = Tensor::from_vec(w.clone(), (k, n), &dev_cpu)?;
+            let b_t = Tensor::from_vec(bias.clone(), (n,), &dev_cpu)?;
+            let xs_v = xs_t.to_device(&dev)?;
+            let w_v = w_t.to_device(&dev)?;
+            let b_v = b_t.to_device(&dev)?;
+            // Reference: the unfused path on the SAME vulkan device, so the
+            // comparison isolates the bias epilogue from GPU-vs-CPU noise.
+            let reference = xs_v
+                .broadcast_matmul(&w_v)?
+                .broadcast_add(&b_v)?
+                .to_device(&dev_cpu)?
+                .to_dtype(DType::F32)?;
+            let fused = mul_mat_add_forced(&xs_v, &w_v, &b_v)?;
+            let fused_cpu = fused.to_device(&dev_cpu)?.to_dtype(DType::F32)?;
+
+            let a = fused_cpu.flatten_all()?.to_vec1::<f32>()?;
+            let b = reference.flatten_all()?.to_vec1::<f32>()?;
+            let diff = a
+                .iter()
+                .zip(b.iter())
+                .map(|(x, y)| (*x as f64 - *y as f64).abs())
+                .fold(0.0f64, f64::max);
+            let mut shown = 0;
+            for (bi, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                if (x - y).abs() > 1e-3 && shown < 8 {
+                    let flat = bi;
+                    let bt = flat / (m * n);
+                    let rem = flat % (m * n);
+                    let row = rem / n;
+                    let col = rem % n;
+                    println!(
+                        "mismatch batch={bt} row={row} col={col}: got {x} want {y} delta={:.6} bias[col]={} bias[row]={}",
+                        x - y,
+                        (col % 11) as f32 * 0.21 - 0.9,
+                        (row % 11) as f32 * 0.21 - 0.9
+                    );
+                    shown += 1;
+                }
+            }
+            println!("SHAPE batch={batch} m={m} k={k} n={n}: max diff {diff:.6} {}", if diff < 2e-3 {"OK"} else {"FAIL"});
+            // Full map of bias-only positions (got == bias[col] exactly):
+            // reveals which tile/batch/row/col region lost its matmul part.
+            let mut bias_only = 0usize;
+            let mut first: Option<(usize, usize, usize)> = None;
+            let mut last: Option<(usize, usize, usize)> = None;
+            for (bt_i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                let flat_b = bt_i / (m * n);
+                let rem_b = bt_i % (m * n);
+                let col_b = rem_b % n;
+                if (*x - *y).abs() > 1e-3 && (*x - (col_b % 11) as f32 * 0.21 + 0.9).abs() < 1e-4 {
+                    bias_only += 1;
+                    if first.is_none() {
+                        first = Some((flat_b, rem_b / n, col_b));
+                    }
+                    last = Some((flat_b, rem_b / n, col_b));
+                }
+            }
+            if bias_only > 0 {
+                println!(
+                    "bias-only count={bias_only} first={first:?} last={last:?}"
+                );
+            }
+            worst = worst.max(diff);
+        }
+        assert!(worst < 2e-3, "worst shape diff {worst}");
+        Ok(())
+    }
+}
+
+#[cfg(all(test, any(feature = "vulkan", feature = "wgpu")))]
+mod layernorm_rope_tests {
+    use super::{layernorm_rope_fused, rope_fused};
+    use candle::{DType, Device, Tensor, D};
+    use candle::IndexOp;
+
+    fn rope_reference(y: &Tensor, cos: &Tensor, sin: &Tensor) -> candle::Result<Tensor> {
+        let d = y.dim(D::Minus1)?;
+        let half = d / 2;
+        let quarter = half / 2;
+        let y2 = y.i((.., .., .., quarter..half))?;
+        let y1 = y.i((.., .., .., ..quarter))?;
+        let x2 = y.i((.., .., .., (half + quarter)..))?;
+        let x1 = y.i((.., .., .., half..(half + quarter)))?;
+        let partner = Tensor::cat(&[&y2, &y1, &x2, &x1], D::Minus1)?;
+        y.broadcast_mul(cos)?.broadcast_add(&partner.broadcast_mul(sin)?)
+    }
+
+    fn ln_reference(
+        x: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        eps: f64,
+    ) -> candle::Result<Tensor> {
+        let d = x.dim(D::Minus1)?;
+        let mean = (x.sum_keepdim(D::Minus1)? / d as f64)?;
+        let xc = x.broadcast_sub(&mean)?;
+        let var = (xc.sqr()?.sum_keepdim(D::Minus1)? / d as f64)?;
+        let normed = xc.broadcast_div(&(var + eps)?.sqrt()?)?;
+        normed.broadcast_mul(weight)?.broadcast_add(bias)
+    }
+
+    fn check(device: &Device) -> anyhow::Result<()> {
+        let (b, h, n, d) = (2usize, 4usize, 37usize, 64usize);
+        // Strided qkv-style view: (b, n, 3, h, d) -> transpose(1, 3) -> [.., 0]
+        let qkv = (0..b * n * 3 * h * d)
+            .map(|v| (v % 19) as f32 * 0.11 - 0.9)
+            .collect::<Vec<_>>();
+        let qkv = Tensor::from_vec(qkv, (b, n, 3, h, d), &Device::Cpu)?.to_device(device)?;
+        let q_view = qkv.transpose(1, 3)?.i((.., .., 0))?;
+        assert!(!q_view.is_contiguous());
+
+        let w = (0..d).map(|v| (v % 7) as f32 * 0.2 - 0.5).collect::<Vec<_>>();
+        let btab = (0..d)
+            .map(|v| (v % 5) as f32 * 0.15 - 0.3)
+            .collect::<Vec<_>>();
+        let ctab = (0..b * n * d)
+            .map(|v| (v % 13) as f32 * 0.05 - 0.3)
+            .collect::<Vec<_>>();
+        let stab = (0..b * n * d)
+            .map(|v| (v % 17) as f32 * 0.06 - 0.45)
+            .collect::<Vec<_>>();
+        let weight = Tensor::from_vec(w, (d,), &Device::Cpu)?.to_device(device)?;
+        let bias = Tensor::from_vec(btab, (d,), &Device::Cpu)?.to_device(device)?;
+        let cos = Tensor::from_vec(ctab, (b, 1, n, d), &Device::Cpu)?.to_device(device)?;
+        let sin = Tensor::from_vec(stab, (b, 1, n, d), &Device::Cpu)?.to_device(device)?;
+
+        // LN+rope on the strided view.
+        let fused = layernorm_rope_fused(&q_view, &weight, &bias, 1e-5, &cos, &sin)?;
+        assert_eq!(fused.dims(), &[b, h, n, d]);
+        assert!(fused.is_contiguous());
+        let y = ln_reference(&q_view, &weight, &bias, 1e-5)?;
+        let reference = rope_reference(&y, &cos, &sin)?;
+        let diff = fused
+            .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .sub(&reference.to_device(&Device::Cpu)?.to_dtype(DType::F32)?)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()? as f64;
+        println!(
+            "LN+rope strided max diff {diff:.6} {}",
+            if diff < 2e-3 { "OK" } else { "FAIL" }
+        );
+        assert!(diff < 2e-3);
+
+        // RoPE-only on a contiguous input.
+        let y_contig = ln_reference(&q_view, &weight, &bias, 1e-5)?.contiguous()?;
+        let fused_rope = rope_fused(&y_contig, &cos, &sin)?;
+        let reference_rope = rope_reference(&y_contig, &cos, &sin)?;
+        let diff_rope = fused_rope
+            .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .sub(&reference_rope.to_device(&Device::Cpu)?.to_dtype(DType::F32)?)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()? as f64;
+        println!(
+            "rope-only contiguous max diff {diff_rope:.6} {}",
+            if diff_rope < 2e-3 { "OK" } else { "FAIL" }
+        );
+        assert!(diff_rope < 2e-3);
+        Ok(())
+    }
+
+    // One sequential test: creating vulkan and wgpu devices concurrently in
+    // separate test threads races the loader/driver init ("Unable to find a
+    // Vulkan driver" under load).
+    #[test]
+    fn layernorm_rope_fused_matches_unfused() -> anyhow::Result<()> {
+        if let Ok(dev) = Device::new_vulkan(0) {
+            check(&dev)?;
+        } else {
+            println!("vulkan device unavailable, skipped");
+        }
+        if let Ok(dev) = Device::new_wgpu(0) {
+            check(&dev)?;
+        } else {
+            println!("wgpu device unavailable, skipped");
+        }
+        Ok(())
+    }
 }

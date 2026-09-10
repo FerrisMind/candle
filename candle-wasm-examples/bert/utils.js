@@ -1,88 +1,30 @@
-/**
- * Resolve / reload the worker-owned model for a device mode.
- * Does not run inference. On success, worker reports resolvedDevice + adapterName.
- */
-export async function setDevice(
+export async function getEmbeddings(
   worker,
   weightsURL,
   tokenizerURL,
   configURL,
   modelID,
-  deviceMode,
+  sentences,
   updateStatus = null
 ) {
   return new Promise((resolve, reject) => {
     worker.postMessage({
-      command: "setDevice",
       weightsURL,
       tokenizerURL,
       configURL,
       modelID,
-      deviceMode,
-    });
-    function messageHandler(event) {
-      const data = event.data;
-      if (data.status === "deviceError") {
-        worker.removeEventListener("message", messageHandler);
-        const err = new Error(data.error || "deviceError");
-        err.deviceError = data;
-        reject(err);
-        return;
-      }
-      if ("error" in data && data.status === "error") {
-        worker.removeEventListener("message", messageHandler);
-        reject(new Error(data.error));
-        return;
-      }
-      if (data.status === "ready") {
-        worker.removeEventListener("message", messageHandler);
-        resolve(data);
-        return;
-      }
-      if (updateStatus) updateStatus(data);
-    }
-    worker.addEventListener("message", messageHandler);
-  });
-}
-
-/**
- * Run embeddings on the already-loaded instance.
- * Must NOT pass deviceMode — device is fixed by setDevice.
- */
-export async function getEmbeddings(
-  worker,
-  modelID,
-  sentences,
-  updateStatus = null,
-  normalize = true
-) {
-  return new Promise((resolve, reject) => {
-    worker.postMessage({
-      command: "run",
-      modelID,
       sentences,
-      normalize,
     });
     function messageHandler(event) {
-      const data = event.data;
-      if (data.status === "deviceError") {
+      if ("error" in event.data) {
         worker.removeEventListener("message", messageHandler);
-        const err = new Error(data.error || "deviceError");
-        err.deviceError = data;
-        reject(err);
-        return;
+        reject(new Error(event.data.error));
       }
-      if ("error" in data || data.status === "error") {
+      if (event.data.status === "complete") {
         worker.removeEventListener("message", messageHandler);
-        reject(new Error(data.error));
-        return;
+        resolve(event.data);
       }
-      if (data.status === "complete") {
-        worker.removeEventListener("message", messageHandler);
-        resolve(data);
-        return;
-      }
-      if (updateStatus) updateStatus(data);
+      if (updateStatus) updateStatus(event.data);
     }
     worker.addEventListener("message", messageHandler);
   });
@@ -106,8 +48,8 @@ const MODELS = {
     document_prefix: "passage: ",
   },
   sentence_transformers_all_MiniLM_L6_v2: {
-    // Local cache: G:\models\all-MiniLM-L6-v2 (junction → ./models/all-MiniLM-L6-v2)
-    base_url: "./models/all-MiniLM-L6-v2/",
+    base_url:
+      "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/refs%2Fpr%2F21/",
     search_prefix: "",
     document_prefix: "",
   },

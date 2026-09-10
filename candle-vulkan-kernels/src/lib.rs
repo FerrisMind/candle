@@ -62,6 +62,18 @@ pub fn spirv_modules() -> &'static [SpirvModule] {
     spv::ALL_SPIRV_MODULES
 }
 
+/// Reverse lookup: resolve a SPIR-V word slice back to its module name.
+/// Fast path is pointer identity — callers normally pass the static slice
+/// straight through; the content compare is the fallback for copied slices.
+pub fn name_of(spirv_words: &[u32]) -> Option<&'static str> {
+    spv::ALL_SPIRV_MODULES
+        .iter()
+        .find(|module| {
+            std::ptr::eq(module.words.as_ptr(), spirv_words.as_ptr()) || module.words == spirv_words
+        })
+        .map(|module| module.name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::spirv;

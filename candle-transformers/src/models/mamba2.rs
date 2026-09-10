@@ -725,14 +725,24 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, mut vb: VarBuilder) -> Result<Self> {
+        // HF `*-hf` checkpoints nest everything under `backbone.` and name the
+        // final norm `norm`; candle's own layout is flat with `norm_f`. Accept
+        // both layouts.
+        if vb.contains_tensor("backbone.embeddings.weight") {
+            vb = vb.pp("backbone");
+        }
         let embedding = candle_nn::embedding(cfg.vocab_size(), cfg.d_model, vb.pp("embeddings"))?;
         let mut layers = Vec::with_capacity(cfg.n_layer);
         let vb_l = vb.pp("layers");
         for layer_idx in 0..cfg.n_layer {
             layers.push(ResidualBlock::new(layer_idx, cfg, vb_l.pp(layer_idx))?);
         }
-        let norm_f = candle_nn::rms_norm(cfg.d_model, 1e-5, vb.pp("norm_f"))?;
+        let norm_f = if vb.contains_tensor("norm_f.weight") {
+            candle_nn::rms_norm(cfg.d_model, 1e-5, vb.pp("norm_f"))?
+        } else {
+            candle_nn::rms_norm(cfg.d_model, 1e-5, vb.pp("norm"))?
+        };
         let lm_head = Linear::from_weights(embedding.embeddings().clone(), None);
         Ok(Self {
             embedding,

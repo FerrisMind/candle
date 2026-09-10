@@ -11,6 +11,18 @@ const WG_SIZE: u32 = 256;
 /// wgpu validates dispatch dims <= 65535 even when the adapter reports 65536.
 const WGPU_DISPATCH_WG_CAP: u32 = 65535;
 
+/// Budget (bytes) of retained in-flight submission buffers before
+/// `flush_active_batch` drains the queue. The 32-submission count cap alone
+/// lets 10+ GiB of chunky attention-score buffers (325-604 MB each) pile up
+/// and exhaust a 12 GiB card. 512 MiB matches the measured-optimal vulkan
+/// value on the same WDDM system. Override via `CANDLE_WGPU_INFLIGHT_MAX_BYTES`.
+fn wgpu_inflight_byte_budget() -> u64 {
+    std::env::var("CANDLE_WGPU_INFLIGHT_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(512 * 1024 * 1024)
+}
+
 fn wgpu_dispatch_wg_cap(device: &WgpuDevice) -> u32 {
     device
         .inner
@@ -150,12 +162,64 @@ struct SumRowsParams {
 }
 const _: () = assert!(size_of::<SumRowsParams>() <= 256);
 
+/// Params for `reduce_rows_strided.wgsl` / `arg_reduce_rows_strided.wgsl`:
+/// last-dim reduce where the reduced dim may carry a non-unit stride.
+/// Outer dims are stored innermost-first (ne1 = nearest to the reduced dim).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StridedReduceParams {
+    offset_src: u32,
+    offset_dst: u32,
+    stride_src0: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
+    row_begin: u32,
+    mode: u32,
+    _pad0: u32,
+}
+const _: () = assert!(size_of::<StridedReduceParams>() <= 256);
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ArgMaxParams {
     offset_src: u32,
     offset_dst: u32,
     ne0: u32,
+    _pad0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ConvTransposeParams {
+    ne: u32, // total output elements (b * c_out * out_h * out_w)
+    offset_src: u32, // in elements
+    offset_w: u32,   // in elements
+    offset_dst: u32, // in elements
+    // Input strides (in elements), innermost-first from dims4: [w, h, c, b].
+    st_in_b: u32,
+    st_in_c: u32,
+    st_in_h: u32,
+    st_in_w: u32,
+    // Kernel strides (in elements), innermost-first: [kw, kh, c_out, c_in].
+    st_k_ci: u32,
+    st_k_co: u32,
+    st_k_h: u32,
+    st_k_w: u32,
+    out_h: u32,
+    out_w: u32,
+    c_out: u32,
+    c_in: u32,
+    i_h: u32,
+    i_w: u32,
+    k_h: u32,
+    k_w: u32,
+    stride: u32,
+    dilation: u32,
+    padding: u32,
     _pad0: u32,
 }
 
@@ -680,8 +744,10 @@ struct WgpuInner {
     queue: wgpu::Queue,
     features: wgpu::Features,
     limits: wgpu::Limits,
-    /// Cached `CANDLE_WGPU_COOP_MATMUL` (default true when hardware allows).
+    /// Cached `CANDLE_WGPU_COOP_MATMUL` (default false — f16 MMA breaks the
+    /// DType::F32 accuracy contract; opt in explicitly).
     coop_matmul_enabled: bool,
+    gpu_profile: std::sync::Mutex<Option<std::sync::Arc<WgpuGpuProfile>>>,
     /// Last uncaptured / device-lost error message (worker-safe; no panic).
     runtime_error: Arc<Mutex<Option<String>>>,
     /// Set by `set_device_lost_callback` when the GPU device is lost.
@@ -781,8 +847,156 @@ struct WgpuElemBgKey {
     storage_sizes: Vec<u64>,
 }
 
+
+/// GPU-timestamp profiler (CANDLE_WGPU_GPU_PROFILE=1): every batched
+/// dispatch runs in its own compute pass, so a per-pass begin/end timestamp
+/// pair gives exact per-kernel GPU time. Resolved asynchronously after each
+/// submission completes and aggregated by kernel label.
+const WGPU_GPU_PROFILE_QUERY_COUNT: u32 = 4096;
+/// Drain the pool once this many queries are handed out.
+const WGPU_GPU_PROFILE_DRAIN_AT: u32 = 2048;
+const WGPU_GPU_PROFILE_READ_SLOTS: usize = 32;
+
+struct WgpuGpuProfile {
+
+    // (uses fully-qualified atomics)
+    query_set: wgpu::QuerySet,
+    resolve: Vec<Arc<wgpu::Buffer>>,
+    readback: Vec<Arc<wgpu::Buffer>>,
+    cursor: std::sync::atomic::AtomicU32,
+    read_slot: std::sync::atomic::AtomicU32,
+    timestamp_period_ns: f64,
+    agg: std::sync::Mutex<HashMap<&'static str, (u64, u64)>>,
+    /// Pass ranges handed out since the last drain.
+    pending: std::sync::Mutex<Vec<(u32, u32, &'static str)>>,
+}
+
+impl std::fmt::Debug for WgpuGpuProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WgpuGpuProfile")
+    }
+}
+
+impl WgpuGpuProfile {
+    fn next_indices(&self) -> Option<(u32, u32)> {
+        let q0 = self
+            .cursor
+            .fetch_add(2, std::sync::atomic::Ordering::AcqRel);
+        if q0 + 1 >= WGPU_GPU_PROFILE_QUERY_COUNT {
+            return None; // pool exhausted; remaining passes run unprofiled
+        }
+        Some((q0, q0 + 1))
+    }
+
+    fn drain(&self, device: &wgpu::Device, queue: &wgpu::Queue, cursor: u32) {
+        let mut ranges = match self.pending.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(e) => std::mem::take(&mut *e.into_inner()),
+        };
+        if ranges.is_empty() {
+            return;
+        }
+        ranges.sort_by_key(|(q0, _, _)| *q0);
+        let first = ranges.first().unwrap().0;
+        let last = ranges.last().unwrap().1;
+        let count = last - first + 1;
+        self.cursor.store(0, std::sync::atomic::Ordering::Release);
+        let slot = (self.read_slot.fetch_add(1, std::sync::atomic::Ordering::AcqRel) % WGPU_GPU_PROFILE_READ_SLOTS as u32) as usize;
+        let resolve = self.resolve[slot].clone();
+        let readback = self.readback[slot].clone();
+        let labels: Vec<(u32, u32, &'static str)> = ranges.to_vec();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("candle-wgpu-gpu-profile-readout"),
+        });
+        encoder.resolve_query_set(&self.query_set, first..(first + count), &resolve, 0);
+        encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, count as u64 * 8);
+        queue.submit([encoder.finish()]);
+        let period = self.timestamp_period_ns;
+        let byte_len = count as u64 * 8;
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        readback
+            .slice(0..byte_len)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = result;
+                let _ = tx.send(());
+            });
+        device.poll(wgpu::PollType::wait_indefinitely());
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+        {
+            let data = readback.get_mapped_range(0..byte_len);
+            let mut agg = match self.agg.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            for (q0, _q1, label) in &labels {
+                let i0 = (*q0 - first) as usize;
+                let begin =
+                    u64::from_le_bytes(data[i0 * 8..i0 * 8 + 8].try_into().unwrap_or([0; 8]));
+                let end = u64::from_le_bytes(
+                    data[(i0 + 1) * 8..(i0 + 1) * 8 + 8]
+                        .try_into()
+                        .unwrap_or([0; 8]),
+                );
+                let ticks = end.saturating_sub(begin);
+                let entry = agg.entry(label).or_insert((0u64, 0u64));
+                entry.0 += 1;
+                entry.1 += (ticks as f64 * period) as u64;
+            }
+        }
+        readback.unmap();
+        // Mirror into the thread-local report table (same thread: all wgpu
+        // calls run on the dispatching thread).
+        WGPU_GPU_PROFILE_AGG.with(|tl| {
+            let mut tl = match tl.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            let mut agg = match self.agg.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            for (name, (count, nanos)) in agg.iter_mut() {
+                let e = tl.entry(*name).or_insert((0u64, 0u64));
+                e.0 += *count;
+                e.1 += *nanos;
+                *count = 0;
+                *nanos = 0;
+            }
+        });
+    }
+}
+
+/// Aggregated GPU kernel report (label, dispatch count, total ms), hottest
+/// first. None unless CANDLE_WGPU_GPU_PROFILE=1 and the adapter supports
+/// timestamp queries.
+pub fn wgpu_gpu_profile_report() -> Option<Vec<(&'static str, u64, f64)>> {
+    WGPU_GPU_PROFILE_ENABLED
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(|| ())?;
+    WGPU_GPU_PROFILE_AGG.with(|agg| {
+        let agg = agg.lock().ok()?;
+        let mut rows: Vec<(&'static str, u64, f64)> = agg
+            .iter()
+            .map(|(name, (count, nanos))| (*name, *count, *nanos as f64 / 1e6))
+            .collect();
+        rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        Some(rows)
+    })
+}
+
+static WGPU_GPU_PROFILE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static WGPU_GPU_PROFILE_AGG: std::sync::Mutex<HashMap<&'static str, (u64, u64)>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
 struct WgpuPendingDispatch {
     pipeline: Arc<WgpuCachedPipeline>,
+    label: &'static str,
+    /// wgpu_buffer_key of every STORAGE buffer bound by this dispatch —
+    /// the dependency set for pass folding (uniform params excluded: they
+    /// are written before submission, never by dispatches).
+    buffer_keys: smallvec::SmallVec<[usize; 8]>,
     bind_group: wgpu::BindGroup,
     workgroups: (u32, u32, u32),
     /// Pre-resolved dynamic offsets (storage + uniform). Empty when using
@@ -796,6 +1010,9 @@ struct WgpuPendingDispatch {
 }
 
 struct WgpuActiveBatch {
+    /// (begin_ts_index, end_ts_index, kernel label) per encoded pass —
+    /// filled only when the GPU-timestamp profiler is active.
+    profile_ranges: Vec<(u32, u32, &'static str)>,
     encoder: wgpu::CommandEncoder,
     retained_buffers: Vec<Arc<wgpu::Buffer>>,
     /// Compute dispatches held until encode_pending_dispatches (one pass).
@@ -819,6 +1036,10 @@ impl std::fmt::Debug for WgpuActiveBatch {
 
 struct WgpuPendingSubmission {
     retained_buffers: Vec<Arc<wgpu::Buffer>>,
+    /// Total device bytes of `retained_buffers`, used to bound in-flight VRAM
+    /// by bytes (the 32-submission cap alone permits 10+ GiB of chunky
+    /// attention-score buffers to pile up and exhaust the card).
+    retained_bytes: u64,
     completed: Arc<AtomicBool>,
 }
 
@@ -876,6 +1097,8 @@ fn wgpu_shader_cache_key(shader: &str) -> (u64, usize) {
 struct WgpuCachedPipeline {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
+    /// Kernel name for the GPU-timestamp profiler.
+    label: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -938,6 +1161,20 @@ impl WgpuDevice {
             .lock()
             .ok()
             .and_then(|mut guard| guard.take())
+    }
+
+    /// Drain a wgpu uncaptured / device-lost error (if any) that
+    /// `on_uncaptured_error` captured into `runtime_error`, returning its
+    /// message. Runs one non-blocking poll first so the handler has delivered
+    /// the error (wgpu reports validation failures asynchronously). A burned
+    /// submission index almost always has such an error behind it; surfacing
+    /// it here is what makes the real root cause visible instead of a bare
+    /// `WrongSubmissionIndex` failure.
+    fn surface_runtime_error(&self) -> Option<String> {
+        let _ = self.inner.device.poll(wgpu::PollType::Poll);
+        self.take_runtime_error().inspect(|msg| {
+            eprintln!("[candle-wgpu] validation error: {msg}");
+        })
     }
 
     /// Whether the underlying `wgpu::Device` has reported a device-lost event.
@@ -1120,6 +1357,25 @@ fn any_as_bytes<T>(value: &T) -> &[u8] {
     }
 }
 
+/// Params for the fused LayerNorm->RoPE kernel (rope_layernorm.wgsl). All
+/// scalars, so the WGSL struct layout matches the C repr with no padding.
+#[repr(C)]
+struct RopeLayerNormParams {
+    offset_src: u32,
+    stride_s0: u32,
+    stride_s1: u32,
+    stride_s2: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
+    ne3: u32,
+    quarter: u32,
+    apply_norm: u32,
+    eps: f32,
+    _pad: u32,
+}
+
+
 fn bytes_to_vec<T: Copy>(bytes: &[u8], count: usize) -> Result<Vec<T>> {
     let byte_len = count * std::mem::size_of::<T>();
     if bytes.len() != byte_len {
@@ -1133,10 +1389,13 @@ fn bytes_to_vec<T: Copy>(bytes: &[u8], count: usize) -> Result<Vec<T>> {
     Ok(out)
 }
 
-fn cpu_storage_to_bytes(storage: &CpuStorage) -> Result<(DType, usize, Vec<u8>)> {
+fn cpu_storage_to_bytes(storage: &CpuStorage) -> Result<(DType, usize, &[u8])> {
     macro_rules! typed {
         ($storage:expr, $dtype:expr) => {{
-            let bytes = typed_as_bytes($storage).to_vec();
+            // Borrowed reinterpret: queue.write_buffer copies the bytes into
+            // wgpu's internal staging anyway, so an owned copy here (an extra
+            // allocation plus full-size memcpy per upload) is unnecessary.
+            let bytes = typed_as_bytes($storage);
             Ok(($dtype, $storage.len(), bytes))
         }};
     }
@@ -1224,10 +1483,16 @@ fn scalar_raw_words(
     Ok(words)
 }
 
-fn wgpu_padded_write_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut padded = bytes.to_vec();
-    padded.resize(wgpu_copy_size(bytes.len()), 0);
-    padded
+fn wgpu_padded_write_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let padded_len = wgpu_copy_size(bytes.len());
+    if padded_len == bytes.len() {
+        // Common case: already 4-byte aligned, no padding allocation.
+        std::borrow::Cow::Borrowed(bytes)
+    } else {
+        let mut padded = bytes.to_vec();
+        padded.resize(padded_len, 0);
+        std::borrow::Cow::Owned(padded)
+    }
 }
 
 impl WgpuDevice {
@@ -1543,7 +1808,13 @@ impl WgpuDevice {
             }
         }
         if let Ok(mut pending) = self.inner.storage_pool_pending.lock() {
-            if pending.len() < 512 {
+            // Byte-cap the backlog: between pool flushes a dense forward can
+            // recycle hundreds of chunky intermediates, and 512 count-only
+            // entries of 300-700 MB attention-score buffers hold multiple GiB
+            // of VRAM invisibly. Mirror the free-pool ceiling.
+            const BACKLOG_MAX_BYTES: usize = 512 * 1024 * 1024;
+            let bytes: usize = pending.iter().map(|b| b.size() as usize).sum();
+            if pending.len() < 512 && bytes + buffer.size() as usize <= BACKLOG_MAX_BYTES {
                 pending.push(Arc::clone(buffer));
             }
         }
@@ -1559,25 +1830,40 @@ impl WgpuDevice {
         // OOM'd at ~456 MiB reason regardless of reuse. Once the byte cap is
         // exceeded we DROP the Arc so the wgpu buffer is destroyed and its
         // sub-allocation returns to gpu-allocator, instead of recycling it.
-        const BUCKET_CAP: usize = 8;
-        // F6 (native): raise the pooled-bytes ceiling. The D2.3 1 GiB cap was
-        // sized for the KV-cat monotonic-growth case, but it made SD-512 drop
-        // the ~1 GiB f32 attention-score intermediate every time it was recycled
-        // (total_bytes + 1 GiB > cap), forcing a fresh carve and a fresh
-        // gpu-allocator block on each forward -> the peak compounded to ~11.8 GiB.
-        // The larger ceiling lets that big intermediate survive in the free pool
-        // and be reused across steps, avoiding the re-carve. Keep 3 GiB on native.
+        // BUCKET_CAP 4 / MAX_BYTES 512 MiB (native): dense vision models
+        // (pi3/pi3x) allocate thousands of distinct intermediate sizes per
+        // forward, so a bigger pool mostly hoards one-shot sizes — the D2.3
+        // comment below is the extreme case. The cap must stay well under the
+        // card budget because pool residency is invisible to the inflight
+        // byte budget (which now counts it — see flush_active_batch). The F6
+        // SD-512 re-carve compounding applies to single ~1 GiB intermediates;
+        // those exceed the cap by design and get destroyed + re-carved, which
+        // is bounded because the inflight budget drains them each step.
+        // Override via CANDLE_WGPU_POOL_MAX_BYTES.
+        fn pool_max_bytes() -> usize {
+            static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *CAP.get_or_init(|| {
+                std::env::var("CANDLE_WGPU_POOL_MAX_BYTES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(512 * 1024 * 1024)
+            })
+        }
         #[cfg(not(target_arch = "wasm32"))]
-        const MAX_BYTES: usize = 3 * 1024 * 1024 * 1024; // 3 GiB of pooled buffers
-                                                         // D8 (wasm): the recycled free pool is the largest *persistent* holder on
-                                                         // WebGPU and never auto-shrinks, so a 3 GiB cap lets it retain ~700 MiB+
-                                                         // of whisper scratch while the GPU delta is ~4x that in gpu-allocator
-                                                         // blocks. Cap it to real scratch (512 MiB) on wasm32 — small models are
-                                                         // well under this and the size-class pool is repopulated each step, so
-                                                         // dropping the over-cap Arc (wgpu destroys the buffer, its block returns
-                                                         // to gpu-allocator) is safe at a confirmed-drain point.
+        const BUCKET_CAP: usize = 4;
         #[cfg(target_arch = "wasm32")]
-        const MAX_BYTES: usize = 512 * 1024 * 1024; // 512 MiB on wasm (WebGPU)
+        const BUCKET_CAP: usize = 8;
+        #[cfg(not(target_arch = "wasm32"))]
+        let max_bytes = pool_max_bytes();
+        // D8 (wasm): the recycled free pool is the largest *persistent* holder on
+        // WebGPU and never auto-shrinks, so a 3 GiB cap lets it retain ~700 MiB+
+        // of whisper scratch while the GPU delta is ~4x that in gpu-allocator
+        // blocks. Cap it to real scratch (512 MiB) on wasm32 — small models are
+        // well under this and the size-class pool is repopulated each step, so
+        // dropping the over-cap Arc (wgpu destroys the buffer, its block returns
+        // to gpu-allocator) is safe at a confirmed-drain point.
+        #[cfg(target_arch = "wasm32")]
+        let max_bytes = 512 * 1024 * 1024; // 512 MiB on wasm (WebGPU)
         let pending = match self.inner.storage_pool_pending.lock() {
             Ok(mut g) => std::mem::take(&mut *g),
             Err(_) => return,
@@ -1586,11 +1872,15 @@ impl WgpuDevice {
             return;
         }
         if let Ok(mut pool) = self.inner.storage_buffer_pool.lock() {
-            let mut total_bytes: usize = pool.values().flatten().map(|b| b.size() as usize).sum();
+            let mut total_bytes: usize = pool
+                .values()
+                .flatten()
+                .map(|b| b.size() as usize)
+                .sum();
             for buffer in pending {
                 let size = buffer.size() as usize;
                 let bucket = pool.entry(size as u64).or_default();
-                if bucket.len() < BUCKET_CAP && total_bytes + size <= MAX_BYTES {
+                if bucket.len() < BUCKET_CAP && total_bytes + size <= max_bytes {
                     total_bytes += size;
                     bucket.push(buffer);
                 }
@@ -1777,12 +2067,16 @@ impl WgpuDevice {
     /// Chunked to avoid oversized single `queue.write_buffer` calls on browsers.
     fn write_storage_bytes(&self, buffer: &wgpu::Buffer, bytes: &[u8]) -> Result<()> {
         const UPLOAD_CHUNK: usize = 1024 * 1024;
-        let padded = wgpu_padded_write_bytes(bytes);
+        let padded: std::borrow::Cow<'_, [u8]> = wgpu_padded_write_bytes(bytes);
         let mut off = 0usize;
         while off < padded.len() {
             let end = (off + UPLOAD_CHUNK).min(padded.len());
             // Keep each write 4-byte aligned (WebGPU writeBuffer requirement).
-            let end = if end < padded.len() { end & !3 } else { end };
+            let end = if end < padded.len() {
+                end & !3
+            } else {
+                end
+            };
             if end <= off {
                 break;
             }
@@ -1920,7 +2214,23 @@ impl WgpuDevice {
         Ok(())
     }
 
-    const MAX_BATCH_DISPATCHES: u32 = 32;
+    /// Dispatches per command batch. 32 (the old fixed cap) split pi3x into
+    /// ~300+ submissions; on Windows WDDM/DX12 every flush that triggers a
+    /// blocking drain costs ~10+ ms of fence-signal latency, so fewer, bigger
+    /// batches directly cut wall time. Override via
+    /// `CANDLE_WGPU_MAX_BATCH_DISPATCHES`.
+    fn max_batch_dispatches() -> u32 {
+        static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("CANDLE_WGPU_MAX_BATCH_DISPATCHES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                // 64 measured 6x WORSE than 32 on pi3 (430 s vs 75 s): the
+                // uniform ring is sized for a few in-flight batches, and
+                // bigger batches wrap it into reuse-waits. Keep 32.
+                .unwrap_or(32)
+        })
+    }
 
     fn begin_active_batch(&self) -> Result<WgpuActiveBatch> {
         let encoder = self
@@ -1931,6 +2241,7 @@ impl WgpuDevice {
             });
         Ok(WgpuActiveBatch {
             encoder,
+            profile_ranges: Vec::new(),
             retained_buffers: Vec::new(),
             pending_dispatches: Vec::new(),
             dispatch_count: 0,
@@ -1987,22 +2298,162 @@ impl WgpuDevice {
         // write→read ordering required by BatchNorm-style broadcast chains and
         // multi-layer models (ConvMixer). Independent microbench batches still
         // share one encoder/submit.
-        for d in &batch.pending_dispatches {
-            let mut pass = batch
-                .encoder
-                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+        // Lazily create the GPU-timestamp profiler on first batch encode.
+        let profiler: Option<std::sync::Arc<WgpuGpuProfile>> = if WGPU_GPU_PROFILE_ENABLED
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let mut guard = match device.inner.gpu_profile.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            if guard.is_none()
+                && !device
+                    .inner
+                    .features
+                    .contains(wgpu::Features::TIMESTAMP_QUERY)
+            {
+                eprintln!("[candle-wgpu] gpu-profile: TIMESTAMP_QUERY feature missing (features={:?})", device.inner.features);
+            }
+            if guard.is_none()
+                && device
+                    .inner
+                    .features
+                    .contains(wgpu::Features::TIMESTAMP_QUERY)
+            {
+                let query_set = device.inner.device.create_query_set(&wgpu::QuerySetDescriptor {
+                    ty: wgpu::QueryType::Timestamp,
+                    count: WGPU_GPU_PROFILE_QUERY_COUNT,
+                    label: Some("candle-wgpu-gpu-profile"),
+                });
+                let mk = |label: String, usage: wgpu::BufferUsages| {
+                    std::sync::Arc::new(device.inner.device.create_buffer(
+                        &wgpu::BufferDescriptor {
+                            label: Some(&label),
+                            size: WGPU_GPU_PROFILE_QUERY_COUNT as u64 * 8,
+                            usage,
+                            mapped_at_creation: false,
+                        },
+                    ))
+                };
+                let resolve = (0..WGPU_GPU_PROFILE_READ_SLOTS)
+                    .map(|i| {
+                        mk(
+                            format!("candle-wgpu-gpu-profile-resolve-{i}"),
+                            wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                        )
+                    })
+                    .collect();
+                let readback = (0..WGPU_GPU_PROFILE_READ_SLOTS)
+                    .map(|i| {
+                        mk(
+                            format!("candle-wgpu-gpu-profile-readback-{i}"),
+                            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        )
+                    })
+                    .collect();
+                *guard = Some(std::sync::Arc::new(WgpuGpuProfile {
+                    query_set,
+                    resolve,
+                    readback,
+                    cursor: std::sync::atomic::AtomicU32::new(0),
+                    read_slot: std::sync::atomic::AtomicU32::new(0),
+                    timestamp_period_ns: f64::from(device.inner.queue.get_timestamp_period()),
+                    agg: std::sync::Mutex::new(HashMap::new()),
+                    pending: std::sync::Mutex::new(Vec::new()),
+                }));
+            }
+            guard.as_ref().map(std::sync::Arc::clone)
+        } else {
+            None
+        };
+        // Pass folding: consecutive dispatches whose storage-buffer sets are
+        // pairwise disjoint run in ONE compute pass — WebGPU provides no
+        // barriers inside a pass, but disjoint buffer sets make the order
+        // irrelevant, and one pass instead of N removes N-1 WDDM pass
+        // boundaries. Dependent dispatches (dst of N is src of N+1) start a
+        // new group exactly as before. Disabled while the timestamp profiler
+        // is active (it keys on per-dispatch passes) and by
+        // CANDLE_WGPU_PASS_FOLDING=0.
+        let folding = profiler.is_none()
+            && std::env::var("CANDLE_WGPU_PASS_FOLDING").as_deref() != Ok(&"0");
+        if !folding {
+            for d in &batch.pending_dispatches {
+                let ts_write = profiler.as_ref().and_then(|p| {
+                    p.next_indices().map(|(b, e)| {
+                        wgpu::ComputePassTimestampWrites {
+                            query_set: &p.query_set,
+                            beginning_of_pass_write_index: Some(b),
+                            end_of_pass_write_index: Some(e),
+                        }
+                    })
+                });
+                if let (Some(p), Some(tw)) = (&profiler, &ts_write) {
+                    if let Ok(mut pending) = p.pending.lock() {
+                        pending.push((
+                            tw.beginning_of_pass_write_index.unwrap_or(0),
+                            tw.end_of_pass_write_index.unwrap_or(0),
+                            d.label,
+                        ));
+                    }
+                }
+                let mut pass = batch
+                    .encoder
+                    .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("candle-wgpu-batch-pass"),
+                        timestamp_writes: ts_write,
+                    });
+                pass.set_pipeline(&d.pipeline.pipeline);
+                if d.use_immediates && d.deferred_uniform_len > 0 {
+                    let n = d.deferred_uniform_len as usize;
+                    pass.set_immediates(0, &d.deferred_uniform[..n]);
+                    pass.set_bind_group(0, &d.bind_group, &[]);
+                } else {
+                    pass.set_bind_group(0, &d.bind_group, &d.dynamic_offsets);
+                }
+                pass.dispatch_workgroups(d.workgroups.0, d.workgroups.1, d.workgroups.2);
+            }
+        } else {
+            const PASS_DESC: fn() -> wgpu::ComputePassDescriptor<'static> =
+                || wgpu::ComputePassDescriptor {
                     label: Some("candle-wgpu-batch-pass"),
                     timestamp_writes: None,
-                });
-            pass.set_pipeline(&d.pipeline.pipeline);
-            if d.use_immediates && d.deferred_uniform_len > 0 {
-                let n = d.deferred_uniform_len as usize;
-                pass.set_immediates(0, &d.deferred_uniform[..n]);
-                pass.set_bind_group(0, &d.bind_group, &[]);
-            } else {
-                pass.set_bind_group(0, &d.bind_group, &d.dynamic_offsets);
+                };
+            let dispatches = std::mem::take(&mut batch.pending_dispatches);
+            let mut group_start = 0usize;
+            let mut group_buffers: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            let mut emit_group = |batch: &mut WgpuActiveBatch,
+                                  dispatches: &[WgpuPendingDispatch],
+                                  range: std::ops::Range<usize>| {
+                if range.start >= range.end {
+                    return;
+                }
+                let mut pass = batch
+                    .encoder
+                    .begin_compute_pass(&PASS_DESC());
+                for d in &dispatches[range.clone()] {
+                    pass.set_pipeline(&d.pipeline.pipeline);
+                    if d.use_immediates && d.deferred_uniform_len > 0 {
+                        let n = d.deferred_uniform_len as usize;
+                        pass.set_immediates(0, &d.deferred_uniform[..n]);
+                        pass.set_bind_group(0, &d.bind_group, &[]);
+                    } else {
+                        pass.set_bind_group(0, &d.bind_group, &d.dynamic_offsets);
+                    }
+                    pass.dispatch_workgroups(d.workgroups.0, d.workgroups.1, d.workgroups.2);
+                }
+            };
+            for (idx, d) in dispatches.iter().enumerate() {
+                let conflict = d.buffer_keys.iter().any(|k| group_buffers.contains(k));
+                if conflict && idx > group_start {
+                    emit_group(batch, &dispatches, group_start..idx);
+                    group_buffers.clear();
+                    group_start = idx;
+                }
+                group_buffers.extend(d.buffer_keys.iter().copied());
             }
-            pass.dispatch_workgroups(d.workgroups.0, d.workgroups.1, d.workgroups.2);
+            emit_group(batch, &dispatches, group_start..dispatches.len());
+            batch.pending_dispatches = dispatches;
         }
         batch.pending_dispatches.clear();
     }
@@ -2033,7 +2484,9 @@ impl WgpuDevice {
         let Some(batch) = batch else {
             return Ok(false);
         };
-        if batch.dispatch_count == 0 && batch.pending_dispatches.is_empty() && batch.copy_count == 0
+        if batch.dispatch_count == 0
+            && batch.pending_dispatches.is_empty()
+            && batch.copy_count == 0
         {
             let mut slot = self
                 .inner
@@ -2059,7 +2512,17 @@ impl WgpuDevice {
         self.inner
             .queue
             .on_submitted_work_done(move || done.store(true, Ordering::Release));
+        if let Ok(profiler) = self.inner.gpu_profile.lock() {
+            if let Some(profiler) = profiler.as_ref() {
+                let cursor = profiler.cursor.load(std::sync::atomic::Ordering::Acquire);
+                if cursor >= WGPU_GPU_PROFILE_DRAIN_AT {
+                    profiler.drain(&self.inner.device, &self.inner.queue, cursor);
+                }
+            }
+        }
         const MAX_IN_FLIGHT_SUBMISSIONS: usize = 32;
+        // Retained device bytes of this submission (before the move below).
+        let retained_bytes: u64 = batch.retained_buffers.iter().map(|b| b.size()).sum();
         let mut pending = self
             .inner
             .pending_submissions
@@ -2087,8 +2550,73 @@ impl WgpuDevice {
         }
         pending.push(WgpuPendingSubmission {
             retained_buffers: batch.retained_buffers,
+            retained_bytes,
             completed,
         });
+        // Byte-budget drain: the 32-submission cap above only bounds the
+        // COUNT, but a naive multi-head attention holds one or two 325-604 MB
+        // score matrices per submission, so 32 in flight is 10+ GiB — enough
+        // to exhaust a 12 GiB card before the count cap ever trips (observed
+        // OOM on pi3x/triposr decode). When the retained bytes exceed the
+        // budget, drain (wait for completion) so chunky buffers return to the
+        // pool / driver instead of piling up. Overridable for tuning.
+        //
+        // The pool and recycle backlog are each already byte-capped at
+        // 512 MiB, so total deliberate retention is bounded; when in-flight
+        // alone is under budget but the total is over, a pool flush
+        // (promotes backlog → pool, drops over-cap Arcs to the allocator)
+        // brings the total down without any GPU wait.
+        let in_flight_bytes: u64 = pending.iter().map(|s| s.retained_bytes).sum();
+        let pool_bytes: u64 = self
+            .inner
+            .storage_buffer_pool
+            .lock()
+            .map(|pool| pool.values().flatten().map(|b| b.size()).sum())
+            .unwrap_or(0);
+        let backlog_bytes: u64 = self
+            .inner
+            .storage_pool_pending
+            .lock()
+            .map(|backlog| backlog.iter().map(|b| b.size()).sum())
+            .unwrap_or(0);
+        // Grace band (ported from the vulkan backend): blocking drains cost
+        // ~10+ ms of WDDM fence-signal latency each, so only drain when
+        // in-flight bytes exceed budget x grace; inside the band the
+        // submission-completed poll (run by the next cleanup) retires work
+        // without waiting. Override via `CANDLE_WGPU_INFLIGHT_GRACE`.
+        fn wgpu_inflight_grace_multiplier() -> f64 {
+            static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+            *V.get_or_init(|| {
+                std::env::var("CANDLE_WGPU_INFLIGHT_GRACE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    // 1.0 = always drain at the budget (the measured-best
+                    // wgpu behavior): unlike vulkan, wgpu's non-blocking
+                    // retirement only advances inside device.poll, so a grace
+                    // band lets in-flight pile up and made pi3 75 s -> 112 s.
+                    // Override via CANDLE_WGPU_INFLIGHT_GRACE.
+                    .unwrap_or(1.0)
+            })
+        }
+        let budget = wgpu_inflight_byte_budget();
+        let blocking_threshold = (budget as f64 * wgpu_inflight_grace_multiplier()) as u64;
+        if in_flight_bytes > blocking_threshold {
+            drop(pending);
+            // wasm: poll-only (blocking Wait is a no-op); native: blocking drain.
+            #[cfg(target_arch = "wasm32")]
+            self.cleanup_pending_submissions(false)?;
+            #[cfg(not(target_arch = "wasm32"))]
+            self.cleanup_pending_submissions(true)?;
+        } else if in_flight_bytes + pool_bytes + backlog_bytes > budget {
+            drop(pending);
+            #[cfg(target_arch = "wasm32")]
+            self.flush_storage_pool_pending();
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.cleanup_pending_submissions(false)?;
+                self.flush_storage_pool_pending();
+            }
+        }
         let _ = reason;
         Ok(true)
     }
@@ -2192,18 +2720,65 @@ impl WgpuDevice {
             });
             // Wait only for this (last) submission; all earlier queue work is
             // already complete by FIFO. Map callbacks fire on completion.
-            self.inner
-                .device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(sub_idx),
-                    timeout: None,
-                })
-                .map_err(Error::wrap)?;
+            //
+            // wgpu-core consumes a submission index BEFORE encoder validation
+            // (device/queue.rs: active_submission_index += 1; a failed submit
+            // never advances `last_successful_submission_index`), so if any
+            // earlier encoder failed validation, the indexes in between are
+            // burned and `Wait { Some(sub_idx) }` fails with
+            // WrongSubmissionIndex even though the queue is otherwise fine.
+            // Fall back to waiting on the most recent submission — always
+            // valid — and let the surfaced validation error below gate the
+            // read.
+            if let Err(poll_err) = self.inner.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(sub_idx),
+                timeout: None,
+            }) {
+                if let wgpu::PollError::WrongSubmissionIndex(requested, successful) = poll_err {
+                    eprintln!(
+                        "[candle-wgpu] readback wait burned submission index (requested={requested}, last successful={successful}); waiting on last successful submission"
+                    );
+                    self.inner
+                        .device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: None,
+                            timeout: None,
+                        })
+                        .map_err(|e| {
+                            Error::Msg(format!("wgpu readback fallback wait failed: {e}")).bt()
+                        })?;
+                } else {
+                    let runtime = self.surface_runtime_error();
+                    return Err(Error::Msg(format!(
+                        "wgpu readback poll failed: {poll_err}{}",
+                        runtime
+                            .as_deref()
+                            .map(|m| format!("; validation error: {m}"))
+                            .unwrap_or_default()
+                    ))
+                    .bt());
+                }
+            }
+            let runtime_msg = self.surface_runtime_error();
+            if let Some(msg) = &runtime_msg {
+                // The copy submit's index was burned, so its data cannot be
+                // trusted (a map callback on an idle staging buffer would fire
+                // with Ok and yield garbage). Surface the real validation error
+                // and let the caller's retry path re-run the readback.
+                return Err(Error::Msg(format!("wgpu readback aborted: {msg}")).bt());
+            }
             rx.recv()
                 .map_err(Error::wrap)?
                 .map_err(Error::wrap)
                 .map_err(|e| {
-                    Error::Msg(format!("wgpu readback map_async failed (size={size}): {e}")).bt()
+                    Error::Msg(format!(
+                        "wgpu readback map_async failed (size={size}): {e}{}",
+                        runtime_msg
+                            .as_deref()
+                            .map(|m| format!("; validation error: {m}"))
+                            .unwrap_or_default()
+                    ))
+                    .bt()
                 })?;
             let mut data = slice.get_mapped_range().to_vec();
             data.truncate(size);
@@ -2257,13 +2832,40 @@ impl WgpuDevice {
         });
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.inner
-                .device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(sub_idx),
-                    timeout: None,
-                })
-                .map_err(Error::wrap)?;
+            // Same burned-index fallback as the sync path: wait for this copy
+            // submission, but if an earlier submit failed validation, its index
+            // is burned and the wait fails with WrongSubmissionIndex — fall back
+            // to the most recent submission (always valid). The surfaced
+            // validation error below then gates the read.
+            if let Err(poll_err) = self.inner.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(sub_idx),
+                timeout: None,
+            }) {
+                if let wgpu::PollError::WrongSubmissionIndex(requested, successful) = poll_err {
+                    eprintln!(
+                        "[candle-wgpu] async readback wait burned submission index (requested={requested}, last successful={successful}); waiting on last successful submission"
+                    );
+                    self.inner
+                        .device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: None,
+                            timeout: None,
+                        })
+                        .map_err(|e| {
+                            Error::Msg(format!("wgpu readback fallback wait failed: {e}")).bt()
+                        })?;
+                } else {
+                    let runtime = self.surface_runtime_error();
+                    return Err(Error::Msg(format!(
+                        "wgpu readback poll failed: {poll_err}{}",
+                        runtime
+                            .as_deref()
+                            .map(|m| format!("; validation error: {m}"))
+                            .unwrap_or_default()
+                    ))
+                    .bt());
+                }
+            }
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -2271,11 +2873,22 @@ impl WgpuDevice {
             let _ = sub_idx;
             let _ = self.inner.device.poll(wgpu::PollType::Poll);
         }
+        let runtime_msg = self.surface_runtime_error();
+        if let Some(msg) = &runtime_msg {
+            return Err(Error::Msg(format!("wgpu readback aborted: {msg}")).bt());
+        }
         rx.await
             .map_err(|_| Error::msg("wgpu readback oneshot canceled"))?
             .map_err(Error::wrap)
             .map_err(|e| {
-                Error::Msg(format!("wgpu readback map_async failed (size={size}): {e}")).bt()
+                Error::Msg(format!(
+                    "wgpu readback map_async failed (size={size}): {e}{}",
+                    runtime_msg
+                        .as_deref()
+                        .map(|m| format!("; validation error: {m}"))
+                        .unwrap_or_default()
+                ))
+                .bt()
             })?;
         let mut data = slice.get_mapped_range().to_vec();
         data.truncate(size);
@@ -2477,6 +3090,7 @@ impl WgpuDevice {
                     let cached = Arc::new(WgpuCachedPipeline {
                         bind_group_layout,
                         pipeline,
+                        label,
                     });
                     cache.insert(cache_key, cached.clone());
                     cached
@@ -2489,7 +3103,20 @@ impl WgpuDevice {
         // an address-keyed stale cache hit would make the dispatch read/write
         // the WRONG buffer (observed wrong argmax/argmin indices in the wgpu
         // smoke suite under allocation churn).
-        let cacheable = use_immediates || (!dynamic_offsets.is_empty() && bindings.len() >= 3);
+        //
+        // Bounded by bytes, not just entries: wgpu-core bind groups hold strong
+        // references to their storage buffers, and the LRU eviction below only
+        // fires at 256 entries. A naive multi-head attention pins one or two
+        // multi-hundred-MB score matrices per op (triposr 604MB scores at
+        // seq=3072, pi3 325MB at 1301 tokens), and a mere handful of such
+        // entries exhausts a 12 GiB card before any eviction runs — the device
+        // then OOMs, buffers become invalid, submit validation burns indexes
+        // and the readback aborts. Keep the small hot elementwise bind groups
+        // cached (that is where reuse pays) and allocate large ones per
+        // dispatch instead: their buffers then release once the submission
+        // completes. Threshold is the total referenced storage bytes.
+        let cacheable = (use_immediates || (!dynamic_offsets.is_empty() && bindings.len() >= 3))
+            && !bindings_exceed_cache_bytes(bindings);
         let bind_group = if cacheable {
             let ptrs: Vec<(usize, u64)> = bindings
                 .iter()
@@ -2499,7 +3126,10 @@ impl WgpuDevice {
                         // buffer_binding_range, or the whole-buffer size for
                         // as_entire_binding (size=None). Included in the cache key so
                         // cross-size reuse never aliases a stale bind-group range.
-                        let size = bb.size.map(|s| s.get()).unwrap_or_else(|| bb.buffer.size());
+                        let size = bb
+                            .size
+                            .map(|s| s.get())
+                            .unwrap_or_else(|| bb.buffer.size());
                         Some((self.buffer_oid(bb.buffer) as usize, size))
                     }
                     other => {
@@ -2512,20 +3142,14 @@ impl WgpuDevice {
                 ptrs.iter().map(|(o, _)| *o).collect::<Vec<_>>()
             } else if ptrs.len() >= 3 {
                 // Last ptr is the uniform params buffer; rest are storage.
-                ptrs[..ptrs.len() - 1]
-                    .iter()
-                    .map(|(o, _)| *o)
-                    .collect::<Vec<_>>()
+                ptrs[..ptrs.len() - 1].iter().map(|(o, _)| *o).collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
             let storage_sizes = if use_immediates {
                 ptrs.iter().map(|(_, s)| *s).collect::<Vec<_>>()
             } else if ptrs.len() >= 3 {
-                ptrs[..ptrs.len() - 1]
-                    .iter()
-                    .map(|(_, s)| *s)
-                    .collect::<Vec<_>>()
+                ptrs[..ptrs.len() - 1].iter().map(|(_, s)| *s).collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
@@ -2601,7 +3225,7 @@ impl WgpuDevice {
                 .lock()
                 .map_err(|e| Error::wrap(e.to_string()))?;
             slot.as_ref()
-                .map(|batch| batch.dispatch_count + 1 > Self::MAX_BATCH_DISPATCHES)
+                .map(|batch| batch.dispatch_count + 1 > Self::max_batch_dispatches())
                 .unwrap_or(false)
         };
         if batch_limit {
@@ -2636,8 +3260,24 @@ impl WgpuDevice {
             // BindGroup holds buffer refs until encode; CommandBuffer after.
             // Defer into one compute pass at encode/flush time — fewer
             // begin_compute_pass calls on elementwise batches.
+            let buffer_keys: smallvec::SmallVec<[usize; 8]> = bindings
+                .iter()
+                .enumerate()
+                .filter_map(|(i, be)| match (&be.resource, entries.get(i).map(|e| &e.ty)) {
+                    (
+                        wgpu::BindingResource::Buffer(bb),
+                        Some(wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { .. },
+                            ..
+                        }),
+                    ) => Some(wgpu_buffer_key(bb.buffer)),
+                    _ => None,
+                })
+                .collect();
             batch.pending_dispatches.push(WgpuPendingDispatch {
-                pipeline: cached,
+                pipeline: cached.clone(),
+                label: cached.label,
+                buffer_keys,
                 bind_group,
                 workgroups,
                 dynamic_offsets: dynamic_offsets.iter().copied().collect(),
@@ -4936,12 +5576,24 @@ fn main(
 }
 
 fn bf16_scale_shader() -> String {
+    // Params MUST mirror ScaleParams exactly: the dispatch uploads ScaleParams
+    // bytes, so a shorter struct would misread `ne` from `stride_src1` and the
+    // kernel would silently write nothing (WebGPU buffers are zero-initialised).
     inject_wg_size(format!(
         r#"{BF16_WGSL_HELPERS}
 struct Params {{
     offset_src: u32,
     offset_dst: u32,
+    stride_src1: u32,
+    stride_src2: u32,
+    stride_src3: u32,
+    stride_dst1: u32,
+    stride_dst2: u32,
+    stride_dst3: u32,
     ne: u32,
+    ne0: u32,
+    ne1: u32,
+    ne2: u32,
     scale: f32,
     bias: f32,
 }};
@@ -5400,7 +6052,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     );
     let (ty, main) = match dtype {
         DType::U8 => ("u32", u8_main),
-        DType::I16 => ("u32", i16_main),
+        // BF16 has the same 16-bit layout as I16: the selection is done on
+        // raw bit patterns (u32 pairs), so no decode/encode pass is needed.
+        DType::I16 | DType::BF16 => ("u32", i16_main),
         DType::I64 => ("u32", i64_main),
         _ => (wgpu_scalar_type(dtype)?, standard_main),
     };
@@ -5678,6 +6332,29 @@ fn uniform_binding_dyn<'a>(
             size: Some(size),
         }),
     })
+}
+
+/// Whether a dispatch's bindings reference more storage bytes than the bind
+/// group cache should pin. Cached bind groups keep their buffers alive (wgpu
+/// holds strong refs) until LRU eviction, so huge attention-score matrices
+/// must NOT be cached — allocate those bind groups per dispatch instead.
+fn bindings_exceed_cache_bytes(bindings: &[wgpu::BindGroupEntry<'_>]) -> bool {
+    let max = std::env::var("CANDLE_WGPU_BG_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(16 * 1024 * 1024);
+    let total: u64 = bindings
+        .iter()
+        .filter_map(|e| match &e.resource {
+            wgpu::BindingResource::Buffer(bb) => Some(
+                bb.size
+                    .map(|s| s.get())
+                    .unwrap_or_else(|| bb.buffer.size()),
+            ),
+            _ => None,
+        })
+        .sum();
+    total > max
 }
 
 fn buffer_binding_range<'a>(
@@ -5993,42 +6670,11 @@ impl WgpuStorage {
             storage_entry(1, false),
             uniform_entry(2),
         ];
-        if self.dtype == DType::BF16 && layout.is_contiguous() && bias == 0.0 {
-            // ponytail: in-place pair-write — saves one full attn-scores buffer at long prefill.
-            let mut inplace_params = params;
-            inplace_params.offset_src = 0;
-            inplace_params.offset_dst = 0;
-            let param_buffer = self
-                .device
-                .write_uniform_params(any_as_bytes(&inplace_params))?;
-            let bindings = [
-                storage_layout_binding(self, layout, 0)?,
-                storage_layout_binding(self, layout, 1)?,
-                buffer_binding(2, &param_buffer),
-            ];
-            let pairs = count.div_ceil(2) as u32;
-            self.device.run_compute_linear(
-                &bf16_scale_shader(),
-                &entries,
-                &bindings,
-                pairs,
-                "candle-wgpu-scale-bf16-inplace",
-            )?;
-            return Ok(WgpuStorage {
-                buffer: self.buffer.clone(),
-                device: self.device.clone(),
-                count,
-                dtype: self.dtype,
-            });
-        }
         let dst = if self.dtype == DType::BF16 {
-            if !layout.is_contiguous() {
-                let mut materialized =
-                    unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
-                <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
-                let mat_layout = Layout::contiguous(layout.shape());
-                return materialized.run_scale(&mat_layout, scale, bias);
-            }
+            // Packed u32-pair bf16 scale (decode -> f32 math -> RNE encode):
+            // one pass. The earlier in-place variant here mutated the input
+            // storage and returned it, which is invalid for general callers
+            // (affine must not alias its input).
             unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? }
         } else {
             let (dims, strides) = dims4(layout)?;
@@ -6291,7 +6937,14 @@ impl WgpuStorage {
         }
         if !matches!(
             t.dtype,
-            DType::F32 | DType::F16 | DType::U8 | DType::U32 | DType::I16 | DType::I32 | DType::I64
+            DType::F32
+                | DType::F16
+                | DType::U8
+                | DType::U32
+                | DType::I16
+                | DType::I32
+                | DType::I64
+                | DType::BF16
         ) {
             return Err(Error::UnsupportedDTypeForOp(t.dtype, "wgpu where_cond").bt());
         }
@@ -7271,42 +7924,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         lhs_f32.run_cmp_u8(&rhs_f32, &lhs_contiguous, &rhs_contiguous, op)
     }
 
-    fn bf16_where_via_f32(
-        &self,
-        layout: &Layout,
-        t: &Self,
-        t_l: &Layout,
-        f: &Self,
-        f_l: &Layout,
-    ) -> Result<Self> {
-        if t.dtype != DType::BF16 {
-            return Err(Error::UnsupportedDTypeForOp(t.dtype, "wgpu bf16 where_cond").bt());
-        }
-        if f.dtype != DType::BF16 {
-            return Err(Error::UnsupportedDTypeForOp(f.dtype, "wgpu bf16 where_cond").bt());
-        }
-        let t_f32 = t.materialize_to_f32(t_l)?;
-        let f_f32 = f.materialize_to_f32(f_l)?;
-        let t_contiguous = if t_l.dims().len() > 4 {
-            Layout::contiguous(Self::compact_rank_gt4_shape(t_l))
-        } else {
-            Layout::contiguous(t_l.shape())
-        };
-        let f_contiguous = if f_l.dims().len() > 4 {
-            Layout::contiguous(Self::compact_rank_gt4_shape(f_l))
-        } else {
-            Layout::contiguous(f_l.shape())
-        };
-        let out_f32 =
-            self.run_where_u8_cond(layout, &t_f32, &t_contiguous, &f_f32, &f_contiguous)?;
-        let out_layout = if layout.dims().len() > 4 {
-            Layout::contiguous(Self::compact_rank_gt4_shape(layout))
-        } else {
-            Layout::contiguous(layout.shape())
-        };
-        out_f32.to_dtype(&out_layout, DType::BF16)
-    }
-
     fn gpu_resident_via_f32(
         &self,
         layout: &Layout,
@@ -7741,6 +8358,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         dst_offset: usize,
         shader: &str,
     ) -> Result<()> {
+        self.run_copy_into_with_dst_strides(layout, dst, dst_offset, None, shader)
+    }
+
+    /// Like `run_copy_into` but allows a non-contiguous destination: the copy
+    /// shader reads `stride_dst*` from the params, so a strided destination
+    /// (e.g. `copy2d` rows landing inside a wider cat output) is expressed as
+    /// innermost-first strides instead of `d1 * d1` separate
+    /// `copy_buffer_to_buffer` commands.
+    fn run_copy_into_with_dst_strides(
+        &self,
+        layout: &Layout,
+        dst: &Self,
+        dst_offset: usize,
+        dst_strides_override: Option<[u32; 4]>,
+        shader: &str,
+    ) -> Result<()> {
         let count = layout.shape().elem_count();
         if count == 0 {
             return Ok(());
@@ -7748,10 +8381,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
         let max_workgroups = wgpu_dispatch_wg_cap(&self.device) as usize;
         let max_elems_per_dispatch = max_workgroups * WG_SIZE as usize;
-        let chunk_linear = count > max_elems_per_dispatch && layout.is_contiguous();
+        // Linear chunking assumes a flat contiguous destination; a strided
+        // destination override must take the decomposed-strides path.
+        let chunk_linear = dst_strides_override.is_none()
+            && count > max_elems_per_dispatch
+            && layout.is_contiguous();
 
         let (src_dims, src_strides) = dims4(layout)?;
-        let dst_strides = contiguous_strides(src_dims);
+        let dst_strides = dst_strides_override.unwrap_or_else(|| contiguous_strides(src_dims));
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
@@ -7925,6 +8562,159 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 <Self as BackendStorage>::reduce_op(&permuted, op, &permuted_layout, &[rank - 1])
             }
         }
+    }
+
+    /// Strided last-dim reduce for f32 without a materialize pass: the reduce
+    /// kernels read the reduced-dim stride from the params, so a transposed or
+    /// sliced view is reduced in one dispatch instead of copy-then-reduce.
+    /// Returns `None` when the shape does not fit the kernel (rank > 4, dims
+    /// outside u32, empty rows) and the caller must use the general path.
+    fn try_reduce_rows_strided(
+        &self,
+        op: ReduceOp,
+        layout: &Layout,
+        dim: usize,
+    ) -> Result<Option<Self>> {
+        let rank = layout.dims().len();
+        if rank == 0 || rank > 4 || dim >= rank {
+            return Ok(None);
+        }
+        let ne0: u32 = match layout.dims()[dim].try_into() {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let stride_src0: u32 = match layout.stride()[dim].try_into() {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        if ne0 == 0 || ne0 < 2 {
+            // ne0 == 1 is handled by the identity path in reduce_op; a
+            // workgroup-per-row kernel would spend more on launches than on
+            // the reduction itself.
+            return Ok(None);
+        }
+        // Outer dims innermost-first, padded to the kernel's 3-slot layout.
+        // A padded slot keeps len 1 / stride 0: its index is always 0, so the
+        // stride never contributes.
+        let mut outer_dims = [1u32; 3];
+        let mut outer_strides = [0u32; 3];
+        let mut rows: u64 = 1;
+        let mut slots = 0;
+        for i in (0..rank).rev() {
+            if i == dim {
+                continue;
+            }
+            if slots >= 3 {
+                return Ok(None);
+            }
+            let d: u32 = match layout.dims()[i].try_into() {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            let s: u32 = match layout.stride()[i].try_into() {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            outer_dims[slots] = d;
+            outer_strides[slots] = s;
+            rows *= d as u64;
+            slots += 1;
+        }
+        if rows == 0 || rows > u32::MAX as u64 {
+            return Ok(None);
+        }
+        let offset_src: u32 = match layout.start_offset().try_into() {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let (is_arg, mode, shader) = match op {
+            ReduceOp::Sum => (
+                false,
+                0u32,
+                candle_wgpu_kernels::reduce_rows_strided_shader(WG_SIZE).ok_or_else(|| {
+                    Error::Msg("wgpu shader reduce_rows_strided.wgsl not embedded".into()).bt()
+                })?,
+            ),
+            ReduceOp::Max => (
+                false,
+                1u32,
+                candle_wgpu_kernels::reduce_rows_strided_shader(WG_SIZE).ok_or_else(|| {
+                    Error::Msg("wgpu shader reduce_rows_strided.wgsl not embedded".into()).bt()
+                })?,
+            ),
+            ReduceOp::Min => (
+                false,
+                2u32,
+                candle_wgpu_kernels::reduce_rows_strided_shader(WG_SIZE).ok_or_else(|| {
+                    Error::Msg("wgpu shader reduce_rows_strided.wgsl not embedded".into()).bt()
+                })?,
+            ),
+            ReduceOp::ArgMax => (
+                true,
+                0u32,
+                candle_wgpu_kernels::arg_reduce_rows_strided_shader(WG_SIZE).ok_or_else(|| {
+                    Error::Msg("wgpu shader arg_reduce_rows_strided.wgsl not embedded".into())
+                        .bt()
+                })?,
+            ),
+            ReduceOp::ArgMin => (
+                true,
+                1u32,
+                candle_wgpu_kernels::arg_reduce_rows_strided_shader(WG_SIZE).ok_or_else(|| {
+                    Error::Msg("wgpu shader arg_reduce_rows_strided.wgsl not embedded".into())
+                        .bt()
+                })?,
+            ),
+            _ => return Ok(None),
+        };
+        let mut dst_dims = layout.dims().to_vec();
+        dst_dims[dim] = 1;
+        let dst = unsafe {
+            self.device
+                .alloc_uninit(&Shape::from(dst_dims), if is_arg { DType::U32 } else { DType::F32 })?
+        };
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let max_workgroups = wgpu_dispatch_wg_cap(&self.device) as u32;
+        let mut row_begin: u32 = 0;
+        while row_begin < rows as u32 {
+            let chunk_rows = ((rows as u32) - row_begin).min(max_workgroups);
+            let params = StridedReduceParams {
+                offset_src,
+                offset_dst: 0,
+                stride_src0,
+                stride_src1: outer_strides[0],
+                stride_src2: outer_strides[1],
+                stride_src3: outer_strides[2],
+                ne0,
+                ne1: outer_dims[0],
+                ne2: outer_dims[1],
+                row_begin,
+                mode,
+                _pad0: 0,
+            };
+            const _: () = assert!(size_of::<StridedReduceParams>() <= 256);
+            // Fresh uniform ring slot per chunk so deferred multi-dispatch
+            // never shares one uniform's last write.
+            let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
+            let bindings = [
+                buffer_binding(0, &self.buffer),
+                buffer_binding(1, &dst.buffer),
+                buffer_binding(2, &param_buffer),
+            ];
+            self.device.run_compute(
+                &shader,
+                &entries,
+                &bindings,
+                chunk_rows,
+                "candle-wgpu-reduce-strided",
+            )?;
+            row_begin += chunk_rows;
+        }
+        Ok(Some(dst))
     }
 
     fn run_reduce_non_last_dim(&self, op: ReduceOp, layout: &Layout, dim: usize) -> Result<Self> {
@@ -8627,18 +9417,134 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             buffer_binding(5, &alibi_ref.buffer),
         ];
 
-        let shader_source = candle_wgpu_kernels::get("flash_attn_simple.wgsl")
-            .ok_or_else(|| Error::Msg("wgpu flash_attn_simple shader not found".into()).bt())?
-            .source();
+        // Tiled FA2 (flash_attn_tiled.wgsl): one 64-lane workgroup per
+        // 64-row Q block, K/V streamed through shared tiles — reads each
+        // K/V element once per 64 rows instead of once per row. The naive
+        // kernel re-reads all of K/V per row, which dominated pi3x decode.
+        // Fallbacks: head dims over the 64-wide shared tiles or adapters
+        // without 16 KiB of workgroup storage use the simple kernel.
+        let tiled_ok = head_dim <= 64
+            && head_dim_v <= 64
+            && q.device
+                .inner
+                .limits
+                .max_compute_workgroup_storage_size
+                >= 16384;
         let total_q_rows = (b * h * seq_q) as u32;
-        q.device.run_compute_linear(
-            shader_source,
+        if tiled_ok {
+            let shader_source = candle_wgpu_kernels::get("flash_attn_tiled.wgsl")
+                .ok_or_else(|| {
+                    Error::Msg("wgpu flash_attn_tiled shader not found".into()).bt()
+                })?
+                .source();
+            let q_tiles = ((seq_q as u32) + 63) / 64;
+            q.device.run_compute_xyz(
+                shader_source,
+                &entries,
+                &bindings,
+                (q_tiles, h as u32, b as u32),
+                &[],
+                None,
+                "candle-wgpu-flash-attn-tiled",
+            )?;
+        } else {
+            let shader_source = candle_wgpu_kernels::get("flash_attn_simple.wgsl")
+                .ok_or_else(|| {
+                    Error::Msg("wgpu flash_attn_simple shader not found".into()).bt()
+                })?
+                .source();
+            q.device.run_compute_linear(
+                shader_source,
+                &entries,
+                &bindings,
+                total_q_rows,
+                "candle-wgpu-flash-attn",
+            )?;
+        }
+
+        Ok(dst)
+    }
+
+    /// Fused LayerNorm(+affine) -> RoPE kernel (rope_layernorm.wgsl): one
+    /// 64-lane workgroup per row of the (b, heads, n, head_dim) view. `self`
+    /// may be a strided qkv-projection view as long as the last dim is
+    /// contiguous; `gamma_beta` is [gamma, beta] contiguous F32 (head_dim
+    /// elements each); `cos`/`sin` are contiguous (b, 1, n, head_dim) tables
+    /// with the rotate-half negation already folded into sin. Returns a
+    /// contiguous F32 (b, heads, n, head_dim) storage, so the caller needs no
+    /// follow-up .contiguous() copy.
+    pub fn rope_layernorm(
+        &self,
+        layout: &Layout,
+        gamma_beta: &Self,
+        cos: &Self,
+        sin: &Self,
+        apply_norm: bool,
+        eps: f32,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32
+            || gamma_beta.dtype != DType::F32
+            || cos.dtype != DType::F32
+            || sin.dtype != DType::F32
+        {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu rope_layernorm").bt());
+        }
+        if layout.dims().len() != 4 {
+            return Err(Error::Msg("wgpu rope_layernorm expects rank-4 input".into()).bt());
+        }
+        let dims = layout.dims();
+        let strides = layout.stride();
+        let (b, heads, n, ne0) = (dims[0], dims[1], dims[2], dims[3]);
+        if ne0 != 64 || strides[3] != 1 {
+            return Err(Error::Msg(format!(
+                "wgpu rope_layernorm requires contiguous head_dim==64 rows, got ne0={ne0} stride={}",
+                strides[3]
+            ))
+            .bt());
+        }
+        let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+        let params = RopeLayerNormParams {
+            offset_src: layout.start_offset().try_into()?,
+            stride_s0: strides[0].try_into()?,
+            stride_s1: strides[1].try_into()?,
+            stride_s2: strides[2].try_into()?,
+            ne0: ne0.try_into()?,
+            ne1: heads.try_into()?,
+            ne2: n.try_into()?,
+            ne3: b.try_into()?,
+            quarter: (ne0 / 4).try_into()?,
+            apply_norm: u32::from(apply_norm),
+            eps,
+            _pad: 0,
+        };
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, true),
+            storage_entry(4, false),
+            uniform_entry(5),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &gamma_beta.buffer),
+            buffer_binding(2, &cos.buffer),
+            buffer_binding(3, &sin.buffer),
+            buffer_binding(4, &dst.buffer),
+            buffer_binding(5, &param_buffer),
+        ];
+        let shader = candle_wgpu_kernels::get("rope_layernorm.wgsl")
+            .ok_or_else(|| Error::Msg("wgpu rope_layernorm shader not found".into()).bt())?
+            .source();
+        let rows = b * heads * n;
+        self.device.run_compute(
+            shader,
             &entries,
             &bindings,
-            total_q_rows,
-            "candle-wgpu-flash-attn",
+            rows.try_into()?,
+            "candle-wgpu-rope-layernorm",
         )?;
-
         Ok(dst)
     }
 
@@ -8770,7 +9676,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         })?;
         // ONE workgroup per query head; grid.x == n_q_heads (16 for qwen3).
         let wg_x = n_q_heads.try_into()?;
-        let (wg_x, wg_y) = compute_2d_workgroups(wg_x, wgpu_dispatch_wg_cap(&self.device));
+        let (wg_x, wg_y) =
+            compute_2d_workgroups(wg_x, wgpu_dispatch_wg_cap(&self.device));
         self.device.run_compute_xyz(
             shader,
             &entries,
@@ -9409,9 +10316,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             buffer_binding(3, &dst.buffer),
             buffer_binding(4, &param_buffer),
         ];
-        let shader =
-            candle_wgpu_kernels::rope_cs_shader(wgpu_kernel_dtype(self.dtype)?, WG_SIZE)
-                .ok_or_else(|| Error::Msg("wgpu shader rope_cs.wgsl not embedded".into()).bt())?;
+        let shader = candle_wgpu_kernels::rope_cs_shader(wgpu_kernel_dtype(self.dtype)?, WG_SIZE)
+            .ok_or_else(|| Error::Msg("wgpu shader rope_cs.wgsl not embedded".into()).bt())?;
         let total_wg = (n_threads as u32).div_ceil(WG_SIZE);
         self.device.run_compute(
             &shader,
@@ -9896,25 +10802,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 for (p, &iv) in ids_vals.iter().enumerate().take(ids_len) {
                     if iv >= r0 as u32 && iv < r1 as u32 {
                         sub_ids.push(iv - r0 as u32);
-                        let dst_off = params.offset_dst as usize + p * elems_per_row;
+                        let dst_off =
+                            params.offset_dst as usize + p * elems_per_row;
                         dst_map.push(dst_off as u32);
                     }
                 }
                 if sub_ids.is_empty() {
                     continue;
                 }
-                let sub_buf = src.device.register_buffer_arc(
-                    src.device
-                        .create_storage_buffer_arc(sub_ids.len() * 4, "wgpu-index-map-subids"),
-                );
+                let sub_buf = src.device.register_buffer_arc(src.device.create_storage_buffer_arc(
+                    sub_ids.len() * 4,
+                    "wgpu-index-map-subids",
+                ));
                 src.device
                     .inner
                     .queue
                     .write_buffer(&sub_buf, 0, typed_as_bytes(&sub_ids));
-                let map_buf = src.device.register_buffer_arc(
-                    src.device
-                        .create_storage_buffer_arc(dst_map.len() * 4, "wgpu-index-map-dstmap"),
-                );
+                let map_buf = src.device.register_buffer_arc(src.device.create_storage_buffer_arc(
+                    dst_map.len() * 4,
+                    "wgpu-index-map-dstmap",
+                ));
                 src.device
                     .inner
                     .queue
@@ -9929,8 +10836,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     _pad4: 0,
                     _pad5: 0,
                 };
-                let map_param_buffer =
-                    src.device.write_uniform_params(any_as_bytes(&map_params))?;
+                let map_param_buffer = src.device.write_uniform_params(any_as_bytes(&map_params))?;
                 let src_byte_off = (r0 * elems_per_row * src_elem_bytes) as u64;
                 let src_byte_len = ((r1 - r0) * elems_per_row * src_elem_bytes) as u64;
                 let map_bindings = [
@@ -10413,13 +11319,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             buffer_binding(2, &dst.buffer),
             buffer_binding(3, &param_buffer),
         ];
-        let shader_storage = candle_wgpu_kernels::gemv_shader(wgpu_kernel_dtype(self.dtype)?)
-            .ok_or_else(|| Error::Msg("wgpu shader gemv.wgsl not embedded".into()).bt())?;
+        let shader_storage =
+            candle_wgpu_kernels::gemv_shader(wgpu_kernel_dtype(self.dtype)?).ok_or_else(|| {
+                Error::Msg("wgpu shader gemv.wgsl not embedded".into()).bt()
+            })?;
         let shader = shader_storage.as_str();
         // One thread per output column: grid.x = ceil(n / WG_SIZE).
         let total_wg = n.div_ceil(WG_SIZE as usize);
-        let (wg_x, wg_y) =
-            compute_2d_workgroups(total_wg.try_into()?, wgpu_dispatch_wg_cap(&self.device));
+        let (wg_x, wg_y) = compute_2d_workgroups(
+            total_wg.try_into()?,
+            wgpu_dispatch_wg_cap(&self.device),
+        );
         self.device.run_compute_xyz(
             shader,
             &entries,
@@ -10497,9 +11407,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // grid.x = ceil(n / 4) output-column tiles, grid.y = batch, 128 threads/group.
         let wg_x = n.div_ceil(candle_wgpu_kernels::BATCHED_GEMV_F32_OUTPUTS_PER_WG as usize);
         let (wg_x, wg_y) = compute_2d_workgroups(
-            (wg_x as u32).checked_mul(b.try_into()?).ok_or_else(|| {
-                Error::Msg("wgpu backend op batched gemv workgroup overflow".into()).bt()
-            })?,
+            (wg_x as u32)
+                .checked_mul(b.try_into()?)
+                .ok_or_else(|| {
+                    Error::Msg("wgpu backend op batched gemv workgroup overflow".into()).bt()
+                })?,
             wgpu_dispatch_wg_cap(&self.device),
         );
         self.device.run_compute_xyz(
@@ -10582,14 +11494,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             buffer_binding(2, &dst.buffer),
             buffer_binding(3, &param_buffer),
         ];
-        let shader = candle_wgpu_kernels::ctx_gemv_f32_shader()
-            .ok_or_else(|| Error::Msg("wgpu shader ctx_gemv_f32.wgsl not embedded".into()).bt())?;
+        let shader = candle_wgpu_kernels::ctx_gemv_f32_shader().ok_or_else(|| {
+            Error::Msg("wgpu shader ctx_gemv_f32.wgsl not embedded".into()).bt()
+        })?;
         // grid.x = ceil(n / 32) head_dim tiles (32 columns/warp), grid.y = batch.
         let wg_x = n.div_ceil(candle_wgpu_kernels::CTX_GEMV_F32_I_GROUP as usize);
         let (wg_x, wg_y) = compute_2d_workgroups(
-            (wg_x as u32).checked_mul(b.try_into()?).ok_or_else(|| {
-                Error::Msg("wgpu backend op ctx gemv workgroup overflow".into()).bt()
-            })?,
+            (wg_x as u32)
+                .checked_mul(b.try_into()?)
+                .ok_or_else(|| {
+                    Error::Msg("wgpu backend op ctx gemv workgroup overflow".into()).bt()
+                })?,
             wgpu_dispatch_wg_cap(&self.device),
         );
         self.device.run_compute_xyz(
@@ -10702,7 +11617,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 && lhs_l.is_contiguous()
                 && Self::batched_gemv_inner_contiguous(&rhs_t_src)
             {
-                let dst = self.run_batched_gemv_f32(rhs, lhs_l, &rhs_t_src, b, m, n, k)?;
+                let dst =
+                    self.run_batched_gemv_f32(rhs, lhs_l, &rhs_t_src, b, m, n, k)?;
                 return Ok(dst);
             }
         }
@@ -10728,15 +11644,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // gate_up/down/lm_head): route to a purpose-built GEMV instead of the generic
         // tiled GEMM, which is catastrophic for m == 1 (one thread per output element
         // with strided transposed-RHS reads; measured ~5-12 GFLOP/s). Guard requires a
-        // contiguous (k, n) RHS with unit column stride (coalesced warp reads) and a
-        // contiguous (1, k) LHS; anything else keeps the generic dispatch.
+        // contiguous (k, n) RHS with unit column stride (coalesced warp reads), or a
+        // K-major RHS (stride[0] == 1, e.g. dense QMatMul weights stored as (n, k)
+        // and viewed transposed) where each thread streams its output row from
+        // contiguous memory. Anything else keeps the generic dispatch.
         if b == 1
             && m == 1
             && rank == 2
             && (self.dtype == DType::F16 || self.dtype == DType::F32)
             && lhs_l.is_contiguous()
-            && rhs_l.is_contiguous()
-            && rhs_l.stride()[1] == 1
+            && ((rhs_l.is_contiguous() && rhs_l.stride()[1] == 1) || rhs_l.stride()[0] == 1)
         {
             let dst = self.run_m1_gemv(rhs, lhs_l, rhs_l, b, m, n, k)?;
             // F32: `run_m1_gemv` writes f32 directly (native_dst_dtype == F32), so
@@ -10907,9 +11824,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    // Cooperative matrix: Ampere+ Vulkan exposes 16×16 f16 A/B → f32 C.
-                    // Mixed-precision for large GEMMs; small squares stay full-f32 warptile.
-                    let coop_ok = self.device.inner.coop_matmul_enabled
+                // Cooperative matrix: Ampere+ Vulkan exposes 16×16 f16 A/B → f32 C.
+                // Mixed-precision for large GEMMs; small squares stay full-f32 warptile.
+                let coop_ok = self.device.inner.coop_matmul_enabled
                     && self
                         .device
                         .inner
@@ -10920,56 +11837,58 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                         .inner
                         .features
                         .contains(wgpu::Features::SHADER_F16)
-                    && m.is_multiple_of(16)
-                    && n.is_multiple_of(16)
-                    && k.is_multiple_of(16)
                     && m >= 64
                     && n >= 64
                     && k >= 64
                     // Exclude small square smokes (64³) where f16 error exceeds
                     // tight abs tols; allow tall/wide (e.g. 64×4096) and ≥128².
+                    // The 16-alignment checks were REMOVED: mul_mat_coop_64.wgsl
+                    // already zero-fills out-of-range shared-tile loads and
+                    // clips stores (kernel handles ragged m/n/k), and pi3x
+                    // linears are m=3903/1301 — unaligned m forced ~515 GEMMs
+                    // per model onto the scalar warptile at 40ms/ea (20.8s GPU
+                    // of the 87s wall).
                     && (m >= 128 || n >= 128)
                     && params.stride_1k == 1;
-                    if coop_ok {
-                        use_warptile = true;
-                        // coop64 (64×64, 512 thr) measured faster than the 128×64
-                        // dual-MMA on BOTH squares and tall GEMMs (RTX 3060):
-                        // 1024³ 0.53 vs 0.55 sync / 0.426 vs 0.446 batch20;
-                        // 64×4096 0.545 vs 0.685 sync / 0.448 vs 0.585 batch20.
-                        matmul_label = "candle-wgpu-matmul-coop64";
-                        candle_wgpu_kernels::matmul_coop_64_shader().ok_or_else(|| {
-                            Error::Msg("wgpu shader mul_mat_coop_64.wgsl not embedded".into()).bt()
-                        })?
-                    } else if m >= 64 && n >= 64 && k >= 64 && params.stride_1k == 1 {
-                        matmul_label = "candle-wgpu-matmul-warptile";
-                        use_warptile = true;
-                        candle_wgpu_kernels::matmul_warptile_shader().ok_or_else(|| {
-                            Error::Msg("wgpu shader mul_mat_warptile.wgsl not embedded".into()).bt()
-                        })?
-                    } else if m.max(n) >= 32 && k >= 32 {
-                        matmul_label = "candle-wgpu-matmul-fast";
-                        use_reg_tile = true;
-                        // VEC loads assume contiguous K (unit stride_0k / stride_1k).
-                        let vectorized = m.is_multiple_of(4)
-                            && n.is_multiple_of(4)
-                            && params.stride_0k == 1
-                            && params.stride_1k == 1;
-                        shader_storage = candle_wgpu_kernels::matmul_fast_shader(
-                            wgpu_kernel_dtype(DType::F32)?,
-                            vectorized,
-                        )
-                        .ok_or_else(|| {
-                            Error::Msg("wgpu shader mul_mat_reg_tile.wgsl not embedded".into()).bt()
-                        })?;
-                        &shader_storage
-                    } else {
-                        matmul_label = "candle-wgpu-matmul";
-                        shader_storage =
-                            candle_wgpu_kernels::matmul_f32_shader().ok_or_else(|| {
-                                Error::Msg("wgpu shader mul_mat.wgsl not embedded".into()).bt()
-                            })?;
-                        &shader_storage
-                    }
+                if coop_ok {
+                    use_warptile = true;
+                    // coop64 (64×64, 512 thr) measured faster than the 128×64
+                    // dual-MMA on BOTH squares and tall GEMMs (RTX 3060):
+                    // 1024³ 0.53 vs 0.55 sync / 0.426 vs 0.446 batch20;
+                    // 64×4096 0.545 vs 0.685 sync / 0.448 vs 0.585 batch20.
+                    matmul_label = "candle-wgpu-matmul-coop64";
+                    candle_wgpu_kernels::matmul_coop_64_shader().ok_or_else(|| {
+                        Error::Msg("wgpu shader mul_mat_coop_64.wgsl not embedded".into()).bt()
+                    })?
+                } else if m >= 64 && n >= 64 && k >= 64 && params.stride_1k == 1 {
+                    matmul_label = "candle-wgpu-matmul-warptile";
+                    use_warptile = true;
+                    candle_wgpu_kernels::matmul_warptile_shader().ok_or_else(|| {
+                        Error::Msg("wgpu shader mul_mat_warptile.wgsl not embedded".into()).bt()
+                    })?
+                } else if m.max(n) >= 32 && k >= 32 {
+                    matmul_label = "candle-wgpu-matmul-fast";
+                    use_reg_tile = true;
+                    // VEC loads assume contiguous K (unit stride_0k / stride_1k).
+                    let vectorized = m.is_multiple_of(4)
+                        && n.is_multiple_of(4)
+                        && params.stride_0k == 1
+                        && params.stride_1k == 1;
+                    shader_storage = candle_wgpu_kernels::matmul_fast_shader(
+                        wgpu_kernel_dtype(DType::F32)?,
+                        vectorized,
+                    )
+                    .ok_or_else(|| {
+                        Error::Msg("wgpu shader mul_mat_reg_tile.wgsl not embedded".into()).bt()
+                    })?;
+                    &shader_storage
+                } else {
+                    matmul_label = "candle-wgpu-matmul";
+                    shader_storage = candle_wgpu_kernels::matmul_f32_shader().ok_or_else(|| {
+                        Error::Msg("wgpu shader mul_mat.wgsl not embedded".into()).bt()
+                    })?;
+                    &shader_storage
+                }
                 } // not(wasm32)
             }
             DType::F16 => {
@@ -11041,10 +11960,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             || rhs_bytes > max_binding_bytes;
         if needs_batch_chunk {
             if b <= 1 {
-                return Err(Error::Msg(format!(
-                    "wgpu matmul binding exceeds max_storage_buffer_binding_size (dst={dst_bytes}, lhs={lhs_bytes}, rhs={rhs_bytes}, max={max_binding_bytes})"
-                ))
-                .bt());
+                let mut msg = format!(
+                    "wgpu matmul binding exceeds max_storage_buffer_binding_size (dst={dst_bytes}, lhs={lhs_bytes}, rhs={rhs_bytes}, max={max_binding_bytes}, shape=({b},{m},{n},{k}), lhs_dims={:?}, rhs_dims={:?}, lhs_contig={}, rhs_contig={})",
+                    lhs_layout.dims(),
+                    rhs_t_layout.dims(),
+                    lhs_layout.is_contiguous(),
+                    rhs_t_layout.is_contiguous(),
+                );
+                if std::env::var_os("CANDLE_DEBUG_MATMUL_SHAPE").is_some() {
+                    msg.push_str("\n");
+                    msg.push_str(&std::backtrace::Backtrace::force_capture().to_string());
+                }
+                return Err(Error::Msg(msg).bt());
             }
             if matrix_bytes > max_binding_bytes
                 || lhs_matrix_bytes > max_binding_bytes
@@ -11522,6 +12449,111 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         } else {
             result.to_dtype(&final_l, src_dtype)
         }
+    }
+
+    /// Direct gather conv_transpose2d: one thread per output element reads
+    /// the input taps straight out of the (strided) source and kernel and
+    /// accumulates in f32 — no host-built ids/mask, no scatter chain. Runs as
+    /// a single dispatch for F32/F16/BF16; returns None to fall back to the
+    /// im2col-scatter path when a dimension or stride overflows u32.
+    fn run_conv_transpose2d_gather(
+        &self,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose2D,
+    ) -> Result<Option<Self>> {
+        if self.dtype != kernel.dtype
+            || !matches!(self.dtype, DType::F32 | DType::F16 | DType::BF16)
+            || params.stride == 0
+        {
+            return Ok(None);
+        }
+        let (_, src_strides) = dims4(layout)?;
+        let (_, k_strides) = dims4(kernel_l)?;
+        let out_h = params.out_h();
+        let out_w = params.out_w();
+        let ne = params
+            .b_size
+            .checked_mul(params.c_out)
+            .and_then(|v| v.checked_mul(out_h))
+            .and_then(|v| v.checked_mul(out_w));
+        let fits = |v: usize| v <= u32::MAX as usize;
+        // dims4 strides are already u32; only dims/strides beyond u32 (offsets
+        // are usize) need the fallback path.
+        if ne.map(|v| v > u32::MAX as usize).unwrap_or(true)
+            || !fits(out_h)
+            || !fits(out_w)
+            || !fits(params.i_h)
+            || !fits(params.i_w)
+            || !fits(params.k_h)
+            || !fits(params.k_w)
+            || !fits(params.stride)
+            || !fits(params.dilation)
+            || !fits(params.padding)
+        {
+            return Ok(None);
+        }
+        let src_strides: [u32; 4] = src_strides;
+        let k_strides: [u32; 4] = k_strides;
+        let wg_params = ConvTransposeParams {
+            ne: ne.unwrap() as u32,
+            offset_src: layout.start_offset().try_into()?,
+            offset_w: kernel_l.start_offset().try_into()?,
+            offset_dst: 0,
+            st_in_b: src_strides[3],
+            st_in_c: src_strides[2],
+            st_in_h: src_strides[1],
+            st_in_w: src_strides[0],
+            st_k_ci: k_strides[3],
+            st_k_co: k_strides[2],
+            st_k_h: k_strides[1],
+            st_k_w: k_strides[0],
+            out_h: out_h as u32,
+            out_w: out_w as u32,
+            c_out: params.c_out as u32,
+            c_in: params.c_in as u32,
+            i_h: params.i_h as u32,
+            i_w: params.i_w as u32,
+            k_h: params.k_h as u32,
+            k_w: params.k_w as u32,
+            stride: params.stride as u32,
+            dilation: params.dilation as u32,
+            padding: params.padding as u32,
+            _pad0: 0,
+        };
+        const _: () = assert!(size_of::<ConvTransposeParams>() <= 256);
+        let shader = match self.dtype {
+            DType::F32 => candle_wgpu_kernels::conv_transpose2d_f32_shader(WG_SIZE),
+            DType::F16 => candle_wgpu_kernels::conv_transpose2d_f16_shader(WG_SIZE),
+            DType::BF16 => candle_wgpu_kernels::conv_transpose2d_bf16_shader(WG_SIZE),
+            _ => unreachable!(),
+        }
+        .ok_or_else(|| Error::Msg("wgpu shader conv_transpose2d.wgsl not embedded".into()).bt())?;
+        let final_shape = Shape::from(params.out_dims());
+        let dst = unsafe { self.device.alloc_uninit(&final_shape, self.dtype)? };
+        let param_buffer = self.device.write_uniform_params(any_as_bytes(&wg_params))?;
+        let entries = [
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ];
+        let bindings = [
+            buffer_binding(0, &self.buffer),
+            buffer_binding(1, &kernel.buffer),
+            buffer_binding(2, &dst.buffer),
+            buffer_binding(3, &param_buffer),
+        ];
+        let workgroups = (ne.unwrap() as u32).div_ceil(WG_SIZE);
+        self.device.run_compute(
+            &shader,
+            &entries,
+            &bindings,
+            workgroups,
+            "candle-wgpu-conv-transpose2d",
+        )?;
+        Ok(Some(dst))
     }
 
     /// Native conv_transpose2d (CUDA parity: f16/bf16 in, f32 accumulate via
@@ -12275,9 +13307,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 chunk_params.offset_idx =
                     (params.offset_idx as usize + p0 * params.stride_idx0 as usize).try_into()?;
                 chunk_params.n_rows = (p1 - p0).try_into()?;
-                let chunk_param_buffer = self
-                    .device
-                    .write_uniform_params(any_as_bytes(&chunk_params))?;
+                let chunk_param_buffer =
+                    self.device.write_uniform_params(any_as_bytes(&chunk_params))?;
                 let chunk_len = p1 - p0;
                 let dst_byte_off = (p0 * elem_per_pos * 4) as u64;
                 let dst_byte_len = (chunk_len * elem_per_pos * 4) as u64;
@@ -12508,10 +13539,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             buffer_binding(2, &param_buffer),
         ];
 
-        let shader_source =
-            candle_wgpu_kernels::quantize_q8_1_roundtrip_shader().ok_or_else(|| {
-                Error::Msg("wgpu quantize_q8_1_roundtrip shader not found".into()).bt()
-            })?;
+        let shader_source = candle_wgpu_kernels::quantize_q8_1_roundtrip_shader()
+            .ok_or_else(|| Error::Msg("wgpu quantize_q8_1_roundtrip shader not found".into()).bt())?;
 
         let num_wgs = (num_blocks as u32).div_ceil(64);
         self.device.run_compute_xyz(
@@ -12998,8 +14027,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // compounds through the residual stream — mirror of the Vulkan
         // 67e07ec5 fix. Previously gated to Q8_1 dtype; extended to all
         // quantized dtypes to match the CPU/cuda mmq activation contract.
-        let q8_1_owned: Option<WgpuStorage> =
-            Some(src.quantize_q8_1_lhs_roundtrip(src_layout.shape().elem_count())?);
+        let q8_1_owned: Option<WgpuStorage> = Some(src.quantize_q8_1_lhs_roundtrip(
+            src_layout.shape().elem_count(),
+        )?);
         let (src, src_layout) = match &q8_1_owned {
             Some(rc) => (rc, Layout::contiguous(src_layout.shape().clone())),
             None => (src, src_layout),
@@ -13876,8 +14906,11 @@ impl BackendStorage for WgpuStorage {
                 .queue
                 .on_submitted_work_done(move || done.store(true, Ordering::Release));
             if let Ok(mut pending) = self.device.inner.pending_submissions.lock() {
+                let retained = vec![self.buffer.clone(), buffer.clone()];
+                let retained_bytes: u64 = retained.iter().map(|b| b.size()).sum();
                 pending.push(WgpuPendingSubmission {
-                    retained_buffers: vec![self.buffer.clone(), buffer.clone()],
+                    retained_buffers: retained,
+                    retained_bytes,
                     completed,
                 });
             }
@@ -13921,14 +14954,10 @@ impl BackendStorage for WgpuStorage {
                 scaled.to_dtype(&src_f32_layout, DType::F16)
             }
             DType::BF16 => {
-                let src_f32 = self.materialize_to_f32(layout)?;
-                let src_f32_layout = if layout.dims().len() > 4 {
-                    Layout::contiguous(Self::compact_rank_gt4_shape(layout))
-                } else {
-                    Layout::contiguous(layout.shape())
-                };
-                let scaled = src_f32.run_scale(&src_f32_layout, mul as f32, add as f32)?;
-                scaled.to_dtype(&src_f32_layout, DType::BF16)
+                // Packed bf16 scale kernel (u32 pairs, decode -> f32 math ->
+                // RNE encode): one pass instead of the f32 hub's three
+                // (bf16->f32 materialize, f32 scale, f32->bf16 convert).
+                self.run_scale(layout, mul as f32, add as f32)
             }
             DType::F8E4M3 => self.f8e4m3_unary_via_f32(layout, |src, src_l| {
                 src.run_scale(src_l, mul as f32, add as f32)
@@ -14083,6 +15112,35 @@ impl BackendStorage for WgpuStorage {
             return self.run_reduce_multi_dim(op, layout, reduce_dims);
         }
         let dim = reduce_dims[0];
+        // Reducing a length-1 dim is an identity on the values (sum/max/min
+        // return the elements; argmax/argmin are all-zero indices) — a naive
+        // per-row reduce kernel would launch one near-empty workgroup per
+        // outer element and spend milliseconds on launch overhead.
+        if layout.dims()[dim] == 1 && layout.dims().iter().product::<usize>() > 0 {
+            match op {
+                ReduceOp::Sum | ReduceOp::Max | ReduceOp::Min => return self.try_clone(layout),
+                ReduceOp::ArgMax | ReduceOp::ArgMin => {
+                    let mut dst_dims = layout.dims().to_vec();
+                    dst_dims[dim] = 1;
+                    let dst_shape = Shape::from(dst_dims);
+                    let mut dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::U32)? };
+                    dst.const_set(crate::scalar::Scalar::U32(0), &Layout::contiguous(dst_shape))?;
+                    return Ok(dst);
+                }
+                _ => {}
+            }
+        }
+        // Strided-aware single-dispatch reduce (no materialize pass) for the
+        // common value/arg reductions; falls back to the copy-based paths when
+        // the shape does not fit the strided kernels.
+        match op {
+            ReduceOp::Sum | ReduceOp::Max | ReduceOp::Min | ReduceOp::ArgMax | ReduceOp::ArgMin => {
+                if let Some(reduced) = self.try_reduce_rows_strided(op, layout, dim)? {
+                    return Ok(reduced);
+                }
+            }
+            _ => {}
+        }
         // The last-dim kernels (sum_rows / extrema) index src assuming UNIT stride
         // along the reduced dim. A non-contiguous view (reduced-dim stride != 1,
         // e.g. reshape((b,c,l))->transpose(1,2) feeds layer_norm) would read
@@ -14583,9 +15641,6 @@ impl BackendStorage for WgpuStorage {
         f: &Self,
         f_l: &Layout,
     ) -> Result<Self> {
-        if t.dtype == DType::BF16 {
-            return self.bf16_where_via_f32(layout, t, t_l, f, f_l);
-        }
         if wgpu_f16_emulates_f32(&t.device, t.dtype) {
             let t_f32 = t.materialize_to_f32(t_l)?;
             let f_f32 = f.materialize_to_f32(f_l)?;
@@ -14674,6 +15729,9 @@ impl BackendStorage for WgpuStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self> {
+        if let Some(out) = self.run_conv_transpose2d_gather(layout, kernel, kernel_l, params)? {
+            return Ok(out);
+        }
         self.run_conv_transpose2d_f32(layout, kernel, kernel_l, params)
     }
     fn avg_pool2d(
@@ -15194,6 +16252,37 @@ impl BackendStorage for WgpuStorage {
         if elem_size == 0 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu copy2d").bt());
         }
+        // Fast path: one strided gather dispatch instead of `d1` separate
+        // `copy_buffer_to_buffer` commands. wgpu command recording/validation
+        // costs ~2us per command, which dominates `cat` along a non-zeroth dim
+        // (a 256-row cat was paying 512 recorded copies per call). The copy
+        // shader takes the row strides from the params, so the same gather
+        // covers both contiguous and row-strided sources.
+        let d1_gather = d1 >= 8 && d2 > 0
+            && matches!(self.dtype, DType::F32 | DType::F16 | DType::U32 | DType::I32);
+        if d1_gather {
+            let src_layout = Layout::new(
+                Shape::from((d1, d2)),
+                vec![src_stride1, 1],
+                src_offset,
+            );
+            let dst_strides = [1u32, dst_stride1.try_into()?, 0, 0];
+            let shader = copy_shader(self.dtype, self.dtype)?;
+            match self.run_copy_into_with_dst_strides(
+                &src_layout,
+                dst,
+                dst_offset,
+                Some(dst_strides),
+                &shader,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    // Unsupported shapes (u32 overflow on huge dims) fall back
+                    // to the command path below.
+                    tracing::debug!("wgpu copy2d gather fallback: {err}");
+                }
+            }
+        }
         self.device.ensure_active_batch()?;
         {
             let mut slot = self
@@ -15218,7 +16307,10 @@ impl BackendStorage for WgpuStorage {
                     (d2 * elem_size) as u64,
                 );
             }
-            WgpuDevice::retain_buffers_into(batch, vec![self.buffer.clone(), dst.buffer.clone()]);
+            WgpuDevice::retain_buffers_into(
+                batch,
+                vec![self.buffer.clone(), dst.buffer.clone()],
+            );
             batch.copy_count += 1;
         }
         Ok(())
@@ -15270,6 +16362,7 @@ fn wgpu_required_features(adapter_features: wgpu::Features) -> wgpu::Features {
             | wgpu::Features::SUBGROUP_BARRIER
             | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
             | wgpu::Features::IMMEDIATES
+            | wgpu::Features::TIMESTAMP_QUERY
             | wgpu::Features::SHADER_F64;
         adapter_features & optional
     }
@@ -15296,8 +16389,16 @@ fn wgpu_install_runtime_handlers(
     let err_slot = Arc::clone(runtime_error);
     device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
         let msg = format!("wgpu uncaptured error: {error}");
+        // Keep the FIRST error: later uncaptured errors are almost always
+        // symptoms of the first one (e.g. a bind group created against an
+        // invalid buffer), and the tail overwrite made the root cause
+        // invisible. Log every occurrence immediately so the first one is
+        // on record even if it is never drained.
+        eprintln!("[candle-wgpu] uncaptured error: {msg}");
         if let Ok(mut guard) = err_slot.lock() {
-            *guard = Some(msg);
+            if guard.is_none() {
+                *guard = Some(msg);
+            }
         }
     }));
     let err_slot = Arc::clone(runtime_error);
@@ -15323,11 +16424,25 @@ fn wgpu_finish_device(
     let device_lost = Arc::new(AtomicBool::new(false));
     wgpu_install_runtime_handlers(&device, &runtime_error, &device_lost);
     // Cache env once — env::var on every matmul was measurable host cost.
+    // OPT-IN: the coop GEMM executes f16 tensor-core MMA (10-bit mantissa on
+    // f32 inputs) — ~1e-3 relative error, far above the fp32-accumulation
+    // tolerance of plain DType::F32 matmul (backend_smoke shape sweep).
+    // Default off so DType::F32 keeps exact-fp32 semantics; callers that
+    // accept the tradeoff set CANDLE_WGPU_COOP_MATMUL=1 (measured 1.9–2.5×
+    // on attention/linear shapes). Mirrors the vulkan
+    // CANDLE_VULKAN_F32_UNALIGNED_COOPMAT opt-in.
     let coop_matmul_enabled = std::env::var("CANDLE_WGPU_COOP_MATMUL")
-        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-        .unwrap_or(true);
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    WGPU_GPU_PROFILE_ENABLED.store(
+        std::env::var("CANDLE_WGPU_GPU_PROFILE")
+            .map(|v| v != "0")
+            .unwrap_or(false),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // WebGPU requires dynamic uniform offsets multiple of this alignment.
-    let uniform_dyn_slot = u64::from(adapter_limits.min_uniform_buffer_offset_alignment).max(256);
+    let uniform_dyn_slot =
+        u64::from(adapter_limits.min_uniform_buffer_offset_alignment).max(256);
     WgpuDevice {
         inner: Arc::new(WgpuInner {
             ordinal,
@@ -15341,6 +16456,7 @@ fn wgpu_finish_device(
             features: required_features,
             limits: adapter_limits,
             coop_matmul_enabled,
+            gpu_profile: std::sync::Mutex::new(None),
             runtime_error,
             device_lost,
             seed_value: RwLock::new(299_792_458),
@@ -15548,10 +16664,36 @@ fn wgpu_select_native_adapter(ordinal: usize) -> Result<wgpu::Adapter> {
     Ok(adapters.swap_remove(selected_index))
 }
 
+/// Same rationale as the vulkan test serial slot: all tests share the cached
+/// adapter/device and the submission pipeline assumes single-threaded
+/// driving; serialize whole tests via the thread-local lock (each libtest
+/// test owns one thread).
+#[cfg(test)]
+fn wgpu_acquire_test_serial_slot() {
+    use std::cell::RefCell;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+    thread_local! {
+        static HELD: RefCell<Option<MutexGuard<'static, ()>>> =
+            const { RefCell::new(None) };
+    }
+    HELD.with(|held| {
+        if held.borrow().is_none() {
+            let guard = SERIAL
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *held.borrow_mut() = Some(guard);
+        }
+    });
+}
+
 impl BackendDevice for WgpuDevice {
     type Storage = WgpuStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
+        #[cfg(test)]
+        wgpu_acquire_test_serial_slot();
         #[cfg(target_arch = "wasm32")]
         {
             let _ = ordinal;
@@ -15596,6 +16738,15 @@ impl BackendDevice for WgpuDevice {
         let size = byte_len(dtype, count, "wgpu alloc_uninit")?;
         // wgpu can't allocate 0-byte buffers; use a 1-byte dummy for empty shapes.
         let alloc_size = size.max(1);
+        if alloc_size >= 256 * 1024 * 1024
+            && std::env::var_os("CANDLE_DEBUG_LARGE_ALLOC").is_some()
+        {
+            eprintln!(
+                "[candle-wgpu] large alloc_uninit: shape={shape:?} dtype={dtype:?} count={count} bytes={alloc_size}"
+            );
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("{bt}");
+        }
         // 1024² f32 = 4 MiB — common matmul dst size. Waiting here forced a
         // full GPU stall on every GEMM. Only block for truly large buffers, and
         // only if there is actually in-flight work.
@@ -15637,7 +16788,23 @@ impl BackendDevice for WgpuDevice {
     }
 
     fn storage_from_slice<T: WithDType>(&self, data: &[T]) -> Result<Self::Storage> {
-        self.storage_from_cpu_storage(&T::to_cpu_storage(data))
+        if data.is_empty() {
+            return self.storage_from_cpu_storage(&T::to_cpu_storage(data));
+        }
+        // Upload straight from the caller's slice: building an owned CpuStorage
+        // first would add a full-size host copy of the data per upload.
+        let bytes = typed_as_bytes(data);
+        let buffer = self.register_buffer_arc(self.create_storage_buffer_arc(
+            bytes.len(),
+            "candle-wgpu-upload",
+        ));
+        self.write_storage_bytes(&buffer, bytes)?;
+        Ok(WgpuStorage {
+            buffer,
+            device: self.clone(),
+            count: data.len(),
+            dtype: T::DTYPE,
+        })
     }
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
@@ -15792,10 +16959,7 @@ mod compute_2d_self_check {
         let (ha, la) = wgpu_shader_cache_key(&a);
         let (hb, lb) = wgpu_shader_cache_key(&b);
         assert_eq!(la, lb);
-        assert_ne!(
-            ha, hb,
-            "distinct shader contents must not collide on cache key"
-        );
+        assert_ne!(ha, hb, "distinct shader contents must not collide on cache key");
     }
 }
 

@@ -1,7 +1,35 @@
 #![allow(dead_code)]
 
 use candle_core::{DType, Device, Result, Tensor};
+use std::cell::RefCell;
 use std::sync::{Mutex, MutexGuard};
+
+/// The vulkan/wgpu batching backends assume single-threaded op submission on a
+/// shared device (the device cache hands every caller the same device inner).
+/// Parallel libtest threads therefore corrupt in-flight batches — wrong values
+/// or lost-device errors. Every GPU integration test acquires its device
+/// through `backend_device_or_skip`, so holding this slot for the test
+/// thread's whole lifetime serializes the suite exactly like the
+/// `#[cfg(test)]` serial slot that protects the in-lib unit tests, without
+/// touching any call site.
+static GPU_TEST_SERIAL_LOCK: Mutex<()> = Mutex::new(());
+thread_local! {
+    static GPU_TEST_SERIAL_HELD: RefCell<Option<MutexGuard<'static, ()>>> =
+        const { RefCell::new(None) };
+}
+
+pub fn acquire_gpu_test_serial_slot() {
+    GPU_TEST_SERIAL_HELD.with(|slot| {
+        let mut held = slot.borrow_mut();
+        if held.is_none() {
+            *held = Some(
+                GPU_TEST_SERIAL_LOCK
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
+        }
+    });
+}
 
 /// The CPU-fallback counters asserted by `native_required` are process-global,
 /// so any test that reads or resets them must hold this lock for its full
@@ -36,6 +64,7 @@ pub fn backend_name(backend: TestBackend) -> &'static str {
 }
 
 pub fn backend_device_or_skip(test_name: &str, backend: TestBackend) -> Result<Option<Device>> {
+    acquire_gpu_test_serial_slot();
     let require_device = std::env::var_os(required_device_env_var(backend)).is_some();
     let device = match backend {
         TestBackend::Wgpu => Device::new_wgpu(0),

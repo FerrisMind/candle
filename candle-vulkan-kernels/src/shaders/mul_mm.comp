@@ -50,9 +50,14 @@
 #endif
 // Virtual B^T keeps A unaligned/strided but B (candle LHS) is K-contiguous;
 // force BATCH_B=1 so wide LOAD_VEC_B indexing matches the aligned GEMM path.
+// With scalar LOAD_VEC_B=1 the batched-pair branch is required instead: its
+// `row * 2` addressing doubles the K step, so BATCH_B=1 there would read K
+// twice past the panel and overflow the BK/2 shared-memory stride.
 #ifdef VIRTUAL_BT
+#if LOAD_VEC_B > 1
 #undef LOAD_VEC_BATCH_B
 #define LOAD_VEC_BATCH_B 1
+#endif
 #endif
 
 #if !defined(TO_FLOAT_TYPE)
@@ -75,6 +80,14 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+#endif
+
+#ifdef BIAS_ADD
+// GEMM with bias epilogue (MUL_MAT_ADD fusion): adds bias[n] to each output
+// column, removing the separate broadcast-add dispatch + activation-sized
+// round trip after every Linear. Registered only for MatMulIdType::NONE
+// f32 variants, so binding 3 is free.
+layout (binding = 3) readonly buffer BIAS {float data_bias[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -467,7 +480,11 @@ void main() {
         }
     }
 #else
+#ifdef BIAS_ADD
+    const bool is_aligned = false; // bias needs per-element stores
+#else
     const bool is_aligned = p.stride_d % 4 == 0;  // Assumption: D_TYPE == float
+#endif
 
     [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
         [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
@@ -483,7 +500,11 @@ void main() {
 
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
                 [[unroll]] for (uint col = 0; col < TN; col += storestride) {
+#ifdef BIAS_ADD
+                    data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(TO_FLOAT_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]) + data_bias[dr + cm_row * TM + store_r]);
+#else
                     data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+#endif
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
             } else if (dr + cm_row * TM < p.M && dc + cm_col * TN < p.N) {
@@ -493,7 +514,11 @@ void main() {
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
                 [[unroll]] for (uint col = 0; col < TN; col += storestride) {
                     if (dr + cm_row * TM + store_r < p.M && dc + cm_col * TN + col + store_c < p.N) {
+#ifdef BIAS_ADD
+                        data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(TO_FLOAT_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]) + data_bias[dr + cm_row * TM + store_r]);
+#else
                         data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+#endif
                     }
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
@@ -525,10 +550,18 @@ void main() {
                     }
 #else
                     if (dr_warp + 2 * cr < p.M && dc_warp + cc < p.N) {
+#ifdef BIAS_ADD
+                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr] = D_TYPE(sums[sums_idx].x + data_bias[dr_warp + 2 * cr]);
+#else
                         data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr] = D_TYPE(sums[sums_idx].x);
+#endif
                     }
                     if (dr_warp + 2 * cr + 1 < p.M && dc_warp + cc < p.N) {
+#ifdef BIAS_ADD
+                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(sums[sums_idx].y + data_bias[dr_warp + 2 * cr + 1]);
+#else
                         data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(sums[sums_idx].y);
+#endif
                     }
 #endif // MUL_MAT_ID
                 }

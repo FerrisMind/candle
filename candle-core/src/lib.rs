@@ -97,10 +97,10 @@ pub mod wgpu_backend;
 
 #[cfg(feature = "cudnn")]
 pub use cuda_backend::cudnn;
+#[cfg(feature = "cutile")]
+pub use cuda_backend::cutile;
 
 pub use cpu_backend::{CpuStorage, CpuStorageRef};
-#[cfg(feature = "ug")]
-pub use custom_op::UgIOp1;
 pub use custom_op::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
 pub use device::{Device, DeviceLocation, NdArray};
 pub use dtype::{DType, DTypeParseError, FloatDType, IntDType, WithDType};
@@ -135,13 +135,16 @@ pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
 
 #[cfg(feature = "wgpu")]
-pub use wgpu_backend::{WgpuDevice, WgpuError, WgpuStorage};
+pub use wgpu_backend::{wgpu_gpu_profile_report, WgpuDevice, WgpuError, WgpuStorage};
 
 #[cfg(not(feature = "wgpu"))]
 pub use dummy_wgpu_backend::{WgpuDevice, WgpuError, WgpuStorage};
 
 #[cfg(feature = "vulkan")]
-pub use vulkan_backend::{VulkanDevice, VulkanError, VulkanStorage};
+pub use vulkan_backend::{
+    vulkan_cpu_profile_report, vulkan_flush_reason_report, vulkan_gpu_profile_report, VulkanDevice,
+    VulkanError, VulkanStorage,
+};
 
 #[cfg(not(feature = "vulkan"))]
 pub use dummy_vulkan_backend::{VulkanDevice, VulkanError, VulkanStorage};

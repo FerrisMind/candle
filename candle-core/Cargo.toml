@@ -19,6 +19,7 @@ candle-vulkan-kernels = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
 objc2-foundation = { workspace = true, optional = true }
 cudarc = { workspace = true, optional = true }
+cutile = { workspace = true, optional = true }
 ash = { workspace = true, optional = true }
 gpu-allocator = { workspace = true, optional = true }
 gemm = { workspace = true }
@@ -43,8 +44,9 @@ tracing = { workspace = true }
 yoke = { workspace = true }
 zerocopy = { workspace = true }
 zip = { workspace = true }
+parking_lot = "0.12.5"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokenizers = { workspace = true, features = ["onig"] }
+tokenizers = { workspace = true, features = ["fancy-regex"] }
 # Native wgpu: Vulkan / DX12 / Metal / GLES + WGSL (workspace features).
 wgpu = { workspace = true, optional = true }
 
@@ -57,9 +59,6 @@ wgpu = { version = "29", default-features = false, features = ["std", "webgpu", 
 # candle-core's own wasm32 build doesn't hit getrandom's compile_error.
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
-[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))'.dependencies]
-candle-ug = { workspace = true, optional = true }
-
 [dev-dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -67,10 +66,13 @@ criterion = { workspace = true }
 proptest = "1.6.0"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+tracing-chrome = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 default = []
-cuda = ["cudarc", "dep:candle-kernels", "candle-ug?/cuda"]
+cuda = ["cudarc", "dep:candle-kernels"]
+cutile = ["cuda", "dep:cutile"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]
 mkl = ["dep:intel-mkl-src"]
@@ -79,12 +81,10 @@ metal = [
     "dep:objc2-metal",
     "dep:objc2-foundation",
     "dep:candle-metal-kernels",
-    "candle-ug?/metal",
 ]
 metal-debug-labels = ["metal", "candle-metal-kernels/debug-labels"]
 wgpu = ["dep:wgpu", "dep:pollster", "dep:candle-wgpu-kernels", "dep:futures-channel"]
 vulkan = ["dep:ash", "dep:gpu-allocator", "dep:candle-vulkan-kernels", "dep:rustc-hash"]
-ug = ["dep:candle-ug"]
 
 [[bench]]
 name = "bench_main"
@@ -97,6 +97,10 @@ required-features = ["metal"]
 [[example]]
 name = "cuda_basics"
 required-features = ["cuda"]
+
+[[example]]
+name = "cutile"
+required-features = ["cutile"]
 
 [[example]]
 name = "backend_parity_microbench"

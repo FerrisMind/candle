@@ -881,6 +881,46 @@ fn generate_candle_spirv_modules(
             candle_shaders_dir.join("batched_gemv_f16.comp"),
             &[],
         ),
+        (
+            "rope_layernorm_f32",
+            candle_shaders_dir.join("rope_layernorm.comp"),
+            &[],
+        ),
+        // Native f16/bf16 affine and sqrt: single-pass variants of the ggml
+        // scale/sqrt shaders. The bf16 sources are fork-local (candle-shaders);
+        // the f16 variants reuse the upstream .comp files with different macro
+        // dictionaries. Registered here rather than in vulkan-shaders-gen.cpp
+        // so that file stays a pristine copy of llama.cpp.
+        (
+            "scale_f16",
+            shaders_dir.join("scale.comp"),
+            &["A_TYPE=float16_t", "D_TYPE=float16_t", "FLOAT_TYPE=float"],
+        ),
+        (
+            "scale_bf16",
+            candle_shaders_dir.join("scale_bf16.comp"),
+            &[
+                "DATA_A_BF16=1",
+                "DATA_D_BF16=1",
+                "A_TYPE=uint16_t",
+                "D_TYPE=uint16_t",
+            ],
+        ),
+        (
+            "sqrt_f16",
+            shaders_dir.join("sqrt.comp"),
+            &["A_TYPE=float16_t", "D_TYPE=float16_t", "FLOAT_TYPE=float"],
+        ),
+        (
+            "sqrt_bf16",
+            candle_shaders_dir.join("sqrt_bf16.comp"),
+            &[
+                "DATA_A_BF16=1",
+                "DATA_D_BF16=1",
+                "A_TYPE=uint16_t",
+                "D_TYPE=uint16_t",
+            ],
+        ),
     ];
     for (name, source, defines) in modules {
         let output = spv_dir.join(format!("{name}.spv"));

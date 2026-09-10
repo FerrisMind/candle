@@ -222,114 +222,18 @@ impl Tensor {
 
     fn conv_transpose2d_wgpu_decomp(
         &self,
-        kernel: &Self,
-        params: &ParamsConvTranspose2D,
+        _kernel: &Self,
+        _params: &ParamsConvTranspose2D,
     ) -> Result<Option<Self>> {
-        if !self.device().is_wgpu() {
-            return Ok(None);
-        }
-        let src_dtype = match self.dtype() {
-            DType::F32 | DType::F16 => self.dtype(),
-            _ => return Ok(None),
-        };
-        if src_dtype != kernel.dtype() {
-            return Ok(None);
-        }
-
-        let input_spatial = match params.i_h.checked_mul(params.i_w) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        let kernel_spatial = match params.k_h.checked_mul(params.k_w) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        let src_len = match input_spatial.checked_mul(kernel_spatial) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        let out_h = params.out_h();
-        let out_w = params.out_w();
-        let out_spatial = match out_h.checked_mul(out_w) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        if out_spatial > u32::MAX as usize {
-            return Ok(None);
-        }
-
-        let input = if src_dtype == DType::F32 {
-            self.clone()
-        } else {
-            self.to_dtype(DType::F32)?
-        };
-        let kernel = if src_dtype == DType::F32 {
-            kernel.clone()
-        } else {
-            kernel.to_dtype(DType::F32)?
-        };
-
-        let input_hw = input
-            .permute((0, 2, 3, 1))?
-            .contiguous()?
-            .reshape((params.b_size * input_spatial, params.c_in))?;
-        let kernel_mm = kernel
-            .contiguous()?
-            .reshape((params.c_in, params.c_out * kernel_spatial))?;
-        let cols = input_hw.matmul(&kernel_mm)?.reshape((
-            params.b_size,
-            input_spatial,
-            params.c_out,
-            params.k_h,
-            params.k_w,
-        ))?;
-        let src = cols
-            .permute((0, 2, 1, 3, 4))?
-            .contiguous()?
-            .reshape((params.b_size * params.c_out, src_len))?;
-
-        let mut ids = Vec::with_capacity(src_len);
-        let mut mask = Vec::with_capacity(src_len);
-        for i_h in 0..params.i_h {
-            let base_h = i_h * params.stride;
-            for i_w in 0..params.i_w {
-                let base_w = i_w * params.stride;
-                for k_h in 0..params.k_h {
-                    let out_h_idx = base_h + k_h * params.dilation;
-                    for k_w in 0..params.k_w {
-                        let out_w_idx = base_w + k_w * params.dilation;
-                        if out_h_idx >= params.padding && out_w_idx >= params.padding {
-                            let out_h_idx = out_h_idx - params.padding;
-                            let out_w_idx = out_w_idx - params.padding;
-                            if out_h_idx < out_h && out_w_idx < out_w {
-                                ids.push((out_h_idx * out_w + out_w_idx) as u32);
-                                mask.push(1f32);
-                                continue;
-                            }
-                        }
-                        ids.push(0);
-                        mask.push(0f32);
-                    }
-                }
-            }
-        }
-
-        let ids = Tensor::from_vec(ids, src_len, self.device())?;
-        let mask = Tensor::from_vec(mask, (1, src_len), self.device())?;
-        let src = src.broadcast_mul(&mask)?;
-        let out = Tensor::zeros(
-            (params.b_size * params.c_out, out_spatial),
-            DType::F32,
-            self.device(),
-        )?
-        .index_add(&ids, &src, 1)?
-        .reshape((params.b_size, params.c_out, out_h, out_w))?;
-        let out = if src_dtype == DType::F32 {
-            out
-        } else {
-            out.to_dtype(src_dtype)?
-        };
-        Ok(Some(out))
+        // Superseded by the storage-level direct gather kernel
+        // (WgpuStorage::run_conv_transpose2d_gather): one dispatch per call
+        // for F32/F16/BF16, native dtype end to end, no host-built ids/mask
+        // and no matmul + mask-mul + index_add scatter chain. The old
+        // tensor-level decomposition only survived for F32/F16 and was the
+        // dominant conv_transpose2d cost; returning None falls through to
+        // the storage path, which handles all native dtypes via the gather
+        // and keeps F64/U8 on the f32-hub scatter fallback.
+        Ok(None)
     }
 
     fn conv1d_single_group(&self, kernel: &Self, params: &ParamsConv1D) -> Result<Self> {
