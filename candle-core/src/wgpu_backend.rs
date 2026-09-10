@@ -4052,6 +4052,68 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     )
 }
 
+/// Params for the unaligned U8 `copy2d` byte-copy shader. All scalars, so the
+/// WGSL struct layout matches the C repr with no padding.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct U8UnalignedCopy2dParams {
+    elem_base: u32,
+    n_bytes: u32,
+    src_offset: u32,
+    dst_offset: u32,
+    d1: u32,
+    d2: u32,
+    src_stride1: u32,
+    dst_stride1: u32,
+}
+const _: () = assert!(size_of::<U8UnalignedCopy2dParams>() <= 256);
+
+fn u8_unaligned_copy2d_wgsl() -> String {
+    format!(
+        r#"
+// Byte-exact U8 copy2d for regions whose offsets/size are not multiples of
+// COPY_BUFFER_ALIGNMENT (4): one invocation per byte, reading the source byte
+// through the u32 view and updating the destination word with atomics so
+// invocations that share a destination word never clobber each other. Used by
+// `copy2d`'s unaligned fallback (cat/slice_assign of U8 masks with odd piece
+// lengths), where the encoder copy violates COPY_BUFFER_ALIGNMENT (silently
+// dropped by wgpu validation) and the word-aligned emulated copy cannot place
+// sub-word destination offsets.
+struct Params {{
+    elem_base: u32,
+    n_bytes: u32,
+    src_offset: u32,
+    dst_offset: u32,
+    d1: u32,
+    d2: u32,
+    src_stride1: u32,
+    dst_stride1: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<atomic<u32>>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size({WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let j = params.elem_base + gid.x;
+    if (j >= params.n_bytes) {{
+        return;
+    }}
+    let row = j / params.d2;
+    let col = j % params.d2;
+    let src_byte = params.src_offset + row * params.src_stride1 + col;
+    let dst_byte = params.dst_offset + row * params.dst_stride1 + col;
+    let b = (src[src_byte / 4u] >> (8u * (src_byte % 4u))) & 0xffu;
+    let w = dst_byte / 4u;
+    let sh = 8u * (dst_byte % 4u);
+    atomicAnd(&dst[w], ~(0xffu << sh));
+    atomicOr(&dst[w], b << sh);
+}}
+"#
+    )
+}
+
 fn bf16_gather_last_dim_wgsl() -> String {
     format!(
         r#"
@@ -8152,6 +8214,69 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{{body}}}
                 &bindings,
                 workgroups,
                 "candle-wgpu-emulated-copy",
+            )?;
+            wi_base += chunk_wi;
+        }
+        Ok(())
+    }
+
+    /// Byte-exact copy2d for U8 regions whose byte offsets/size are not
+    /// multiples of `COPY_BUFFER_ALIGNMENT` (4). One dispatch per byte with
+    /// atomic word updates (see `u8_unaligned_copy2d_wgsl`): every destination
+    /// byte is written exactly once, and disjoint-byte atomics keep invocations
+    /// sharing a u32 destination word from clobbering each other. Dispatches go
+    /// through the active batch as computes, so program order with the pending
+    /// dispatches queued before this call is preserved.
+    #[allow(clippy::too_many_arguments)]
+    fn run_u8_unaligned_copy2d(
+        &self,
+        dst: &mut Self,
+        d1: usize,
+        d2: usize,
+        src_stride1: usize,
+        dst_stride1: usize,
+        src_offset: usize,
+        dst_offset: usize,
+    ) -> Result<()> {
+        let total_bytes = d1 * d2;
+        if total_bytes == 0 {
+            return Ok(());
+        }
+        let shader = u8_unaligned_copy2d_wgsl();
+        let entries = [
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ];
+        let max_workgroups = wgpu_dispatch_wg_cap(&self.device) as usize;
+        let max_work_items = max_workgroups * WG_SIZE as usize;
+        let n_bytes_u32: u32 = total_bytes.try_into()?;
+        let mut wi_base = 0usize;
+        while wi_base < total_bytes {
+            let chunk_wi = (total_bytes - wi_base).min(max_work_items);
+            let params = U8UnalignedCopy2dParams {
+                elem_base: wi_base.try_into()?,
+                n_bytes: n_bytes_u32,
+                src_offset: src_offset.try_into()?,
+                dst_offset: dst_offset.try_into()?,
+                d1: d1.try_into()?,
+                d2: d2.try_into()?,
+                src_stride1: src_stride1.try_into()?,
+                dst_stride1: dst_stride1.try_into()?,
+            };
+            let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
+            let bindings = [
+                buffer_binding(0, &self.buffer),
+                buffer_binding(1, &dst.buffer),
+                buffer_binding(2, &param_buffer),
+            ];
+            let workgroups: u32 = chunk_wi.try_into().map(|v: u32| v.div_ceil(WG_SIZE))?;
+            self.device.run_compute(
+                &shader,
+                &entries,
+                &bindings,
+                workgroups,
+                "candle-wgpu-u8-copy2d",
             )?;
             wi_base += chunk_wi;
         }
@@ -16304,6 +16429,44 @@ impl BackendStorage for WgpuStorage {
             }
         }
         self.device.ensure_active_batch()?;
+        // copy_buffer_to_buffer requires the src/dst offsets and the size to be
+        // multiples of COPY_BUFFER_ALIGNMENT (4). The byte size is d2 * elem_size:
+        // for 1-byte dtypes (U8 masks padded by slice_assign/pad_with_zeros cats)
+        // this is the raw element count, so odd mask lengths (e.g. 94/114 bytes)
+        // emit unaligned commands that wgpu VALIDATES AND DROPS, silently
+        // corrupting cat/slice_assign results with stale recycled buffer bytes.
+        // Mirror the guard copy_strided_src already has: route unaligned calls
+        // through the shader paths instead of raw encoder copies.
+        let row_bytes = d2 * elem_size;
+        let aligned = row_bytes % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
+            && (src_offset * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
+            && (dst_offset * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0;
+        if !aligned {
+            if self.dtype == DType::U8 {
+                // 1-byte dtypes cannot use the per-row copy_strided_src fallback:
+                // its emulated u8 copy is word-granular and rejects sub-word
+                // offsets. Use the dedicated byte-exact shader instead.
+                return self.run_u8_unaligned_copy2d(
+                    dst,
+                    d1,
+                    d2,
+                    src_stride1,
+                    dst_stride1,
+                    src_offset,
+                    dst_offset,
+                );
+            }
+            // 2/4/8-byte dtypes: per-row copy_strided_src keeps aligned rows on
+            // the fast record_buffer_copy path and sends unaligned rows through
+            // the existing copy/emulated shader fallback for every dtype.
+            let row_shape = Shape::from(d2);
+            for i1 in 0..d1 {
+                let src_l =
+                    Layout::new(row_shape.clone(), vec![1], src_offset + i1 * src_stride1);
+                self.copy_strided_src(dst, dst_offset + i1 * dst_stride1, &src_l)?;
+            }
+            return Ok(());
+        }
         {
             let mut slot = self
                 .device
