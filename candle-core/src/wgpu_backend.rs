@@ -16456,6 +16456,10 @@ impl BackendStorage for WgpuStorage {
         // this is the raw element count, so odd mask lengths (e.g. 94/114 bytes)
         // emit unaligned commands that wgpu VALIDATES AND DROPS, silently
         // corrupting cat/slice_assign results with stale recycled buffer bytes.
+        // Row i1 lands at (offset + i1*stride) * elem_size, so the row STRIDES
+        // must be checked too: a dim-1 cat of U8 (16,20)+(16,94) has 4-aligned
+        // row bytes (20) but an unaligned destination row stride (114), so row
+        // 1 landed at byte offset 114 (OmniVoice stage0 slice_assign pad).
         // Mirror the guard copy_strided_src already has: route the whole call
         // through per-row copy_strided_src, which keeps aligned rows on the fast
         // record_buffer_copy path and sends unaligned rows through the existing
@@ -16463,7 +16467,9 @@ impl BackendStorage for WgpuStorage {
         let row_bytes = d2 * elem_size;
         let aligned = row_bytes % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
             && (src_offset * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
-            && (dst_offset * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0;
+            && (dst_offset * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
+            && (src_stride1 * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
+            && (dst_stride1 * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0;
         if !aligned {
             if self.dtype == DType::U8 {
                 // 1-byte dtypes cannot use the per-row copy_strided_src fallback:
