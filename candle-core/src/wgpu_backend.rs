@@ -1173,6 +1173,10 @@ impl WgpuDevice {
     fn surface_runtime_error(&self) -> Option<String> {
         let _ = self.inner.device.poll(wgpu::PollType::Poll);
         self.take_runtime_error().inspect(|msg| {
+            // Also log at error level: eprintln alone is easy to lose in CLI
+            // output, and a drained validation error here means earlier commands
+            // were DROPPED — the caller must never treat subsequent data as valid.
+            tracing::error!("[candle-wgpu] validation error: {msg}");
             eprintln!("[candle-wgpu] validation error: {msg}");
         })
     }
@@ -2512,6 +2516,17 @@ impl WgpuDevice {
         self.inner
             .queue
             .on_submitted_work_done(move || done.store(true, Ordering::Release));
+        // Surface any validation error this submission produced NOW. The
+        // `on_uncaptured_error` handler only eprintlns, and the readback path
+        // drains this slot and retries — a retry that succeeds on STALE recycled
+        // buffer bytes when commands were dropped by validation (L6.0 §2: the
+        // unaligned copy2d failures were silently returning wrong cat/slice_assign
+        // data). Failing the flush turns every silently-dropped command into a
+        // hard error at the op that caused it.
+        let _ = self.inner.device.poll(wgpu::PollType::Poll);
+        if let Some(msg) = self.take_runtime_error() {
+            return Err(Error::Msg(format!("wgpu batch failed validation: {msg}")).bt());
+        }
         if let Ok(profiler) = self.inner.gpu_profile.lock() {
             if let Some(profiler) = profiler.as_ref() {
                 let cursor = profiler.cursor.load(std::sync::atomic::Ordering::Acquire);
@@ -2799,6 +2814,12 @@ impl WgpuDevice {
             Err(_) => {
                 self.synchronize()?;
                 let _ = self.trim_pipeline_cache();
+                // Do not blindly trust a retry that follows a drained validation
+                // error: the staging copy may be fine but earlier DROPPED
+                // commands leave stale bytes, and a successful second read would
+                // silently return garbage (L6.0 §2). Batch submissions now fail
+                // loudly (flush_active_batch), so this retry only runs for
+                // transient read failures with no pending validation error.
                 try_read()
             }
         }
@@ -16435,8 +16456,10 @@ impl BackendStorage for WgpuStorage {
         // this is the raw element count, so odd mask lengths (e.g. 94/114 bytes)
         // emit unaligned commands that wgpu VALIDATES AND DROPS, silently
         // corrupting cat/slice_assign results with stale recycled buffer bytes.
-        // Mirror the guard copy_strided_src already has: route unaligned calls
-        // through the shader paths instead of raw encoder copies.
+        // Mirror the guard copy_strided_src already has: route the whole call
+        // through per-row copy_strided_src, which keeps aligned rows on the fast
+        // record_buffer_copy path and sends unaligned rows through the existing
+        // copy/emulated shader fallback for every dtype.
         let row_bytes = d2 * elem_size;
         let aligned = row_bytes % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
             && (src_offset * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
@@ -16456,9 +16479,6 @@ impl BackendStorage for WgpuStorage {
                     dst_offset,
                 );
             }
-            // 2/4/8-byte dtypes: per-row copy_strided_src keeps aligned rows on
-            // the fast record_buffer_copy path and sends unaligned rows through
-            // the existing copy/emulated shader fallback for every dtype.
             let row_shape = Shape::from(d2);
             for i1 in 0..d1 {
                 let src_l =
