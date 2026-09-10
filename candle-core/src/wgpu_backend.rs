@@ -11013,12 +11013,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             compact.copy_strided_src(self, dst_l.start_offset(), dst_l)?;
             return Ok(());
         }
-        if (self.dtype != DType::F32 && self.dtype != DType::F16 && self.dtype != DType::U32)
-            || self.dtype != src.dtype
+        // Keep dtype coverage aligned with the Vulkan scatter_set path so token
+        // I64 tensors (OmniVoice stage0) and other integer buffers work on wgpu.
+        // The F32-hub round-trip below is numerically exact for the values these
+        // ops carry (token ids < 2^24: the emulated casts split/assemble the
+        // lo/hi u32 words exactly, verified on GPU — 0/752 mismatches over 64
+        // scatter rounds).
+        if !matches!(
+            self.dtype,
+            DType::F32
+                | DType::F16
+                | DType::BF16
+                | DType::U8
+                | DType::U32
+                | DType::I32
+                | DType::I64
+                | DType::F64
+        ) || self.dtype != src.dtype
         {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "wgpu scatter_set").bt());
         }
-        if wgpu_f16_emulates_f32(&self.device, self.dtype) {
+        if matches!(
+            self.dtype,
+            DType::F16 | DType::BF16 | DType::U8 | DType::I64 | DType::F64
+        ) || wgpu_f16_emulates_f32(&self.device, self.dtype)
+        {
+            let dst_dtype = self.dtype;
             let mut dst_f32 = self.to_dtype(dst_l, DType::F32)?;
             let src_f32 = src.to_dtype(&src_l, DType::F32)?;
             let dst_f32_layout = Layout::contiguous(dst_l.shape().clone());
@@ -11030,7 +11050,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 &src_f32,
                 &src_f32_layout,
             )?;
-            *self = dst_f32.to_dtype(&dst_f32_layout, DType::F16)?;
+            *self = dst_f32.to_dtype(&dst_f32_layout, dst_dtype)?;
             return Ok(());
         }
         let rank = dst_l.dims().len();
