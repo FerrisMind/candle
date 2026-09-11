@@ -2726,7 +2726,11 @@ impl VulkanDevice {
     /// Create a dedicated, exact-sized device-local buffer. Used for weight-load
     /// buffers whose sizes are large enough that sub-allocating them into shared
     /// blocks leaves significant intra-block slack (see create_buffer_with_location).
-    fn create_dedicated_buffer(&self, size: usize, name: &'static str) -> Result<Arc<VulkanBuffer>> {
+    fn create_dedicated_buffer(
+        &self,
+        size: usize,
+        name: &'static str,
+    ) -> Result<Arc<VulkanBuffer>> {
         self.create_buffer_with_location(
             size,
             name,
@@ -4590,16 +4594,13 @@ impl VulkanStorage {
             VulkanBinding::Storage(&rhs_t.buffer),
             VulkanBinding::Storage(&dst.buffer),
         ];
-        let spirv = candle_vulkan_kernels::spirv("batched_gemv_f32")
-            .ok_or_else(|| Error::Msg("vulkan shader batched_gemv_f32 not generated".into()).bt())?;
+        let spirv = candle_vulkan_kernels::spirv("batched_gemv_f32").ok_or_else(|| {
+            Error::Msg("vulkan shader batched_gemv_f32 not generated".into()).bt()
+        })?;
         // 128 threads/group, 4 output groups (32 lanes each) computed per group.
         let workgroups = (n.div_ceil(4).try_into()?, b.try_into()?, 1u32);
-        self.device.run_compute_3d(
-            spirv,
-            &bindings,
-            Some(any_as_bytes(&params)),
-            workgroups,
-        )?;
+        self.device
+            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
         Ok(dst)
     }
 
@@ -4651,15 +4652,12 @@ impl VulkanStorage {
             VulkanBinding::Storage(&rhs_t.buffer),
             VulkanBinding::Storage(&dst.buffer),
         ];
-        let spirv = candle_vulkan_kernels::spirv("batched_gemv_f16")
-            .ok_or_else(|| Error::Msg("vulkan shader batched_gemv_f16 not generated".into()).bt())?;
+        let spirv = candle_vulkan_kernels::spirv("batched_gemv_f16").ok_or_else(|| {
+            Error::Msg("vulkan shader batched_gemv_f16 not generated".into()).bt()
+        })?;
         let workgroups = (n.div_ceil(4).try_into()?, b.try_into()?, 1u32);
-        self.device.run_compute_3d(
-            spirv,
-            &bindings,
-            Some(any_as_bytes(&params)),
-            workgroups,
-        )?;
+        self.device
+            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
         // Accumulate in F32 then round back to the F16 activation dtype, matching the
         // `matmul_f16_fp32` decode path (f32 accum, f16 result) so downstream ops see
         // the same dtype as before (fixes dtype mismatch in the MLP silu*up chain).
@@ -4733,12 +4731,8 @@ impl VulkanStorage {
             .ok_or_else(|| Error::Msg("vulkan shader ctx_gemv_f32 not generated".into()).bt())?;
         // 256 threads/group = 8 l-slice warps x 32 head_dim lanes; grid.x tiles head_dim.
         let workgroups = (n.div_ceil(32).try_into()?, b.try_into()?, 1u32);
-        self.device.run_compute_3d(
-            spirv,
-            &bindings,
-            Some(any_as_bytes(&params)),
-            workgroups,
-        )?;
+        self.device
+            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), workgroups)?;
         Ok(dst)
     }
 
@@ -8803,7 +8797,8 @@ impl VulkanStorage {
             // Any genuinely intra-block-strided view falls back to the per-batch
             // path below (still correct, just slower).
             if lhs_layout.is_contiguous() && Self::batched_gemv_inner_contiguous(&rhs_t_layout) {
-                let dst = lhs.run_batched_gemv_f32(rhs_t, &lhs_layout, &rhs_t_layout, b, m, n, k)?;
+                let dst =
+                    lhs.run_batched_gemv_f32(rhs_t, &lhs_layout, &rhs_t_layout, b, m, n, k)?;
                 drop(lhs_contiguous);
                 return Ok(dst);
             }
@@ -10483,8 +10478,7 @@ impl Drop for VulkanBuffer {
                 // the allocator accumulation that caused the vulkan prefill OOM.
                 if self.size > 0 {
                     if let Ok(mut pool) = self.device.inner.gpu_buffer_pool.lock() {
-                        let total_bytes: usize =
-                            pool.values().flatten().map(|b| b.size).sum();
+                        let total_bytes: usize = pool.values().flatten().map(|b| b.size).sum();
                         let entry = pool.entry(self.size).or_default();
                         if entry.len() < VulkanDevice::max_gpu_pool_per_size_class()
                             && total_bytes + self.size <= VulkanDevice::max_gpu_pool_total_bytes()

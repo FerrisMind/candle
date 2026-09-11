@@ -1776,8 +1776,12 @@ fn smoke_q8_1_activation_reference(device: &Device) -> Result<()> {
     };
 
     let lhs_vals = (0..k).map(|_| 0.1 + next_f32() * 7.9).collect::<Vec<_>>();
-    let rhs_vals = (0..(k * n)).map(|_| 0.5 + next_f32() * 9.5).collect::<Vec<_>>();
-    let lhs_multi_vals = (0..(3 * k)).map(|_| 0.1 + next_f32() * 7.9).collect::<Vec<_>>();
+    let rhs_vals = (0..(k * n))
+        .map(|_| 0.5 + next_f32() * 9.5)
+        .collect::<Vec<_>>();
+    let lhs_multi_vals = (0..(3 * k))
+        .map(|_| 0.1 + next_f32() * 7.9)
+        .collect::<Vec<_>>();
 
     // matvec route: input_m == 1 (the wgpu dispatch routes m==1 to quantized_matvec)
     let lhs_mv = Tensor::from_slice(&lhs_vals, (1, k), device)?;

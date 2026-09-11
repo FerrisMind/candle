@@ -248,9 +248,7 @@ fn ssd_chunked_gpu_impl(
     let decay_states = (a_last.broadcast_as(a_cumsum.shape())? - &a_cumsum)?.exp()?; // [BN, H, CS]
     let decay_s = decay_states.unsqueeze(D::Minus1)?; // [BN, H, CS, 1]
     let b_weighted = b_perm.broadcast_mul(&decay_s)?; // [BN, H, CS, DState]
-    let states = x_t
-        .transpose(D::Minus2, D::Minus1)?
-        .matmul(&b_weighted)?; // [BN, H, D, DState]
+    let states = x_t.transpose(D::Minus2, D::Minus1)?.matmul(&b_weighted)?; // [BN, H, D, DState]
 
     // Inter-chunk recurrence over the chunk axis, batched over BF = B * H.
     let states_hd = states.contiguous()?.reshape((batch, n_chunks, h, d * ds))?; // [B, NC, H, D*DS]
@@ -288,9 +286,7 @@ fn ssd_chunked_gpu_impl(
     let c_t2 = c_bn.permute((0, 2, 1, 3))?.contiguous()?; // [BN,H,CS,DState]
     let c_states = c_t2.matmul(&states_out_bn.transpose(D::Minus2, D::Minus1)?)?; // [BN,H,CS,D]
     let decay_out = a_cumsum.exp()?.unsqueeze(D::Minus1)?; // [BN,H,CS,1]
-    let y_off = c_states
-        .broadcast_mul(&decay_out)?
-        .permute((0, 2, 1, 3))?; // [BN,CS,H,D]
+    let y_off = c_states.broadcast_mul(&decay_out)?.permute((0, 2, 1, 3))?; // [BN,CS,H,D]
 
     let y = (&y_diag + &y_off)?; // [BN,CS,H,D]
     let y = y.reshape((batch, seq_len, h, d))?; // [B,L,H,D]
@@ -807,8 +803,12 @@ mod tests {
         cs: usize,
         ds: usize,
     ) -> Result<()> {
-        let init =
-            Tensor::randn(0f32, 1f32, (x.dim(0)?, x.dim(2)?, x.dim(3)?, ds), x.device())?;
+        let init = Tensor::randn(
+            0f32,
+            1f32,
+            (x.dim(0)?, x.dim(2)?, x.dim(3)?, ds),
+            x.device(),
+        )?;
         let (y1, f1) = ssd_chunked_impl(x, a, b, c, cs, Some(&init), ds)?;
         let (y2, f2) = ssd_chunked_gpu_impl(x, a, b, c, cs, Some(&init), ds)?;
 
@@ -819,10 +819,7 @@ mod tests {
         let y1_v = y1.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let y2_v = y2.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         for (i, (a, b)) in y1_v.iter().zip(y2_v.iter()).enumerate() {
-            assert!(
-                (a - b).abs() <= tol,
-                "y[{i}] mismatch: gpu={b} generic={a}"
-            );
+            assert!((a - b).abs() <= tol, "y[{i}] mismatch: gpu={b} generic={a}");
         }
         let f1_v = f1.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let f2_v = f2.flatten_all().unwrap().to_vec1::<f32>().unwrap();

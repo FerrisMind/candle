@@ -26,7 +26,10 @@ use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::quantized_qwen3::ModelWeights;
 
 #[derive(Parser, Debug)]
-#[command(name = "candle-bench", about = "llama-bench style benchmark for candle")]
+#[command(
+    name = "candle-bench",
+    about = "llama-bench style benchmark for candle"
+)]
 struct Args {
     /// Path to GGUF model file.
     #[arg(long)]
@@ -58,9 +61,7 @@ struct Args {
 }
 
 fn parse_usize_list(s: &str) -> Vec<usize> {
-    s.split(',')
-        .filter_map(|v| v.trim().parse().ok())
-        .collect()
+    s.split(',').filter_map(|v| v.trim().parse().ok()).collect()
 }
 
 fn load_model(args: &Args) -> Result<(ModelWeights, Tokenizer, Device)> {
@@ -70,7 +71,7 @@ fn load_model(args: &Args) -> Result<(ModelWeights, Tokenizer, Device)> {
     let start = Instant::now();
     let model = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(&args.model))?;
     let mut total_size = 0usize;
-    for (_, tensor) in model.tensor_infos.iter() {
+    for tensor in model.tensor_infos.values() {
         let elem_count = tensor.shape.elem_count();
         total_size += elem_count * tensor.ggml_dtype.type_size() / tensor.ggml_dtype.block_size();
     }
@@ -81,18 +82,27 @@ fn load_model(args: &Args) -> Result<(ModelWeights, Tokenizer, Device)> {
         start.elapsed().as_secs_f64(),
     );
     let model = ModelWeights::from_gguf(model, &mut file, &device)?;
-    let tokenizer =
-        Tokenizer::from_file(&args.tokenizer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let tokenizer = Tokenizer::from_file(&args.tokenizer).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok((model, tokenizer, device))
 }
 
 /// Generate synthetic prompt token IDs of exactly `n` tokens.
 fn synthetic_tokens(tokenizer: &Tokenizer, n: usize) -> Result<Vec<u32>> {
     let mut text = String::new();
-    while tokenizer.encode(text.as_str(), false).map_err(anyhow::Error::msg)?.get_ids().len() < n {
+    while tokenizer
+        .encode(text.as_str(), false)
+        .map_err(anyhow::Error::msg)?
+        .get_ids()
+        .len()
+        < n
+    {
         text.push_str("the ");
     }
-    let mut ids = tokenizer.encode(text.as_str(), false).map_err(anyhow::Error::msg)?.get_ids().to_vec();
+    let mut ids = tokenizer
+        .encode(text.as_str(), false)
+        .map_err(anyhow::Error::msg)?
+        .get_ids()
+        .to_vec();
     ids.truncate(n);
     Ok(ids)
 }

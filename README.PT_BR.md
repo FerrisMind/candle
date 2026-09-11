@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/License-Apache--2.0%20%2F%20MIT-2ea44f" alt="Apache 2.0 / MIT">
   <img src="https://img.shields.io/badge/Rust-edition%202021-93450a?logo=rust" alt="Rust edition 2021">
   <img src="https://img.shields.io/badge/Backends-Vulkan%20%2B%20WGPU-5B7CFA" alt="Vulkan and WGPU">
-  <img src="https://img.shields.io/badge/Fork-0.0.174-d4730e" alt="Fork version 0.0.174">
+  <img src="https://img.shields.io/badge/Fork-0.1.0-d4730e" alt="Fork version 0.1.0">
   <img src="https://img.shields.io/badge/Upstream-Candle%200.11.0-232323" alt="Upstream Candle 0.11.0">
   <img src="https://img.shields.io/badge/Branch-wgpu%2Fvulkan-232323" alt="wgpu/vulkan branch">
 </p>
@@ -39,7 +39,7 @@ Os backends **CPU** e **CUDA** permanecem sincronizados diretamente com o [huggi
 | Fork ([FerrisMind/candle](https://github.com/FerrisMind/candle)) | Upstream ([huggingface/candle](https://github.com/huggingface/candle)) |
 |------------------------------------------------------------------|------------------------------------------------------------------------|
 | Branch `wgpu/vulkan` | `main` |
-| Crates do fork **0.0.174** (`candle-core` / `candle-nn` / `candle-transformers` / `candle-examples` / `candle-*-kernels` Vulkan e WGPU); inalterados ficam **0.11.0** | Candle **0.11.0** |
+| Crates do fork **0.1.0** (`candle-core` / `candle-nn` / `candle-transformers` / `candle-examples` / `candle-*-kernels` Vulkan e WGPU); inalterados ficam **0.11.0** | Candle **0.11.0** |
 | Último sync CPU/CUDA [`b3e5b40f`](https://github.com/FerrisMind/candle/commit/b3e5b40f) (2026-08-17) | Tip [`162b59b9`](https://github.com/FerrisMind/candle/commit/162b59b9) (#3892) |
 | Somente no fork | **Vulkan** + **WGPU / WebGPU** nativos |
 

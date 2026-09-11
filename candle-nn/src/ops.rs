@@ -1606,13 +1606,8 @@ impl candle::CustomOp3 for Sdpa {
     ) -> Result<(candle::VulkanStorage, Shape)> {
         let out_dims = vec![q_l.dim(0)?, q_l.dim(1)?, q_l.dim(2)?, v_l.dim(3)?];
         let q_dtype = q.dtype();
-        let out = candle::VulkanStorage::flash_attn(
-            q, q_l,
-            k, k_l,
-            v, v_l,
-            self.scale,
-            self.do_causal,
-        )?;
+        let out =
+            candle::VulkanStorage::flash_attn(q, q_l, k, k_l, v, v_l, self.scale, self.do_causal)?;
         // Cast back to input dtype if needed (flash_attn always outputs F32)
         let out = if out.dtype() != q_dtype {
             let out_l = candle::Layout::contiguous(candle::Shape::from_dims(&out_dims));
@@ -1635,13 +1630,8 @@ impl candle::CustomOp3 for Sdpa {
     ) -> Result<(candle::WgpuStorage, Shape)> {
         let out_dims = vec![q_l.dim(0)?, q_l.dim(1)?, q_l.dim(2)?, v_l.dim(3)?];
         let q_dtype = q.dtype();
-        let out = candle::WgpuStorage::flash_attn(
-            q, q_l,
-            k, k_l,
-            v, v_l,
-            self.scale,
-            self.do_causal,
-        )?;
+        let out =
+            candle::WgpuStorage::flash_attn(q, q_l, k, k_l, v, v_l, self.scale, self.do_causal)?;
         // Cast back to input dtype if needed (flash_attn always outputs F32)
         let out = if out.dtype() != q_dtype {
             let out_l = candle::Layout::contiguous(candle::Shape::from_dims(&out_dims));
@@ -1866,21 +1856,33 @@ pub fn flash_attn(
             crate::attention::AttnMask::None
         };
         let res = match q.dtype() {
-            DType::F32 => {
-                crate::attention::cpu_flash::flash_attn::<f32>(
-                    q, k, v, softmax_scale, mask, None, None,
-                )
-            }
-            DType::F16 => {
-                crate::attention::cpu_flash::flash_attn::<half::f16>(
-                    q, k, v, softmax_scale, mask, None, None,
-                )
-            }
-            DType::BF16 => {
-                crate::attention::cpu_flash::flash_attn::<half::bf16>(
-                    q, k, v, softmax_scale, mask, None, None,
-                )
-            }
+            DType::F32 => crate::attention::cpu_flash::flash_attn::<f32>(
+                q,
+                k,
+                v,
+                softmax_scale,
+                mask,
+                None,
+                None,
+            ),
+            DType::F16 => crate::attention::cpu_flash::flash_attn::<half::f16>(
+                q,
+                k,
+                v,
+                softmax_scale,
+                mask,
+                None,
+                None,
+            ),
+            DType::BF16 => crate::attention::cpu_flash::flash_attn::<half::bf16>(
+                q,
+                k,
+                v,
+                softmax_scale,
+                mask,
+                None,
+                None,
+            ),
             _ => Err(candle::Error::Msg(
                 "unsupported dtype for cpu flash attention".to_string(),
             )),

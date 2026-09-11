@@ -28,11 +28,7 @@ impl CustomOp1 for TestSigmoid {
         "test_sigmoid"
     }
 
-    fn cpu_fwd(
-        &self,
-        _storage: &CpuStorage,
-        _layout: &Layout,
-    ) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(&self, _storage: &CpuStorage, _layout: &Layout) -> Result<(CpuStorage, Shape)> {
         // Not used in this test (cpu reference is computed with built-in ops).
         Err(candle_core::Error::Msg("test_sigmoid cpu not used".into()))
     }
@@ -74,7 +70,9 @@ fn vulkan_conv1d_long_l_matches_cpu() -> Result<()> {
 
     // Deterministic, non-trivial input and a small weight.
     let input: Vec<f32> = (0..l_in).map(|i| ((i % 97) as f32) * 0.01 - 0.5).collect();
-    let weight: Vec<f32> = (0..cout * cin * k).map(|i| (i as f32) * 0.25 - 1.0).collect();
+    let weight: Vec<f32> = (0..cout * cin * k)
+        .map(|i| (i as f32) * 0.25 - 1.0)
+        .collect();
 
     let it_cpu = Tensor::from_vec(input.clone(), (1, cin, l_in), &cpu)?;
     let it_vk = Tensor::from_vec(input, (1, cin, l_in), &vk)?;
@@ -126,7 +124,10 @@ fn vulkan_sigmoid_bf16_matches_cpu() -> Result<()> {
     let in_bf16_as_f32 = in_bf16.to_dtype(DType::F32)?;
     let one = Tensor::new(1.0f32, &cpu)?;
     let ref_f32 = in_bf16_as_f32.neg()?.exp()?.broadcast_add(&one)?.recip()?;
-    let ref_out = ref_f32.to_dtype(DType::BF16)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    let ref_out = ref_f32
+        .to_dtype(DType::BF16)?
+        .to_dtype(DType::F32)?
+        .to_vec1::<f32>()?;
 
     // Vulkan: bf16 input -> sigmoid (f32-emulated in the backend) -> f32.
     let vk_t = Tensor::from_vec(data, 64, &vk)?.to_dtype(DType::BF16)?;

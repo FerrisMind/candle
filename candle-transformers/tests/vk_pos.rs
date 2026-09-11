@@ -3,7 +3,11 @@ use candle::{Device, Result, Tensor};
 fn md(a: &Tensor, b: &Tensor) -> Result<f32> {
     let va = a.flatten_all()?.to_vec1::<f32>()?;
     let vb = b.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
-    Ok(va.iter().zip(vb.iter()).map(|(x,y)|(x-y).abs()).fold(0.0f32, f32::max))
+    Ok(va
+        .iter()
+        .zip(vb.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max))
 }
 fn sinusoids(length: usize, channels: usize, device: &Device) -> Result<Tensor> {
     let max_timescale = 10000f32;
@@ -12,7 +16,9 @@ fn sinusoids(length: usize, channels: usize, device: &Device) -> Result<Tensor> 
         .map(|i| (i as f32 * (-log_timescale_increment)).exp())
         .collect();
     let inv_timescales = Tensor::new(inv_timescales.as_slice(), device)?.unsqueeze(0)?;
-    let arange = Tensor::arange(0, length as u32, device)?.to_dtype(candle::DType::F32)?.unsqueeze(1)?;
+    let arange = Tensor::arange(0, length as u32, device)?
+        .to_dtype(candle::DType::F32)?
+        .unsqueeze(1)?;
     let sh = (length, channels / 2);
     let scaled_time = (arange.broadcast_as(sh)? * inv_timescales.broadcast_as(sh)?)?;
     Tensor::cat(&[scaled_time.sin()?, scaled_time.cos()?], 1)

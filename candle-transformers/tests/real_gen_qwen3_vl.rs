@@ -11,6 +11,13 @@
 //!
 //! Env: `CANDLE_QWEN3_VL_DIR` (default: unsloth Qwen3-VL-2B-Thinking).
 
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::needless_range_loop
+)]
+#![allow(unused_assignments)]
+
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
@@ -48,7 +55,11 @@ fn load_cfg(dir: &Path) -> Result<Config> {
     Ok(cfg)
 }
 
-fn load_model(dir: &Path, device: &Device, dtype: DType) -> Result<(Qwen3VLModel, Tokenizer, Config)> {
+fn load_model(
+    dir: &Path,
+    device: &Device,
+    dtype: DType,
+) -> Result<(Qwen3VLModel, Tokenizer, Config)> {
     let weights = dir.join("model.safetensors");
     if !weights.is_file() {
         candle::bail!("missing {weights:?}; set CANDLE_QWEN3_VL_DIR");
@@ -136,7 +147,7 @@ fn build_multimodal_ids(
     ids.push(NL_ID);
     ids.push(VISION_START_ID);
     let pad_start = ids.len();
-    ids.extend(std::iter::repeat(IMAGE_TOKEN_ID).take(num_image_tokens));
+    ids.extend(std::iter::repeat_n(IMAGE_TOKEN_ID, num_image_tokens));
     let pad_end = ids.len();
     ids.push(VISION_END_ID);
     ids.extend(encode_text(tok, user_text)?);
@@ -168,7 +179,10 @@ fn prefill_multimodal(
     }
     let (pad_start, pad_end) = img_pad_spans[0];
     if pad_end > prompt_ids.len() || pad_start >= pad_end {
-        candle::bail!("bad img pad span {pad_start}..{pad_end} for len {}", prompt_ids.len());
+        candle::bail!(
+            "bad img pad span {pad_start}..{pad_end} for len {}",
+            prompt_ids.len()
+        );
     }
 
     if prompt_ids.is_empty() {
@@ -262,9 +276,7 @@ fn greedy_multimodal(
         if step == 0 {
             let v = logits_1d.to_vec1::<f32>()?;
             let mut idx: Vec<usize> = (0..v.len()).collect();
-            idx.sort_by(|&a, &b| {
-                v[b].partial_cmp(&v[a]).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap_or(std::cmp::Ordering::Equal));
             let top5: Vec<(usize, f32)> = idx.iter().take(5).map(|&i| (i, v[i])).collect();
             let finite = v.iter().filter(|x| x.is_finite()).count();
             let maxv = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);

@@ -1,4 +1,4 @@
-use candle::{Device, Result, Tensor, DType};
+use candle::{DType, Device, Result, Tensor};
 use candle_nn::Module;
 use candle_transformers::models::{llama2_c, llama2_c_weights};
 use std::fs::File;
@@ -6,15 +6,33 @@ use std::path::PathBuf;
 
 fn maxdiff(a: &Tensor, b: &Tensor) -> Result<f32> {
     let va = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let vb = b.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    Ok(va.iter().zip(vb.iter()).map(|(x,y)|(x-y).abs()).fold(0.0f32, f32::max))
+    let vb = b
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok(va
+        .iter()
+        .zip(vb.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max))
 }
 fn find(p: &std::path::Path, name: &str) -> Option<PathBuf> {
-    if p.is_file() && p.file_name()?.to_str()? == name { return Some(p.to_path_buf()); }
-    if p.is_dir() { for e in std::fs::read_dir(p).ok()? { if let Ok(e)=e { if let Some(f)=find(&e.path(), name){return Some(f);} } } }
+    if p.is_file() && p.file_name()?.to_str()? == name {
+        return Some(p.to_path_buf());
+    }
+    if p.is_dir() {
+        for e in std::fs::read_dir(p).ok()?.flatten() {
+            if let Some(f) = find(&e.path(), name) {
+                return Some(f);
+            }
+        }
+    }
     None
 }
-fn silu(xs: &Tensor) -> Result<Tensor> { xs / (xs.neg()?.exp()? + 1.0)? }
+fn silu(xs: &Tensor) -> Result<Tensor> {
+    xs / (xs.neg()?.exp()? + 1.0)?
+}
 
 #[test]
 fn upload_silu() -> Result<()> {
@@ -27,12 +45,26 @@ fn upload_silu() -> Result<()> {
     let weights = llama2_c_weights::TransformerWeights::from_reader(&mut file, &config, &cpu)?;
     let vb = weights.var_builder(&config, &cpu)?;
     let emb = candle_nn::embedding(config.vocab_size, config.dim, vb.pp("model.embed_tokens"))?;
-    let ids = [1u32,13,42,7,19,5];
-    let x = emb.forward(&Tensor::from_slice(&ids,(1,6),&cpu)?)?;
-    let rms = candle_nn::rms_norm(config.dim, config.norm_eps, vb.pp("model.layers.0.post_attention_layernorm"))?;
+    let ids = [1u32, 13, 42, 7, 19, 5];
+    let x = emb.forward(&Tensor::from_slice(&ids, (1, 6), &cpu)?)?;
+    let rms = candle_nn::rms_norm(
+        config.dim,
+        config.norm_eps,
+        vb.pp("model.layers.0.post_attention_layernorm"),
+    )?;
     let n = rms.forward(&x)?;
-    let g_c = candle_nn::linear_no_bias(config.dim, config.hidden_dim, vb.pp("model.layers.0.mlp.gate_proj"))?.forward(&n)?;
-    let u_c = candle_nn::linear_no_bias(config.dim, config.hidden_dim, vb.pp("model.layers.0.mlp.up_proj"))?.forward(&n)?;
+    let g_c = candle_nn::linear_no_bias(
+        config.dim,
+        config.hidden_dim,
+        vb.pp("model.layers.0.mlp.gate_proj"),
+    )?
+    .forward(&n)?;
+    let u_c = candle_nn::linear_no_bias(
+        config.dim,
+        config.hidden_dim,
+        vb.pp("model.layers.0.mlp.up_proj"),
+    )?
+    .forward(&n)?;
     let s_c = silu(&g_c)?;
     let mul_c = (&s_c * &u_c)?;
 

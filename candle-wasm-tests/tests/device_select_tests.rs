@@ -33,10 +33,7 @@ async fn resolve_auto_never_panics() {
         .resolve()
         .await
         .expect("Auto resolve must return Ok (Cpu or Wgpu), never panic");
-    assert!(matches!(
-        r.resolved,
-        ResolvedKind::Cpu | ResolvedKind::Wgpu
-    ));
+    assert!(matches!(r.resolved, ResolvedKind::Cpu | ResolvedKind::Wgpu));
 }
 
 /// Explicit `wgpu`: Ok if adapter works, Err if unavailable / feature off.

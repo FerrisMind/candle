@@ -18,8 +18,14 @@ fn contig_race() -> Result<()> {
     let m_g = (&s_g * &bg)?;
     let md = {
         let vc = m_c.flatten_all()?.to_vec1::<f32>()?;
-        let vg = m_g.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
-        vc.iter().zip(vg.iter()).map(|(x,y)|(x-y).abs()).fold(0.0f32, f32::max)
+        let vg = m_g
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        vc.iter()
+            .zip(vg.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
     };
     println!("no-sync chain md={md}");
 
@@ -29,8 +35,14 @@ fn contig_race() -> Result<()> {
     let m_g2 = (&s_g2 * &bg)?;
     let md2 = {
         let vc = m_c.flatten_all()?.to_vec1::<f32>()?;
-        let vg = m_g2.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
-        vc.iter().zip(vg.iter()).map(|(x,y)|(x-y).abs()).fold(0.0f32, f32::max)
+        let vg = m_g2
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        vc.iter()
+            .zip(vg.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
     };
     println!("sync-after-silu md={md2}");
 
@@ -39,8 +51,14 @@ fn contig_race() -> Result<()> {
     let m_c3 = (&a * &b)?;
     let md3 = {
         let vc = m_c3.flatten_all()?.to_vec1::<f32>()?;
-        let vg = m_g3.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
-        vc.iter().zip(vg.iter()).map(|(x,y)|(x-y).abs()).fold(0.0f32, f32::max)
+        let vg = m_g3
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        vc.iter()
+            .zip(vg.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
     };
     println!("single mul md={md3}");
 
@@ -53,8 +71,14 @@ fn contig_race() -> Result<()> {
     }
     let md4 = {
         let vc = x_c.flatten_all()?.to_vec1::<f32>()?;
-        let vg = x_g.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
-        vc.iter().zip(vg.iter()).map(|(x,y)|(x-y).abs()).fold(0.0f32, f32::max)
+        let vg = x_g
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        vc.iter()
+            .zip(vg.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
     };
     println!("20 adds md={md4}");
     Ok(())

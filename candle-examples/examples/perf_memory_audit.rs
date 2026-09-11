@@ -1,25 +1,4 @@
-/// Performance and memory audit harness for Vulkan and WGPU backends.
-///
-/// This example measures steady-state dispatch latency and host-side memory
-/// pressure for representative workloads (matmul, elementwise, quantized
-/// matvec) on both GPU backends.
-///
-/// Build:
-///   cargo build --release --example perf_memory_audit --features vulkan
-///   cargo build --release --example perf_memory_audit --features wgpu
-///
-/// Run:
-///   cargo run --release --example perf_memory_audit --features vulkan
-///   cargo run --release --example perf_memory_audit --features wgpu
-///
-/// Protocol (per AGENTS.md §11):
-/// - release build
-/// - warmup (5 iterations)
-/// - explicit device.synchronize() before each timed iteration
-/// - median and p95 over >= 30 reps
-/// - memory delta measured via process working set (Windows)
-/// - growth slope > 1% over 100 iterations = leak candidate
-use std::time::Instant;
+#![allow(dead_code)]
 
 #[cfg(any(feature = "vulkan", feature = "wgpu"))]
 fn main() -> anyhow::Result<()> {

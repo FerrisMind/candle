@@ -1,10 +1,17 @@
-use candle::{Device, Result, Tensor, DType};
-use candle_nn::Module;
+use candle::{DType, Device, Result, Tensor};
 
 fn md(a: &Tensor, b: &Tensor) -> Result<f32> {
     let va = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let vb = b.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    Ok(va.iter().zip(vb.iter()).map(|(x,y)|(x-y).abs()).fold(0.0f32, f32::max))
+    let vb = b
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok(va
+        .iter()
+        .zip(vb.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max))
 }
 
 #[test]

@@ -26,12 +26,26 @@ fn softmax_deterministic(dev: &Device, rows: usize, l: usize) -> bool {
     let b = cpu.to_dtype(DType::BF16).unwrap().to_device(dev).unwrap();
     let s1 = ops::softmax_last_dim(&a).unwrap();
     let s2 = ops::softmax_last_dim(&b).unwrap();
-    let d1 = s1.flatten_all().unwrap().to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap();
-    let d2 = s2.flatten_all().unwrap().to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap();
+    let d1 = s1
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let d2 = s2
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
     if d1.len() != d2.len() {
         return false;
     }
-    d1.iter().zip(d2.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+    d1.iter()
+        .zip(d2.iter())
+        .all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 #[test]

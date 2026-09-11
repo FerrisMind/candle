@@ -1,6 +1,6 @@
 //! Stage-by-stage Qwen3-VL vision tower on Vulkan.
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::{Module, VarBuilder};
+use candle_nn::VarBuilder;
 use candle_transformers::models::qwen3_vl::{Config, Qwen3VLModel};
 use std::path::PathBuf;
 
@@ -114,9 +114,7 @@ fn vl_stage_vulkan() -> Result<()> {
     let emb = Tensor::randn(0f32, 0.1, (2304, 1024), &cpu)?;
     let idx = Tensor::from_vec((0i64..64).collect::<Vec<_>>(), (64,), &cpu)?;
     let p_c = emb.index_select(&idx, 0)?;
-    let p_v = emb
-        .to_device(&vk)?
-        .index_select(&idx.to_device(&vk)?, 0)?;
+    let p_v = emb.to_device(&vk)?.index_select(&idx.to_device(&vk)?, 0)?;
     vk.synchronize()?;
     println!("index_select {}", maxdiff(&p_v, &p_c)?);
 

@@ -41,10 +41,14 @@ fn downcast(t: &Tensor) -> Result<Vec<f32>> {
 }
 
 fn lcg(seed: u64, n: usize) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut s = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 13) % 4093) as f32 / 61.0 - 32.0
         })
         .collect()
@@ -57,7 +61,12 @@ fn gauss(seed: u64, n: usize) -> Vec<f32> {
     use rand_distr::{Distribution, StandardNormal};
     let mut rng = StdRng::seed_from_u64(seed);
     let d: StandardNormal = StandardNormal;
-    (0..n).map(|_| { let x: f64 = d.sample(&mut rng); x as f32 }).collect()
+    (0..n)
+        .map(|_| {
+            let x: f64 = d.sample(&mut rng);
+            x as f32
+        })
+        .collect()
 }
 
 fn model_path() -> String {
@@ -71,7 +80,10 @@ fn vb_from_path(mp: &str, dtype: DType, device: &Device) -> Result<VarBuilder<'s
 }
 
 fn conv_cfg(padding: usize) -> Conv2dConfig {
-    Conv2dConfig { padding, ..Default::default() }
+    Conv2dConfig {
+        padding,
+        ..Default::default()
+    }
 }
 
 // ---- ResnetBlock2D (candle-transformers resnet.rs, temb=None) ----
@@ -85,18 +97,37 @@ struct ResnetBlock2D {
 }
 
 impl ResnetBlock2D {
-    fn new(vb: VarBuilder, in_channels: usize, out_channels: usize, groups: usize, eps: f64) -> Result<Self> {
+    fn new(
+        vb: VarBuilder,
+        in_channels: usize,
+        out_channels: usize,
+        groups: usize,
+        eps: f64,
+    ) -> Result<Self> {
         let norm1 = group_norm(groups, in_channels, eps, vb.pp("norm1"))?;
         let conv1 = conv2d(in_channels, out_channels, 3, conv_cfg(1), vb.pp("conv1"))?;
         let norm2 = group_norm(groups, out_channels, eps, vb.pp("norm2"))?;
         let conv2 = conv2d(out_channels, out_channels, 3, conv_cfg(1), vb.pp("conv2"))?;
         let use_in_shortcut = in_channels != out_channels;
         let conv_shortcut = if use_in_shortcut {
-            Some(conv2d(in_channels, out_channels, 1, conv_cfg(0), vb.pp("conv_shortcut"))?)
+            Some(conv2d(
+                in_channels,
+                out_channels,
+                1,
+                conv_cfg(0),
+                vb.pp("conv_shortcut"),
+            )?)
         } else {
             None
         };
-        Ok(Self { norm1, conv1, norm2, conv2, conv_shortcut, output_scale_factor: 1. })
+        Ok(Self {
+            norm1,
+            conv1,
+            norm2,
+            conv2,
+            conv_shortcut,
+            output_scale_factor: 1.,
+        })
     }
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let shortcut_xs = match &self.conv_shortcut {
@@ -105,7 +136,9 @@ impl ResnetBlock2D {
         };
         let xs = self.norm1.forward(xs)?;
         let xs = self.conv1.forward(&candle_nn::ops::silu(&xs)?)?;
-        let xs = self.conv2.forward(&candle_nn::ops::silu(&self.norm2.forward(&xs)?)?)?;
+        let xs = self
+            .conv2
+            .forward(&candle_nn::ops::silu(&self.norm2.forward(&xs)?)?)?;
         (shortcut_xs + xs)? / self.output_scale_factor
     }
 }
@@ -137,7 +170,15 @@ impl AttentionBlock {
         let key = linear(channels, channels, vb.pp(kp))?;
         let value = linear(channels, channels, vb.pp(vp))?;
         let proj_attn = linear(channels, channels, vb.pp(op))?;
-        Ok(Self { group_norm, query, key, value, proj_attn, channels, num_heads })
+        Ok(Self {
+            group_norm,
+            query,
+            key,
+            value,
+            proj_attn,
+            channels,
+            num_heads,
+        })
     }
 
     fn transpose_for_scores(&self, xs: Tensor) -> Result<Tensor> {
@@ -152,7 +193,11 @@ impl Module for AttentionBlock {
         let in_dtype = xs.dtype();
         let residual = xs;
         let (batch, channel, height, width) = xs.dims4()?;
-        let xs = self.group_norm.forward(xs)?.reshape((batch, channel, height * width))?.transpose(1, 2)?;
+        let xs = self
+            .group_norm
+            .forward(xs)?
+            .reshape((batch, channel, height * width))?
+            .transpose(1, 2)?;
 
         let query = self.query.forward(&xs)?;
         let key = self.key.forward(&xs)?;
@@ -171,7 +216,11 @@ impl Module for AttentionBlock {
         let xs = xs.to_dtype(in_dtype)?;
         let xs = xs.transpose(1, 2)?.contiguous()?;
         let xs = xs.flatten_from(D::Minus2)?;
-        let xs = self.proj_attn.forward(&xs)?.t()?.reshape((batch, channel, height, width))?;
+        let xs = self
+            .proj_attn
+            .forward(&xs)?
+            .t()?
+            .reshape((batch, channel, height, width))?;
         (xs + residual)? / 1.0
     }
 }
@@ -187,8 +236,13 @@ impl UNetMidBlock2D {
     fn new(vb: VarBuilder, in_channels: usize, groups: usize, eps: f64) -> Result<Self> {
         let resnet = ResnetBlock2D::new(vb.pp("resnets.0"), in_channels, in_channels, groups, eps)?;
         let attn = AttentionBlock::new(vb.pp("attentions.0"), in_channels, groups, eps)?;
-        let resnet2 = ResnetBlock2D::new(vb.pp("resnets.1"), in_channels, in_channels, groups, eps)?;
-        Ok(Self { resnet, attn, resnet2 })
+        let resnet2 =
+            ResnetBlock2D::new(vb.pp("resnets.1"), in_channels, in_channels, groups, eps)?;
+        Ok(Self {
+            resnet,
+            attn,
+            resnet2,
+        })
     }
 }
 
@@ -216,14 +270,30 @@ struct UpDecoderBlock2D {
 }
 
 impl UpDecoderBlock2D {
-    fn new(vb: VarBuilder, in_channels: usize, out_channels: usize, num_layers: usize, add_upsample: bool) -> Result<Self> {
+    fn new(
+        vb: VarBuilder,
+        in_channels: usize,
+        out_channels: usize,
+        num_layers: usize,
+        add_upsample: bool,
+    ) -> Result<Self> {
         let mut resnets = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let cin = if i == 0 { in_channels } else { out_channels };
-            resnets.push(ResnetBlock2D::new(vb.pp(format!("resnets.{i}")), cin, out_channels, 32, 1e-6)?);
+            resnets.push(ResnetBlock2D::new(
+                vb.pp(format!("resnets.{i}")),
+                cin,
+                out_channels,
+                32,
+                1e-6,
+            )?);
         }
         let upsampler = if add_upsample {
-            Some(Upsample2D::new(vb.pp("upsamplers.0"), out_channels, out_channels)?)
+            Some(Upsample2D::new(
+                vb.pp("upsamplers.0"),
+                out_channels,
+                out_channels,
+            )?)
         } else {
             None
         };
@@ -261,22 +331,52 @@ impl Decoder {
         let reversed: Vec<_> = boc.iter().copied().rev().collect();
         for index in 0..boc.len() {
             let outc = reversed[index];
-            let inc = if index > 0 { reversed[index - 1] } else { reversed[0] };
+            let inc = if index > 0 {
+                reversed[index - 1]
+            } else {
+                reversed[0]
+            };
             let is_final = index + 1 == boc.len();
-            add_upblock(&mut up_blocks, vb.pp(format!("up_blocks.{index}")), inc, outc, 3, !is_final)?;
+            add_upblock(
+                &mut up_blocks,
+                vb.pp(format!("up_blocks.{index}")),
+                inc,
+                outc,
+                3,
+                !is_final,
+            )?;
         }
         let conv_norm_out = group_norm(32, boc[0], 1e-6, vb.pp("conv_norm_out"))?;
         let conv_out = conv2d(boc[0], out_channels, 3, conv_cfg(1), vb.pp("conv_out"))?;
-        Ok(Self { conv_in, mid_block, up_blocks, conv_norm_out, conv_out })
+        Ok(Self {
+            conv_in,
+            mid_block,
+            up_blocks,
+            conv_norm_out,
+            conv_out,
+        })
     }
 
     // Forward returning every named stage (trace) for the bisect.
     #[allow(clippy::type_complexity)]
-    fn forward_trace(&self, xs: &Tensor) -> Result<(
-        Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
+    fn forward_trace(
+        &self,
+        xs: &Tensor,
+    ) -> Result<(
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
     )> {
-        let t0 = self.conv_in.forward(xs)?;                     // [1,512,32,32]
-        let mid_res0 = self.mid_block.resnet.forward(&t0)?;     // resnets.0
+        let t0 = self.conv_in.forward(xs)?; // [1,512,32,32]
+        let mid_res0 = self.mid_block.resnet.forward(&t0)?; // resnets.0
         let mid_attn = self.mid_block.attn.forward(&mid_res0)?;
         let mid_out = self.mid_block.resnet2.forward(&mid_attn)?; // mid_block output
         let up0 = self.up_blocks[0].forward(&mid_out)?;
@@ -286,7 +386,9 @@ impl Decoder {
         let norm_out = self.conv_norm_out.forward(&up3)?;
         let silu_out = candle_nn::ops::silu(&norm_out)?;
         let out = self.conv_out.forward(&silu_out)?;
-        Ok((t0, mid_res0, mid_attn, mid_out, up0, up1, up2, up3, norm_out, silu_out, out))
+        Ok((
+            t0, mid_res0, mid_attn, mid_out, up0, up1, up2, up3, norm_out, silu_out, out,
+        ))
     }
 }
 
@@ -298,7 +400,13 @@ fn add_upblock(
     num_layers: usize,
     add_upsample: bool,
 ) -> Result<()> {
-    v.push(UpDecoderBlock2D::new(vb, inc, outc, num_layers, add_upsample)?);
+    v.push(UpDecoderBlock2D::new(
+        vb,
+        inc,
+        outc,
+        num_layers,
+        add_upsample,
+    )?);
     Ok(())
 }
 
@@ -327,8 +435,10 @@ fn vae_decode_fixed_latent_cpu_vs_wgpu() -> Result<()> {
     // Fixed known latent [1,4,32,32] (latent for a 256x256 image; /8 & SD vae scale).
     let n = 4 * 32 * 32;
     let data = lcg(12345, n);
-    let lat_cpu = Tensor::from_vec(data.clone(), [1, 4, 32, 32].as_slice(), &cpu)?.to_dtype(DType::F32)?;
-    let lat_wgpu = Tensor::from_vec(data, [1, 4, 32, 32].as_slice(), &wgpu)?.to_dtype(DType::F32)?;
+    let lat_cpu =
+        Tensor::from_vec(data.clone(), [1, 4, 32, 32].as_slice(), &cpu)?.to_dtype(DType::F32)?;
+    let lat_wgpu =
+        Tensor::from_vec(data, [1, 4, 32, 32].as_slice(), &wgpu)?.to_dtype(DType::F32)?;
 
     let c = cpu_dec.forward_trace(&lat_cpu)?;
     let g = wgpu_dec.forward_trace(&lat_wgpu)?;
@@ -338,20 +448,40 @@ fn vae_decode_fixed_latent_cpu_vs_wgpu() -> Result<()> {
         "silu_out", "out",
     ];
     let cvals = [
-        downcast(&c.0)?, downcast(&c.1)?, downcast(&c.2)?, downcast(&c.3)?, downcast(&c.4)?,
-        downcast(&c.5)?, downcast(&c.6)?, downcast(&c.7)?, downcast(&c.8)?, downcast(&c.9)?,
+        downcast(&c.0)?,
+        downcast(&c.1)?,
+        downcast(&c.2)?,
+        downcast(&c.3)?,
+        downcast(&c.4)?,
+        downcast(&c.5)?,
+        downcast(&c.6)?,
+        downcast(&c.7)?,
+        downcast(&c.8)?,
+        downcast(&c.9)?,
         downcast(&c.10)?,
     ];
     let gvals = [
-        downcast(&g.0)?, downcast(&g.1)?, downcast(&g.2)?, downcast(&g.3)?, downcast(&g.4)?,
-        downcast(&g.5)?, downcast(&g.6)?, downcast(&g.7)?, downcast(&g.8)?, downcast(&g.9)?,
+        downcast(&g.0)?,
+        downcast(&g.1)?,
+        downcast(&g.2)?,
+        downcast(&g.3)?,
+        downcast(&g.4)?,
+        downcast(&g.5)?,
+        downcast(&g.6)?,
+        downcast(&g.7)?,
+        downcast(&g.8)?,
+        downcast(&g.9)?,
         downcast(&g.10)?,
     ];
 
     for i in 0..labels.len() {
         let r = relerr(&cvals[i], &gvals[i]);
         let ma = maxabs(&cvals[i], &gvals[i]);
-        eprintln!("[vae] {:10} cpu-vs-wgpu relerr={r:.6} maxabs={ma:.6} n={}", labels[i], cvals[i].len());
+        eprintln!(
+            "[vae] {:10} cpu-vs-wgpu relerr={r:.6} maxabs={ma:.6} n={}",
+            labels[i],
+            cvals[i].len()
+        );
     }
 
     // Final 3-channel output: per-channel means (R,G,B) to detect green-zeroing.
@@ -424,7 +554,13 @@ struct CrossAttention {
     scale: f64,
 }
 impl CrossAttention {
-    fn new(vb: VarBuilder, query_dim: usize, context_dim: Option<usize>, heads: usize, dim_head: usize) -> Result<Self> {
+    fn new(
+        vb: VarBuilder,
+        query_dim: usize,
+        context_dim: Option<usize>,
+        heads: usize,
+        dim_head: usize,
+    ) -> Result<Self> {
         let inner_dim = dim_head * heads;
         let context_dim = context_dim.unwrap_or(query_dim);
         let scale = 1.0 / f64::sqrt(dim_head as f64);
@@ -432,7 +568,14 @@ impl CrossAttention {
         let to_k = candle_nn::linear_no_bias(context_dim, inner_dim, vb.pp("to_k"))?;
         let to_v = candle_nn::linear_no_bias(context_dim, inner_dim, vb.pp("to_v"))?;
         let to_out = linear(inner_dim, query_dim, vb.pp("to_out.0"))?;
-        Ok(Self { to_q, to_k, to_v, to_out, heads, scale })
+        Ok(Self {
+            to_q,
+            to_k,
+            to_v,
+            to_out,
+            heads,
+            scale,
+        })
     }
 
     fn reshape_heads_to_batch_dim(&self, xs: &Tensor) -> Result<Tensor> {
@@ -469,7 +612,11 @@ impl CrossAttention {
 
     // Trace: returns (q_h, k_h, v_h, scores, probs, attn_out_heads, out).
     #[allow(clippy::type_complexity)]
-    fn forward_trace(&self, xs: &Tensor, context: Option<&Tensor>) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    fn forward_trace(
+        &self,
+        xs: &Tensor,
+        context: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
         let query = self.to_q.forward(xs)?;
         let context = context.unwrap_or(xs).contiguous()?;
         let key = self.to_k.forward(&context)?;
@@ -484,7 +631,9 @@ impl CrossAttention {
         let scores = q32.matmul(&(k32.t()? * self.scale)?)?;
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let attn = probs.matmul(&v32)?.to_dtype(in_dtype)?;
-        let out = self.reshape_batch_dim_to_heads(&attn)?.apply(&self.to_out)?;
+        let out = self
+            .reshape_batch_dim_to_heads(&attn)?
+            .apply(&self.to_out)?;
         Ok((query, key, value, scores, probs, attn, out))
     }
 }
@@ -498,14 +647,27 @@ struct BasicTransformerBlock {
     norm3: candle_nn::LayerNorm,
 }
 impl BasicTransformerBlock {
-    fn new(vb: VarBuilder, dim: usize, n_heads: usize, d_head: usize, context_dim: Option<usize>) -> Result<Self> {
+    fn new(
+        vb: VarBuilder,
+        dim: usize,
+        n_heads: usize,
+        d_head: usize,
+        context_dim: Option<usize>,
+    ) -> Result<Self> {
         let attn1 = CrossAttention::new(vb.pp("attn1"), dim, None, n_heads, d_head)?;
         let ff = FeedForward::new(vb.pp("ff"), dim)?;
         let attn2 = CrossAttention::new(vb.pp("attn2"), dim, context_dim, n_heads, d_head)?;
         let norm1 = layer_norm(dim, 1e-5, vb.pp("norm1"))?;
         let norm2 = layer_norm(dim, 1e-5, vb.pp("norm2"))?;
         let norm3 = layer_norm(dim, 1e-5, vb.pp("norm3"))?;
-        Ok(Self { attn1, ff, attn2, norm1, norm2, norm3 })
+        Ok(Self {
+            attn1,
+            ff,
+            attn2,
+            norm1,
+            norm2,
+            norm3,
+        })
     }
     fn forward(&self, xs: &Tensor, context: Option<&Tensor>) -> Result<Tensor> {
         let xs = (self.attn1.forward(&self.norm1.forward(xs)?, None)? + xs)?;
@@ -521,15 +683,45 @@ struct SpatialTransformer {
     proj_out: Conv2d,
 }
 impl SpatialTransformer {
-    fn new(vb: VarBuilder, in_channels: usize, n_heads: usize, d_head: usize, context_dim: Option<usize>, num_groups: usize) -> Result<Self> {
+    fn new(
+        vb: VarBuilder,
+        in_channels: usize,
+        n_heads: usize,
+        d_head: usize,
+        context_dim: Option<usize>,
+        num_groups: usize,
+    ) -> Result<Self> {
         let inner_dim = n_heads * d_head;
         let norm = group_norm(num_groups, in_channels, 1e-6, vb.pp("norm"))?;
-        let proj_in = conv2d(in_channels, inner_dim, 1, Default::default(), vb.pp("proj_in"))?;
+        let proj_in = conv2d(
+            in_channels,
+            inner_dim,
+            1,
+            Default::default(),
+            vb.pp("proj_in"),
+        )?;
         let mut blocks = Vec::with_capacity(1);
-        let tb = BasicTransformerBlock::new(vb.pp("transformer_blocks.0"), inner_dim, n_heads, d_head, context_dim)?;
+        let tb = BasicTransformerBlock::new(
+            vb.pp("transformer_blocks.0"),
+            inner_dim,
+            n_heads,
+            d_head,
+            context_dim,
+        )?;
         blocks.push(tb);
-        let proj_out = conv2d(inner_dim, in_channels, 1, Default::default(), vb.pp("proj_out"))?;
-        Ok(Self { norm, proj_in, blocks, proj_out })
+        let proj_out = conv2d(
+            inner_dim,
+            in_channels,
+            1,
+            Default::default(),
+            vb.pp("proj_out"),
+        )?;
+        Ok(Self {
+            norm,
+            proj_in,
+            blocks,
+            proj_out,
+        })
     }
     fn forward(&self, xs: &Tensor, context: Option<&Tensor>) -> Result<Tensor> {
         let (batch, _channel, height, weight) = xs.dims4()?;
@@ -537,13 +729,18 @@ impl SpatialTransformer {
         let xs = self.norm.forward(xs)?;
         let xs = self.proj_in.forward(&xs)?;
         let inner_dim = xs.dim(1)?;
-        let xs = xs.transpose(1, 2)?.t()?.reshape((batch, height * weight, inner_dim))?;
+        let xs = xs
+            .transpose(1, 2)?
+            .t()?
+            .reshape((batch, height * weight, inner_dim))?;
         let mut xs = xs;
         for block in self.blocks.iter() {
             xs = block.forward(&xs, context)?;
         }
         let xs = self.proj_out.forward(
-            &xs.reshape((batch, height, weight, inner_dim))?.t()?.transpose(1, 2)?,
+            &xs.reshape((batch, height, weight, inner_dim))?
+                .t()?
+                .transpose(1, 2)?,
         )?;
         xs + residual
     }
@@ -567,24 +764,36 @@ fn unet_cross_attn_cpu_vs_wgpu() -> Result<()> {
     // Two shapes: mid-block (1280 ch, 8x8 latent => seq 64) and down0 (320 ch, 32x32 => seq 1024).
     for (name, prefix, in_ch, sp, n_ctx) in [
         ("mid", "mid_block.attentions.0", 1280usize, 8usize, 768usize),
-        ("down0", "down_blocks.0.attentions.0", 320usize, 32usize, 768usize),
+        (
+            "down0",
+            "down_blocks.0.attentions.0",
+            320usize,
+            32usize,
+            768usize,
+        ),
     ] {
         let cpu_vb = vb_from_path(&mp, DType::F32, &cpu)?;
         let wgpu_vb = vb_from_path(&mp, DType::F32, &wgpu)?;
         let n_heads = 8usize;
         let d_head = in_ch / n_heads;
-        let cpu_t = SpatialTransformer::new(cpu_vb.pp(prefix), in_ch, n_heads, d_head, Some(n_ctx), 32)?;
-        let wgpu_t = SpatialTransformer::new(wgpu_vb.pp(prefix), in_ch, n_heads, d_head, Some(n_ctx), 32)?;
+        let cpu_t =
+            SpatialTransformer::new(cpu_vb.pp(prefix), in_ch, n_heads, d_head, Some(n_ctx), 32)?;
+        let wgpu_t =
+            SpatialTransformer::new(wgpu_vb.pp(prefix), in_ch, n_heads, d_head, Some(n_ctx), 32)?;
 
         // deterministic hidden [1,in_ch,sp,sp] and context [1, 77, n_ctx]
         let n_hidden = in_ch * sp * sp;
         let hdata = lcg(777, n_hidden);
         let n_ctx_el = 77 * n_ctx;
         let cdata = lcg(888, n_ctx_el);
-        let hidden_cpu = Tensor::from_vec(hdata.clone(), [1, in_ch, sp, sp].as_slice(), &cpu)?.to_dtype(DType::F32)?;
-        let hidden_wgpu = Tensor::from_vec(hdata, [1, in_ch, sp, sp].as_slice(), &wgpu)?.to_dtype(DType::F32)?;
-        let ctx_cpu = Tensor::from_vec(cdata.clone(), [1, 77, n_ctx].as_slice(), &cpu)?.to_dtype(DType::F32)?;
-        let ctx_wgpu = Tensor::from_vec(cdata, [1, 77, n_ctx].as_slice(), &wgpu)?.to_dtype(DType::F32)?;
+        let hidden_cpu = Tensor::from_vec(hdata.clone(), [1, in_ch, sp, sp].as_slice(), &cpu)?
+            .to_dtype(DType::F32)?;
+        let hidden_wgpu =
+            Tensor::from_vec(hdata, [1, in_ch, sp, sp].as_slice(), &wgpu)?.to_dtype(DType::F32)?;
+        let ctx_cpu = Tensor::from_vec(cdata.clone(), [1, 77, n_ctx].as_slice(), &cpu)?
+            .to_dtype(DType::F32)?;
+        let ctx_wgpu =
+            Tensor::from_vec(cdata, [1, 77, n_ctx].as_slice(), &wgpu)?.to_dtype(DType::F32)?;
 
         let out_c = downcast(&cpu_t.forward(&hidden_cpu, Some(&ctx_cpu))?)?;
         let out_g = downcast(&wgpu_t.forward(&hidden_wgpu, Some(&ctx_wgpu))?)?;
@@ -626,14 +835,19 @@ fn xattn_mid_trace() -> Result<()> {
 
     let cpu_vb = vb_from_path(&mp, DType::F32, &cpu)?;
     let wgpu_vb = vb_from_path(&mp, DType::F32, &wgpu)?;
-    let cpu_t = SpatialTransformer::new(cpu_vb.pp(prefix), in_ch, n_heads, d_head, Some(n_ctx), 32)?;
-    let wgpu_t = SpatialTransformer::new(wgpu_vb.pp(prefix), in_ch, n_heads, d_head, Some(n_ctx), 32)?;
+    let cpu_t =
+        SpatialTransformer::new(cpu_vb.pp(prefix), in_ch, n_heads, d_head, Some(n_ctx), 32)?;
+    let wgpu_t =
+        SpatialTransformer::new(wgpu_vb.pp(prefix), in_ch, n_heads, d_head, Some(n_ctx), 32)?;
 
     let hdata = gauss(777, in_ch * sp * sp);
     let cdata = gauss(888, 77 * n_ctx);
-    let hidden_c = Tensor::from_vec(hdata.clone(), [1, in_ch, sp, sp].as_slice(), &cpu)?.to_dtype(DType::F32)?;
-    let ctx_c = Tensor::from_vec(cdata.clone(), [1, 77, n_ctx].as_slice(), &cpu)?.to_dtype(DType::F32)?;
-    let hidden_g = Tensor::from_vec(hdata, [1, in_ch, sp, sp].as_slice(), &wgpu)?.to_dtype(DType::F32)?;
+    let hidden_c = Tensor::from_vec(hdata.clone(), [1, in_ch, sp, sp].as_slice(), &cpu)?
+        .to_dtype(DType::F32)?;
+    let ctx_c =
+        Tensor::from_vec(cdata.clone(), [1, 77, n_ctx].as_slice(), &cpu)?.to_dtype(DType::F32)?;
+    let hidden_g =
+        Tensor::from_vec(hdata, [1, in_ch, sp, sp].as_slice(), &wgpu)?.to_dtype(DType::F32)?;
     let ctx_g = Tensor::from_vec(cdata, [1, 77, n_ctx].as_slice(), &wgpu)?.to_dtype(DType::F32)?;
 
     let c = trace_transformer(&cpu_t, &hidden_c, &ctx_c)?;
@@ -643,13 +857,21 @@ fn xattn_mid_trace() -> Result<()> {
         let (_, gv) = &g[i];
         let r = relerr(cv, gv);
         let ma = maxabs(cv, gv);
-        eprintln!("[trace] {:16} cpu-vs-wgpu relerr={r:.6} maxabs={ma:.6} n={}", name, cv.len());
+        eprintln!(
+            "[trace] {:16} cpu-vs-wgpu relerr={r:.6} maxabs={ma:.6} n={}",
+            name,
+            cv.len()
+        );
     }
     Ok(())
 }
 
 #[allow(clippy::type_complexity)]
-fn trace_transformer(st: &SpatialTransformer, hidden: &Tensor, ctx: &Tensor) -> Result<Vec<(String, Vec<f32>)>> {
+fn trace_transformer(
+    st: &SpatialTransformer,
+    hidden: &Tensor,
+    ctx: &Tensor,
+) -> Result<Vec<(String, Vec<f32>)>> {
     let mut out = Vec::new();
     let (batch, _ch, h, w) = hidden.dims4()?;
     let t_norm = st.norm.forward(hidden)?;
@@ -657,7 +879,10 @@ fn trace_transformer(st: &SpatialTransformer, hidden: &Tensor, ctx: &Tensor) -> 
     let t_pi = st.proj_in.forward(&t_norm)?;
     out.push(("proj_in(conv1)".into(), downcast(&t_pi)?));
     let inner_dim = t_pi.dim(1)?;
-    let t_rs = t_pi.transpose(1, 2)?.t()?.reshape((batch, h * w, inner_dim))?;
+    let t_rs = t_pi
+        .transpose(1, 2)?
+        .t()?
+        .reshape((batch, h * w, inner_dim))?;
     out.push(("reshape(seq,dim)".into(), downcast(&t_rs)?));
 
     let blk = &st.blocks[0];
@@ -693,7 +918,10 @@ fn trace_transformer(st: &SpatialTransformer, hidden: &Tensor, ctx: &Tensor) -> 
     let xs3 = (&ff + &xs2)?;
     out.push(("res3".into(), downcast(&xs3)?));
 
-    let t_po = xs3.reshape((batch, h, w, inner_dim))?.t()?.transpose(1, 2)?;
+    let t_po = xs3
+        .reshape((batch, h, w, inner_dim))?
+        .t()?
+        .transpose(1, 2)?;
     let t_po2 = st.proj_out.forward(&t_po)?;
     out.push(("proj_out(conv1)".into(), downcast(&t_po2)?));
     let fin = (&t_po2 + hidden)?;
@@ -726,15 +954,20 @@ fn xattn_mid_determinism() -> Result<()> {
 
     let cpu_vb = vb_from_path(&mp, DType::F32, &cpu)?;
     let wgpu_vb = vb_from_path(&mp, DType::F32, &wgpu)?;
-    let cpu_t = SpatialTransformer::new(cpu_vb.pp(prefix), in_ch, n_heads, d_head, Some(n_ctx), 32)?;
-    let wgpu_t = SpatialTransformer::new(wgpu_vb.pp(prefix), in_ch, n_heads, d_head, Some(n_ctx), 32)?;
+    let cpu_t =
+        SpatialTransformer::new(cpu_vb.pp(prefix), in_ch, n_heads, d_head, Some(n_ctx), 32)?;
+    let wgpu_t =
+        SpatialTransformer::new(wgpu_vb.pp(prefix), in_ch, n_heads, d_head, Some(n_ctx), 32)?;
 
     // gaussian (sane) inputs
     let hdata = gauss(1234, in_ch * sp * sp);
     let cdata = gauss(5678, 77 * n_ctx);
-    let hidden_c = Tensor::from_vec(hdata.clone(), [1, in_ch, sp, sp].as_slice(), &cpu)?.to_dtype(DType::F32)?;
-    let ctx_c = Tensor::from_vec(cdata.clone(), [1, 77, n_ctx].as_slice(), &cpu)?.to_dtype(DType::F32)?;
-    let hidden_g = Tensor::from_vec(hdata, [1, in_ch, sp, sp].as_slice(), &wgpu)?.to_dtype(DType::F32)?;
+    let hidden_c = Tensor::from_vec(hdata.clone(), [1, in_ch, sp, sp].as_slice(), &cpu)?
+        .to_dtype(DType::F32)?;
+    let ctx_c =
+        Tensor::from_vec(cdata.clone(), [1, 77, n_ctx].as_slice(), &cpu)?.to_dtype(DType::F32)?;
+    let hidden_g =
+        Tensor::from_vec(hdata, [1, in_ch, sp, sp].as_slice(), &wgpu)?.to_dtype(DType::F32)?;
     let ctx_g = Tensor::from_vec(cdata, [1, 77, n_ctx].as_slice(), &wgpu)?.to_dtype(DType::F32)?;
 
     let out_c = downcast(&cpu_t.forward(&hidden_c, Some(&ctx_c))?)?;
@@ -745,7 +978,10 @@ fn xattn_mid_determinism() -> Result<()> {
     let ma = maxabs(&out_c, &out_g1);
     eprintln!("[det] gaussian mid cpu-vs-wgpu relerr={r:.6} maxabs={ma:.6} | wgpu run-run maxabs={det:.6}");
     // If a real kernel bug: wgpu deterministic (run-run ~0) but cpu-vs-wgpu wrong (large).
-    eprintln!("[det] => wgpu deterministic={} (run-run), cpu-vs-wgpu divergence shown above", det < 1e-5f32);
+    eprintln!(
+        "[det] => wgpu deterministic={} (run-run), cpu-vs-wgpu divergence shown above",
+        det < 1e-5f32
+    );
     Ok(())
 }
 
@@ -774,7 +1010,8 @@ fn xattn_reshape_probe() -> Result<()> {
     let wgpu_attn = CrossAttention::new(wgpu_vb.pp(prefix).pp("attn1"), 1280, None, 8, 160)?;
 
     let dat = gauss(42, 64 * 1280);
-    let x_c = Tensor::from_vec(dat.clone(), [1, 64, 1280].as_slice(), &cpu)?.to_dtype(DType::F32)?;
+    let x_c =
+        Tensor::from_vec(dat.clone(), [1, 64, 1280].as_slice(), &cpu)?.to_dtype(DType::F32)?;
     let x_g = Tensor::from_vec(dat, [1, 64, 1280].as_slice(), &wgpu)?.to_dtype(DType::F32)?;
 
     // pre-reshape (to_q linear output)
@@ -782,24 +1019,38 @@ fn xattn_reshape_probe() -> Result<()> {
     let q_pre_g = wgpu_attn.to_q.forward(&x_g)?;
     let cpre = downcast(&q_pre_c)?;
     let gpre = downcast(&q_pre_g)?;
-    eprintln!("[probe] to_q(pre-reshape)  cpu-vs-wgpu relerr={:.6} maxabs={:.6}", relerr(&cpre, &gpre), maxabs(&cpre, &gpre));
+    eprintln!(
+        "[probe] to_q(pre-reshape)  cpu-vs-wgpu relerr={:.6} maxabs={:.6}",
+        relerr(&cpre, &gpre),
+        maxabs(&cpre, &gpre)
+    );
 
     // post-reshape (reshape_heads_to_batch_dim)
     let q_post_c = cpu_attn.reshape_heads_to_batch_dim(&q_pre_c)?;
     let q_post_g = wgpu_attn.reshape_heads_to_batch_dim(&q_pre_g)?;
     let cpost = downcast(&q_post_c)?;
     let gpost = downcast(&q_post_g)?;
-    eprintln!("[probe] to_q(post-reshape) cpu-vs-wgpu relerr={:.6} maxabs={:.6}", relerr(&cpost, &gpost), maxabs(&cpost, &gpost));
+    eprintln!(
+        "[probe] to_q(post-reshape) cpu-vs-wgpu relerr={:.6} maxabs={:.6}",
+        relerr(&cpost, &gpost),
+        maxabs(&cpost, &gpost)
+    );
 
     // Also test the reshape sequence applied to a CONTIGUOUS gaussian tensor directly
     // (isolates transpose+reshape from any matmul).
-    let raw = Tensor::from_vec(gauss(99, 64 * 1280), [1, 64, 1280].as_slice(), &cpu)?.to_dtype(DType::F32)?;
-    let raw_g = Tensor::from_vec(gauss(99, 64 * 1280), [1, 64, 1280].as_slice(), &wgpu)?.to_dtype(DType::F32)?;
+    let raw = Tensor::from_vec(gauss(99, 64 * 1280), [1, 64, 1280].as_slice(), &cpu)?
+        .to_dtype(DType::F32)?;
+    let raw_g = Tensor::from_vec(gauss(99, 64 * 1280), [1, 64, 1280].as_slice(), &wgpu)?
+        .to_dtype(DType::F32)?;
     let rs_c = cpu_attn.reshape_heads_to_batch_dim(&raw)?;
     let rs_g = wgpu_attn.reshape_heads_to_batch_dim(&raw_g)?;
     let crs = downcast(&rs_c)?;
     let grs = downcast(&rs_g)?;
-    eprintln!("[probe] reshape(Tensor raw) cpu-vs-wgpu relerr={:.6} maxabs={:.6}", relerr(&crs, &grs), maxabs(&crs, &grs));
+    eprintln!(
+        "[probe] reshape(Tensor raw) cpu-vs-wgpu relerr={:.6} maxabs={:.6}",
+        relerr(&crs, &grs),
+        maxabs(&crs, &grs)
+    );
     Ok(())
 }
 
@@ -835,8 +1086,6 @@ fn matmul_kernel_probe() -> Result<()> {
     Ok(())
 }
 
-
-
 // Regression (Worker-F4): the wgpu seeded RNG (randn/rand_uniform) must produce
 // a correct distribution. splitmix64 constants were lo/hi SWAPPED and u64_mul
 // was broken, biasing randn to mean~-0.67/std~0.33 (all-negative compressed)
@@ -854,9 +1103,19 @@ fn wgpu_rng_distribution() -> Result<()> {
     let un = downcast(&un)?;
     let um: f32 = un.iter().sum::<f32>() / n as f32;
     let usd: f32 = (un.iter().map(|v| v * v).sum::<f32>() / n as f32 - um * um).sqrt();
-    eprintln!("[rng] rand_uniform mean={um:.4} std={usd:.4} (expect mean~0.5 std~0.2887) min={} max={}", un.iter().copied().fold(f32::INFINITY, f32::min), un.iter().copied().fold(f32::NEG_INFINITY, f32::max));
-    assert!((um - 0.5).abs() < 0.02, "[rng] rand_uniform mean={um:.4} != ~0.5 (biased RNG)");
-    assert!((usd - 0.2887).abs() < 0.02, "[rng] rand_uniform std={usd:.4} != ~0.2887");
+    eprintln!(
+        "[rng] rand_uniform mean={um:.4} std={usd:.4} (expect mean~0.5 std~0.2887) min={} max={}",
+        un.iter().copied().fold(f32::INFINITY, f32::min),
+        un.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+    );
+    assert!(
+        (um - 0.5).abs() < 0.02,
+        "[rng] rand_uniform mean={um:.4} != ~0.5 (biased RNG)"
+    );
+    assert!(
+        (usd - 0.2887).abs() < 0.02,
+        "[rng] rand_uniform std={usd:.4} != ~0.2887"
+    );
 
     wgpu.set_seed(12345)?;
     let rn = Tensor::randn(0f64, 1f64, n, &wgpu)?;
@@ -865,11 +1124,22 @@ fn wgpu_rng_distribution() -> Result<()> {
     let rsd: f32 = (rn.iter().map(|v| v * v).sum::<f32>() / n as f32 - rm * rm).sqrt();
     let rmin = rn.iter().copied().fold(f32::INFINITY, f32::min);
     let rmax = rn.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    eprintln!("[rng] randn mean={rm:.4} std={rsd:.4} (expect mean~0 std~1) min={rmin:.3} max={rmax:.3}");
-    assert!(rm.abs() < 0.02, "[rng] randn mean={rm:.4} != ~0 (biased RNG)");
+    eprintln!(
+        "[rng] randn mean={rm:.4} std={rsd:.4} (expect mean~0 std~1) min={rmin:.3} max={rmax:.3}"
+    );
+    assert!(
+        rm.abs() < 0.02,
+        "[rng] randn mean={rm:.4} != ~0 (biased RNG)"
+    );
     assert!((rsd - 1.0).abs() < 0.05, "[rng] randn std={rsd:.4} != ~1");
     // Fully-correct randn must have both signs present and a wide spread.
-    assert!(rmin < -3.0 && rmax > 3.0, "[rng] randn range [{rmin:.3},{rmax:.3}] suspiciously narrow (compressed)");
-    assert!(rn.iter().any(|&v| v > 0.0) && rn.iter().any(|&v| v < 0.0), "[rng] randn has no sign mix (all one sign = biased)");
+    assert!(
+        rmin < -3.0 && rmax > 3.0,
+        "[rng] randn range [{rmin:.3},{rmax:.3}] suspiciously narrow (compressed)"
+    );
+    assert!(
+        rn.iter().any(|&v| v > 0.0) && rn.iter().any(|&v| v < 0.0),
+        "[rng] randn has no sign mix (all one sign = biased)"
+    );
     Ok(())
 }

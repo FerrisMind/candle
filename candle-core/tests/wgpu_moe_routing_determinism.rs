@@ -18,7 +18,7 @@
 //! exact same comparator, so an in-process correctness drift is caught too.
 #![cfg(feature = "wgpu")]
 
-use candle_core::{D, Device, Result, Tensor};
+use candle_core::{Device, Result, Tensor, D};
 
 const N_EXPERTS: usize = 64;
 const TOP_K: usize = 8;
