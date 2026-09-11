@@ -10049,8 +10049,14 @@ let spirv = candle_vulkan_kernels::spirv(spirv_name)
                 ]
             }
         } else {
+            // L63 fix: 128 threads (4 warps). mul_mm.comp splits a workgroup
+            // into warp_r = warp_i % (BM / WM) and warp_c = warp_i / (BM / WM)
+            // warps; with BM=64/BN=64/WM=32/WN=32 a full 64x64 tile needs
+            // 2x2=4 warps. 64 threads gave warp_c == 0 for every invocation,
+            // so only rows [0, WN) of each BN=64 tile were computed and the
+            // remaining rows kept their zero-initialized dst values.
             [
-                (0, 64),
+                (0, 128),
                 (1, 64),
                 (2, 64),
                 (4, 32),
@@ -10065,7 +10071,16 @@ let spirv = candle_vulkan_kernels::spirv(spirv_name)
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
-            (n.try_into()?, input_m.try_into()?, batch_count.try_into()?),
+            // Tile-based dispatch: mul_mm maps gl_WorkGroupID.x -> ir (M tiles
+            // of BM=64) and .y -> ic (N tiles of BN=64); dispatching raw
+            // n/input_m oversubscribed x by ~64x: ik >= 1 workgroups have an
+            // empty K loop and write zeros at ik*batch_stride_d offsets,
+            // out of bounds past dst.
+            (
+                n.div_ceil(64).try_into()?,
+                input_m.div_ceil(64).try_into()?,
+                batch_count.try_into()?,
+            ),
             Some(&spec),
         )?;
         drop(src_contiguous);
