@@ -13582,12 +13582,23 @@ struct Params {{
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
 @compute @workgroup_size({WG_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    if (gid.x >= params.ne) {{ return; }}
-    let word = src[gid.x / 2u];
-    let half_idx = gid.x % 2u;
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {{
+    // Fold the 2D dispatch back to a linear thread index: `run_compute` splits
+    // workgroup counts above `max_compute_workgroups_per_dimension` (65535) into
+    // (wg_x, wg_y). Indexing by `global_invocation_id.x` alone re-decodes the
+    // first wg_x*WG_SIZE elements for every wg_y row and leaves the rest of dst
+    // as uninitialized bytes (silent corruption for GGUF float blobs with more
+    // than 65535*256 elements, e.g. a 151676x1024 BF16 embed_tokens weight).
+    let linear = (wid.x + wid.y * num_wg.x) * {WG_SIZE}u + lid.x;
+    if (linear >= params.ne) {{ return; }}
+    let word = src[linear / 2u];
+    let half_idx = linear % 2u;
     let half_bits = (word >> (16u * half_idx)) & 0xffffu;
-    dst[gid.x] = {decode};
+    dst[linear] = {decode};
 }}
 "#
         );
