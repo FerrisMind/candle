@@ -4,6 +4,8 @@ debug/
 data/
 dist/
 target/
+# Custom CARGO_TARGET_DIR (e.g. target-l64 for ASCII-path CUDA builds).
+/target-*/
 
 # Remove Cargo.lock from gitignore if creating an executable, leave it for libraries
 # More information here https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html
