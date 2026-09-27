@@ -34,21 +34,9 @@
 
 **CPU** and **CUDA** backends are kept in direct sync with [huggingface/candle](https://github.com/huggingface/candle) `main`. Nothing from those upstream backends has been removed; this fork only adds Vulkan and WGPU on top.
 
-## Upstream correspondence
-
-| Fork ([FerrisMind/candle](https://github.com/FerrisMind/candle)) | Upstream ([huggingface/candle](https://github.com/huggingface/candle)) |
-|------------------------------------------------------------------|------------------------------------------------------------------------|
-| Branch `wgpu/vulkan` | `main` |
-| Fork crates **0.1.0** (`candle-core` / `candle-nn` / `candle-transformers` / `candle-examples` / `candle-*-kernels` for Vulkan & WGPU); unchanged crates stay **0.11.0** | Candle **0.11.0** |
-| Last CPU/CUDA sync [`b3e5b40f`](https://github.com/FerrisMind/candle/commit/b3e5b40f) (2026-08-17) | Tip [`162b59b9`](https://github.com/FerrisMind/candle/commit/162b59b9) (#3892) |
-| Fork-only | Native **Vulkan** + **WGPU / WebGPU** |
-
-CPU and CUDA stay in sync with upstream `main` (nothing removed). Vulkan and WGPU exist only in this fork.
-
 ## Table of Contents
 
 - [Platform matrix](#platform-matrix)
-- [Upstream correspondence](#upstream-correspondence)
 - [What is this?](#what-is-this)
 - [Key Features](#key-features)
 - [Repository Layout](#repository-layout)

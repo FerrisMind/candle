@@ -34,21 +34,9 @@
 
 Бэкенды **CPU** и **CUDA** синхронизируются напрямую с [huggingface/candle](https://github.com/huggingface/candle) `main`. Из них ничего не удалено; этот форк только добавляет Vulkan и WGPU поверх upstream.
 
-## Соответствие upstream
-
-| Форк ([FerrisMind/candle](https://github.com/FerrisMind/candle)) | Upstream ([huggingface/candle](https://github.com/huggingface/candle)) |
-|------------------------------------------------------------------|------------------------------------------------------------------------|
-| Ветка `wgpu/vulkan` | `main` |
-| Крейты форка **0.1.0** (`candle-core` / `candle-nn` / `candle-transformers` / `candle-examples` / `candle-*-kernels` для Vulkan и WGPU); без изменений — **0.11.0** | Candle **0.11.0** |
-| Последний sync CPU/CUDA [`b3e5b40f`](https://github.com/FerrisMind/candle/commit/b3e5b40f) (2026-08-17) | Tip [`162b59b9`](https://github.com/FerrisMind/candle/commit/162b59b9) (#3892) |
-| Только в форке | Native **Vulkan** + **WGPU / WebGPU** |
-
-CPU и CUDA синхронизируются с upstream `main` (ничего не удалено). Vulkan и WGPU есть только в этом форке.
-
 ## Содержание
 
 - [Матрица платформ](#матрица-платформ)
-- [Соответствие upstream](#соответствие-upstream)
 - [Что это?](#что-это)
 - [Ключевые возможности](#ключевые-возможности)
 - [Структура репозитория](#структура-репозитория)
