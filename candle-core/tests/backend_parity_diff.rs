@@ -27,7 +27,7 @@ mod support;
 use candle_core::test_utils::{
     compare_f32_slices, compare_f64_slices, compare_int_slices, diff_tolerance, is_integer_dtype,
 };
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Storage, Tensor};
 use std::collections::BTreeMap;
 use std::fmt::Write;
 

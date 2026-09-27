@@ -1,5 +1,8 @@
 mod support;
 
+use candle_core::{DType, Result, Tensor};
+use support::{assert_tensors_close, native_required, TestBackend};
+
 #[cfg(feature = "wgpu")]
 #[test]
 #[ignore = "requires a usable wgpu adapter and driver"]

@@ -3,6 +3,7 @@
 mod support;
 
 use candle_core::{DType, Device, Result, Tensor};
+use support::{native_required, TestBackend};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
