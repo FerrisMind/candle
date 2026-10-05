@@ -3,7 +3,6 @@
 
 #[cfg(any(feature = "wgpu", feature = "vulkan"))]
 use candle::backend::BackendStorage;
-use candle::backend::BackendDevice;
 use candle::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
 use rayon::prelude::*;
 
@@ -1099,8 +1098,6 @@ impl Module for Identity {
     }
 }
 
-#[allow(dead_code)]
-
 /// Fused Linear forward (MUL_MAT_ADD): `x @ w_t + bias` in one dispatch.
 /// Only the vulkan backend fuses it (bias-epilogue matmul kernel); every
 /// other backend uses the plain unfused form.
@@ -1129,9 +1126,7 @@ pub fn mul_mat_add(x: &Tensor, w_t: &Tensor, bias: &Tensor) -> Result<Tensor> {
     }
     let batch = x.dim(0)?;
     let (k, n) = (w_t.dim(0)?, w_t.dim(1)?);
-    let w_t = w_t
-        .unsqueeze(0)?
-        .broadcast_as(Shape::from((batch, k, n)))?;
+    let w_t = w_t.unsqueeze(0)?.broadcast_as(Shape::from((batch, k, n)))?;
     x.apply_op3_no_bwd(&w_t, bias, &MulMatAdd)
 }
 
@@ -1141,9 +1136,7 @@ pub fn mul_mat_add(x: &Tensor, w_t: &Tensor, bias: &Tensor) -> Result<Tensor> {
 pub fn mul_mat_add_forced(x: &Tensor, w_t: &Tensor, bias: &Tensor) -> Result<Tensor> {
     let batch = x.dim(0)?;
     let (k, n) = (w_t.dim(0)?, w_t.dim(1)?);
-    let w_t = w_t
-        .unsqueeze(0)?
-        .broadcast_as(Shape::from((batch, k, n)))?;
+    let w_t = w_t.unsqueeze(0)?.broadcast_as(Shape::from((batch, k, n)))?;
     x.apply_op3_no_bwd(&w_t, bias, &MulMatAdd)
 }
 
@@ -1175,7 +1168,7 @@ impl candle::CustomOp3 for MulMatAdd {
         w: &candle::VulkanStorage,
         w_l: &Layout,
         b: &candle::VulkanStorage,
-        b_l: &Layout,
+        _b_l: &Layout,
     ) -> Result<(candle::VulkanStorage, Shape)> {
         let x_dims = x_l.dims();
         let (batch, m, k) = (x_dims[0], x_dims[1], x_dims[2]);
@@ -1222,11 +1215,15 @@ pub fn layernorm_rope_fused(
         candle::bail!("layernorm_rope_fused: unsupported layout/device for the fused kernel");
     }
     let gamma_beta = Tensor::cat(&[weight, bias], 0)?;
-    x.apply_op3_no_bwd(cos, sin, &LayerNormRope {
-        gamma_beta,
-        eps,
-        apply_norm: true,
-    })
+    x.apply_op3_no_bwd(
+        cos,
+        sin,
+        &LayerNormRope {
+            gamma_beta,
+            eps,
+            apply_norm: true,
+        },
+    )
 }
 
 /// RoPE-only variant of the fused kernel (no norm), for sites that rope an
@@ -1243,11 +1240,15 @@ pub fn rope_fused(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     }
     // The kernel never reads the gamma/beta binding when apply_norm == 0;
     // bind the (always-present, correctly typed) cos table in its place.
-    x.apply_op3_no_bwd(cos, sin, &LayerNormRope {
-        gamma_beta: cos.clone(),
-        eps: 0.0,
-        apply_norm: false,
-    })
+    x.apply_op3_no_bwd(
+        cos,
+        sin,
+        &LayerNormRope {
+            gamma_beta: cos.clone(),
+            eps: 0.0,
+            apply_norm: false,
+        },
+    )
 }
 
 fn tables_match(x: &Tensor, cos: &Tensor, sin: &Tensor, head_dim: usize) -> Result<bool> {
@@ -1290,9 +1291,9 @@ impl candle::CustomOp3 for LayerNormRope {
         x: &candle::VulkanStorage,
         x_l: &Layout,
         cos: &candle::VulkanStorage,
-        cos_l: &Layout,
+        _cos_l: &Layout,
         sin: &candle::VulkanStorage,
-        sin_l: &Layout,
+        _sin_l: &Layout,
     ) -> Result<(candle::VulkanStorage, Shape)> {
         let (gb_storage, _gb_layout) = self.gamma_beta.storage_and_layout();
         let gb = match &*gb_storage {
@@ -1309,9 +1310,9 @@ impl candle::CustomOp3 for LayerNormRope {
         x: &candle::WgpuStorage,
         x_l: &Layout,
         cos: &candle::WgpuStorage,
-        cos_l: &Layout,
+        _cos_l: &Layout,
         sin: &candle::WgpuStorage,
-        sin_l: &Layout,
+        _sin_l: &Layout,
     ) -> Result<(candle::WgpuStorage, Shape)> {
         let (gb_storage, _gb_layout) = self.gamma_beta.storage_and_layout();
         let gb = match &*gb_storage {
@@ -1344,7 +1345,13 @@ impl candle::CustomOp3 for Sdpa {
         _s3: &CpuStorage,
         _l3: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
-        candle::bail!("SDPA has no cpu impl")
+        candle::bail!(
+            "SDPA has no cpu impl (scale={}, softcapping={}, mask={}, causal={})",
+            self.scale,
+            self.softcapping,
+            self.mask.is_some(),
+            self.do_causal
+        )
     }
 
     #[cfg(feature = "metal")]
@@ -1606,8 +1613,27 @@ impl candle::CustomOp3 for Sdpa {
     ) -> Result<(candle::VulkanStorage, Shape)> {
         let out_dims = vec![q_l.dim(0)?, q_l.dim(1)?, q_l.dim(2)?, v_l.dim(3)?];
         let q_dtype = q.dtype();
-        let out =
-            candle::VulkanStorage::flash_attn(q, q_l, k, k_l, v, v_l, self.scale, self.do_causal)?;
+        if let Some(mask) = &self.mask {
+            candle::bail!(
+                "fused vulkan sdpa has no additive-mask kernel; `sdpa()` applies masks via the unfused GPU path (mask shape {:?})",
+                mask.shape()
+            );
+        }
+        let softcap = (self.softcapping != 1.0).then_some(self.softcapping);
+        let out = candle::VulkanStorage::flash_attn_ext(
+            q,
+            q_l,
+            k,
+            k_l,
+            v,
+            v_l,
+            None,
+            None,
+            None,
+            softcap,
+            self.scale,
+            self.do_causal,
+        )?;
         // Cast back to input dtype if needed (flash_attn always outputs F32)
         let out = if out.dtype() != q_dtype {
             let out_l = candle::Layout::contiguous(candle::Shape::from_dims(&out_dims));
@@ -1630,8 +1656,27 @@ impl candle::CustomOp3 for Sdpa {
     ) -> Result<(candle::WgpuStorage, Shape)> {
         let out_dims = vec![q_l.dim(0)?, q_l.dim(1)?, q_l.dim(2)?, v_l.dim(3)?];
         let q_dtype = q.dtype();
-        let out =
-            candle::WgpuStorage::flash_attn(q, q_l, k, k_l, v, v_l, self.scale, self.do_causal)?;
+        if let Some(mask) = &self.mask {
+            candle::bail!(
+                "fused wgpu sdpa has no additive-mask kernel; `sdpa()` applies masks via the unfused GPU path (mask shape {:?})",
+                mask.shape()
+            );
+        }
+        let softcap = (self.softcapping != 1.0).then_some(self.softcapping);
+        let out = candle::WgpuStorage::flash_attn_ext(
+            q,
+            q_l,
+            k,
+            k_l,
+            v,
+            v_l,
+            None,
+            None,
+            None,
+            softcap,
+            self.scale,
+            self.do_causal,
+        )?;
         // Cast back to input dtype if needed (flash_attn always outputs F32)
         let out = if out.dtype() != q_dtype {
             let out_l = candle::Layout::contiguous(candle::Shape::from_dims(&out_dims));
@@ -1795,7 +1840,7 @@ pub fn sdpa(
     scale: f32,
     softcapping: f32,
 ) -> Result<Tensor> {
-    if q.device().is_metal() || q.device().is_vulkan() || q.device().is_wgpu() {
+    if q.device().is_metal() {
         return q.apply_op3_no_bwd(
             k,
             v,
@@ -1803,6 +1848,20 @@ pub fn sdpa(
                 scale,
                 softcapping,
                 mask: mask.cloned(),
+                do_causal,
+            },
+        );
+    }
+    // Additive mask is not a fused flash-attn buffer on vulkan/wgpu. The
+    // unfused path is ordinary GPU tensor ops (matmul / add / softmax).
+    if (q.device().is_vulkan() || q.device().is_wgpu()) && mask.is_none() {
+        return q.apply_op3_no_bwd(
+            k,
+            v,
+            &Sdpa {
+                scale,
+                softcapping,
+                mask: None,
                 do_causal,
             },
         );
@@ -1913,17 +1972,21 @@ mod mul_mat_add_tests {
         // breaks the unaligned cm1 bias epilogue.
         for (batch, m, k, n) in [
             (1usize, 64usize, 128usize, 256usize), // all aligned (was green)
-            (1, 40, 96, 130), // all unaligned
-            (1, 64, 128, 130), // n-edge only (candle M unaligned)
-            (1, 40, 128, 256), // m-edge only (candle N unaligned)
-            (1, 64, 96, 256), // k-edge only
-            (3, 64, 128, 256), // batch only
+            (1, 40, 96, 130),                      // all unaligned
+            (1, 64, 128, 130),                     // n-edge only (candle M unaligned)
+            (1, 40, 128, 256),                     // m-edge only (candle N unaligned)
+            (1, 64, 96, 256),                      // k-edge only
+            (3, 64, 128, 256),                     // batch only
         ] {
             let xs = (0..batch * m * k)
                 .map(|v| (v % 17) as f32 * 0.13 - 1.0)
                 .collect::<Vec<_>>();
-            let w = (0..k * n).map(|v| (v % 23) as f32 * 0.07 - 0.8).collect::<Vec<_>>();
-            let bias = (0..n).map(|v| (v % 11) as f32 * 0.21 - 0.9).collect::<Vec<_>>();
+            let w = (0..k * n)
+                .map(|v| (v % 23) as f32 * 0.07 - 0.8)
+                .collect::<Vec<_>>();
+            let bias = (0..n)
+                .map(|v| (v % 11) as f32 * 0.21 - 0.9)
+                .collect::<Vec<_>>();
             let xs_t = Tensor::from_vec(xs.clone(), (batch, m, k), &dev_cpu)?;
             let w_t = Tensor::from_vec(w.clone(), (k, n), &dev_cpu)?;
             let b_t = Tensor::from_vec(bias.clone(), (n,), &dev_cpu)?;
@@ -1964,7 +2027,10 @@ mod mul_mat_add_tests {
                     shown += 1;
                 }
             }
-            println!("SHAPE batch={batch} m={m} k={k} n={n}: max diff {diff:.6} {}", if diff < 2e-3 {"OK"} else {"FAIL"});
+            println!(
+                "SHAPE batch={batch} m={m} k={k} n={n}: max diff {diff:.6} {}",
+                if diff < 2e-3 { "OK" } else { "FAIL" }
+            );
             // Full map of bias-only positions (got == bias[col] exactly):
             // reveals which tile/batch/row/col region lost its matmul part.
             let mut bias_only = 0usize;
@@ -1983,9 +2049,7 @@ mod mul_mat_add_tests {
                 }
             }
             if bias_only > 0 {
-                println!(
-                    "bias-only count={bias_only} first={first:?} last={last:?}"
-                );
+                println!("bias-only count={bias_only} first={first:?} last={last:?}");
             }
             worst = worst.max(diff);
         }
@@ -1997,8 +2061,8 @@ mod mul_mat_add_tests {
 #[cfg(all(test, any(feature = "vulkan", feature = "wgpu")))]
 mod layernorm_rope_tests {
     use super::{layernorm_rope_fused, rope_fused};
-    use candle::{DType, Device, Tensor, D};
     use candle::IndexOp;
+    use candle::{DType, Device, Tensor, D};
 
     fn rope_reference(y: &Tensor, cos: &Tensor, sin: &Tensor) -> candle::Result<Tensor> {
         let d = y.dim(D::Minus1)?;
@@ -2009,7 +2073,8 @@ mod layernorm_rope_tests {
         let x2 = y.i((.., .., .., (half + quarter)..))?;
         let x1 = y.i((.., .., .., half..(half + quarter)))?;
         let partner = Tensor::cat(&[&y2, &y1, &x2, &x1], D::Minus1)?;
-        y.broadcast_mul(cos)?.broadcast_add(&partner.broadcast_mul(sin)?)
+        y.broadcast_mul(cos)?
+            .broadcast_add(&partner.broadcast_mul(sin)?)
     }
 
     fn ln_reference(
@@ -2036,7 +2101,9 @@ mod layernorm_rope_tests {
         let q_view = qkv.transpose(1, 3)?.i((.., .., 0))?;
         assert!(!q_view.is_contiguous());
 
-        let w = (0..d).map(|v| (v % 7) as f32 * 0.2 - 0.5).collect::<Vec<_>>();
+        let w = (0..d)
+            .map(|v| (v % 7) as f32 * 0.2 - 0.5)
+            .collect::<Vec<_>>();
         let btab = (0..d)
             .map(|v| (v % 5) as f32 * 0.15 - 0.3)
             .collect::<Vec<_>>();
@@ -2078,7 +2145,11 @@ mod layernorm_rope_tests {
         let diff_rope = fused_rope
             .to_device(&Device::Cpu)?
             .to_dtype(DType::F32)?
-            .sub(&reference_rope.to_device(&Device::Cpu)?.to_dtype(DType::F32)?)?
+            .sub(
+                &reference_rope
+                    .to_device(&Device::Cpu)?
+                    .to_dtype(DType::F32)?,
+            )?
             .abs()?
             .flatten_all()?
             .max(0)?
