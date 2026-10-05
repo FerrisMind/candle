@@ -211,7 +211,6 @@ struct RopeLayerNormParams {
     _pad: u32,
 }
 
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VulkanWhereU8Params {
@@ -866,19 +865,71 @@ pub struct VulkanCpuProfilePhase {
 
 pub static VULKAN_CPU_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 pub static VULKAN_CPU_PROFILE_PHASES: [VulkanCpuProfilePhase; 13] = [
-    VulkanCpuProfilePhase { name: "transfer_deps", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
-    VulkanCpuProfilePhase { name: "cleanup_amortized", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
-    VulkanCpuProfilePhase { name: "pipeline_lookup", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
-    VulkanCpuProfilePhase { name: "batch_capacity", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
-    VulkanCpuProfilePhase { name: "descriptor_set", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
-    VulkanCpuProfilePhase { name: "cmd_record", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
-    VulkanCpuProfilePhase { name: "alloc_uninit", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
-    VulkanCpuProfilePhase { name: "alloc_pool_hit", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
-    VulkanCpuProfilePhase { name: "alloc_allocator", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
-    VulkanCpuProfilePhase { name: "dispatch_total", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
-    VulkanCpuProfilePhase { name: "flush_submit", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
-    VulkanCpuProfilePhase { name: "flush_drain", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
-    VulkanCpuProfilePhase { name: "flush_rest", nanos: AtomicU64::new(0), count: AtomicU64::new(0) },
+    VulkanCpuProfilePhase {
+        name: "transfer_deps",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "cleanup_amortized",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "pipeline_lookup",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "batch_capacity",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "descriptor_set",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "cmd_record",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_uninit",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_pool_hit",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_allocator",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "dispatch_total",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "flush_submit",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "flush_drain",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "flush_rest",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
 ];
 
 fn cpu_phase_index(name: &str) -> usize {
@@ -891,13 +942,18 @@ fn cpu_phase_index(name: &str) -> usize {
 macro_rules! cpu_phase {
     ($name:expr, $body:expr) => {{
         let __enabled = VULKAN_CPU_PROFILE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
-        let __t0 = if __enabled { Some(std::time::Instant::now()) } else { None };
+        let __t0 = if __enabled {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let __out = $body;
         if let Some(__t0) = __t0 {
             let __idx = cpu_phase_index($name);
-            VULKAN_CPU_PROFILE_PHASES[__idx]
-                .nanos
-                .fetch_add(__t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            VULKAN_CPU_PROFILE_PHASES[__idx].nanos.fetch_add(
+                __t0.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             VULKAN_CPU_PROFILE_PHASES[__idx]
                 .count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -931,7 +987,7 @@ pub fn vulkan_flush_reason_report() -> Option<Vec<(&'static str, u64)>> {
         .iter()
         .map(|(name, count)| (*name, count.load(std::sync::atomic::Ordering::Relaxed)))
         .collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.1));
     Some(rows)
 }
 
@@ -1038,8 +1094,10 @@ impl VulkanGpuProfiler {
                 allocation_scheme: AllocationScheme::GpuAllocatorManaged,
             })
             .ok()?;
-        unsafe { device.bind_buffer_memory(results_buffer, allocation.memory(), allocation.offset()) }
-            .ok()?;
+        unsafe {
+            device.bind_buffer_memory(results_buffer, allocation.memory(), allocation.offset())
+        }
+        .ok()?;
         Some(Self {
             query_pool,
             results_buffer,
@@ -1075,8 +1133,7 @@ impl VulkanGpuProfiler {
             for (index, name) in profile.names.iter().enumerate() {
                 let start = ticks[2 * index];
                 let end = ticks[2 * index + 1];
-                let elapsed_ns =
-                    end.saturating_sub(start) as f64 * self.timestamp_period_ns as f64;
+                let elapsed_ns = end.saturating_sub(start) as f64 * self.timestamp_period_ns as f64;
                 let entry = aggregate
                     .entries
                     .entry(name.unwrap_or("<unnamed>"))
@@ -1091,7 +1148,8 @@ impl VulkanGpuProfiler {
 /// Aggregated per-kernel GPU time from the env-gated timestamp profiler.
 /// Returns `(wall_seconds, rows)` sorted by total GPU time, descending, or
 /// None when profiling was never enabled / no results were collected.
-pub fn vulkan_gpu_profile_report() -> Option<(f64, Vec<(&'static str, u64, f64)>)> {
+type VulkanGpuProfileRows = Vec<(&'static str, u64, f64)>;
+pub fn vulkan_gpu_profile_report() -> Option<(f64, VulkanGpuProfileRows)> {
     let mut state = GPU_PROFILE_STATE.lock().ok()?;
     let aggregate = state.as_mut()?;
     let wall_seconds = aggregate.wall_start.elapsed().as_secs_f64();
@@ -2314,8 +2372,7 @@ impl VulkanDevice {
                     .lock()
                     .map_err(|e| Error::wrap(e.to_string()))?;
                 if let Some(batch) = slot.as_ref() {
-                    let d = batch.dispatch_count + dispatches_to_add
-                        > Self::max_batch_dispatches();
+                    let d = batch.dispatch_count + dispatches_to_add > Self::max_batch_dispatches();
                     let c = batch.copy_count + copies_to_add > Self::max_batch_copies();
                     let ds = batch.descriptor_set_count + descriptor_sets_to_add
                         > Self::max_batch_descriptor_sets();
@@ -2387,34 +2444,34 @@ impl VulkanDevice {
         // Snapshot the profiler results into host-visible memory while the
         // command buffer is still recordable; they are read out (aggregated)
         // once this batch's submission is retired.
-        let batch_profile = if queue_kind == SubmissionQueueKind::Compute
-            && batch.dispatch_count > 0
-        {
-            if let Some(profiler) = &self.inner.gpu_profile {
-                unsafe {
-                    self.inner.device.cmd_copy_query_pool_results(
-                        batch.resources.command_buffer,
-                        profiler.query_pool,
-                        batch.profile_slot * GPU_PROFILE_QUERIES_PER_BATCH,
-                        2 * batch.dispatch_count,
-                        profiler.results_buffer,
-                        u64::from(batch.profile_slot) * u64::from(GPU_PROFILE_QUERIES_PER_BATCH)
-                            * std::mem::size_of::<u64>() as vk::DeviceSize,
-                        std::mem::size_of::<u64>() as vk::DeviceSize,
-                        vk::QueryResultFlags::TYPE_64,
-                    );
+        let batch_profile =
+            if queue_kind == SubmissionQueueKind::Compute && batch.dispatch_count > 0 {
+                if let Some(profiler) = &self.inner.gpu_profile {
+                    unsafe {
+                        self.inner.device.cmd_copy_query_pool_results(
+                            batch.resources.command_buffer,
+                            profiler.query_pool,
+                            batch.profile_slot * GPU_PROFILE_QUERIES_PER_BATCH,
+                            2 * batch.dispatch_count,
+                            profiler.results_buffer,
+                            u64::from(batch.profile_slot)
+                                * u64::from(GPU_PROFILE_QUERIES_PER_BATCH)
+                                * std::mem::size_of::<u64>() as vk::DeviceSize,
+                            std::mem::size_of::<u64>() as vk::DeviceSize,
+                            vk::QueryResultFlags::TYPE_64,
+                        );
+                    }
+                    Some(VulkanBatchProfile {
+                        query_count: 2 * batch.dispatch_count,
+                        first_query: u64::from(batch.profile_slot * GPU_PROFILE_QUERIES_PER_BATCH),
+                        names: Arc::new(std::mem::take(&mut batch.profile_names)),
+                    })
+                } else {
+                    None
                 }
-                Some(VulkanBatchProfile {
-                    query_count: 2 * batch.dispatch_count,
-                    first_query: u64::from(batch.profile_slot * GPU_PROFILE_QUERIES_PER_BATCH),
-                    names: Arc::new(std::mem::take(&mut batch.profile_names)),
-                })
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
         unsafe {
             self.inner
                 .device
@@ -2700,14 +2757,18 @@ impl VulkanDevice {
                 self.cleanup_pending_submissions_amortized()?;
                 if VULKAN_CPU_PROFILE_ENABLED.load(Ordering::Relaxed) {
                     let idx = cpu_phase_index("alloc_pool_hit");
-                    VULKAN_CPU_PROFILE_PHASES[idx].count.fetch_add(1, Ordering::Relaxed);
+                    VULKAN_CPU_PROFILE_PHASES[idx]
+                        .count
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 return Ok(buf);
             }
         }
         if VULKAN_CPU_PROFILE_ENABLED.load(Ordering::Relaxed) {
             let idx = cpu_phase_index("alloc_allocator");
-            VULKAN_CPU_PROFILE_PHASES[idx].count.fetch_add(1, Ordering::Relaxed);
+            VULKAN_CPU_PROFILE_PHASES[idx]
+                .count
+                .fetch_add(1, Ordering::Relaxed);
         }
         self.create_buffer_with_location(
             size,
@@ -3202,6 +3263,39 @@ impl VulkanDevice {
         self.cleanup_pending_submissions(true)
     }
 
+    fn mapped_memory_range(&self, allocation: &Allocation, size: u64) -> vk::MappedMemoryRange<'_> {
+        let atom = self.inner.non_coherent_atom_size.max(1);
+        let start = allocation.offset() / atom * atom;
+        let end = (allocation.offset() + size).div_ceil(atom) * atom;
+        let memory = unsafe { allocation.memory() };
+        vk::MappedMemoryRange::default()
+            .memory(memory)
+            .offset(start)
+            .size(end - start)
+    }
+
+    fn flush_mapped(&self, allocation: &Allocation, size: u64) -> Result<()> {
+        let range = self.mapped_memory_range(allocation, size);
+        unsafe {
+            self.inner
+                .device
+                .flush_mapped_memory_ranges(std::slice::from_ref(&range))
+                .map_err(Error::wrap)?;
+        }
+        Ok(())
+    }
+
+    fn invalidate_mapped(&self, allocation: &Allocation, size: u64) -> Result<()> {
+        let range = self.mapped_memory_range(allocation, size);
+        unsafe {
+            self.inner
+                .device
+                .invalidate_mapped_memory_ranges(std::slice::from_ref(&range))
+                .map_err(Error::wrap)?;
+        }
+        Ok(())
+    }
+
     fn map_write_host_buffer(&self, buffer: &VulkanBuffer, bytes: &[u8]) -> Result<()> {
         if bytes.len() > buffer.size {
             crate::bail!("vulkan write larger than buffer")
@@ -3232,11 +3326,10 @@ impl VulkanDevice {
             if bytes.len() < buffer.size {
                 std::ptr::write_bytes(mapped_ptr.add(bytes.len()), 0, buffer.size - bytes.len());
             }
-            // Staging buffers come from gpu-allocator with HOST_VISIBLE |
-            // HOST_COHERENT guaranteed (its CpuToGpu required-bits include
-            // HOST_COHERENT), so per the Vulkan spec no flush is needed and
-            // the explicit flush call only cost a driver transition.
-            if allocation.mapped_ptr().is_none() {
+        }
+        self.flush_mapped(allocation, buffer.size as u64)?;
+        if allocation.mapped_ptr().is_none() {
+            unsafe {
                 self.inner.device.unmap_memory(allocation.memory());
             }
         }
@@ -3251,9 +3344,8 @@ impl VulkanDevice {
         let allocation = alloc_guard
             .as_ref()
             .ok_or_else(|| Error::msg("freed vulkan allocation"))?;
+        self.invalidate_mapped(allocation, buffer.size as u64)?;
         unsafe {
-            // Readback staging is HOST_VISIBLE | HOST_COHERENT (gpu-allocator
-            // GpuToCpu required bits), so no invalidate is needed.
             let mapped_ptr = if let Some(ptr) = allocation.mapped_ptr() {
                 ptr.cast::<u8>().as_ptr()
             } else {
@@ -3558,7 +3650,10 @@ impl VulkanDevice {
         )
         .entered();
         cpu_phase!("transfer_deps", self.wait_for_transfer_dependencies()?);
-        cpu_phase!("cleanup_amortized", self.cleanup_pending_submissions_amortized()?);
+        cpu_phase!(
+            "cleanup_amortized",
+            self.cleanup_pending_submissions_amortized()?
+        );
         let binding_signature = bindings
             .iter()
             .map(|binding| binding.descriptor_type().as_raw() as u32)
@@ -3720,16 +3815,19 @@ impl VulkanDevice {
             acc.checked_add(binding.buffer().size)
                 .ok_or_else(|| Error::msg("vulkan compute batch byte count overflow"))
         })?;
-        cpu_phase!("batch_capacity", self.ensure_active_batch_capacity(
-            SubmissionQueueKind::Compute,
-            self.inner.queue_family_index,
-            1,
-            0,
-            1,
-            storage_count,
-            0,
-            compute_bytes,
-        )?);
+        cpu_phase!(
+            "batch_capacity",
+            self.ensure_active_batch_capacity(
+                SubmissionQueueKind::Compute,
+                self.inner.queue_family_index,
+                1,
+                0,
+                1,
+                storage_count,
+                0,
+                compute_bytes,
+            )?
+        );
         let mut slot = self
             .active_batch_slot(SubmissionQueueKind::Compute)
             .lock()
@@ -3738,12 +3836,45 @@ impl VulkanDevice {
             .as_mut()
             .ok_or_else(|| Error::msg("vulkan compute batch missing after ensure"))?;
         let descriptor_set = cpu_phase!("descriptor_set", {
-        let descriptor_set = if let Some(cached_sets) = batch
-            .cached_descriptor_sets
-            .get_mut(&cached.descriptor_set_layout)
-        {
-            if let Some(descriptor_set) = cached_sets.pop() {
-                descriptor_set
+            let descriptor_set = if let Some(cached_sets) = batch
+                .cached_descriptor_sets
+                .get_mut(&cached.descriptor_set_layout)
+            {
+                if let Some(descriptor_set) = cached_sets.pop() {
+                    descriptor_set
+                } else {
+                    let remaining_capacity = Self::max_allocated_descriptor_sets_per_batch()
+                        .saturating_sub(batch.allocated_descriptor_set_count);
+                    if remaining_capacity == 0 {
+                        crate::bail!("vulkan descriptor set cache exhausted inside active batch")
+                    }
+                    let alloc_count =
+                        remaining_capacity.min(Self::DESCRIPTOR_SET_ALLOC_CHUNK) as usize;
+                    let set_layouts = SmallVec::<[vk::DescriptorSetLayout; 8]>::from_elem(
+                        cached.descriptor_set_layout,
+                        alloc_count,
+                    );
+                    let set_alloc_info = vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(batch.resources.descriptor_pool)
+                        .set_layouts(&set_layouts);
+                    let mut descriptor_sets = self
+                        .inner
+                        .device
+                        .allocate_descriptor_sets(&set_alloc_info)
+                        .map_err(Error::wrap)?;
+                    batch.allocated_descriptor_set_count += alloc_count as u32;
+                    let descriptor_set = descriptor_sets.pop().ok_or_else(|| {
+                        Error::msg("vulkan descriptor allocation returned no sets")
+                    })?;
+                    if !descriptor_sets.is_empty() {
+                        batch
+                            .cached_descriptor_sets
+                            .entry(cached.descriptor_set_layout)
+                            .or_default()
+                            .extend(descriptor_sets);
+                    }
+                    descriptor_set
+                }
             } else {
                 let remaining_capacity = Self::max_allocated_descriptor_sets_per_batch()
                     .saturating_sub(batch.allocated_descriptor_set_count);
@@ -3775,126 +3906,97 @@ impl VulkanDevice {
                         .extend(descriptor_sets);
                 }
                 descriptor_set
-            }
-        } else {
-            let remaining_capacity = Self::max_allocated_descriptor_sets_per_batch()
-                .saturating_sub(batch.allocated_descriptor_set_count);
-            if remaining_capacity == 0 {
-                crate::bail!("vulkan descriptor set cache exhausted inside active batch")
-            }
-            let alloc_count = remaining_capacity.min(Self::DESCRIPTOR_SET_ALLOC_CHUNK) as usize;
-            let set_layouts = SmallVec::<[vk::DescriptorSetLayout; 8]>::from_elem(
-                cached.descriptor_set_layout,
-                alloc_count,
-            );
-            let set_alloc_info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(batch.resources.descriptor_pool)
-                .set_layouts(&set_layouts);
-            let mut descriptor_sets = self
-                .inner
-                .device
-                .allocate_descriptor_sets(&set_alloc_info)
-                .map_err(Error::wrap)?;
-            batch.allocated_descriptor_set_count += alloc_count as u32;
-            let descriptor_set = descriptor_sets
-                .pop()
-                .ok_or_else(|| Error::msg("vulkan descriptor allocation returned no sets"))?;
-            if !descriptor_sets.is_empty() {
-                batch
-                    .cached_descriptor_sets
-                    .entry(cached.descriptor_set_layout)
-                    .or_default()
-                    .extend(descriptor_sets);
-            }
+            };
+            let buffer_infos = bindings
+                .iter()
+                .map(|binding| {
+                    let buffer = binding.buffer();
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(buffer.buffer)
+                        .offset(0)
+                        .range(buffer.size as u64)
+                })
+                .collect::<SmallVec<[vk::DescriptorBufferInfo; 8]>>();
+            let writes = bindings
+                .iter()
+                .enumerate()
+                .map(|(binding, entry)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(binding as u32)
+                        .descriptor_type(entry.descriptor_type())
+                        .buffer_info(std::slice::from_ref(&buffer_infos[binding]))
+                })
+                .collect::<SmallVec<[vk::WriteDescriptorSet<'_>; 8]>>();
+            self.inner.device.update_descriptor_sets(&writes, &[]);
             descriptor_set
-        };
-        let buffer_infos = bindings
-            .iter()
-            .map(|binding| {
-                let buffer = binding.buffer();
-                vk::DescriptorBufferInfo::default()
-                    .buffer(buffer.buffer)
-                    .offset(0)
-                    .range(buffer.size as u64)
-            })
-            .collect::<SmallVec<[vk::DescriptorBufferInfo; 8]>>();
-        let writes = bindings
-            .iter()
-            .enumerate()
-            .map(|(binding, entry)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(descriptor_set)
-                    .dst_binding(binding as u32)
-                    .descriptor_type(entry.descriptor_type())
-                    .buffer_info(std::slice::from_ref(&buffer_infos[binding]))
-            })
-            .collect::<SmallVec<[vk::WriteDescriptorSet<'_>; 8]>>();
-        self.inner.device.update_descriptor_sets(&writes, &[]);
-        descriptor_set
         });
         let command_buffer = batch.resources.command_buffer;
         cpu_phase!("cmd_record", {
-        self.inner.device.cmd_bind_pipeline(
-            command_buffer,
-            vk::PipelineBindPoint::COMPUTE,
-            cached.pipeline,
-        );
-        self.inner.device.cmd_bind_descriptor_sets(
-            command_buffer,
-            vk::PipelineBindPoint::COMPUTE,
-            cached.pipeline_layout,
-            0,
-            std::slice::from_ref(&descriptor_set),
-            &[],
-        );
-        if let Some(bytes) = push_constants {
-            self.inner.device.cmd_push_constants(
+            self.inner.device.cmd_bind_pipeline(
                 command_buffer,
-                cached.pipeline_layout,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                bytes,
+                vk::PipelineBindPoint::COMPUTE,
+                cached.pipeline,
             );
-        }
-        // Profiler window: BOTTOM_OF_PIPE (before dispatch) to BOTTOM_OF_PIPE
-        // (after dispatch). BOTTOM is synchronized by the inter-dispatch memory
-        // barrier, so windows are strictly sequential and the per-kernel sums
-        // stay below wall time; the barrier wait between dispatches lands at
-        // the start of the following dispatch's window.
-        let profile_start_index = batch.profile_names.len() as u32;
-        let profiler = self.inner.gpu_profile.as_ref().filter(|_| {
-            // Query pool slots are bounded by MAX_BATCH_DISPATCHES; a defensive
-            // guard keeps the timestamp writes in range even if that limit and
-            // GPU_PROFILE_QUERIES_PER_BATCH ever diverge.
-            2 * profile_start_index + 1 < GPU_PROFILE_QUERIES_PER_BATCH
-        });
-        if let Some(profiler) = profiler {
-            unsafe {
-                self.inner.device.cmd_write_timestamp(
+            self.inner.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                cached.pipeline_layout,
+                0,
+                std::slice::from_ref(&descriptor_set),
+                &[],
+            );
+            if let Some(bytes) = push_constants {
+                self.inner.device.cmd_push_constants(
                     command_buffer,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    profiler.query_pool,
-                    batch.profile_slot * GPU_PROFILE_QUERIES_PER_BATCH
-                        + 2 * profile_start_index,
+                    cached.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    bytes,
                 );
             }
-        }
-        self.inner
-            .device
-            .cmd_dispatch(command_buffer, workgroups.0, workgroups.1, workgroups.2);
-        if let Some(profiler) = profiler {
-            unsafe {
-                self.inner.device.cmd_write_timestamp(
-                    command_buffer,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    profiler.query_pool,
-                    batch.profile_slot * GPU_PROFILE_QUERIES_PER_BATCH
-                        + 2 * profile_start_index
-                        + 1,
-                );
+            // Profiler window: BOTTOM_OF_PIPE (before dispatch) to BOTTOM_OF_PIPE
+            // (after dispatch). BOTTOM is synchronized by the inter-dispatch memory
+            // barrier, so windows are strictly sequential and the per-kernel sums
+            // stay below wall time; the barrier wait between dispatches lands at
+            // the start of the following dispatch's window.
+            let profile_start_index = batch.profile_names.len() as u32;
+            let profiler = self.inner.gpu_profile.as_ref().filter(|_| {
+                // Query pool slots are bounded by MAX_BATCH_DISPATCHES; a defensive
+                // guard keeps the timestamp writes in range even if that limit and
+                // GPU_PROFILE_QUERIES_PER_BATCH ever diverge.
+                2 * profile_start_index + 1 < GPU_PROFILE_QUERIES_PER_BATCH
+            });
+            if let Some(profiler) = profiler {
+                unsafe {
+                    self.inner.device.cmd_write_timestamp(
+                        command_buffer,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        profiler.query_pool,
+                        batch.profile_slot * GPU_PROFILE_QUERIES_PER_BATCH
+                            + 2 * profile_start_index,
+                    );
+                }
             }
-        }
-        self.cmd_batch_memory_barrier(command_buffer);
+            self.inner.device.cmd_dispatch(
+                command_buffer,
+                workgroups.0,
+                workgroups.1,
+                workgroups.2,
+            );
+            if let Some(profiler) = profiler {
+                unsafe {
+                    self.inner.device.cmd_write_timestamp(
+                        command_buffer,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        profiler.query_pool,
+                        batch.profile_slot * GPU_PROFILE_QUERIES_PER_BATCH
+                            + 2 * profile_start_index
+                            + 1,
+                    );
+                }
+            }
+            self.cmd_batch_memory_barrier(command_buffer);
         });
         batch.dispatch_count += 1;
         batch.profile_names.push(cached.spirv_name);
@@ -5731,6 +5833,15 @@ impl VulkanStorage {
         dst_offset: usize,
         spirv: &[u32],
     ) -> Result<()> {
+        // The copy shader is rank-4 (ggml packing). Rank > 4, or offsets that
+        // do not fit the original 16-bit packed slot, go through vkCmdCopyBuffer
+        // regions instead of a broken shader dispatch.
+        if layout.dims().len() > 4
+            || layout.start_offset() > u16::MAX as usize
+            || dst_offset > u16::MAX as usize
+        {
+            return self.run_copy_into_via_regions(layout, dst, dst_offset);
+        }
         let dst_layout = Layout::contiguous_with_offset(layout.shape().clone(), dst_offset);
         self.run_copy_between(layout, dst, &dst_layout, spirv)
     }
@@ -8474,11 +8585,14 @@ impl VulkanStorage {
         }
         let wg_x = rows.min(65535);
         let wg_y = rows.div_ceil(wg_x);
-        self.device
-            .run_compute_3d(spirv, &bindings, Some(any_as_bytes(&params)), (wg_x, wg_y, 1))?;
+        self.device.run_compute_3d(
+            spirv,
+            &bindings,
+            Some(any_as_bytes(&params)),
+            (wg_x, wg_y, 1),
+        )?;
         Ok(dst)
     }
-
 
     fn run_matmul_f32(
         &self,
@@ -8950,21 +9064,17 @@ impl VulkanStorage {
             broadcast3: 1,
             padded_n: padded_m.try_into()?,
         };
-                let mut bindings = vec![
+        let mut bindings = vec![
             VulkanBinding::Storage(&rhs_t.buffer),
-            VulkanBinding::Storage(
-                padded_lhs
-                    .as_ref()
-                    .map_or(&lhs.buffer, |p| &p.buffer),
-            ),
+            VulkanBinding::Storage(padded_lhs.as_ref().map_or(&lhs.buffer, |p| &p.buffer)),
             VulkanBinding::Storage(&dst.buffer),
         ];
         if let Some(bias) = bias {
             bindings.push(VulkanBinding::Storage(&bias.buffer));
         } // Prefer the aligned tiled variant when M/N are multiples of the 64x64
-        // tile and K is a multiple of 32 — this matches ggml-vulkan's aligned
-        // GEMM path and avoids residual edge handling overhead.
-        // Virtual BT forces the unaligned virtual kernel (strided-K A loads).
+          // tile and K is a multiple of 32 — this matches ggml-vulkan's aligned
+          // GEMM path and avoids residual edge handling overhead.
+          // Virtual BT forces the unaligned virtual kernel (strided-K A loads).
         let spirv_name = match self.dtype {
             // Tall-skinny virtual B^T: prefer coopmat when available.
             DType::F32
@@ -9016,9 +9126,7 @@ impl VulkanStorage {
             // Padded-B tall GEMM (see pad_lhs_to_64): every load is in
             // bounds by construction, so the fully ALIGNED exact-fp32 kernel
             // applies even when candle M is not tile-aligned.
-            DType::F32
-                if pad_lhs_to_64 && vulkan_spirv_exists("matmul_f32_f32_aligned_fp32") =>
-            {
+            DType::F32 if pad_lhs_to_64 && vulkan_spirv_exists("matmul_f32_f32_aligned_fp32") => {
                 "matmul_f32_f32_aligned_fp32"
             }
             DType::F32 => "matmul_f32_f32_fp32",
@@ -9029,14 +9137,14 @@ impl VulkanStorage {
                 return Err(Error::UnsupportedDTypeForOp(other, "vulkan matmul").bt());
             }
         };
-                // Bias epilogue: swap in the BIAS_ADD variant and bind the bias
+        // Bias epilogue: swap in the BIAS_ADD variant and bind the bias
         // vector (length = candle N) as binding 3 (4th slice entry).
         let bias_name = bias.and_then(|_| {
             let name = format!("{spirv_name}_bias");
             vulkan_spirv_exists(&name).then_some(name)
         });
         let spirv_name = bias_name.as_deref().unwrap_or(spirv_name);
-let spirv = candle_vulkan_kernels::spirv(spirv_name)
+        let spirv = candle_vulkan_kernels::spirv(spirv_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
         // ggml `m_warptile` layout: {BLOCK_SIZE, BM, BN, (BK), WM, WN, WMITER,
         // TM, TN, (TK), WARP}. The thread count must satisfy
@@ -10579,10 +10687,8 @@ impl Drop for VulkanInner {
             let _ = self.device.device_wait_idle();
 
             if let Some(mut profiler) = self.gpu_profile.take() {
-                unsafe {
-                    self.device.destroy_query_pool(profiler.query_pool, None);
-                    self.device.destroy_buffer(profiler.results_buffer, None);
-                }
+                self.device.destroy_query_pool(profiler.query_pool, None);
+                self.device.destroy_buffer(profiler.results_buffer, None);
                 if let Some(allocation) = profiler.allocation.take() {
                     if let Ok(mut allocator) = self.allocator.lock() {
                         if let Some(allocator) = allocator.as_mut() {
@@ -10711,14 +10817,16 @@ impl BackendStorage for VulkanStorage {
             }
             if self.dtype == DType::BF16 {
                 // Native bf16 affine: one pass, no f32 round-trip copies.
-                let spirv = candle_vulkan_kernels::spirv("scale_bf16")
-                    .ok_or_else(|| Error::Msg("vulkan shader scale_bf16 not generated".into()).bt())?;
+                let spirv = candle_vulkan_kernels::spirv("scale_bf16").ok_or_else(|| {
+                    Error::Msg("vulkan shader scale_bf16 not generated".into()).bt()
+                })?;
                 return self.run_unary_generic_with_params(layout, spirv, mul as f32, add as f32);
             }
             if self.dtype == DType::F16 {
                 // Native f16 affine: one pass, no f32 round-trip copies.
-                let spirv = candle_vulkan_kernels::spirv("scale_f16")
-                    .ok_or_else(|| Error::Msg("vulkan shader scale_f16 not generated".into()).bt())?;
+                let spirv = candle_vulkan_kernels::spirv("scale_f16").ok_or_else(|| {
+                    Error::Msg("vulkan shader scale_f16 not generated".into()).bt()
+                })?;
                 return self.run_unary_generic_with_params(layout, spirv, mul as f32, add as f32);
             }
             if self.dtype != DType::F32 {
@@ -11017,8 +11125,9 @@ impl BackendStorage for VulkanStorage {
             // Native bf16 sqrt exists; other bf16 unaries still go through an
             // f32 materialize round-trip.
             if B::NAME == "sqrt" {
-                let spirv = candle_vulkan_kernels::spirv("sqrt_bf16")
-                    .ok_or_else(|| Error::Msg("vulkan shader sqrt_bf16 not generated".into()).bt())?;
+                let spirv = candle_vulkan_kernels::spirv("sqrt_bf16").ok_or_else(|| {
+                    Error::Msg("vulkan shader sqrt_bf16 not generated".into()).bt()
+                })?;
                 return self.run_unary_generic(layout, spirv);
             }
             return self.bf16_unary_via_f32(layout, |src, src_l| src.unary_impl::<B>(src_l));
@@ -11038,9 +11147,7 @@ impl BackendStorage for VulkanStorage {
         if self.dtype != DType::F32 && self.dtype != DType::F16 {
             return Err(Error::UnsupportedDTypeForOp(self.dtype, "vulkan unary").bt());
         }
-        if self.dtype == DType::F16
-            && matches!(B::NAME, "sin" | "cos" | "sqr" | "erf" | "recip")
-        {
+        if self.dtype == DType::F16 && matches!(B::NAME, "sin" | "cos" | "sqr" | "erf" | "recip") {
             // sqrt is excluded: native sqrt_f16 exists, the rest still go
             // through an f32 materialize round-trip.
             let mut materialized = unsafe { self.device.alloc_uninit(layout.shape(), DType::F16)? };
@@ -11501,7 +11608,6 @@ impl BackendStorage for VulkanStorage {
     ) -> Result<Self> {
         self.run_matmul_f32(rhs, bmnk, lhs_l, rhs_l)
     }
-
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
         if self.dtype != dst.dtype {
@@ -12176,7 +12282,7 @@ impl BackendDevice for VulkanDevice {
         } else {
             self.create_buffer(bytes.len(), "candle-vulkan-upload")?
         };
-        self.write_buffer(&buffer, &bytes)?;
+        self.write_buffer(&buffer, bytes)?;
         Ok(VulkanStorage {
             buffer,
             device: self.clone(),
