@@ -150,24 +150,22 @@ pub fn layer_norm<C: Into<LayerNormConfig>>(
 ) -> Result<LayerNorm> {
     let config = config.into();
 
-    // Convert old format to new format if needed from a PyTorch state_dict.
-    // Safetensors are not always in the newer weight/bias format.
+    // Prefer an existing alias when present; otherwise default to "weight"/"bias" so
+    // VarMap-backed builders can still lazily Init missing tensors. Bias is only
+    // probed when config.affine is true (rms_norm / layer_norm_no_bias).
     // https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_utils.py#L575
-    let weight_tensor_name = ["weight", "gamma"]
-        .iter()
-        .find(|&name| vb.contains_tensor(name))
-        .ok_or_else(|| Error::Msg("Failed to find weight tensor".into()))?;
+    let weight_name = ["weight", "gamma"]
+        .into_iter()
+        .find(|name| vb.contains_tensor(name))
+        .unwrap_or("weight");
+    let weight = vb.get_with_hints(size, weight_name, crate::Init::Const(1.))?;
 
-    let weight = vb.get_with_hints(size, weight_tensor_name, crate::Init::Const(1.))?;
-
-    // Only look for a bias when the config actually wants one: RMSNorm-style
-    // checkpoints (affine = false) legitimately have no bias/beta tensor.
     let bias = if config.affine {
-        let bias_tensor_name = ["bias", "beta"]
-            .iter()
-            .find(|&name| vb.contains_tensor(name))
-            .ok_or_else(|| Error::Msg("Failed to find bias tensor".into()))?;
-        Some(vb.get_with_hints(size, bias_tensor_name, crate::Init::Const(0.))?)
+        let bias_name = ["bias", "beta"]
+            .into_iter()
+            .find(|name| vb.contains_tensor(name))
+            .unwrap_or("bias");
+        Some(vb.get_with_hints(size, bias_name, crate::Init::Const(0.))?)
     } else {
         None
     };
