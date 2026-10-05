@@ -28,7 +28,7 @@
 //! ```
 //!
 //! [`Layer Normalization`]: https://arxiv.org/abs/1607.06450
-use candle::{DType, Error, Module, Result, Tensor, D};
+use candle::{DType, Module, Result, Tensor, D};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerNormConfig {
@@ -150,8 +150,8 @@ pub fn layer_norm<C: Into<LayerNormConfig>>(
 ) -> Result<LayerNorm> {
     let config = config.into();
 
-    // Convert old format to new format if needed from a PyTorch state_dict
-    // Safetensors not always in new weight/bias format
+    // Convert old format to new format if needed from a PyTorch state_dict.
+    // Safetensors are not always in the newer weight/bias format.
     // https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_utils.py#L575
     let weight_tensor_name = ["weight", "gamma"]
         .iter()
