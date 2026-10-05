@@ -3,8 +3,8 @@
 mod support;
 
 use candle_core::{DType, Device, Result, Tensor};
-use support::{native_required, TestBackend};
 use serde::Deserialize;
+use support::{native_required, TestBackend};
 
 #[derive(Debug, Deserialize)]
 struct FixtureRoot {

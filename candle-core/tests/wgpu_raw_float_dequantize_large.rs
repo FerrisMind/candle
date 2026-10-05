@@ -73,11 +73,7 @@ fn wgpu_ggml_bf16_dequantize_beyond_dispatch_cap_matches_cpu() -> Result<()> {
     let qt_cpu = QTensor::new(qcpu, shape)?;
     let want = qt_cpu.dequantize(&Device::Cpu)?;
 
-    let qwgpu = QStorage::from_data(
-        std::borrow::Cow::Owned(bytes),
-        &device,
-        GgmlDType::BF16,
-    )?;
+    let qwgpu = QStorage::from_data(std::borrow::Cow::Owned(bytes), &device, GgmlDType::BF16)?;
     let qt_wgpu = QTensor::new(qwgpu, shape)?;
     let got = qt_wgpu.dequantize(&device)?;
     assert_eq!(got.dtype(), DType::F32);
