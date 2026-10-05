@@ -37,10 +37,34 @@ impl Linear {
     pub fn bias(&self) -> Option<&Tensor> {
         self.bias.as_ref()
     }
+
+    /// Vulkan fused `x @ w.t() + bias` (MUL_MAT_ADD). Falls back to unfused
+    /// matmul+add when the shape/dtype gate in `ops::mul_mat_add` does not match.
+    fn forward_mul_mat_add(weight: &Tensor, x: &Tensor, bias: &Tensor) -> candle::Result<Tensor> {
+        let w_t = weight.t()?.contiguous()?;
+        match *x.dims() {
+            [b1, b2, m, k] if x.is_contiguous() => {
+                crate::ops::mul_mat_add(&x.reshape((b1 * b2, m, k))?, &w_t, bias)?
+                    .reshape((b1, b2, m, ()))
+            }
+            [b1, b2, _, _] => {
+                let w = weight.broadcast_left((b1, b2))?.t()?.contiguous()?;
+                crate::ops::mul_mat_add(x, &w, bias)
+            }
+            [_, _, _] => crate::ops::mul_mat_add(x, &w_t, bias),
+            [_, _] => crate::ops::mul_mat_add(&x.unsqueeze(0)?, &w_t, bias)?.squeeze(0),
+            _ => x.matmul(&w_t)?.broadcast_add(bias),
+        }
+    }
 }
 
 impl super::Module for Linear {
     fn forward(&self, x: &Tensor) -> candle::Result<Tensor> {
+        if let Some(bias) = &self.bias {
+            if x.device().is_vulkan() {
+                return Self::forward_mul_mat_add(&self.weight, x, bias);
+            }
+        }
         // When possible, we avoid using a broadcasted matmul as it is much slower
         // than the standard matmul for the cuda and cpu backends.
         let x = match *x.dims() {
