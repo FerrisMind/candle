@@ -136,10 +136,7 @@ impl T5ModelBuilder {
         Ok(t5::T5ForConditionalGeneration::load(vb, &self.config)?)
     }
 
-    fn get_local_or_remote_file(
-        filename: &str,
-        api: &Repo,
-    ) -> Result<PathBuf> {
+    fn get_local_or_remote_file(filename: &str, api: &Repo) -> Result<PathBuf> {
         let local_filename = std::path::PathBuf::from(filename);
         if local_filename.exists() {
             Ok(local_filename)

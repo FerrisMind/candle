@@ -700,37 +700,34 @@ fn main() -> Result<()> {
             println!("No audio file submitted: Downloading https://huggingface.co/datasets/Narsil/candle_demo/blob/main/samples_jfk.wav");
             dataset.get("samples_jfk.wav")?
         };
-        let (config, tokenizer, model) = if let (
-            Some(config_file),
-            Some(tokenizer_file),
-            Some(weight_file),
-        ) = (
-            args.config_file.as_deref(),
-            args.tokenizer_file.as_deref(),
-            args.weight_file.as_deref(),
-        ) {
-            (
-                std::path::PathBuf::from(config_file),
-                std::path::PathBuf::from(tokenizer_file),
-                std::path::PathBuf::from(weight_file),
-            )
-        } else if args.quantized {
-            let ext = match args.model {
-                WhichModel::TinyEn => "tiny-en",
-                WhichModel::Tiny => "tiny",
-                _ => unimplemented!("no quantized support for {:?}", args.model),
+        let (config, tokenizer, model) =
+            if let (Some(config_file), Some(tokenizer_file), Some(weight_file)) = (
+                args.config_file.as_deref(),
+                args.tokenizer_file.as_deref(),
+                args.weight_file.as_deref(),
+            ) {
+                (
+                    std::path::PathBuf::from(config_file),
+                    std::path::PathBuf::from(tokenizer_file),
+                    std::path::PathBuf::from(weight_file),
+                )
+            } else if args.quantized {
+                let ext = match args.model {
+                    WhichModel::TinyEn => "tiny-en",
+                    WhichModel::Tiny => "tiny",
+                    _ => unimplemented!("no quantized support for {:?}", args.model),
+                };
+                (
+                    repo.get(format!("config-{ext}.json"))?,
+                    repo.get(format!("tokenizer-{ext}.json"))?,
+                    repo.get(format!("model-{ext}-q80.gguf"))?,
+                )
+            } else {
+                let config = repo.get("config.json")?;
+                let tokenizer = repo.get("tokenizer.json")?;
+                let model = repo.get("model.safetensors")?;
+                (config, tokenizer, model)
             };
-            (
-                repo.get(format!("config-{ext}.json"))?,
-                repo.get(format!("tokenizer-{ext}.json"))?,
-                repo.get(format!("model-{ext}-q80.gguf"))?,
-            )
-        } else {
-            let config = repo.get("config.json")?;
-            let tokenizer = repo.get("tokenizer.json")?;
-            let model = repo.get("model.safetensors")?;
-            (config, tokenizer, model)
-        };
         (config, tokenizer, model, sample)
     };
     let config: Config = serde_json::from_str(&std::fs::read_to_string(config_filename)?)?;
