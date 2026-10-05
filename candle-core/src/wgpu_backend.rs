@@ -195,7 +195,7 @@ struct ArgMaxParams {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ConvTransposeParams {
-    ne: u32, // total output elements (b * c_out * out_h * out_w)
+    ne: u32,         // total output elements (b * c_out * out_h * out_w)
     offset_src: u32, // in elements
     offset_w: u32,   // in elements
     offset_dst: u32, // in elements
@@ -847,7 +847,6 @@ struct WgpuElemBgKey {
     storage_sizes: Vec<u64>,
 }
 
-
 /// GPU-timestamp profiler (CANDLE_WGPU_GPU_PROFILE=1): every batched
 /// dispatch runs in its own compute pass, so a per-pass begin/end timestamp
 /// pair gives exact per-kernel GPU time. Resolved asynchronously after each
@@ -858,7 +857,6 @@ const WGPU_GPU_PROFILE_DRAIN_AT: u32 = 2048;
 const WGPU_GPU_PROFILE_READ_SLOTS: usize = 32;
 
 struct WgpuGpuProfile {
-
     // (uses fully-qualified atomics)
     query_set: wgpu::QuerySet,
     resolve: Vec<Arc<wgpu::Buffer>>,
@@ -889,10 +887,22 @@ impl WgpuGpuProfile {
     }
 
     fn drain(&self, device: &wgpu::Device, queue: &wgpu::Queue, cursor: u32) {
-        let mut ranges = match self.pending.lock() {
+        let ranges = match self.pending.lock() {
             Ok(mut g) => std::mem::take(&mut *g),
             Err(e) => std::mem::take(&mut *e.into_inner()),
         };
+        // `cursor` is the exclusive high-water of issued query indices. Keep
+        // any ranges that have not been written yet (should be empty in the
+        // current allocator, but the cutoff is what makes drain correct).
+        let (mut ranges, leftover): (Vec<_>, Vec<_>) = ranges
+            .into_iter()
+            .partition(|(q0, q1, _)| *q0 < cursor && *q1 < cursor);
+        if !leftover.is_empty() {
+            match self.pending.lock() {
+                Ok(mut pending) => pending.extend(leftover),
+                Err(poisoned) => poisoned.into_inner().extend(leftover),
+            }
+        }
         if ranges.is_empty() {
             return;
         }
@@ -901,7 +911,10 @@ impl WgpuGpuProfile {
         let last = ranges.last().unwrap().1;
         let count = last - first + 1;
         self.cursor.store(0, std::sync::atomic::Ordering::Release);
-        let slot = (self.read_slot.fetch_add(1, std::sync::atomic::Ordering::AcqRel) % WGPU_GPU_PROFILE_READ_SLOTS as u32) as usize;
+        let slot = (self
+            .read_slot
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            % WGPU_GPU_PROFILE_READ_SLOTS as u32) as usize;
         let resolve = self.resolve[slot].clone();
         let readback = self.readback[slot].clone();
         let labels: Vec<(u32, u32, &'static str)> = ranges.to_vec();
@@ -920,7 +933,7 @@ impl WgpuGpuProfile {
                 let _ = result;
                 let _ = tx.send(());
             });
-        device.poll(wgpu::PollType::wait_indefinitely());
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
         let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
         {
             let data = readback.get_mapped_range(0..byte_len);
@@ -972,7 +985,7 @@ impl WgpuGpuProfile {
 pub fn wgpu_gpu_profile_report() -> Option<Vec<(&'static str, u64, f64)>> {
     WGPU_GPU_PROFILE_ENABLED
         .load(std::sync::atomic::Ordering::Relaxed)
-        .then(|| ())?;
+        .then_some(())?;
     WGPU_GPU_PROFILE_AGG.with(|agg| {
         let agg = agg.lock().ok()?;
         let mut rows: Vec<(&'static str, u64, f64)> = agg
@@ -984,7 +997,8 @@ pub fn wgpu_gpu_profile_report() -> Option<Vec<(&'static str, u64, f64)>> {
     })
 }
 
-static WGPU_GPU_PROFILE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WGPU_GPU_PROFILE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 thread_local! {
     static WGPU_GPU_PROFILE_AGG: std::sync::Mutex<HashMap<&'static str, (u64, u64)>> =
         std::sync::Mutex::new(HashMap::new());
@@ -1011,7 +1025,8 @@ struct WgpuPendingDispatch {
 
 struct WgpuActiveBatch {
     /// (begin_ts_index, end_ts_index, kernel label) per encoded pass —
-    /// filled only when the GPU-timestamp profiler is active.
+    /// filled only when the GPU-timestamp profiler is active, then merged
+    /// into the profiler pending list on flush.
     profile_ranges: Vec<(u32, u32, &'static str)>,
     encoder: wgpu::CommandEncoder,
     retained_buffers: Vec<Arc<wgpu::Buffer>>,
@@ -1394,7 +1409,6 @@ struct RopeLayerNormParams {
     eps: f32,
     _pad: u32,
 }
-
 
 fn bytes_to_vec<T: Copy>(bytes: &[u8], count: usize) -> Result<Vec<T>> {
     let byte_len = count * std::mem::size_of::<T>();
@@ -1892,11 +1906,7 @@ impl WgpuDevice {
             return;
         }
         if let Ok(mut pool) = self.inner.storage_buffer_pool.lock() {
-            let mut total_bytes: usize = pool
-                .values()
-                .flatten()
-                .map(|b| b.size() as usize)
-                .sum();
+            let mut total_bytes: usize = pool.values().flatten().map(|b| b.size() as usize).sum();
             for buffer in pending {
                 let size = buffer.size() as usize;
                 let bucket = pool.entry(size as u64).or_default();
@@ -2092,11 +2102,7 @@ impl WgpuDevice {
         while off < padded.len() {
             let end = (off + UPLOAD_CHUNK).min(padded.len());
             // Keep each write 4-byte aligned (WebGPU writeBuffer requirement).
-            let end = if end < padded.len() {
-                end & !3
-            } else {
-                end
-            };
+            let end = if end < padded.len() { end & !3 } else { end };
             if end <= off {
                 break;
             }
@@ -2332,7 +2338,10 @@ impl WgpuDevice {
                     .features
                     .contains(wgpu::Features::TIMESTAMP_QUERY)
             {
-                eprintln!("[candle-wgpu] gpu-profile: TIMESTAMP_QUERY feature missing (features={:?})", device.inner.features);
+                eprintln!(
+                    "[candle-wgpu] gpu-profile: TIMESTAMP_QUERY feature missing (features={:?})",
+                    device.inner.features
+                );
             }
             if guard.is_none()
                 && device
@@ -2340,11 +2349,14 @@ impl WgpuDevice {
                     .features
                     .contains(wgpu::Features::TIMESTAMP_QUERY)
             {
-                let query_set = device.inner.device.create_query_set(&wgpu::QuerySetDescriptor {
-                    ty: wgpu::QueryType::Timestamp,
-                    count: WGPU_GPU_PROFILE_QUERY_COUNT,
-                    label: Some("candle-wgpu-gpu-profile"),
-                });
+                let query_set = device
+                    .inner
+                    .device
+                    .create_query_set(&wgpu::QuerySetDescriptor {
+                        ty: wgpu::QueryType::Timestamp,
+                        count: WGPU_GPU_PROFILE_QUERY_COUNT,
+                        label: Some("candle-wgpu-gpu-profile"),
+                    });
                 let mk = |label: String, usage: wgpu::BufferUsages| {
                     std::sync::Arc::new(device.inner.device.create_buffer(
                         &wgpu::BufferDescriptor {
@@ -2394,28 +2406,24 @@ impl WgpuDevice {
         // new group exactly as before. Disabled while the timestamp profiler
         // is active (it keys on per-dispatch passes) and by
         // CANDLE_WGPU_PASS_FOLDING=0.
-        let folding = profiler.is_none()
-            && std::env::var("CANDLE_WGPU_PASS_FOLDING").as_deref() != Ok(&"0");
+        let folding =
+            profiler.is_none() && std::env::var("CANDLE_WGPU_PASS_FOLDING").as_deref() != Ok("0");
         if !folding {
-            for d in &batch.pending_dispatches {
-                let ts_write = profiler.as_ref().and_then(|p| {
-                    p.next_indices().map(|(b, e)| {
-                        wgpu::ComputePassTimestampWrites {
-                            query_set: &p.query_set,
-                            beginning_of_pass_write_index: Some(b),
-                            end_of_pass_write_index: Some(e),
-                        }
-                    })
-                });
-                if let (Some(p), Some(tw)) = (&profiler, &ts_write) {
-                    if let Ok(mut pending) = p.pending.lock() {
-                        pending.push((
-                            tw.beginning_of_pass_write_index.unwrap_or(0),
-                            tw.end_of_pass_write_index.unwrap_or(0),
-                            d.label,
-                        ));
-                    }
+            for i in 0..batch.pending_dispatches.len() {
+                let label = batch.pending_dispatches[i].label;
+                let ts_idx = profiler.as_ref().and_then(|p| p.next_indices());
+                if let Some((b, e)) = ts_idx {
+                    batch.profile_ranges.push((b, e, label));
                 }
+                let ts_write = match (profiler.as_ref(), ts_idx) {
+                    (Some(p), Some((b, e))) => Some(wgpu::ComputePassTimestampWrites {
+                        query_set: &p.query_set,
+                        beginning_of_pass_write_index: Some(b),
+                        end_of_pass_write_index: Some(e),
+                    }),
+                    _ => None,
+                };
+                let d = &batch.pending_dispatches[i];
                 let mut pass = batch
                     .encoder
                     .begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2442,15 +2450,13 @@ impl WgpuDevice {
             let mut group_start = 0usize;
             let mut group_buffers: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
-            let mut emit_group = |batch: &mut WgpuActiveBatch,
-                                  dispatches: &[WgpuPendingDispatch],
-                                  range: std::ops::Range<usize>| {
+            let emit_group = |batch: &mut WgpuActiveBatch,
+                              dispatches: &[WgpuPendingDispatch],
+                              range: std::ops::Range<usize>| {
                 if range.start >= range.end {
                     return;
                 }
-                let mut pass = batch
-                    .encoder
-                    .begin_compute_pass(&PASS_DESC());
+                let mut pass = batch.encoder.begin_compute_pass(&PASS_DESC());
                 for d in &dispatches[range.clone()] {
                     pass.set_pipeline(&d.pipeline.pipeline);
                     if d.use_immediates && d.deferred_uniform_len > 0 {
@@ -2504,9 +2510,7 @@ impl WgpuDevice {
         let Some(batch) = batch else {
             return Ok(false);
         };
-        if batch.dispatch_count == 0
-            && batch.pending_dispatches.is_empty()
-            && batch.copy_count == 0
+        if batch.dispatch_count == 0 && batch.pending_dispatches.is_empty() && batch.copy_count == 0
         {
             let mut slot = self
                 .inner
@@ -2548,6 +2552,12 @@ impl WgpuDevice {
         }
         if let Ok(profiler) = self.inner.gpu_profile.lock() {
             if let Some(profiler) = profiler.as_ref() {
+                if !batch.profile_ranges.is_empty() {
+                    match profiler.pending.lock() {
+                        Ok(mut pending) => pending.append(&mut batch.profile_ranges),
+                        Err(poisoned) => poisoned.into_inner().append(&mut batch.profile_ranges),
+                    }
+                }
                 let cursor = profiler.cursor.load(std::sync::atomic::Ordering::Acquire);
                 if cursor >= WGPU_GPU_PROFILE_DRAIN_AT {
                     profiler.drain(&self.inner.device, &self.inner.queue, cursor);
@@ -3172,10 +3182,7 @@ impl WgpuDevice {
                         // buffer_binding_range, or the whole-buffer size for
                         // as_entire_binding (size=None). Included in the cache key so
                         // cross-size reuse never aliases a stale bind-group range.
-                        let size = bb
-                            .size
-                            .map(|s| s.get())
-                            .unwrap_or_else(|| bb.buffer.size());
+                        let size = bb.size.map(|s| s.get()).unwrap_or_else(|| bb.buffer.size());
                         Some((self.buffer_oid(bb.buffer) as usize, size))
                     }
                     other => {
@@ -3188,14 +3195,20 @@ impl WgpuDevice {
                 ptrs.iter().map(|(o, _)| *o).collect::<Vec<_>>()
             } else if ptrs.len() >= 3 {
                 // Last ptr is the uniform params buffer; rest are storage.
-                ptrs[..ptrs.len() - 1].iter().map(|(o, _)| *o).collect::<Vec<_>>()
+                ptrs[..ptrs.len() - 1]
+                    .iter()
+                    .map(|(o, _)| *o)
+                    .collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
             let storage_sizes = if use_immediates {
                 ptrs.iter().map(|(_, s)| *s).collect::<Vec<_>>()
             } else if ptrs.len() >= 3 {
-                ptrs[..ptrs.len() - 1].iter().map(|(_, s)| *s).collect::<Vec<_>>()
+                ptrs[..ptrs.len() - 1]
+                    .iter()
+                    .map(|(_, s)| *s)
+                    .collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
@@ -3309,16 +3322,18 @@ impl WgpuDevice {
             let buffer_keys: smallvec::SmallVec<[usize; 8]> = bindings
                 .iter()
                 .enumerate()
-                .filter_map(|(i, be)| match (&be.resource, entries.get(i).map(|e| &e.ty)) {
-                    (
-                        wgpu::BindingResource::Buffer(bb),
-                        Some(wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { .. },
-                            ..
-                        }),
-                    ) => Some(wgpu_buffer_key(bb.buffer)),
-                    _ => None,
-                })
+                .filter_map(
+                    |(i, be)| match (&be.resource, entries.get(i).map(|e| &e.ty)) {
+                        (
+                            wgpu::BindingResource::Buffer(bb),
+                            Some(wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { .. },
+                                ..
+                            }),
+                        ) => Some(wgpu_buffer_key(bb.buffer)),
+                        _ => None,
+                    },
+                )
                 .collect();
             batch.pending_dispatches.push(WgpuPendingDispatch {
                 pipeline: cached.clone(),
@@ -6454,11 +6469,9 @@ fn bindings_exceed_cache_bytes(bindings: &[wgpu::BindGroupEntry<'_>]) -> bool {
     let total: u64 = bindings
         .iter()
         .filter_map(|e| match &e.resource {
-            wgpu::BindingResource::Buffer(bb) => Some(
-                bb.size
-                    .map(|s| s.get())
-                    .unwrap_or_else(|| bb.buffer.size()),
-            ),
+            wgpu::BindingResource::Buffer(bb) => {
+                Some(bb.size.map(|s| s.get()).unwrap_or_else(|| bb.buffer.size()))
+            }
             _ => None,
         })
         .sum();
@@ -8824,32 +8837,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 true,
                 0u32,
                 candle_wgpu_kernels::arg_reduce_rows_strided_shader(WG_SIZE).ok_or_else(|| {
-                    Error::Msg("wgpu shader arg_reduce_rows_strided.wgsl not embedded".into())
-                        .bt()
+                    Error::Msg("wgpu shader arg_reduce_rows_strided.wgsl not embedded".into()).bt()
                 })?,
             ),
             ReduceOp::ArgMin => (
                 true,
                 1u32,
                 candle_wgpu_kernels::arg_reduce_rows_strided_shader(WG_SIZE).ok_or_else(|| {
-                    Error::Msg("wgpu shader arg_reduce_rows_strided.wgsl not embedded".into())
-                        .bt()
+                    Error::Msg("wgpu shader arg_reduce_rows_strided.wgsl not embedded".into()).bt()
                 })?,
             ),
-            _ => return Ok(None),
         };
         let mut dst_dims = layout.dims().to_vec();
         dst_dims[dim] = 1;
         let dst = unsafe {
-            self.device
-                .alloc_uninit(&Shape::from(dst_dims), if is_arg { DType::U32 } else { DType::F32 })?
+            self.device.alloc_uninit(
+                &Shape::from(dst_dims),
+                if is_arg { DType::U32 } else { DType::F32 },
+            )?
         };
         let entries = [
             storage_entry(0, false),
             storage_entry(1, false),
             uniform_entry(2),
         ];
-        let max_workgroups = wgpu_dispatch_wg_cap(&self.device) as u32;
+        let max_workgroups = wgpu_dispatch_wg_cap(&self.device);
         let mut row_begin: u32 = 0;
         while row_begin < rows as u32 {
             let chunk_rows = ((rows as u32) - row_begin).min(max_workgroups);
@@ -9596,19 +9608,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // without 16 KiB of workgroup storage use the simple kernel.
         let tiled_ok = head_dim <= 64
             && head_dim_v <= 64
-            && q.device
-                .inner
-                .limits
-                .max_compute_workgroup_storage_size
-                >= 16384;
+            && q.device.inner.limits.max_compute_workgroup_storage_size >= 16384;
         let total_q_rows = (b * h * seq_q) as u32;
         if tiled_ok {
             let shader_source = candle_wgpu_kernels::get("flash_attn_tiled.wgsl")
-                .ok_or_else(|| {
-                    Error::Msg("wgpu flash_attn_tiled shader not found".into()).bt()
-                })?
+                .ok_or_else(|| Error::Msg("wgpu flash_attn_tiled shader not found".into()).bt())?
                 .source();
-            let q_tiles = ((seq_q as u32) + 63) / 64;
+            let q_tiles = (seq_q as u32).div_ceil(64);
             q.device.run_compute_xyz(
                 shader_source,
                 &entries,
@@ -9620,9 +9626,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             )?;
         } else {
             let shader_source = candle_wgpu_kernels::get("flash_attn_simple.wgsl")
-                .ok_or_else(|| {
-                    Error::Msg("wgpu flash_attn_simple shader not found".into()).bt()
-                })?
+                .ok_or_else(|| Error::Msg("wgpu flash_attn_simple shader not found".into()).bt())?
                 .source();
             q.device.run_compute_linear(
                 shader_source,
@@ -9847,8 +9851,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         })?;
         // ONE workgroup per query head; grid.x == n_q_heads (16 for qwen3).
         let wg_x = n_q_heads.try_into()?;
-        let (wg_x, wg_y) =
-            compute_2d_workgroups(wg_x, wgpu_dispatch_wg_cap(&self.device));
+        let (wg_x, wg_y) = compute_2d_workgroups(wg_x, wgpu_dispatch_wg_cap(&self.device));
         self.device.run_compute_xyz(
             shader,
             &entries,
@@ -10487,8 +10490,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             buffer_binding(3, &dst.buffer),
             buffer_binding(4, &param_buffer),
         ];
-        let shader = candle_wgpu_kernels::rope_cs_shader(wgpu_kernel_dtype(self.dtype)?, WG_SIZE)
-            .ok_or_else(|| Error::Msg("wgpu shader rope_cs.wgsl not embedded".into()).bt())?;
+        let shader =
+            candle_wgpu_kernels::rope_cs_shader(wgpu_kernel_dtype(self.dtype)?, WG_SIZE)
+                .ok_or_else(|| Error::Msg("wgpu shader rope_cs.wgsl not embedded".into()).bt())?;
         let total_wg = (n_threads as u32).div_ceil(WG_SIZE);
         self.device.run_compute(
             &shader,
@@ -10973,26 +10977,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 for (p, &iv) in ids_vals.iter().enumerate().take(ids_len) {
                     if iv >= r0 as u32 && iv < r1 as u32 {
                         sub_ids.push(iv - r0 as u32);
-                        let dst_off =
-                            params.offset_dst as usize + p * elems_per_row;
+                        let dst_off = params.offset_dst as usize + p * elems_per_row;
                         dst_map.push(dst_off as u32);
                     }
                 }
                 if sub_ids.is_empty() {
                     continue;
                 }
-                let sub_buf = src.device.register_buffer_arc(src.device.create_storage_buffer_arc(
-                    sub_ids.len() * 4,
-                    "wgpu-index-map-subids",
-                ));
+                let sub_buf = src.device.register_buffer_arc(
+                    src.device
+                        .create_storage_buffer_arc(sub_ids.len() * 4, "wgpu-index-map-subids"),
+                );
                 src.device
                     .inner
                     .queue
                     .write_buffer(&sub_buf, 0, typed_as_bytes(&sub_ids));
-                let map_buf = src.device.register_buffer_arc(src.device.create_storage_buffer_arc(
-                    dst_map.len() * 4,
-                    "wgpu-index-map-dstmap",
-                ));
+                let map_buf = src.device.register_buffer_arc(
+                    src.device
+                        .create_storage_buffer_arc(dst_map.len() * 4, "wgpu-index-map-dstmap"),
+                );
                 src.device
                     .inner
                     .queue
@@ -11007,7 +11010,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     _pad4: 0,
                     _pad5: 0,
                 };
-                let map_param_buffer = src.device.write_uniform_params(any_as_bytes(&map_params))?;
+                let map_param_buffer =
+                    src.device.write_uniform_params(any_as_bytes(&map_params))?;
                 let src_byte_off = (r0 * elems_per_row * src_elem_bytes) as u64;
                 let src_byte_len = ((r1 - r0) * elems_per_row * src_elem_bytes) as u64;
                 let map_bindings = [
@@ -11510,17 +11514,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             buffer_binding(2, &dst.buffer),
             buffer_binding(3, &param_buffer),
         ];
-        let shader_storage =
-            candle_wgpu_kernels::gemv_shader(wgpu_kernel_dtype(self.dtype)?).ok_or_else(|| {
-                Error::Msg("wgpu shader gemv.wgsl not embedded".into()).bt()
-            })?;
+        let shader_storage = candle_wgpu_kernels::gemv_shader(wgpu_kernel_dtype(self.dtype)?)
+            .ok_or_else(|| Error::Msg("wgpu shader gemv.wgsl not embedded".into()).bt())?;
         let shader = shader_storage.as_str();
         // One thread per output column: grid.x = ceil(n / WG_SIZE).
         let total_wg = n.div_ceil(WG_SIZE as usize);
-        let (wg_x, wg_y) = compute_2d_workgroups(
-            total_wg.try_into()?,
-            wgpu_dispatch_wg_cap(&self.device),
-        );
+        let (wg_x, wg_y) =
+            compute_2d_workgroups(total_wg.try_into()?, wgpu_dispatch_wg_cap(&self.device));
         self.device.run_compute_xyz(
             shader,
             &entries,
@@ -11598,11 +11598,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // grid.x = ceil(n / 4) output-column tiles, grid.y = batch, 128 threads/group.
         let wg_x = n.div_ceil(candle_wgpu_kernels::BATCHED_GEMV_F32_OUTPUTS_PER_WG as usize);
         let (wg_x, wg_y) = compute_2d_workgroups(
-            (wg_x as u32)
-                .checked_mul(b.try_into()?)
-                .ok_or_else(|| {
-                    Error::Msg("wgpu backend op batched gemv workgroup overflow".into()).bt()
-                })?,
+            (wg_x as u32).checked_mul(b.try_into()?).ok_or_else(|| {
+                Error::Msg("wgpu backend op batched gemv workgroup overflow".into()).bt()
+            })?,
             wgpu_dispatch_wg_cap(&self.device),
         );
         self.device.run_compute_xyz(
@@ -11685,17 +11683,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             buffer_binding(2, &dst.buffer),
             buffer_binding(3, &param_buffer),
         ];
-        let shader = candle_wgpu_kernels::ctx_gemv_f32_shader().ok_or_else(|| {
-            Error::Msg("wgpu shader ctx_gemv_f32.wgsl not embedded".into()).bt()
-        })?;
+        let shader = candle_wgpu_kernels::ctx_gemv_f32_shader()
+            .ok_or_else(|| Error::Msg("wgpu shader ctx_gemv_f32.wgsl not embedded".into()).bt())?;
         // grid.x = ceil(n / 32) head_dim tiles (32 columns/warp), grid.y = batch.
         let wg_x = n.div_ceil(candle_wgpu_kernels::CTX_GEMV_F32_I_GROUP as usize);
         let (wg_x, wg_y) = compute_2d_workgroups(
-            (wg_x as u32)
-                .checked_mul(b.try_into()?)
-                .ok_or_else(|| {
-                    Error::Msg("wgpu backend op ctx gemv workgroup overflow".into()).bt()
-                })?,
+            (wg_x as u32).checked_mul(b.try_into()?).ok_or_else(|| {
+                Error::Msg("wgpu backend op ctx gemv workgroup overflow".into()).bt()
+            })?,
             wgpu_dispatch_wg_cap(&self.device),
         );
         self.device.run_compute_xyz(
@@ -11808,8 +11803,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 && lhs_l.is_contiguous()
                 && Self::batched_gemv_inner_contiguous(&rhs_t_src)
             {
-                let dst =
-                    self.run_batched_gemv_f32(rhs, lhs_l, &rhs_t_src, b, m, n, k)?;
+                let dst = self.run_batched_gemv_f32(rhs, lhs_l, &rhs_t_src, b, m, n, k)?;
                 return Ok(dst);
             }
         }
@@ -12015,9 +12009,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                // Cooperative matrix: Ampere+ Vulkan exposes 16×16 f16 A/B → f32 C.
-                // Mixed-precision for large GEMMs; small squares stay full-f32 warptile.
-                let coop_ok = self.device.inner.coop_matmul_enabled
+                    // Cooperative matrix: Ampere+ Vulkan exposes 16×16 f16 A/B → f32 C.
+                    // Mixed-precision for large GEMMs; small squares stay full-f32 warptile.
+                    let coop_ok = self.device.inner.coop_matmul_enabled
                     && self
                         .device
                         .inner
@@ -12041,45 +12035,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     // of the 87s wall).
                     && (m >= 128 || n >= 128)
                     && params.stride_1k == 1;
-                if coop_ok {
-                    use_warptile = true;
-                    // coop64 (64×64, 512 thr) measured faster than the 128×64
-                    // dual-MMA on BOTH squares and tall GEMMs (RTX 3060):
-                    // 1024³ 0.53 vs 0.55 sync / 0.426 vs 0.446 batch20;
-                    // 64×4096 0.545 vs 0.685 sync / 0.448 vs 0.585 batch20.
-                    matmul_label = "candle-wgpu-matmul-coop64";
-                    candle_wgpu_kernels::matmul_coop_64_shader().ok_or_else(|| {
-                        Error::Msg("wgpu shader mul_mat_coop_64.wgsl not embedded".into()).bt()
-                    })?
-                } else if m >= 64 && n >= 64 && k >= 64 && params.stride_1k == 1 {
-                    matmul_label = "candle-wgpu-matmul-warptile";
-                    use_warptile = true;
-                    candle_wgpu_kernels::matmul_warptile_shader().ok_or_else(|| {
-                        Error::Msg("wgpu shader mul_mat_warptile.wgsl not embedded".into()).bt()
-                    })?
-                } else if m.max(n) >= 32 && k >= 32 {
-                    matmul_label = "candle-wgpu-matmul-fast";
-                    use_reg_tile = true;
-                    // VEC loads assume contiguous K (unit stride_0k / stride_1k).
-                    let vectorized = m.is_multiple_of(4)
-                        && n.is_multiple_of(4)
-                        && params.stride_0k == 1
-                        && params.stride_1k == 1;
-                    shader_storage = candle_wgpu_kernels::matmul_fast_shader(
-                        wgpu_kernel_dtype(DType::F32)?,
-                        vectorized,
-                    )
-                    .ok_or_else(|| {
-                        Error::Msg("wgpu shader mul_mat_reg_tile.wgsl not embedded".into()).bt()
-                    })?;
-                    &shader_storage
-                } else {
-                    matmul_label = "candle-wgpu-matmul";
-                    shader_storage = candle_wgpu_kernels::matmul_f32_shader().ok_or_else(|| {
-                        Error::Msg("wgpu shader mul_mat.wgsl not embedded".into()).bt()
-                    })?;
-                    &shader_storage
-                }
+                    if coop_ok {
+                        use_warptile = true;
+                        // coop64 (64×64, 512 thr) measured faster than the 128×64
+                        // dual-MMA on BOTH squares and tall GEMMs (RTX 3060):
+                        // 1024³ 0.53 vs 0.55 sync / 0.426 vs 0.446 batch20;
+                        // 64×4096 0.545 vs 0.685 sync / 0.448 vs 0.585 batch20.
+                        matmul_label = "candle-wgpu-matmul-coop64";
+                        candle_wgpu_kernels::matmul_coop_64_shader().ok_or_else(|| {
+                            Error::Msg("wgpu shader mul_mat_coop_64.wgsl not embedded".into()).bt()
+                        })?
+                    } else if m >= 64 && n >= 64 && k >= 64 && params.stride_1k == 1 {
+                        matmul_label = "candle-wgpu-matmul-warptile";
+                        use_warptile = true;
+                        candle_wgpu_kernels::matmul_warptile_shader().ok_or_else(|| {
+                            Error::Msg("wgpu shader mul_mat_warptile.wgsl not embedded".into()).bt()
+                        })?
+                    } else if m.max(n) >= 32 && k >= 32 {
+                        matmul_label = "candle-wgpu-matmul-fast";
+                        use_reg_tile = true;
+                        // VEC loads assume contiguous K (unit stride_0k / stride_1k).
+                        let vectorized = m.is_multiple_of(4)
+                            && n.is_multiple_of(4)
+                            && params.stride_0k == 1
+                            && params.stride_1k == 1;
+                        shader_storage = candle_wgpu_kernels::matmul_fast_shader(
+                            wgpu_kernel_dtype(DType::F32)?,
+                            vectorized,
+                        )
+                        .ok_or_else(|| {
+                            Error::Msg("wgpu shader mul_mat_reg_tile.wgsl not embedded".into()).bt()
+                        })?;
+                        &shader_storage
+                    } else {
+                        matmul_label = "candle-wgpu-matmul";
+                        shader_storage =
+                            candle_wgpu_kernels::matmul_f32_shader().ok_or_else(|| {
+                                Error::Msg("wgpu shader mul_mat.wgsl not embedded".into()).bt()
+                            })?;
+                        &shader_storage
+                    }
                 } // not(wasm32)
             }
             DType::F16 => {
@@ -12159,7 +12154,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     rhs_t_layout.is_contiguous(),
                 );
                 if std::env::var_os("CANDLE_DEBUG_MATMUL_SHAPE").is_some() {
-                    msg.push_str("\n");
+                    msg.push('\n');
                     msg.push_str(&std::backtrace::Backtrace::force_capture().to_string());
                 }
                 return Err(Error::Msg(msg).bt());
@@ -13498,8 +13493,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 chunk_params.offset_idx =
                     (params.offset_idx as usize + p0 * params.stride_idx0 as usize).try_into()?;
                 chunk_params.n_rows = (p1 - p0).try_into()?;
-                let chunk_param_buffer =
-                    self.device.write_uniform_params(any_as_bytes(&chunk_params))?;
+                let chunk_param_buffer = self
+                    .device
+                    .write_uniform_params(any_as_bytes(&chunk_params))?;
                 let chunk_len = p1 - p0;
                 let dst_byte_off = (p0 * elem_per_pos * 4) as u64;
                 let dst_byte_len = (chunk_len * elem_per_pos * 4) as u64;
@@ -13741,8 +13737,10 @@ fn main(
             buffer_binding(2, &param_buffer),
         ];
 
-        let shader_source = candle_wgpu_kernels::quantize_q8_1_roundtrip_shader()
-            .ok_or_else(|| Error::Msg("wgpu quantize_q8_1_roundtrip shader not found".into()).bt())?;
+        let shader_source =
+            candle_wgpu_kernels::quantize_q8_1_roundtrip_shader().ok_or_else(|| {
+                Error::Msg("wgpu quantize_q8_1_roundtrip shader not found".into()).bt()
+            })?;
 
         let num_wgs = (num_blocks as u32).div_ceil(64);
         self.device.run_compute_xyz(
@@ -14229,9 +14227,8 @@ fn main(
         // compounds through the residual stream — mirror of the Vulkan
         // 67e07ec5 fix. Previously gated to Q8_1 dtype; extended to all
         // quantized dtypes to match the CPU/cuda mmq activation contract.
-        let q8_1_owned: Option<WgpuStorage> = Some(src.quantize_q8_1_lhs_roundtrip(
-            src_layout.shape().elem_count(),
-        )?);
+        let q8_1_owned: Option<WgpuStorage> =
+            Some(src.quantize_q8_1_lhs_roundtrip(src_layout.shape().elem_count())?);
         let (src, src_layout) = match &q8_1_owned {
             Some(rc) => (rc, Layout::contiguous(src_layout.shape().clone())),
             None => (src, src_layout),
@@ -15326,10 +15323,12 @@ impl BackendStorage for WgpuStorage {
                     dst_dims[dim] = 1;
                     let dst_shape = Shape::from(dst_dims);
                     let mut dst = unsafe { self.device.alloc_uninit(&dst_shape, DType::U32)? };
-                    dst.const_set(crate::scalar::Scalar::U32(0), &Layout::contiguous(dst_shape))?;
+                    dst.const_set(
+                        crate::scalar::Scalar::U32(0),
+                        &Layout::contiguous(dst_shape),
+                    )?;
                     return Ok(dst);
                 }
-                _ => {}
             }
         }
         // Strided-aware single-dispatch reduce (no materialize pass) for the
@@ -15341,7 +15340,6 @@ impl BackendStorage for WgpuStorage {
                     return Ok(reduced);
                 }
             }
-            _ => {}
         }
         // The last-dim kernels (sum_rows / extrema) index src assuming UNIT stride
         // along the reduced dim. A non-contiguous view (reduced-dim stride != 1,
@@ -16460,14 +16458,14 @@ impl BackendStorage for WgpuStorage {
         // (a 256-row cat was paying 512 recorded copies per call). The copy
         // shader takes the row strides from the params, so the same gather
         // covers both contiguous and row-strided sources.
-        let d1_gather = d1 >= 8 && d2 > 0
-            && matches!(self.dtype, DType::F32 | DType::F16 | DType::U32 | DType::I32);
-        if d1_gather {
-            let src_layout = Layout::new(
-                Shape::from((d1, d2)),
-                vec![src_stride1, 1],
-                src_offset,
+        let d1_gather = d1 >= 8
+            && d2 > 0
+            && matches!(
+                self.dtype,
+                DType::F32 | DType::F16 | DType::U32 | DType::I32
             );
+        if d1_gather {
+            let src_layout = Layout::new(Shape::from((d1, d2)), vec![src_stride1, 1], src_offset);
             let dst_strides = [1u32, dst_stride1.try_into()?, 0, 0];
             let shader = copy_shader(self.dtype, self.dtype)?;
             match self.run_copy_into_with_dst_strides(
@@ -16501,11 +16499,11 @@ impl BackendStorage for WgpuStorage {
         // record_buffer_copy path and sends unaligned rows through the existing
         // copy/emulated shader fallback for every dtype.
         let row_bytes = d2 * elem_size;
-        let aligned = row_bytes % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
-            && (src_offset * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
-            && (dst_offset * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
-            && (src_stride1 * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0
-            && (dst_stride1 * elem_size) % wgpu::COPY_BUFFER_ALIGNMENT as usize == 0;
+        let aligned = row_bytes.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize)
+            && (src_offset * elem_size).is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize)
+            && (dst_offset * elem_size).is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize)
+            && (src_stride1 * elem_size).is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize)
+            && (dst_stride1 * elem_size).is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize);
         if !aligned {
             if self.dtype == DType::U8 {
                 // 1-byte dtypes cannot use the per-row copy_strided_src fallback:
@@ -16523,8 +16521,7 @@ impl BackendStorage for WgpuStorage {
             }
             let row_shape = Shape::from(d2);
             for i1 in 0..d1 {
-                let src_l =
-                    Layout::new(row_shape.clone(), vec![1], src_offset + i1 * src_stride1);
+                let src_l = Layout::new(row_shape.clone(), vec![1], src_offset + i1 * src_stride1);
                 self.copy_strided_src(dst, dst_offset + i1 * dst_stride1, &src_l)?;
             }
             return Ok(());
@@ -16552,10 +16549,7 @@ impl BackendStorage for WgpuStorage {
                     (d2 * elem_size) as u64,
                 );
             }
-            WgpuDevice::retain_buffers_into(
-                batch,
-                vec![self.buffer.clone(), dst.buffer.clone()],
-            );
+            WgpuDevice::retain_buffers_into(batch, vec![self.buffer.clone(), dst.buffer.clone()]);
             batch.copy_count += 1;
         }
         Ok(())
@@ -16686,8 +16680,7 @@ fn wgpu_finish_device(
         std::sync::atomic::Ordering::Relaxed,
     );
     // WebGPU requires dynamic uniform offsets multiple of this alignment.
-    let uniform_dyn_slot =
-        u64::from(adapter_limits.min_uniform_buffer_offset_alignment).max(256);
+    let uniform_dyn_slot = u64::from(adapter_limits.min_uniform_buffer_offset_alignment).max(256);
     WgpuDevice {
         inner: Arc::new(WgpuInner {
             ordinal,
@@ -16983,8 +16976,7 @@ impl BackendDevice for WgpuDevice {
         let size = byte_len(dtype, count, "wgpu alloc_uninit")?;
         // wgpu can't allocate 0-byte buffers; use a 1-byte dummy for empty shapes.
         let alloc_size = size.max(1);
-        if alloc_size >= 256 * 1024 * 1024
-            && std::env::var_os("CANDLE_DEBUG_LARGE_ALLOC").is_some()
+        if alloc_size >= 256 * 1024 * 1024 && std::env::var_os("CANDLE_DEBUG_LARGE_ALLOC").is_some()
         {
             eprintln!(
                 "[candle-wgpu] large alloc_uninit: shape={shape:?} dtype={dtype:?} count={count} bytes={alloc_size}"
@@ -17039,10 +17031,8 @@ impl BackendDevice for WgpuDevice {
         // Upload straight from the caller's slice: building an owned CpuStorage
         // first would add a full-size host copy of the data per upload.
         let bytes = typed_as_bytes(data);
-        let buffer = self.register_buffer_arc(self.create_storage_buffer_arc(
-            bytes.len(),
-            "candle-wgpu-upload",
-        ));
+        let buffer = self
+            .register_buffer_arc(self.create_storage_buffer_arc(bytes.len(), "candle-wgpu-upload"));
         self.write_storage_bytes(&buffer, bytes)?;
         Ok(WgpuStorage {
             buffer,
@@ -17059,7 +17049,7 @@ impl BackendDevice for WgpuDevice {
         // Chunk large uploads (same 1 MiB cadence as create_zeroed_storage_buffer /
         // llama.cpp WebGPU WriteBuffer care). Browsers can mishandle a single
         // multi‑100MB writeBuffer from wasm.
-        self.write_storage_bytes(&buffer, &bytes)?;
+        self.write_storage_bytes(&buffer, bytes)?;
         Ok(WgpuStorage {
             buffer,
             device: self.clone(),
@@ -17204,7 +17194,10 @@ mod compute_2d_self_check {
         let (ha, la) = wgpu_shader_cache_key(&a);
         let (hb, lb) = wgpu_shader_cache_key(&b);
         assert_eq!(la, lb);
-        assert_ne!(ha, hb, "distinct shader contents must not collide on cache key");
+        assert_ne!(
+            ha, hb,
+            "distinct shader contents must not collide on cache key"
+        );
     }
 }
 
