@@ -4,13 +4,23 @@
 use candle_core::{Device, Tensor};
 use std::time::Instant;
 
-fn bench_shape(device: &Device, name: &str, shape: (usize, usize, usize), rank: usize, iters: usize) -> candle_core::Result<()> {
+fn bench_shape(
+    device: &Device,
+    name: &str,
+    shape: (usize, usize, usize),
+    rank: usize,
+    iters: usize,
+) -> candle_core::Result<()> {
     let (m, n, k) = shape;
     let b = if rank > 2 { 1 } else { 0 };
     let a_shape: Vec<usize> = if rank > 2 { vec![1, m, k] } else { vec![m, k] };
     let b_shape: Vec<usize> = if rank > 2 { vec![1, k, n] } else { vec![k, n] };
-    let a_vals: Vec<f32> = (0..m * k).map(|i| ((i % 71) as f32 - 35.0) / 17.0).collect();
-    let b_vals: Vec<f32> = (0..k * n).map(|i| ((i % 53) as f32 - 26.0) / 13.0).collect();
+    let a_vals: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 71) as f32 - 35.0) / 17.0)
+        .collect();
+    let b_vals: Vec<f32> = (0..k * n)
+        .map(|i| ((i % 53) as f32 - 26.0) / 13.0)
+        .collect();
     let a = Tensor::from_vec(a_vals, a_shape, device)?;
     let bm = Tensor::from_vec(b_vals, b_shape, device)?;
     let _ = b;
@@ -31,7 +41,10 @@ fn bench_shape(device: &Device, name: &str, shape: (usize, usize, usize), rank: 
     }
     times.sort();
     let med = times[times.len() / 2];
-    println!("rank{rank} {name} m={m} n={n} k={k}: median {:?} ({} iters)", med, iters);
+    println!(
+        "rank{rank} {name} m={m} n={n} k={k}: median {:?} ({} iters)",
+        med, iters
+    );
     Ok(())
 }
 
@@ -46,7 +59,11 @@ fn main() -> candle_core::Result<()> {
         ("aligned_ref", (4096, 4096, 4096), 2),
     ];
     for (name, shape, rank) in shapes {
-        let iters = if shape.0 * shape.1 * shape.2 > 1_000_000_000 { 5 } else { 20 };
+        let iters = if shape.0 * shape.1 * shape.2 > 1_000_000_000 {
+            5
+        } else {
+            20
+        };
         bench_shape(&device, name, *shape, *rank, iters)?;
     }
     Ok(())

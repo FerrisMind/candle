@@ -26,13 +26,9 @@ fn run(dtype: DType) -> candle_core::Result<()> {
 
     // Warmup + correctness vs CPU.
     let out = x.conv_transpose2d(&w, 1, 0, 2, 1)?;
-    let out_cpu = x.to_device(&Device::Cpu)?.conv_transpose2d(
-        &w.to_device(&Device::Cpu)?,
-        1,
-        0,
-        2,
-        1,
-    )?;
+    let out_cpu =
+        x.to_device(&Device::Cpu)?
+            .conv_transpose2d(&w.to_device(&Device::Cpu)?, 1, 0, 2, 1)?;
     let g = out
         .to_device(&Device::Cpu)?
         .to_dtype(DType::F32)?

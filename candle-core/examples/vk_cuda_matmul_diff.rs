@@ -52,10 +52,7 @@ fn main() -> Result<()> {
         (512, 64, 1025),
         (4096, 64, 1025),
     ];
-    let shapes3 = [
-        (24usize, 1025, 1025, 64usize),
-        (24, 1025, 64, 1025),
-    ];
+    let shapes3 = [(24usize, 1025, 1025, 64usize), (24, 1025, 64, 1025)];
     let cuda = Device::new_cuda(0)?;
     let vk = Device::new_vulkan(0)?;
     for (m, n, k) in shapes2 {

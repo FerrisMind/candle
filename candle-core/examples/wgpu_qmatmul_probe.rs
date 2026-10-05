@@ -1,5 +1,5 @@
 use candle_core::quantized::{self, GgmlDType, QMatMul};
-use candle_core::{DType, Device, Tensor, Module};
+use candle_core::{DType, Device, Module, Tensor};
 use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
@@ -30,7 +30,11 @@ fn main() -> anyhow::Result<()> {
     let w = dense.t()?.to_dtype(DType::F32)?;
     let _ = lhs.matmul(&w)?;
     for mm_ in [1usize, 16, 64, 1024] {
-        let lhs_t = Tensor::from_vec((0..mm_ * k).map(|v| v as f32 / 1024.0).collect(), (mm_, k), &dev)?;
+        let lhs_t = Tensor::from_vec(
+            (0..mm_ * k).map(|v| v as f32 / 1024.0).collect(),
+            (mm_, k),
+            &dev,
+        )?;
         let _ = lhs_t.matmul(&w)?;
         let t0 = Instant::now();
         for _ in 0..30 {

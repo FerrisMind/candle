@@ -18,7 +18,11 @@ fn replication_pad2d(xs: &Tensor, pad: usize) -> Result<Tensor> {
 fn main() -> Result<()> {
     let vk = Device::new_vulkan(0)?;
     // W-pad killer shape: (2,64,518,518) cat along W with 1-elem strided args
-    for (b, c, h, w) in [(2usize, 64usize, 37usize, 37usize), (2, 64, 518, 518), (1, 3, 8, 8)] {
+    for (b, c, h, w) in [
+        (2usize, 64usize, 37usize, 37usize),
+        (2, 64, 518, 518),
+        (1, 3, 8, 8),
+    ] {
         let xs = Tensor::randn(0f32, 1.0, (b, c, h, w), &Device::Cpu)?;
         let cpu = replication_pad2d(&xs, 1)?;
         let xsv = xs.to_device(&vk)?;
@@ -46,12 +50,12 @@ fn main() -> Result<()> {
         let a = xs.narrow(3, 0, w / 2)?;
         let b_t = xs.narrow(3, w / 2, w - w / 2)?;
         let cpu_cat = Tensor::cat(&[&a, &b_t], 3)?;
-        let vk_cat = Tensor::cat(
-            &[&a.to_device(&vk)?, &b_t.to_device(&vk)?],
-            3,
-        )?
-        .to_device(&Device::Cpu)?;
-        println!("cat_{b}x{c}x{h}x{w}: max={:.4e}", max_abs(&cpu_cat, &vk_cat)?);
+        let vk_cat =
+            Tensor::cat(&[&a.to_device(&vk)?, &b_t.to_device(&vk)?], 3)?.to_device(&Device::Cpu)?;
+        println!(
+            "cat_{b}x{c}x{h}x{w}: max={:.4e}",
+            max_abs(&cpu_cat, &vk_cat)?
+        );
     }
     Ok(())
 }

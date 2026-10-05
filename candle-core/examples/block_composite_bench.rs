@@ -107,7 +107,9 @@ fn main() -> Result<()> {
             // narrow a (b, seq+5, d) then use last seq rows — strided)
             let xs_wide = Tensor::randn(0f32, 1.0, (b, seq + 5, d), dev)?;
             let xs_strided = xs_wide.i((.., 5..))?;
-            let ms = bench(dev, iters, || xs_strided.reshape((b * seq, d))?.matmul(&wqkv))?;
+            let ms = bench(dev, iters, || {
+                xs_strided.reshape((b * seq, d))?.matmul(&wqkv)
+            })?;
             report(dn, "qkv_linear (strided lhs)", ms);
 
             // split heads exactly like the models

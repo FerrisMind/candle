@@ -5,8 +5,12 @@ fn timed(name: &str, m: usize, k: usize, n: usize) -> candle_core::Result<()> {
     let dev = Device::new_vulkan(0)?;
     let mk = m * k;
     let kn = k * n;
-    let a: Vec<f32> = (0..mk).map(|v| (v as f32 / mk as f32) * 2.0 - 1.0).collect();
-    let b: Vec<f32> = (0..kn).map(|v| (v as f32 / kn as f32) * 2.0 - 1.0).collect();
+    let a: Vec<f32> = (0..mk)
+        .map(|v| (v as f32 / mk as f32) * 2.0 - 1.0)
+        .collect();
+    let b: Vec<f32> = (0..kn)
+        .map(|v| (v as f32 / kn as f32) * 2.0 - 1.0)
+        .collect();
     let ta = Tensor::from_vec(a.clone(), (m, k), &dev)?;
     let tb = Tensor::from_vec(b.clone(), (k, n), &dev)?;
     let out = ta.matmul(&tb)?;
