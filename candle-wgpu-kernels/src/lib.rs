@@ -1506,10 +1506,13 @@ fn conv_transpose2d_shader(workgroup_size: u32, dtype: DType) -> Option<String> 
         DType::F32 => ("f32", "SRC_F32"),
         DType::F16 => ("f16", "SRC_F16"),
     };
-    let tag = (match src_define {
-        "SRC_F32" => 24u8,
-        _ => 25u8,
-    }, workgroup_size);
+    let tag = (
+        match src_define {
+            "SRC_F32" => 24u8,
+            _ => 25u8,
+        },
+        workgroup_size,
+    );
     cached_shader(tag, || {
         let defines = vec![
             "WG_SIZE".to_string(),
