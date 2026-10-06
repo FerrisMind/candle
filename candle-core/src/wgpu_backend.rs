@@ -8686,6 +8686,61 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         Ok(dst)
     }
 
+    /// Rank>4 reduce: see the comment at the dispatch site in `reduce_op`.
+    /// Strided views are materialized first (`copy_strided_src`'s rank>4
+    /// branch compact-collapses, which preserves row-major element order);
+    /// each requested dim is then reduced through an equivalent contiguous
+    /// [outer, span, inner] rank-3 view, one dim at a time.
+    fn run_reduce_rank_gt4(
+        &self,
+        op: ReduceOp,
+        layout: &Layout,
+        reduce_dims: &[usize],
+    ) -> Result<Self> {
+        let rank = layout.dims().len();
+        if reduce_dims.is_empty() {
+            return self.try_clone(layout);
+        }
+        for &dim in reduce_dims {
+            if dim >= rank {
+                crate::bail!("wgpu backend op reduce got out-of-range dim {dim} for rank {rank}")
+            }
+        }
+        let mut materialized;
+        let src: &Self = if layout.is_contiguous() && layout.start_offset() == 0 {
+            self
+        } else {
+            materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+            <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
+            &materialized
+        };
+        let mut cur_dims = layout.dims().to_vec();
+        let mut sorted: Vec<usize> = reduce_dims.to_vec();
+        sorted.sort_unstable();
+        let mut current: Option<Self> = None;
+        for &dim in &sorted {
+            if cur_dims[dim] == 1 {
+                continue;
+            }
+            let outer: usize = cur_dims[..dim].iter().product();
+            let span = cur_dims[dim];
+            let inner: usize = cur_dims[dim + 1..].iter().product();
+            let flat = Layout::contiguous(Shape::from(vec![outer, span, inner]));
+            let reduced = <Self as BackendStorage>::reduce_op(
+                current.as_ref().unwrap_or(src),
+                op,
+                &flat,
+                &[1],
+            )?;
+            cur_dims[dim] = 1;
+            current = Some(reduced);
+        }
+        match current {
+            Some(v) => Ok(v),
+            // Every reduced dim already had length 1: the values are unchanged.
+            None => src.try_clone(&Layout::contiguous(Shape::from(cur_dims))),
+        }
+    }
     fn run_reduce_extrema_last_dim(&self, layout: &Layout, op: ReduceOp) -> Result<Self> {
         let mut materialized_storage;
         let materialized_layout;
@@ -10511,6 +10566,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         alpha_layout: &Layout,
         eps: f32,
     ) -> Result<Self> {
+        // Rank>4 inputs (video latents [B,C,T,H,W] reach this fused kernel
+        // through candle-nn RmsNorm on contiguous tensors): the rms-norm WGSL
+        // is rank-4, but the norm spans the last dim, so a contiguous flat
+        // view [rows, hidden] computes the identical result. Re-enter with it.
+        if layout.dims().len() > 4 {
+            let mut materialized;
+            let src: &Self = if layout.is_contiguous() && layout.start_offset() == 0 {
+                self
+            } else {
+                materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+                <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
+                &materialized
+            };
+            let hidden = layout.dims()[layout.dims().len() - 1];
+            let rows = layout.shape().elem_count() / hidden;
+            let flat = Layout::contiguous(Shape::from(vec![rows, hidden]));
+            return src.rms_norm(&flat, alpha, alpha_layout, eps);
+        }
         // CUDA parity: mixed dtypes and F16 use a GPU-resident F32 hub.
         // rms_norm WGSL only supports f32/bf16 — always upconvert F16.
         if self.dtype != alpha.dtype || self.dtype == DType::F16 || alpha.dtype == DType::F16 {
@@ -10580,16 +10653,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             uniform_entry(3),
         ];
         if self.dtype == DType::BF16 {
-            // ponytail: in-place — shader reads then overwrites rn_src row-wise.
-            let mut inplace_params = params;
-            inplace_params.offset_dst = offset_rn;
-            let param_buffer = self
-                .device
-                .write_uniform_params(any_as_bytes(&inplace_params))?;
+            // Write to a fresh dst buffer. Binding `self.buffer` as dst (in-place)
+            // corrupted the INPUT tensor: rms_norm must stay functional — candle
+            // ops never mutate their inputs, and the caller is free to reuse x
+            // afterwards (residual adds, a later LayerNorm on the same x, ...).
+            // The WGSL already supports a separate dst via offset_dst/stride_dst
+            // (same shape the f32 branch uses below).
+            let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
             let bindings = [
                 buffer_binding(0, &self.buffer),
                 buffer_binding(1, &alpha.buffer),
-                buffer_binding(2, &self.buffer),
+                buffer_binding(2, &dst.buffer),
                 buffer_binding(3, &param_buffer),
             ];
             let rows = count / layout.dims()[layout.dims().len() - 1];
@@ -10603,14 +10677,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 (wg_x, wg_y, 1),
                 &[],
                 None,
-                "candle-wgpu-rms-norm-bf16-inplace",
+                "candle-wgpu-rms-norm-bf16",
             )?;
-            return Ok(WgpuStorage {
-                buffer: self.buffer.clone(),
-                device: self.device.clone(),
-                count,
-                dtype: self.dtype,
-            });
+            return Ok(dst);
         }
         let dst = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
         let bindings = [
@@ -10646,6 +10715,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         beta_layout: &Layout,
         eps: f32,
     ) -> Result<Self> {
+        // Rank>4 inputs: same flat [rows, hidden] collapse as `rms_norm` —
+        // the norm spans the last dim and element order is preserved.
+        if layout.dims().len() > 4 {
+            let mut materialized;
+            let src: &Self = if layout.is_contiguous() && layout.start_offset() == 0 {
+                self
+            } else {
+                materialized = unsafe { self.device.alloc_uninit(layout.shape(), self.dtype)? };
+                <Self as BackendStorage>::copy_strided_src(self, &mut materialized, 0, layout)?;
+                &materialized
+            };
+            let hidden = layout.dims()[layout.dims().len() - 1];
+            let rows = layout.shape().elem_count() / hidden;
+            let flat = Layout::contiguous(Shape::from(vec![rows, hidden]));
+            return src.layer_norm(&flat, alpha, alpha_layout, beta, beta_layout, eps);
+        }
         if self.dtype != DType::F32 || alpha.dtype != DType::F32 || beta.dtype != DType::F32 {
             let out_dtype = self.dtype;
             let src_f32 = self.to_dtype(layout, DType::F32)?;
@@ -15238,6 +15323,14 @@ impl BackendStorage for WgpuStorage {
         self.run_unary_like(layout, &shader, "candle-wgpu-elu")
     }
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
+        // Video latents are rank-5 [B,C,T,H,W] and the reduce kernels are
+        // rank-4. A single reduction over a row-major tensor is equivalent to a
+        // reduction over the middle dim of a contiguous [outer, span, inner]
+        // 3-D view, so reduce one dim at a time through that flat view
+        // (element order is preserved and every kernel dispatch sees rank<=3).
+        if layout.dims().len() > 4 {
+            return self.run_reduce_rank_gt4(op, layout, reduce_dims);
+        }
         if matches!(self.dtype, DType::U8 | DType::U32 | DType::I64 | DType::I32) {
             return self.run_int_reduce(op, layout, reduce_dims);
         }
