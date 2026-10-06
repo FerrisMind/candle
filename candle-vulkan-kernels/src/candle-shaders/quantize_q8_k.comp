@@ -1,0 +1,109 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+// Reproduce the CPU QMatMul A-side (activation) quantization contract for the
+// k-quants (Q2_K..Q6_K). Their `GgmlType::VecDotType` is `BlockQ8K`, whose
+// `from_float` quantizes the activation per **256**-element block with the
+// *signed* extreme value (`max` = the element with the largest absolute value,
+// sign preserved): `iscale = -127/max`, `q = round(x*iscale)` clamped to
+// [-128,127], `d = 1/iscale` and the dequantized value is `d*q` with a **f32**
+// scale — unlike Q8_1, which rounds per 32 elements and stores an f16 scale.
+//
+// The backend previously fed every quantized dtype through the Q8_1 grid
+// (`quantize_q8_1_x4`), which is a different rounding for k-quants: per-layer
+// nmse ~1e-5 vs the CPU reference that compounds to ~1e-2 in whole-model
+// logits (Qwen3-0.6B Q4_K_M missed the model-matrix gate on both backends).
+//
+// The rounded f32 values are what the raw-f32 kernels consume: unlike the
+// per-32 q8_1 grid (whose f16 scale and f16 integer sum can be reproduced by
+// the fused dp4a kernels), the Q8K grid has no exact `block_q8_1_x4`
+// representation, so the k-quants stay on the raw-f32 path.
+
+layout (push_constant) uniform parameter
+{
+    uint ne;
+    uint num_blocks;
+    uint scale_bits;
+} p;
+
+#include "types.glsl"
+
+layout(constant_id = 0) const uint GROUP_SIZE = 64;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {vec4 data_a[];};
+layout (binding = 1) writeonly buffer D {vec4 data_d[];};
+
+// One workgroup (64 threads x vec4) per 256-element block.
+shared float shmem_amax[GROUP_SIZE];
+shared float shmem_maxv[GROUP_SIZE];
+
+// Vulkan permits division to be up to 2 ulp off the IEEE result. The CPU
+// quantizer computes `-127/max` and `1/iscale` with correctly rounded f32
+// division; pick whichever of the 5 surrounding f32 values minimizes the
+// (correctly rounded, fma) residual so the Q8K grid is reproduced bit-exactly.
+float div_ieee(float a, float b) {
+    float q = a / b;
+    int qb = floatBitsToInt(q);
+    float best = abs(fma(b, q, -a));
+    int bidx = 0;
+    float r = abs(fma(b, intBitsToFloat(qb + 1), -a));
+    if (r < best) { best = r; bidx = 1; }
+    r = abs(fma(b, intBitsToFloat(qb + 2), -a));
+    if (r < best) { best = r; bidx = 2; }
+    r = abs(fma(b, intBitsToFloat(qb - 1), -a));
+    if (r < best) { best = r; bidx = -1; }
+    r = abs(fma(b, intBitsToFloat(qb - 2), -a));
+    if (r < best) { best = r; bidx = -2; }
+    return intBitsToFloat(qb + bidx);
+}
+
+void quantize(const uint ib) {
+    const uint tid = gl_LocalInvocationID.x;
+    // GROUP_SIZE threads x vec4 = one 256-element block.
+    const uint idx4 = ib * GROUP_SIZE + tid;
+    const bool in_range = idx4 * 4 < p.ne;
+    const vec4 vals = in_range ? data_a[idx4] : vec4(0.0f);
+
+    // Signed extreme: the first element with a strictly larger |x| wins, as in
+    // `BlockQ8K::from_float` (`if amax < x.abs() { amax = ..; max = x; }`).
+    float amax = 0.0f;
+    float maxv = 0.0f;
+    if (abs(vals.x) > amax) { amax = abs(vals.x); maxv = vals.x; }
+    if (abs(vals.y) > amax) { amax = abs(vals.y); maxv = vals.y; }
+    if (abs(vals.z) > amax) { amax = abs(vals.z); maxv = vals.z; }
+    if (abs(vals.w) > amax) { amax = abs(vals.w); maxv = vals.w; }
+    shmem_amax[tid] = amax;
+    shmem_maxv[tid] = maxv;
+    barrier();
+    [[unroll]] for (uint s = GROUP_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (shmem_amax[tid + s] > shmem_amax[tid]) {
+                shmem_amax[tid] = shmem_amax[tid + s];
+                shmem_maxv[tid] = shmem_maxv[tid + s];
+            }
+        }
+        barrier();
+    }
+
+    const float mx = shmem_maxv[0];
+    const float scale = uintBitsToFloat(p.scale_bits);
+    const float iscale = mx != 0.0f ? div_ieee(-scale, mx) : 0.0f;
+    const float d = iscale != 0.0f ? div_ieee(1.0f, iscale) : 0.0f;
+    const vec4 q = clamp(round(vals * iscale), vec4(-128.0f), vec4(127.0f));
+
+    if (in_range) {
+        data_d[idx4] = vec4(d) * q;
+    }
+}
+
+void main() {
+    uint wgid = gl_WorkGroupID.x;
+    while (wgid < p.num_blocks) {
+        quantize(wgid);
+        wgid += gl_NumWorkGroups.x;
+    }
+}

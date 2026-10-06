@@ -1635,6 +1635,45 @@ fn quantize_f32_storage_to_q8_1_x4(
     Ok(out)
 }
 
+/// Round a f32 activation to the CPU k-quant A-side grid (Q8K: per-256-element
+/// block, signed extreme, f32 scale) and return the dequantized f32 values.
+/// Used with the raw-f32 kernels when the fused q8_1 dp4a path is not taken.
+fn quantize_f32_storage_to_q8_k(
+    device: &VulkanDevice,
+    src: &VulkanStorage,
+    elem_count: usize,
+) -> Result<Arc<VulkanBuffer>> {
+    if src.dtype != DType::F32 {
+        return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan quantize_q8_k").bt());
+    }
+    if !elem_count.is_multiple_of(256) {
+        crate::bail!(
+            "vulkan quantize_q8_k expects element count divisible by 256, got {elem_count}"
+        )
+    }
+    let num_blocks: u32 = (elem_count / 256).try_into()?;
+    let out = device.create_buffer(elem_count * 4, "candle-vulkan-quantize-q8_k")?;
+    let spirv = candle_vulkan_kernels::spirv("quantize_q8_k")
+        .ok_or_else(|| Error::Msg("vulkan shader quantize_q8_k not generated".into()).bt())?;
+    let params = VulkanQuantizeQ8_1Params {
+        ne: elem_count.try_into()?,
+        num_blocks,
+        scale_bits: 127f32.to_bits(),
+    };
+    let workgroups_x = num_blocks.min(device.inner.max_workgroup_count_x.max(1));
+    device.run_compute_specialized(
+        spirv,
+        &[
+            VulkanBinding::Storage(&src.buffer),
+            VulkanBinding::Storage(&out),
+        ],
+        Some(any_as_bytes(&params)),
+        (workgroups_x, 1, 1),
+        Some(&[(0, 64)]),
+    )?;
+    Ok(out)
+}
+
 fn repack_q8_1_storage_to_q8_0(
     device: &VulkanDevice,
     src: &VulkanStorage,
@@ -10186,6 +10225,20 @@ impl VulkanStorage {
             broadcast3: batch_outer.try_into()?,
             padded_n: input_m.try_into()?,
         };
+        // k-quants: the CPU `VecDotType` is `BlockQ8K` (per-256 signed extreme,
+        // f32 scale), which the fused q8_1 kernels cannot represent — their
+        // `block_q8_1_x4` fields carry a per-32 f16 scale and a per-32 f16
+        // integer sum, so the dp4a path would round the activation onto the
+        // wrong grid (~1e-5 nmse per layer vs the CPU, ~1e-2 in whole-model
+        // logits). Force the raw-f32 kernels and round the activation to the
+        // Q8K grid instead, exactly like the wgpu backend does.
+        let is_k_quant = vulkan_is_k_quant(qdtype);
+        let use_q8_1_rhs = use_q8_1_rhs && !is_k_quant;
+        let q8_1_rhs_spirv_name = if use_q8_1_rhs {
+            q8_1_rhs_spirv_name
+        } else {
+            None
+        };
         let q8_1_rhs = if use_q8_1_rhs {
             Some(quantize_f32_storage_to_q8_1_x4(
                 &self.device,
@@ -10195,7 +10248,19 @@ impl VulkanStorage {
         } else {
             None
         };
-        let rhs_binding = q8_1_rhs.as_ref().unwrap_or(&src.buffer);
+        let q8k_rhs = if !use_q8_1_rhs && is_k_quant && src_elem_count.is_multiple_of(256) {
+            Some(quantize_f32_storage_to_q8_k(
+                &self.device,
+                src,
+                src_elem_count,
+            )?)
+        } else {
+            None
+        };
+        let rhs_binding = q8_1_rhs
+            .as_ref()
+            .or(q8k_rhs.as_ref())
+            .unwrap_or(&src.buffer);
         let bindings = [
             VulkanBinding::Storage(&self.buffer),
             VulkanBinding::Storage(rhs_binding),
@@ -10408,6 +10473,11 @@ impl VulkanStorage {
             broadcast2: if batch_n { 1 } else { batch_inner.try_into()? },
             broadcast3: if batch_n { 1 } else { batch_outer.try_into()? },
         };
+        // see quantized_matmul_impl: k-quants stay on the raw-f32 kernel and get
+        // the Q8K-rounded activation instead of the fused q8_1 packing.
+        let is_k_quant = vulkan_is_k_quant(qdtype);
+        let use_q8_1_rhs = use_q8_1_rhs && !is_k_quant;
+        let q8_1_rhs_shader = if use_q8_1_rhs { q8_1_rhs_shader } else { None };
         let q8_1_rhs = if use_q8_1_rhs {
             Some(quantize_f32_storage_to_q8_1_x4(
                 &self.device,
@@ -10417,7 +10487,19 @@ impl VulkanStorage {
         } else {
             None
         };
-        let rhs_binding = q8_1_rhs.as_ref().unwrap_or(&src.buffer);
+        let q8k_rhs = if !use_q8_1_rhs && is_k_quant && src_elem_count.is_multiple_of(256) {
+            Some(quantize_f32_storage_to_q8_k(
+                &self.device,
+                src,
+                src_elem_count,
+            )?)
+        } else {
+            None
+        };
+        let rhs_binding = q8_1_rhs
+            .as_ref()
+            .or(q8k_rhs.as_ref())
+            .unwrap_or(&src.buffer);
         let bindings = [
             VulkanBinding::Storage(&self.buffer),
             VulkanBinding::Storage(rhs_binding),
@@ -12466,6 +12548,7 @@ impl BackendDevice for VulkanDevice {
 #[cfg(all(test, feature = "vulkan"))]
 mod tests {
     use super::*;
+    use crate::quantized::k_quants::{BlockQ8K, GgmlType};
     use crate::Module;
     use float8::F8E4M3 as f8e4m3;
 
@@ -13278,6 +13361,32 @@ mod tests {
         let gpu = device.read_buffer(&packed)?;
         let cpu = exact_q8_1_x4_bytes(&xs);
         assert_eq!(gpu, cpu);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn vulkan_quantize_q8_k_f32_matches_cpu_grid() -> Result<()> {
+        let device = VulkanDevice::new(0)?;
+        for scale in [0.0f32, 1.0, 1000.0] {
+            let xs = (0..256)
+                .map(|i| scale + (i as f32 - 128.0) / 100.0)
+                .collect::<Vec<_>>();
+            let src = device.storage_from_cpu_storage(&CpuStorage::F32(xs.clone()))?;
+            let out = quantize_f32_storage_to_q8_k(&device, &src, xs.len())?;
+            let bytes = device.read_buffer(&out)?;
+            let gpu = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<_>>();
+            let mut quant = vec![BlockQ8K::zeros(); xs.len() / 256];
+            BlockQ8K::from_float(&xs, &mut quant);
+            let mut expect = vec![0f32; xs.len()];
+            BlockQ8K::to_float(&quant, &mut expect);
+            for (i, (g, e)) in gpu.iter().zip(expect.iter()).enumerate() {
+                assert_eq!(g, e, "scale {scale} index {i}");
+            }
+        }
         Ok(())
     }
 

@@ -1629,6 +1629,10 @@ pub fn quantize_q8_1_roundtrip_shader() -> Option<String> {
     Some(get("quantize_q8_1_roundtrip.wgsl")?.source().to_string())
 }
 
+pub fn quantize_q8_k_roundtrip_shader() -> Option<String> {
+    Some(get("quantize_q8_k_roundtrip.wgsl")?.source().to_string())
+}
+
 pub fn quantize_q8_0_shader() -> Option<String> {
     Some(get("quantize_q8_0.wgsl")?.source().to_string())
 }

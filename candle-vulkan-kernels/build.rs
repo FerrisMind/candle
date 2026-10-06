@@ -742,6 +742,13 @@ fn generate_candle_spirv_modules(
             candle_shaders_dir.join("dequant_q8_k_f32.comp"),
             &[],
         ),
+        // CPU k-quant A-side (activation) grid: per-256 signed-max Q8K rounding,
+        // emitted as f32 for the raw-f32 matmul/matvec kernels.
+        (
+            "quantize_q8_k",
+            candle_shaders_dir.join("quantize_q8_k.comp"),
+            &[],
+        ),
         ("layernorm", candle_shaders_dir.join("layernorm.comp"), &[]),
         (
             "flash_attn",
