@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use candle::{DType, Device, Result, Tensor};
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{split_id, HFClientSync};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,17 +121,23 @@ pub fn mean_pool(sequence_output: &Tensor, attention_mask: &Tensor) -> Result<Te
 }
 
 pub fn download_model_artifact(model_id: &str, revision: &str, filename: &str) -> Result<PathBuf> {
-    let api = Api::new().map_err(|err| {
+    let client = HFClientSync::new().map_err(|err| {
         candle::Error::msg(format!(
             "failed to create hf-hub client for {model_id}: {err}"
         ))
     })?;
-    let repo = Repo::with_revision(model_id.to_owned(), RepoType::Model, revision.to_owned());
-    api.repo(repo).get(filename).map_err(|err| {
-        candle::Error::msg(format!(
-            "failed to download {filename} from {model_id}@{revision}: {err}"
-        ))
-    })
+    let (owner, name) = split_id(model_id);
+    client
+        .model(owner, name)
+        .download_file()
+        .filename(filename)
+        .maybe_revision(Some(revision.to_owned()))
+        .send()
+        .map_err(|err| {
+            candle::Error::msg(format!(
+                "failed to download {filename} from {model_id}@{revision}: {err}"
+            ))
+        })
 }
 
 fn run_backend_case<F>(

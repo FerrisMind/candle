@@ -1,5 +1,19 @@
 mod support;
 
+use candle::quantized::gguf_file;
+use candle::{DType, Device, Module, Result, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::{
+    bert, convmixer, llama2_c, llama2_c_weights, qwen3, quantized_qwen3, whisper,
+};
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+use support::{
+    assert_close_tensors, deterministic_f32_data, download_model_artifact, mean_pool,
+    native_required, TestBackend,
+};
+
 #[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 const CASE_FILTER_ENV: &str = "CANDLE_GPU_MODEL_CASE_FILTER";
 
