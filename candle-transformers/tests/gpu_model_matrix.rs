@@ -196,16 +196,24 @@ fn dense_causal_decoder_case(device: &Device) -> Result<()> {
 
 #[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn encoder_only_text_case(device: &Device) -> Result<()> {
-    let config_path = download_model_artifact(
-        "sentence-transformers/all-MiniLM-L6-v2",
-        "refs/pr/21",
-        "config.json",
-    )?;
-    let weights_path = download_model_artifact(
-        "sentence-transformers/all-MiniLM-L6-v2",
-        "refs/pr/21",
-        "model.safetensors",
-    )?;
+    let (config_path, weights_path) = match std::env::var_os("CANDLE_MINILM_DIR") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            (dir.join("config.json"), dir.join("model.safetensors"))
+        }
+        None => (
+            download_model_artifact(
+                "sentence-transformers/all-MiniLM-L6-v2",
+                "refs/pr/21",
+                "config.json",
+            )?,
+            download_model_artifact(
+                "sentence-transformers/all-MiniLM-L6-v2",
+                "refs/pr/21",
+                "model.safetensors",
+            )?,
+        ),
+    };
     let config: bert::Config = serde_json::from_str(&std::fs::read_to_string(config_path)?)
         .map_err(|err| candle::Error::msg(format!("failed to parse MiniLM config: {err}")))?;
     let cpu = Device::Cpu;
@@ -392,10 +400,16 @@ fn quantized_qwen3_multi_quant_case(device: &Device) -> Result<()> {
 
 #[cfg(any(feature = "cuda", feature = "wgpu", feature = "vulkan"))]
 fn audio_seq2seq_case(device: &Device) -> Result<()> {
-    let config_path =
-        download_model_artifact("openai/whisper-tiny.en", "refs/pr/15", "config.json")?;
-    let weights_path =
-        download_model_artifact("openai/whisper-tiny.en", "refs/pr/15", "model.safetensors")?;
+    let (config_path, weights_path) = match std::env::var_os("CANDLE_WHISPER_TINY_DIR") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            (dir.join("config.json"), dir.join("model.safetensors"))
+        }
+        None => (
+            download_model_artifact("openai/whisper-tiny.en", "refs/pr/15", "config.json")?,
+            download_model_artifact("openai/whisper-tiny.en", "refs/pr/15", "model.safetensors")?,
+        ),
+    };
     let config: whisper::Config = serde_json::from_str(&std::fs::read_to_string(config_path)?)
         .map_err(|err| candle::Error::msg(format!("failed to parse Whisper config: {err}")))?;
     let cpu = Device::Cpu;
