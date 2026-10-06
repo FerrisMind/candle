@@ -9166,9 +9166,17 @@ impl VulkanStorage {
           // Virtual BT forces the unaligned virtual kernel (strided-K A loads).
         let spirv_name = match self.dtype {
             // Tall-skinny virtual B^T: prefer coopmat when available.
+            //
+            // The cm1 variants stage A/B through f16 and run the f16-input
+            // coopmat MMA, so plain f32 inputs lose ~10-bit mantissa
+            // precision. The exact fp32 virtual kernel is therefore the
+            // default; the tensor-core variant requires the same opt-in as
+            // the other f32 cm1 variants
+            // (CANDLE_VULKAN_F32_UNALIGNED_COOPMAT=1).
             DType::F32
                 if rhs_virtual_bt
                     && self.device.inner.cooperative_matrix
+                    && vulkan_unaligned_f32_coopmat_enabled()
                     && vulkan_spirv_exists("matmul_f32_f32_virtual_cm1") =>
             {
                 "matmul_f32_f32_virtual_cm1"
@@ -9176,11 +9184,18 @@ impl VulkanStorage {
             DType::F32 if rhs_virtual_bt => "matmul_f32_f32_virtual_fp32",
             // Cooperative-matrix path (Ampere+): f16 A/B → f32 C (same mixed
             // precision as WGPU coop). Skip tiny squares (64³) for tight abs tols.
+            //
+            // f16 A/B also reduces plain f32 inputs to ~10-bit mantissa
+            // precision (measured ~7.5e-3 logit drift on resnet18 im2col
+            // shapes), so keep the exact fp32 aligned tile kernel as the
+            // default and gate this variant behind the same opt-in as the
+            // other f32 cm1 kernels (CANDLE_VULKAN_F32_UNALIGNED_COOPMAT=1).
             DType::F32
                 if f32_aligned
                     && self.device.inner.cooperative_matrix
                     && (m >= 128 || n >= 128)
                     && k >= 64
+                    && vulkan_unaligned_f32_coopmat_enabled()
                     && vulkan_spirv_exists("matmul_f32_f32_aligned_cm1") =>
             {
                 "matmul_f32_f32_aligned_cm1"
@@ -9232,6 +9247,18 @@ impl VulkanStorage {
             let name = format!("{spirv_name}_bias");
             vulkan_spirv_exists(&name).then_some(name)
         });
+        // A bias-epilogue kernel MUST be selected whenever a bias was passed.
+        // Running the plain variant leaves binding 3 unused and the bias is
+        // silently DROPPED (observed: MUL_MAT_ADD returned the plain matmul
+        // result for the virtual B^T kernels, whose `_bias` variants were
+        // never generated). Fail loudly instead of producing wrong numbers.
+        if bias.is_some() && bias_name.is_none() {
+            return Err(Error::Msg(format!(
+                "vulkan matmul: bias epilogue variant {spirv_name}_bias is not generated; \
+                 refusing to run the plain kernel because it would silently drop the bias"
+            ))
+            .bt());
+        }
         let spirv_name = bias_name.as_deref().unwrap_or(spirv_name);
         let spirv = candle_vulkan_kernels::spirv(spirv_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;

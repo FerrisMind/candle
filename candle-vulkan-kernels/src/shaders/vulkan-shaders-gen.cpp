@@ -585,6 +585,11 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             // Dense f32 only, fp32 path, no coopmat (LOAD_VEC_A=1 + strided-K loads).
             if (tname == "f32" && matmul_id_type == MatMulIdType::NONE && !fp16 && !coopmat) {
                 string_to_spv(shader_name + "_f32_f32_virtual", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", "1"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"VIRTUAL_BT", "1"}}), fp16, coopmat, coopmat2, f16acc);
+                // Bias epilogue (MUL_MAT_ADD fusion): without this variant the
+                // host used to fall through to the plain kernel and binding 3
+                // went unused — the bias was silently DROPPED (MUL_MAT_ADD
+                // returned the plain matmul result).
+                string_to_spv(shader_name + "_f32_f32_virtual", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", "1"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"VIRTUAL_BT", "1"}, {"BIAS_ADD", "1"}}), fp16, coopmat, coopmat2, f16acc, "_bias");
             }
         }
         // Virtual B^T + coopmat (tall-skinny tensor-core path).
@@ -592,6 +597,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         // path. A stays scalar/strided virtual loads (LOAD_VEC_A=1).
         if (!coopmat2 && tname == "f32" && matmul_id_type == MatMulIdType::NONE && coopmat && fp16) {
             string_to_spv(shader_name + "_f32_f32_virtual", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"VIRTUAL_BT", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(shader_name + "_f32_f32_virtual", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"VIRTUAL_BT", "1"}, {"BIAS_ADD", "1"}}), fp16, coopmat, coopmat2, f16acc, "_bias");
         }
 
         // Bias-epilogue variants (MUL_MAT_ADD fusion): dense f32, NONE id type.
