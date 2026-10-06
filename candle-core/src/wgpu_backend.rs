@@ -12139,11 +12139,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     } else if m.max(n) >= 32 && k >= 32 {
                         matmul_label = "candle-wgpu-matmul-fast";
                         use_reg_tile = true;
-                        // VEC loads assume contiguous K (unit stride_0k / stride_1k).
+                        // VEC loads assume contiguous K (unit stride_0k / stride_1k)
+                        // AND a VEC_SIZE-aligned row base: init_shmem_src0/src1 read
+                        // `src[src_idx / VEC_SIZE]` and store 4 consecutive shmem
+                        // slots, which is only the elements src_idx..src_idx+3 when
+                        // every row base (global_row * stride_01 / stride_11) is
+                        // 4-aligned. Row strides here equal K, so an odd K (e.g. 77,
+                        // the SD1.5 cross-attention context width) rotates every
+                        // row's vec4 lanes and silently corrupts the dot products.
+                        // K%4!=0 must take the SCALAR reg-tile path. The same holds
+                        // for every other term entering src_idx (batch strides,
+                        // storage offsets) and for the vectorized dst store.
                         let vectorized = m.is_multiple_of(4)
                             && n.is_multiple_of(4)
                             && params.stride_0k == 1
-                            && params.stride_1k == 1;
+                            && params.stride_1k == 1
+                            && params.stride_01.is_multiple_of(4)
+                            && params.stride_11.is_multiple_of(4)
+                            && params.stride_02.is_multiple_of(4)
+                            && params.stride_03.is_multiple_of(4)
+                            && params.stride_12.is_multiple_of(4)
+                            && params.stride_13.is_multiple_of(4)
+                            && params.offset_src0.is_multiple_of(4)
+                            && params.offset_src1.is_multiple_of(4)
+                            && params.offset_dst.is_multiple_of(4);
                         shader_storage = candle_wgpu_kernels::matmul_fast_shader(
                             wgpu_kernel_dtype(DType::F32)?,
                             vectorized,
@@ -12179,10 +12198,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     // VEC loads assume contiguous K (unit stride_0k / stride_1k),
                     // mirroring the F32 reg-tile selection. The native inputs are
                     // materialized contiguous here (or the RHS virtual B^T).
+                    // Same VEC_SIZE-alignment requirement as the F32 branch:
+                    // k%32==0 from tile_ok already makes the row strides 4-aligned,
+                    // but batch strides / storage offsets are layout-dependent.
                     let vectorized = params.stride_0k == 1
                         && params.stride_1k == 1
                         && m.is_multiple_of(4)
-                        && n.is_multiple_of(4);
+                        && n.is_multiple_of(4)
+                        && params.stride_01.is_multiple_of(4)
+                        && params.stride_11.is_multiple_of(4)
+                        && params.stride_02.is_multiple_of(4)
+                        && params.stride_03.is_multiple_of(4)
+                        && params.stride_12.is_multiple_of(4)
+                        && params.stride_13.is_multiple_of(4)
+                        && params.offset_src0.is_multiple_of(4)
+                        && params.offset_src1.is_multiple_of(4)
+                        && params.offset_dst.is_multiple_of(4);
                     shader_storage = candle_wgpu_kernels::matmul_fast_shader(
                         wgpu_kernel_dtype(DType::F16)?,
                         vectorized,
