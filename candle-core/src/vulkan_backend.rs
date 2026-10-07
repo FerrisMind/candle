@@ -1674,19 +1674,25 @@ fn quantize_f32_storage_to_q8_k(
     Ok(out)
 }
 
-/// Pack a f32 activation onto the CPU k-quant A-side grid (Q8K) into the
-/// packed `block_q8_k` layout (f32 `d` + int8 `qs`) consumed by the fused
+/// Pack a f32 or f16 activation onto the CPU k-quant A-side grid (Q8K) into
+/// the packed `block_q8_k` layout (f32 `d` + int8 `qs`) consumed by the fused
 /// integer-dot-product kernels (`matmul_{stem}_q8k`,
 /// `mul_mat_vec_{stem}_q8k_f32`), which need the raw int8 values instead of
-/// the dequantized f32 stream emitted by `quantize_f32_storage_to_q8_k`.
+/// the dequantized f32 stream emitted by `quantize_f32_storage_to_q8_k`. The
+/// f16 variant converts f16 -> f32 in-shader (exact) before the identical Q8K
+/// rounding, so the grid is bit-compatible with the CPU (f16 -> f32 -> Q8K).
 fn quantize_f32_storage_to_q8_k_packed(
     device: &VulkanDevice,
     src: &VulkanStorage,
     elem_count: usize,
 ) -> Result<Arc<VulkanBuffer>> {
-    if src.dtype != DType::F32 {
-        return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan quantize_q8_k_packed").bt());
-    }
+    let spirv_name = match src.dtype {
+        DType::F32 => "quantize_q8_k_packed",
+        DType::F16 => "quantize_q8_k_packed_f16",
+        other => {
+            return Err(Error::UnsupportedDTypeForOp(other, "vulkan quantize_q8_k_packed").bt())
+        }
+    };
     if !elem_count.is_multiple_of(256) {
         crate::bail!(
             "vulkan quantize_q8_k_packed expects element count divisible by 256, got {elem_count}"
@@ -1697,8 +1703,8 @@ fn quantize_f32_storage_to_q8_k_packed(
     // (Q8_K_BYTES = 272 in q8k_layout.glsl, 12 B tail padding included).
     let out_size = num_blocks as usize * 272;
     let out = device.create_buffer(out_size, "candle-vulkan-quantize-q8_k-packed")?;
-    let spirv = candle_vulkan_kernels::spirv("quantize_q8_k_packed").ok_or_else(|| {
-        Error::Msg("vulkan shader quantize_q8_k_packed not generated".into()).bt()
+    let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
+        Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
     })?;
     let params = VulkanQuantizeQ8_1Params {
         ne: elem_count.try_into()?,
@@ -10287,17 +10293,28 @@ impl VulkanStorage {
         };
         // Fused Q8K dp4a path: the B side is the packed `block_q8_k` grid
         // (f32 d + int8 qs) consumed by the `matmul_{stem}_q8k` kernels.
+        // F32 and F16 activations are both fused here: the F16 producer
+        // converts f16 -> f32 in-shader (exact) before the identical Q8K
+        // rounding, so the A-side grid is bit-compatible with the CPU
+        // (f16 -> f32 -> Q8K). Residual: non-fused F16 (gate miss, e.g. no
+        // integer dot product) stays on the dequantize + dense-f32 path — the
+        // raw `matmul_{stem}_f16` kernel is deliberately not used, since it
+        // does not round the activation onto the CPU Q8K grid.
         // `integer_dot_product` mirrors the q8_1 gate above — the dp4a shaders
         // hard-require GL_EXT_integer_dot_product — and subgroup_size <= 32
         // keeps WARP = one subgroup (the 4-warp 64x64 tile). Any false
         // condition falls back to the raw-f32 path below, unchanged.
         let fused_q8k_spirv_name = if !use_q8_1_rhs
             && is_k_quant
-            && src.dtype == DType::F32
+            && (src.dtype == DType::F32 || src.dtype == DType::F16)
             && src_elem_count.is_multiple_of(256)
             && self.device.inner.subgroup_size <= 32
             && self.device.inner.integer_dot_product
-            && vulkan_spirv_exists("quantize_q8_k_packed")
+            && vulkan_spirv_exists(if src.dtype == DType::F32 {
+                "quantize_q8_k_packed"
+            } else {
+                "quantize_q8_k_packed_f16"
+            })
         {
             let name = format!("matmul_{}_q8k", vulkan_quantized_stem(qdtype)?);
             vulkan_spirv_exists(&name).then_some(name)

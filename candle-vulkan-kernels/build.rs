@@ -938,6 +938,11 @@ fn generate_candle_spirv_modules(
             &[],
         ),
         (
+            "quantize_q8_k_packed_f16",
+            candle_shaders_dir.join("quantize_q8_k_packed.comp"),
+            &["INPUT_F16=1"],
+        ),
+        (
             "matmul_q2_k_q8k",
             candle_shaders_dir.join("mul_mmq_q8k.comp"),
             &[

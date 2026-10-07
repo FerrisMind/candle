@@ -464,6 +464,196 @@ fn k8_fused_probe_vulkan() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// F16-activation GEMM cases (campaign leaf k8f-probe)
+// ---------------------------------------------------------------------------
+
+/// The vulkan fused F16 path and the CPU contract compute the same Q8K grid
+/// (f16 -> f32 exact widening, then identical `BlockQ8K::from_float` rounding)
+/// and the same integer dot products, so both checks below must pass at the
+/// f32-noise bound. The CPU F16-input path itself (`matmul_f16`) widens f16 ->
+/// f32 exactly before quantizing, so feeding the widened activation to the CPU
+/// `QMatMul` runs the identical contract computation; only the *output* dtype
+/// differs (the CPU F16-input run rounds the final dot to f16, a ~1e-4 rel
+/// artifact measured and printed separately as `vs(b,f16out)`).
+const F16_OUT_TOL: f64 = 1e-3;
+
+fn f16_gemm_cases() -> Vec<Case> {
+    let mut cases = Vec::new();
+    let dtypes = [
+        GgmlDType::Q2K,
+        GgmlDType::Q3K,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+    ];
+    for &dt in &dtypes {
+        // Voice-model shape (m > 8 -> GEMM branch).
+        cases.push(Case {
+            label: "f16-gemm-voice-qkv",
+            dtype: dt,
+            m: 226,
+            k: 1024,
+            n: 1024,
+            padded: false,
+        });
+        // Existing-probe shapes for m/k/n variety.
+        cases.push(Case {
+            label: "f16-gemm-probe-large",
+            dtype: dt,
+            m: 256,
+            k: 512,
+            n: 256,
+            padded: false,
+        });
+        cases.push(Case {
+            label: "f16-gemm-probe-small",
+            dtype: dt,
+            m: 64,
+            k: 768,
+            n: 512,
+            padded: false,
+        });
+    }
+    cases
+}
+
+fn run_f16_case(dev: &Device, info: &DevInfo, case: &Case, rng: &mut Rng) -> Result<()> {
+    let cpu = Device::Cpu;
+    let Case {
+        label,
+        dtype,
+        m,
+        k,
+        n,
+        padded: _,
+    } = *case;
+    assert!(k % 256 == 0, "probe requires k % 256 == 0, got k={k}");
+    let route = predicted_route(info, dtype, m, k);
+
+    // Deterministic random data, identical recipe to the f32 probe cases. The
+    // activation is stored as F16 first: the f16 rounding of the activation is
+    // part of the scenario, and both devices see the identical f16 values.
+    let w_vals: Vec<f32> = (0..n * k).map(|_| rng.next_f32() * 0.5).collect();
+    let x_vals: Vec<f32> = (0..m * k).map(|_| rng.next_f32() + 0.25).collect();
+
+    let w_cpu = Tensor::from_slice(&w_vals, (n, k), &cpu)?;
+    let x_f32 = Tensor::from_slice(&x_vals, (m, k), &cpu)?;
+    let x_f16_cpu = x_f32.to_dtype(DType::F16)?;
+
+    // Same weights quantized on both devices (bit-exact quantize contract).
+    let qt_cpu = QTensor::quantize(&w_cpu, dtype)?;
+    let w_vk = Tensor::from_slice(&w_vals, (n, k), dev)?;
+    let qt_vk = QTensor::quantize(&w_vk, dtype)?;
+    assert_eq!(
+        qt_cpu.data()?.as_ref(),
+        qt_vk.data()?.as_ref(),
+        "{label} {dtype:?}: quantized weight bytes diverged between cpu and vulkan"
+    );
+
+    // Reference (b): CPU QMatMul contract on the same F16 activation. The CPU
+    // F16-input path widens f16 -> f32 exactly before `BlockQ8K::from_float`,
+    // so the contract is run here at f32 output precision (F32 output).
+    let arc_cpu = std::sync::Arc::new(qt_cpu);
+    let qmm_cpu = QMatMul::from_arc(arc_cpu.clone())?;
+    let ref_b = qmm_cpu.forward(&x_f16_cpu.to_dtype(DType::F32)?)?;
+
+    // Brief-literal CPU run with the F16 input: F16 output, i.e. the final dot
+    // rounded to f16. Kept as a printed artifact metric, not a 1e-5 gate.
+    let ref_b_f16out = qmm_cpu.forward(&x_f16_cpu)?;
+
+    // Vulkan fused runs: the F16 activation and its exact f32 widening. If the
+    // F16 producer rounds onto the same grid as the f32 producer, the packed
+    // Q8K buffers are bit-identical and so are the kernel outputs.
+    let x_vk_f16 = x_f16_cpu.to_device(dev)?;
+    let x_vk_f32b = x_f16_cpu.to_dtype(DType::F32)?.to_device(dev)?;
+    let qmm_vk = QMatMul::from_qtensor(qt_vk)?;
+    let out_vk = qmm_vk.forward(&x_vk_f16)?;
+    let out_vk_f32b = qmm_vk.forward(&x_vk_f32b)?;
+
+    let out_v = out_vk.to_device(&cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let out_vk_f32b_v = out_vk_f32b
+        .to_device(&cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let ref_b_v = ref_b
+        .to_device(&cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let ref_b_f16out_v = ref_b_f16out
+        .to_device(&cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+
+    let mb = check(label, "ref-b(CPU QMatMul, f32 grid)", &out_v, &ref_b_v)?;
+    let ma = check(label, "ref-a(vk f32-widened twin)", &out_v, &out_vk_f32b_v)?;
+
+    // Artifact metrics (printed, weaker bound): the CPU F16-input output is
+    // the same integer-dot result rounded to f16 (~1e-4 rel, f16 ulp), and the
+    // CPU-side gap between that f16 output and the f32 contract output
+    // isolates the rounding itself.
+    let m_f16out = compare(&out_v, &ref_b_f16out_v);
+    let m_cpu_round = compare(&ref_b_f16out_v, &ref_b_v);
+    assert!(
+        m_f16out.rel_rms <= F16_OUT_TOL,
+        "{label} vs ref-b(f16out): rel_rms={:e} exceeds f16-output tol {F16_OUT_TOL}",
+        m_f16out.rel_rms
+    );
+
+    let bit_pct = |mm: &CaseMetrics| (mm.bit_eq as f64 / mm.total as f64) * 100.0;
+    println!(
+        "CASE {label} {dtype:?} m={m} k={k} n={n} route_pred={route:?} | vs(b,f32grid) rel_rms={:.3e} nmse={:.3e} max_abs={:.3e} bit_eq={}/{} ({:.2}%) | vs(a,vk-f32widen) rel_rms={:.3e} bit_eq={}/{} ({:.2}%) | vs(b,f16out) rel_rms={:.3e} | cpu f16out-vs-f32grid rel_rms={:.3e}",
+        mb.rel_rms, mb.nmse, mb.max_abs, mb.bit_eq, mb.total, bit_pct(&mb),
+        ma.rel_rms, ma.bit_eq, ma.total, bit_pct(&ma),
+        m_f16out.rel_rms, m_cpu_round.rel_rms,
+    );
+
+    // Route evidence: on the fused route the two vulkan runs consume identical
+    // packed grids, so a bit-identical output is the expected proof (unlike the
+    // f32 probe's fallback-smell warning). Print it explicitly.
+    if route == Route::FusedGemm && ma.bit_eq == ma.total {
+        println!("    f16 producer grid == f32 producer grid (vk outputs bit-identical)");
+    } else if route == Route::FusedGemm {
+        println!(
+            "    WARNING {label} {dtype:?}: vk f16 vs f32-widened outputs diverge (bit_eq {}/{}), producer grids differ",
+            ma.bit_eq, ma.total
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vulkan")]
+#[test]
+fn k8_fused_probe_f16_vulkan() -> Result<()> {
+    use candle_core::backend::BackendDevice;
+    let vdev = candle_core::vulkan_backend::VulkanDevice::new(0)?;
+    let info = DevInfo {
+        name: vdev.physical_device_name().to_string(),
+        vendor_id: vdev.vendor_id(),
+        subgroup_size: vdev.subgroup_size(),
+        subgroup_min: vdev.subgroup_min_size(),
+        subgroup_max: vdev.subgroup_max_size(),
+        integer_dot: vdev.integer_dot_product_supported(),
+        subgroup_arithmetic: vdev.subgroup_arithmetic_supported(),
+        subgroup_size_control: vdev.subgroup_size_control_supported(),
+    };
+    println!(
+        "device: {} vendor_id={:#06x} subgroup_size={} integer_dot={}",
+        info.name, info.vendor_id, info.subgroup_size, info.integer_dot,
+    );
+    let dev = Device::Vulkan(vdev);
+    // Independent RNG stream: the f32 cases above must see unchanged data.
+    let mut rng = Rng::new(SEED ^ 0xF16_0000_0000_0001);
+    for case in f16_gemm_cases() {
+        run_f16_case(&dev, &info, &case, &mut rng)?;
+    }
+    println!("k8_fused_probe_f16: all cases passed (rel_rms <= {REL_TOL} vs CPU grid contract and the f32-widened vk twin)");
+    Ok(())
+}
+
 /// The brief asks for a k % 256 != 0 case (k = 300). The CPU contract
 /// (`check_shape`) rejects such weights outright — prove it with the exact
 /// error so the report can document why the raw-f32 fallback is instead

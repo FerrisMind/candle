@@ -3,6 +3,7 @@
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 // Round a f32 activation to the CPU k-quant A-side grid (Q8K) and emit the
 // PACKED block (`block_q8_k`: f32 d + int8 qs) consumed by the fused dp4a
@@ -24,7 +25,13 @@ layout (push_constant) uniform parameter
 layout(constant_id = 0) const uint GROUP_SIZE = 64;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
+// INPUT_F16: the A side arrives as f16 storage; the f16 -> f32 conversion is
+// exact, so the Q8K rounding below is identical for both input variants.
+#if defined(INPUT_F16)
+layout (binding = 0) readonly buffer A {f16vec4 data_a[];};
+#else
 layout (binding = 0) readonly buffer A {vec4 data_a[];};
+#endif
 layout (binding = 1) writeonly buffer D {block_q8_k data_d[];};
 
 // One workgroup (64 threads x vec4) per 256-element block.
@@ -59,7 +66,11 @@ void quantize(const uint ib) {
     // GROUP_SIZE threads x vec4 = one 256-element block.
     const uint idx4 = ib * GROUP_SIZE + tid;
     const bool in_range = idx4 * 4 < p.ne;
+#if defined(INPUT_F16)
+    const vec4 vals = in_range ? vec4(data_a[idx4]) : vec4(0.0f);
+#else
     const vec4 vals = in_range ? data_a[idx4] : vec4(0.0f);
+#endif
 
     // Signed extreme: the first element with a strictly larger |x| wins, as in
     // `BlockQ8K::from_float` (`if amax < x.abs() { amax = ..; max = x; }`).
