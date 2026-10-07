@@ -1674,6 +1674,51 @@ fn quantize_f32_storage_to_q8_k(
     Ok(out)
 }
 
+/// Pack a f32 activation onto the CPU k-quant A-side grid (Q8K) into the
+/// packed `block_q8_k` layout (f32 `d` + int8 `qs`) consumed by the fused
+/// integer-dot-product kernels (`matmul_{stem}_q8k`,
+/// `mul_mat_vec_{stem}_q8k_f32`), which need the raw int8 values instead of
+/// the dequantized f32 stream emitted by `quantize_f32_storage_to_q8_k`.
+fn quantize_f32_storage_to_q8_k_packed(
+    device: &VulkanDevice,
+    src: &VulkanStorage,
+    elem_count: usize,
+) -> Result<Arc<VulkanBuffer>> {
+    if src.dtype != DType::F32 {
+        return Err(Error::UnsupportedDTypeForOp(src.dtype, "vulkan quantize_q8_k_packed").bt());
+    }
+    if !elem_count.is_multiple_of(256) {
+        crate::bail!(
+            "vulkan quantize_q8_k_packed expects element count divisible by 256, got {elem_count}"
+        )
+    }
+    let num_blocks: u32 = (elem_count / 256).try_into()?;
+    // std430 stride of `struct block_q8_k { float d; ivec4 qs[16]; }`
+    // (Q8_K_BYTES = 272 in q8k_layout.glsl, 12 B tail padding included).
+    let out_size = num_blocks as usize * 272;
+    let out = device.create_buffer(out_size, "candle-vulkan-quantize-q8_k-packed")?;
+    let spirv = candle_vulkan_kernels::spirv("quantize_q8_k_packed").ok_or_else(|| {
+        Error::Msg("vulkan shader quantize_q8_k_packed not generated".into()).bt()
+    })?;
+    let params = VulkanQuantizeQ8_1Params {
+        ne: elem_count.try_into()?,
+        num_blocks,
+        scale_bits: 127f32.to_bits(),
+    };
+    let workgroups_x = num_blocks.min(device.inner.max_workgroup_count_x.max(1));
+    device.run_compute_specialized(
+        spirv,
+        &[
+            VulkanBinding::Storage(&src.buffer),
+            VulkanBinding::Storage(&out),
+        ],
+        Some(any_as_bytes(&params)),
+        (workgroups_x, 1, 1),
+        Some(&[(0, 64)]),
+    )?;
+    Ok(out)
+}
+
 fn repack_q8_1_storage_to_q8_0(
     device: &VulkanDevice,
     src: &VulkanStorage,
@@ -10230,8 +10275,9 @@ impl VulkanStorage {
         // `block_q8_1_x4` fields carry a per-32 f16 scale and a per-32 f16
         // integer sum, so the dp4a path would round the activation onto the
         // wrong grid (~1e-5 nmse per layer vs the CPU, ~1e-2 in whole-model
-        // logits). Force the raw-f32 kernels and round the activation to the
-        // Q8K grid instead, exactly like the wgpu backend does.
+        // logits). Round the activation to the Q8K grid instead — the fused
+        // Q8K dp4a kernels when available, the raw-f32 kernels otherwise —
+        // exactly like the wgpu backend does.
         let is_k_quant = vulkan_is_k_quant(qdtype);
         let use_q8_1_rhs = use_q8_1_rhs && !is_k_quant;
         let q8_1_rhs_spirv_name = if use_q8_1_rhs {
@@ -10239,6 +10285,26 @@ impl VulkanStorage {
         } else {
             None
         };
+        // Fused Q8K dp4a path: the B side is the packed `block_q8_k` grid
+        // (f32 d + int8 qs) consumed by the `matmul_{stem}_q8k` kernels.
+        // `integer_dot_product` mirrors the q8_1 gate above — the dp4a shaders
+        // hard-require GL_EXT_integer_dot_product — and subgroup_size <= 32
+        // keeps WARP = one subgroup (the 4-warp 64x64 tile). Any false
+        // condition falls back to the raw-f32 path below, unchanged.
+        let fused_q8k_spirv_name = if !use_q8_1_rhs
+            && is_k_quant
+            && src.dtype == DType::F32
+            && src_elem_count.is_multiple_of(256)
+            && self.device.inner.subgroup_size <= 32
+            && self.device.inner.integer_dot_product
+            && vulkan_spirv_exists("quantize_q8_k_packed")
+        {
+            let name = format!("matmul_{}_q8k", vulkan_quantized_stem(qdtype)?);
+            vulkan_spirv_exists(&name).then_some(name)
+        } else {
+            None
+        };
+        let fused_q8k = fused_q8k_spirv_name.is_some();
         let q8_1_rhs = if use_q8_1_rhs {
             Some(quantize_f32_storage_to_q8_1_x4(
                 &self.device,
@@ -10249,11 +10315,14 @@ impl VulkanStorage {
             None
         };
         let q8k_rhs = if !use_q8_1_rhs && is_k_quant && src_elem_count.is_multiple_of(256) {
-            Some(quantize_f32_storage_to_q8_k(
-                &self.device,
-                src,
-                src_elem_count,
-            )?)
+            // Exactly one producer runs per launch: the fused dp4a kernels read
+            // the packed int8 grid, the raw-f32 kernels the dequantized f32
+            // stream.
+            Some(if fused_q8k {
+                quantize_f32_storage_to_q8_k_packed(&self.device, src, src_elem_count)?
+            } else {
+                quantize_f32_storage_to_q8_k(&self.device, src, src_elem_count)?
+            })
         } else {
             None
         };
@@ -10278,6 +10347,8 @@ impl VulkanStorage {
             }
         };
         let spirv_name = if let Some(spirv_name) = q8_1_rhs_spirv_name {
+            spirv_name
+        } else if let Some(spirv_name) = fused_q8k_spirv_name {
             spirv_name
         } else {
             format!("matmul_{}_{}", vulkan_quantized_stem(qdtype)?, rhs_suffix)
@@ -10337,6 +10408,37 @@ impl VulkanStorage {
                     (10, subgroup),
                 ]
             }
+        } else if fused_q8k {
+            // k-quant fused configs: WMITER=(6,1), unlike the standard-quant
+            // (6,2); WARP (=10) must be one subgroup so the dp4a tile math
+            // holds.
+            let subgroup = self.device.inner.subgroup_size.max(8);
+            let subgroup32 = self.device.inner.subgroup_size.max(32);
+            if input_m <= 32 || n <= 32 {
+                [
+                    (0, subgroup32),
+                    (1, 32),
+                    (2, 32),
+                    (4, 32),
+                    (5, 32),
+                    (6, 1),
+                    (7, 2),
+                    (8, 1),
+                    (10, subgroup),
+                ]
+            } else {
+                [
+                    (0, 128),
+                    (1, 64),
+                    (2, 64),
+                    (4, subgroup),
+                    (5, 32),
+                    (6, 1),
+                    (7, 2),
+                    (8, 2),
+                    (10, subgroup),
+                ]
+            }
         } else {
             // L63 fix: 128 threads (4 warps). mul_mm.comp splits a workgroup
             // into warp_r = warp_i % (BM / WM) and warp_c = warp_i / (BM / WM)
@@ -10356,18 +10458,25 @@ impl VulkanStorage {
                 (10, self.device.inner.subgroup_size.max(1)),
             ]
         };
+        // The fused k-quant small config tiles 32x32; every legacy kernel is
+        // 64x64. Never hardcode 64 here — it breaks the 32 config.
+        let (gemm_bm, gemm_bn) = if fused_q8k && (input_m <= 32 || n <= 32) {
+            (32usize, 32usize)
+        } else {
+            (64, 64)
+        };
         self.device.run_compute_specialized(
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
             // Tile-based dispatch: mul_mm maps gl_WorkGroupID.x -> ir (M tiles
-            // of BM=64) and .y -> ic (N tiles of BN=64); dispatching raw
+            // of BM) and .y -> ic (N tiles of BN); dispatching raw
             // n/input_m oversubscribed x by ~64x: ik >= 1 workgroups have an
             // empty K loop and write zeros at ik*batch_stride_d offsets,
             // out of bounds past dst.
             (
-                n.div_ceil(64).try_into()?,
-                input_m.div_ceil(64).try_into()?,
+                n.div_ceil(gemm_bm).try_into()?,
+                input_m.div_ceil(gemm_bn).try_into()?,
                 batch_count.try_into()?,
             ),
             Some(&spec),
@@ -10473,11 +10582,33 @@ impl VulkanStorage {
             broadcast2: if batch_n { 1 } else { batch_inner.try_into()? },
             broadcast3: if batch_n { 1 } else { batch_outer.try_into()? },
         };
-        // see quantized_matmul_impl: k-quants stay on the raw-f32 kernel and get
-        // the Q8K-rounded activation instead of the fused q8_1 packing.
+        // see quantized_matmul_impl: k-quants take the fused Q8K dp4a kernel
+        // when available and the raw-f32 kernel with the Q8K-rounded activation
+        // otherwise; either way the wrong-grid fused q8_1 packing is avoided.
         let is_k_quant = vulkan_is_k_quant(qdtype);
         let use_q8_1_rhs = use_q8_1_rhs && !is_k_quant;
         let q8_1_rhs_shader = if use_q8_1_rhs { q8_1_rhs_shader } else { None };
+        // Fused Q8K dp4a matvec, gated exactly like the pre-fix q8_1 fused
+        // path (`vulkan_should_use_mmvq` with input_m as the row count, or the
+        // forced-rhs flag) plus the GEMM fused conditions. The variant name
+        // must exist so a partial module registration falls back to the
+        // raw-f32 kernel. Never routed for indexed/MoE matvecs.
+        let fused_q8k_matvec = if !use_q8_1_rhs
+            && is_k_quant
+            && src.dtype == DType::F32
+            && src_elem_count.is_multiple_of(256)
+            && self.device.inner.subgroup_size <= 32
+            && self.device.inner.integer_dot_product
+            && (vulkan_should_use_mmvq(&self.device, qdtype, input_m, k) || force_q8_1_rhs)
+            && vulkan_spirv_exists("quantize_q8_k_packed")
+        {
+            let workgroup = vulkan_dmmv_workgroup(&self.device, qdtype, input_m, k, true);
+            let base_name = format!("mul_mat_vec_{}_q8k_f32", vulkan_quantized_stem(qdtype)?);
+            let name = vulkan_dmmv_shader_name(&self.device, qdtype, base_name, workgroup);
+            vulkan_spirv_exists(&name).then_some((name, workgroup))
+        } else {
+            None
+        };
         let q8_1_rhs = if use_q8_1_rhs {
             Some(quantize_f32_storage_to_q8_1_x4(
                 &self.device,
@@ -10488,11 +10619,13 @@ impl VulkanStorage {
             None
         };
         let q8k_rhs = if !use_q8_1_rhs && is_k_quant && src_elem_count.is_multiple_of(256) {
-            Some(quantize_f32_storage_to_q8_k(
-                &self.device,
-                src,
-                src_elem_count,
-            )?)
+            // Exactly one producer runs per launch (packed int8 grid for the
+            // fused dp4a kernel, dequantized f32 stream for the raw-f32 one).
+            Some(if fused_q8k_matvec.is_some() {
+                quantize_f32_storage_to_q8_k_packed(&self.device, src, src_elem_count)?
+            } else {
+                quantize_f32_storage_to_q8_k(&self.device, src, src_elem_count)?
+            })
         } else {
             None
         };
@@ -10516,6 +10649,12 @@ impl VulkanStorage {
                 q8_1_rhs_shader.as_ref().unwrap().0.clone(),
                 vulkan_dmmv_rows_per_group(&self.device, qdtype, true)?,
                 vulkan_dmmv_block_size(&self.device, qdtype, dmmv_workgroup),
+            )
+        } else if let Some((fused_name, fused_workgroup)) = &fused_q8k_matvec {
+            (
+                fused_name.clone(),
+                vulkan_dmmv_rows_per_group(&self.device, qdtype, true)?,
+                vulkan_dmmv_block_size(&self.device, qdtype, *fused_workgroup),
             )
         } else {
             (

@@ -928,10 +928,265 @@ fn generate_candle_spirv_modules(
                 "D_TYPE=uint16_t",
             ],
         ),
+        // Fused Q8K dp4a path: packed per-256-block Q8K activation producer,
+        // k-quant GEMM and matvec consumers. Sources include headers from both
+        // shader directories (types.glsl / mul_mmq_shmem_types.glsl from
+        // src/shaders and the q8k_* headers from candle-shaders).
+        (
+            "quantize_q8_k_packed",
+            candle_shaders_dir.join("quantize_q8_k_packed.comp"),
+            &[],
+        ),
+        (
+            "matmul_q2_k_q8k",
+            candle_shaders_dir.join("mul_mmq_q8k.comp"),
+            &[
+                "DATA_A_Q2_K",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "FLOAT_TYPEV4=vec4",
+                "ACC_TYPE=float",
+                "ACC_TYPEV2=vec2",
+                "D_TYPE=float",
+            ],
+        ),
+        (
+            "matmul_q3_k_q8k",
+            candle_shaders_dir.join("mul_mmq_q8k.comp"),
+            &[
+                "DATA_A_Q3_K",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "FLOAT_TYPEV4=vec4",
+                "ACC_TYPE=float",
+                "ACC_TYPEV2=vec2",
+                "D_TYPE=float",
+            ],
+        ),
+        (
+            "matmul_q4_k_q8k",
+            candle_shaders_dir.join("mul_mmq_q8k.comp"),
+            &[
+                "DATA_A_Q4_K",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "FLOAT_TYPEV4=vec4",
+                "ACC_TYPE=float",
+                "ACC_TYPEV2=vec2",
+                "D_TYPE=float",
+            ],
+        ),
+        (
+            "matmul_q5_k_q8k",
+            candle_shaders_dir.join("mul_mmq_q8k.comp"),
+            &[
+                "DATA_A_Q5_K",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "FLOAT_TYPEV4=vec4",
+                "ACC_TYPE=float",
+                "ACC_TYPEV2=vec2",
+                "D_TYPE=float",
+            ],
+        ),
+        (
+            "matmul_q6_k_q8k",
+            candle_shaders_dir.join("mul_mmq_q8k.comp"),
+            &[
+                "DATA_A_Q6_K",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "FLOAT_TYPEV4=vec4",
+                "ACC_TYPE=float",
+                "ACC_TYPEV2=vec2",
+                "D_TYPE=float",
+            ],
+        ),
+        (
+            "mul_mat_vec_q2_k_q8k_f32",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q2_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+            ],
+        ),
+        (
+            "mul_mat_vec_q2_k_q8k_f32_subgroup",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q2_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+                "USE_SUBGROUP_ADD=1",
+            ],
+        ),
+        (
+            "mul_mat_vec_q2_k_q8k_f32_subgroup_no_shmem",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q2_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+                "USE_SUBGROUP_ADD_NO_SHMEM=1",
+            ],
+        ),
+        (
+            "mul_mat_vec_q3_k_q8k_f32",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q3_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+            ],
+        ),
+        (
+            "mul_mat_vec_q3_k_q8k_f32_subgroup",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q3_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+                "USE_SUBGROUP_ADD=1",
+            ],
+        ),
+        (
+            "mul_mat_vec_q3_k_q8k_f32_subgroup_no_shmem",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q3_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+                "USE_SUBGROUP_ADD_NO_SHMEM=1",
+            ],
+        ),
+        (
+            "mul_mat_vec_q4_k_q8k_f32",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q4_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+            ],
+        ),
+        (
+            "mul_mat_vec_q4_k_q8k_f32_subgroup",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q4_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+                "USE_SUBGROUP_ADD=1",
+            ],
+        ),
+        (
+            "mul_mat_vec_q4_k_q8k_f32_subgroup_no_shmem",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q4_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+                "USE_SUBGROUP_ADD_NO_SHMEM=1",
+            ],
+        ),
+        (
+            "mul_mat_vec_q5_k_q8k_f32",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q5_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+            ],
+        ),
+        (
+            "mul_mat_vec_q5_k_q8k_f32_subgroup",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q5_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+                "USE_SUBGROUP_ADD=1",
+            ],
+        ),
+        (
+            "mul_mat_vec_q5_k_q8k_f32_subgroup_no_shmem",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q5_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+                "USE_SUBGROUP_ADD_NO_SHMEM=1",
+            ],
+        ),
+        (
+            "mul_mat_vec_q6_k_q8k_f32",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q6_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+            ],
+        ),
+        (
+            "mul_mat_vec_q6_k_q8k_f32_subgroup",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q6_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+                "USE_SUBGROUP_ADD=1",
+            ],
+        ),
+        (
+            "mul_mat_vec_q6_k_q8k_f32_subgroup_no_shmem",
+            candle_shaders_dir.join("mul_mat_vec_q8k.comp"),
+            &[
+                "DATA_A_Q6_K",
+                "D_TYPE=float",
+                "FLOAT_TYPE=float",
+                "FLOAT_TYPEV2=vec2",
+                "ACC_TYPE=float",
+                "USE_SUBGROUP_ADD_NO_SHMEM=1",
+            ],
+        ),
     ];
     for (name, source, defines) in modules {
         let output = spv_dir.join(format!("{name}.spv"));
-        compile_spirv(glslc, source, &output, shaders_dir, defines)?;
+        compile_spirv(
+            glslc,
+            source,
+            &output,
+            &[shaders_dir, candle_shaders_dir],
+            defines,
+        )?;
     }
     Ok(())
 }
@@ -940,15 +1195,17 @@ fn compile_spirv(
     glslc: &str,
     source: &Path,
     output: &Path,
-    include_dir: &Path,
+    include_dirs: &[&Path],
     defines: &[&str],
 ) -> std::io::Result<()> {
     let mut command = Command::new(glslc);
     command
         .arg("-fshader-stage=compute")
         .arg("--target-env=vulkan1.2")
-        .arg("-O")
-        .arg(format!("-I{}", include_dir.display()));
+        .arg("-O");
+    for include_dir in include_dirs {
+        command.arg(format!("-I{}", include_dir.display()));
+    }
     for define in defines {
         command.arg(format!("-D{define}"));
     }

@@ -1,0 +1,109 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
+// B is the packed Q8K activation (one f32 scale per 256-element block).
+#define B_TYPE block_q8_k
+
+#include "mul_mat_vec_q8k_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// Only k-quant dtypes are routed to the fused Q8K path.
+#define K_PER_ITER 16
+
+uint a_offset, b_offset, d_offset;
+
+int32_t cache_b_qs[4];
+float cache_b_d;
+
+#include "mul_mat_vec_q8k_funcs.glsl"
+
+void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i) {
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const uint col = i*BLOCK_SIZE + tid*K_PER_ITER;
+
+        // Preload the B side: b_block_idx is a 32-element window index over
+        // the packed Q8K activation, so the 256-element block is b_block_idx/8
+        // and the window within it is b_block_idx%8. Each thread caches 16 of
+        // the window's 32 values as 4 packed int32 words plus the block's f32
+        // scale.
+        const uint b_block_idx = (j*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;  // 32-window index
+        const uint b_qs_idx = tid % (32 / K_PER_ITER);                                  // 0 or 1
+        cache_b_d = data_b[b_block_idx / 8].d;
+        const ivec4 b_qs = data_b[b_block_idx / 8].qs[(b_block_idx % 8) * 2 + b_qs_idx];
+        cache_b_qs[0] = b_qs.x; cache_b_qs[1] = b_qs.y; cache_b_qs[2] = b_qs.z; cache_b_qs[3] = b_qs.w;
+
+        uint ibi = first_row*p.ncols;
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
+            ibi += p.ncols;
+
+            temp[j][n] += mmvq_dot_product(a_block_idx, b_qs_idx);
+        }
+    }
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    const uint tid = gl_LocalInvocationID.x;
+
+    get_offsets(a_offset, b_offset, d_offset);
+    a_offset *= QUANT_K / QUANT_K_Q8_1;
+    b_offset /= QUANT_K_Q8_1;
+
+    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            temp[j][n] = FLOAT_TYPE(0.0f);
+        }
+    }
+
+    uint num_iters = p.ncols / (K_PER_ITER * BLOCK_SIZE);
+    if (num_iters * K_PER_ITER * BLOCK_SIZE + K_PER_ITER*tid < p.ncols) {
+        num_iters++;
+    }
+    int unroll_count = 4;
+    uint unrolled_iters = num_iters & ~(unroll_count - 1);
+
+    uint i = 0;
+    while (i < unrolled_iters) {
+        // Manually partially unroll the loop
+        [[unroll]] for (uint k = 0; k < unroll_count; ++k) {
+            iter(temp, first_row, num_rows, tid, i*K_PER_ITER);
+            i++;
+        }
+    }
+
+    unroll_count = 2;
+    unrolled_iters = num_iters & ~(unroll_count - 1);
+
+    while (i < unrolled_iters) {
+        // Manually partially unroll the loop
+        [[unroll]] for (uint k = 0; k < unroll_count; ++k) {
+            iter(temp, first_row, num_rows, tid, i*K_PER_ITER);
+            i++;
+        }
+    }
+    while (i < num_iters) {
+        iter(temp, first_row, num_rows, tid, i*K_PER_ITER);
+        i++;
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    // do NUM_ROWS at a time, unless there aren't enough remaining rows
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}

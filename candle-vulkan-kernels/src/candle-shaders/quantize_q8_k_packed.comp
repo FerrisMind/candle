@@ -1,0 +1,113 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+// Round a f32 activation to the CPU k-quant A-side grid (Q8K) and emit the
+// PACKED block (`block_q8_k`: f32 d + int8 qs) consumed by the fused dp4a
+// kernels. The rounding is identical to `quantize_q8_k.comp` (which emits the
+// dequantized f32 values for the raw-f32 kernels): per-256 block, signed
+// extreme, `iscale = -127/max`, `d = 1/iscale`, `q = clamp(round(x*iscale))`.
+// Keeping `d` and `q` separate lets the dp4a kernels do the integer dot in
+// int8 and apply the f32 scale afterwards, exactly like the CPU.
+
+layout (push_constant) uniform parameter
+{
+    uint ne;
+    uint num_blocks;
+    uint scale_bits;
+} p;
+
+#include "q8k_layout.glsl"
+
+layout(constant_id = 0) const uint GROUP_SIZE = 64;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {vec4 data_a[];};
+layout (binding = 1) writeonly buffer D {block_q8_k data_d[];};
+
+// One workgroup (64 threads x vec4) per 256-element block.
+shared float shmem_amax[GROUP_SIZE];
+shared float shmem_maxv[GROUP_SIZE];
+// One int32 (4 packed int8) per thread; threads 0..15 then assemble the
+// ivec4 words of the output block from it.
+shared int shmem_qs[GROUP_SIZE];
+
+// Vulkan permits division to be up to 2 ulp off the IEEE result. The CPU
+// quantizer computes `-127/max` and `1/iscale` with correctly rounded f32
+// division; pick whichever of the 5 surrounding f32 values minimizes the
+// (correctly rounded, fma) residual so the Q8K grid is reproduced bit-exactly.
+float div_ieee(float a, float b) {
+    float q = a / b;
+    int qb = floatBitsToInt(q);
+    float best = abs(fma(b, q, -a));
+    int bidx = 0;
+    float r = abs(fma(b, intBitsToFloat(qb + 1), -a));
+    if (r < best) { best = r; bidx = 1; }
+    r = abs(fma(b, intBitsToFloat(qb + 2), -a));
+    if (r < best) { best = r; bidx = 2; }
+    r = abs(fma(b, intBitsToFloat(qb - 1), -a));
+    if (r < best) { best = r; bidx = -1; }
+    r = abs(fma(b, intBitsToFloat(qb - 2), -a));
+    if (r < best) { best = r; bidx = -2; }
+    return intBitsToFloat(qb + bidx);
+}
+
+void quantize(const uint ib) {
+    const uint tid = gl_LocalInvocationID.x;
+    // GROUP_SIZE threads x vec4 = one 256-element block.
+    const uint idx4 = ib * GROUP_SIZE + tid;
+    const bool in_range = idx4 * 4 < p.ne;
+    const vec4 vals = in_range ? data_a[idx4] : vec4(0.0f);
+
+    // Signed extreme: the first element with a strictly larger |x| wins, as in
+    // `BlockQ8K::from_float` (`if amax < x.abs() { amax = ..; max = x; }`).
+    float amax = 0.0f;
+    float maxv = 0.0f;
+    if (abs(vals.x) > amax) { amax = abs(vals.x); maxv = vals.x; }
+    if (abs(vals.y) > amax) { amax = abs(vals.y); maxv = vals.y; }
+    if (abs(vals.z) > amax) { amax = abs(vals.z); maxv = vals.z; }
+    if (abs(vals.w) > amax) { amax = abs(vals.w); maxv = vals.w; }
+    shmem_amax[tid] = amax;
+    shmem_maxv[tid] = maxv;
+    barrier();
+    [[unroll]] for (uint s = GROUP_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (shmem_amax[tid + s] > shmem_amax[tid]) {
+                shmem_amax[tid] = shmem_amax[tid + s];
+                shmem_maxv[tid] = shmem_maxv[tid + s];
+            }
+        }
+        barrier();
+    }
+
+    const float mx = shmem_maxv[0];
+    const float scale = uintBitsToFloat(p.scale_bits);
+    const float iscale = mx != 0.0f ? div_ieee(-scale, mx) : 0.0f;
+    const float d = iscale != 0.0f ? div_ieee(1.0f, iscale) : 0.0f;
+    const vec4 q = clamp(round(vals * iscale), vec4(-128.0f), vec4(127.0f));
+
+    // Pack this thread's 4 int8 values into one word (values 4*tid .. 4*tid+3
+    // land in the little-endian byte order the dp4a dot products expect).
+    shmem_qs[tid] = pack32(i8vec4(int(q.x), int(q.y), int(q.z), int(q.w)));
+    barrier();
+
+    if (tid == 0) {
+        data_d[ib].d = d;
+    }
+    if (tid < 16) {
+        data_d[ib].qs[tid] = ivec4(shmem_qs[tid * 4    ],
+                                   shmem_qs[tid * 4 + 1],
+                                   shmem_qs[tid * 4 + 2],
+                                   shmem_qs[tid * 4 + 3]);
+    }
+}
+
+void main() {
+    uint wgid = gl_WorkGroupID.x;
+    while (wgid < p.num_blocks) {
+        quantize(wgid);
+        wgid += gl_NumWorkGroups.x;
+    }
+}
