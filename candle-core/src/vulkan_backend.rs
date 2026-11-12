@@ -1038,9 +1038,11 @@ fn vulkan_inflight_grace_multiplier() -> f64 {
     std::env::var("CANDLE_VK_INFLIGHT_GRACE")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        // 8: pi3x infer 13.5s (grace 2) -> 12.4s; wider bands only approach the
-        // same stall total while risking more VRAM on 12 GiB cards.
-        .unwrap_or(8.0)
+        // 2: a grace of 8 let up to 2 GiB of in-flight buffers accumulate,
+        // which pushed VGGT/TripoSG ~0.7-1 GiB over the CUDA peak on 12 GiB
+        // cards. Grace 2 keeps most of the drain-avoidance benefit (pi3x
+        // 13.5s at grace 1 vs 12.0s here) without the memory blow-up.
+        .unwrap_or(2.0)
 }
 
 fn gpu_profile_enabled() -> bool {
@@ -2205,13 +2207,12 @@ impl VulkanDevice {
             std::env::var("CANDLE_VK_POOL_MAX_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                // 2 GiB: dense vision models (pi3x) allocate thousands of
-                // distinct intermediate sizes per step; 2 GiB keeps that set
-                // resident and reused (pi3x infer 12.3s -> 11.7s vs a 512 MiB
-                // pool). LLM decode still falls through to the deferred-free
-                // path for each distinct KV size, so the llama VRAM-floor
-                // concern does not grow with this ceiling.
-                .unwrap_or(2 * 1024 * 1024 * 1024)
+                // 0: no retained transient pool. Large checkpoints (TripoSG
+                // 7.4 GiB, VGGT) already fill most of a 12 GiB card; a 2 GiB
+                // pool inflated their peak by ~1-2 GiB over CUDA. Pooling was
+                // only worth ~5-10% wall time on pi3x, so memory parity wins.
+                // Override with CANDLE_VK_POOL_MAX_BYTES for latency-first runs.
+                .unwrap_or(0)
         })
     }
 
@@ -10375,8 +10376,7 @@ impl VulkanStorage {
         let spec = if use_q8_1_rhs {
             let subgroup = self.device.inner.subgroup_size.max(8);
             let subgroup32 = self.device.inner.subgroup_size.max(32);
-            let small = input_m <= 32 || n <= 32;
-            if vulkan_is_k_quant(qdtype) && small {
+            if vulkan_is_k_quant(qdtype) && (input_m <= 32 || n <= 32) {
                 [
                     (0, subgroup32),
                     (1, 32),
@@ -10400,19 +10400,12 @@ impl VulkanStorage {
                     (8, 2),
                     (10, subgroup),
                 ]
-            } else if small {
-                [
-                    (0, subgroup32),
-                    (1, 32),
-                    (2, 32),
-                    (4, 32),
-                    (5, 32),
-                    (6, 2),
-                    (7, 2),
-                    (8, 1),
-                    (10, subgroup),
-                ]
             } else {
+                // Legacy quants always use the 128-thread 64x64 tile. The
+                // 32x32 single-warp config is only valid for the fused k-quant
+                // mul_mmq variants: with Q8_0/Q4_0 weights and n <= 32 it
+                // produced NaN/garbage rows (verified on TripoSG's VAE
+                // (1, 1024) output projection at m >= 64).
                 [
                     (0, 128),
                     (1, 64),

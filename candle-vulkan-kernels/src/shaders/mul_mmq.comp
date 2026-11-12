@@ -244,6 +244,15 @@ void main() {
         pos_b_ib += BK_STEP;
 
         for (uint k_step = 0; k_step < BK_STEP; k_step++) {
+            // Tail K panels (K % (BK * BK_STEP) != 0, e.g. k = 64 or 96) have
+            // no source block: block_a_to_shmem was skipped for this k_step,
+            // so buf_a still holds stale shared memory. B is zero-filled by
+            // block_b_to_shmem, but 0 * NaN is NaN, which surfaced as corrupt
+            // Q8_0 matmul output for k = 32/64 (TripoSG input projections).
+            // Skip the step entirely instead of reading the stale A panel.
+            if (block + k_step * BK >= end_k) {
+                continue;
+            }
             // Load from shared into cache
             [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
                 [[unroll]] for (uint cr = 0; cr < TM; cr++) {
