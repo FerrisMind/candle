@@ -1142,6 +1142,11 @@ impl Drop for WgpuStorage {
 }
 
 impl WgpuDevice {
+    /// gpu-allocator report for the device (allocated vs reserved block bytes).
+    pub fn allocator_report(&self) -> Option<wgpu::AllocatorReport> {
+        self.inner.device.generate_allocator_report()
+    }
+
     pub fn adapter_name(&self) -> &str {
         &self.inner.adapter_name
     }
@@ -16829,6 +16834,32 @@ fn wgpu_required_features(adapter_features: wgpu::Features) -> wgpu::Features {
     }
 }
 
+/// wgpu-hal's sub-allocation block size for device buffers.
+///
+/// `MemoryHints::MemoryUsage` uses 8-64 MiB blocks; a multi-GiB checkpoint
+/// with thousands of differently sized tensors leaves a large fraction of
+/// those blocks unused (measured ~2.5 GiB of slack for the 7.4 GiB TripoSG
+/// weights). A 2 MiB block makes every tensor buffer above 2 MiB take a
+/// dedicated exact-sized allocation (gpu-allocator's
+/// `requires_personal_block`) while small tensors still pack into shared
+/// blocks. Measured dedicated peaks across repeated runs: TripoSG 8.6-9.8 GiB
+/// (CUDA 8.5), VGGT 6.1-7.0 GiB (CUDA 6.7); 256 KiB helps TripoSG slightly
+/// but pushes VGGT to 7.2 GiB, so 2 MiB is the balance.
+/// `CANDLE_WGPU_BLOCK_BYTES=0` restores the old `MemoryUsage` policy.
+fn wgpu_memory_hints() -> wgpu::MemoryHints {
+    let bytes = std::env::var("CANDLE_WGPU_BLOCK_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2 * 1024 * 1024);
+    if bytes > 0 {
+        wgpu::MemoryHints::Manual {
+            suballocated_device_memory_block_size: bytes..bytes.saturating_add(1),
+        }
+    } else {
+        wgpu::MemoryHints::MemoryUsage
+    }
+}
+
 #[cfg(test)]
 mod wgpu_required_features_tests {
     use super::wgpu_required_features;
@@ -16983,7 +17014,7 @@ async fn wgpu_device_from_adapter(ordinal: usize, adapter: wgpu::Adapter) -> Res
             // MiB vs Performance => 128-256 MiB). The KV-cat loop allocates
             // many small buffers that are recycled, so large blocks carve
             // fresh VRAM per alloc and never get returned -> OOM at low VRAM.
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            memory_hints: wgpu_memory_hints(),
             ..Default::default()
         })
         .await
@@ -16999,7 +17030,7 @@ async fn wgpu_device_from_adapter(ordinal: usize, adapter: wgpu::Adapter) -> Res
                     required_features,
                     required_limits: required_limits.clone(),
                     experimental_features,
-                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    memory_hints: wgpu_memory_hints(),
                     ..Default::default()
                 })
                 .await
@@ -17325,6 +17356,15 @@ impl BackendDevice for WgpuDevice {
 
     fn synchronize(&self) -> Result<()> {
         self.flush_active_batch("synchronize")?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // `Queue::write_buffer` keeps bytes in wgpu's pending-write staging
+            // until the next real submit. A caller that synchronizes after a
+            // long weight upload (with no dispatches queued) would otherwise
+            // leave the whole checkpoint in host staging and poll a queue that
+            // never retires it. An empty submit flushes those pending writes.
+            self.inner.queue.submit(std::iter::empty());
+        }
         #[cfg(target_arch = "wasm32")]
         {
             // `PollType::Wait` / `wait_indefinitely` are no-ops or deadlock-prone on
