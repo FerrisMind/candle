@@ -4,10 +4,12 @@
 //! from a pre-trained checkpoint, e.g. using `VarBuilder::from_mmaped_safetensors`, or initialized
 //! for training, e.g. using `VarBuilder::from_varmap`.
 use crate::VarMap;
+use candle::quantized::{gguf_file, QTensor};
 use candle::{safetensors::Load, DType, Device, Error, Result, Shape, Tensor};
 use safetensors::{slice::IndexOp, tensor::SafeTensors};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 fn normalize_dtype_for_device(dtype: DType, _dev: &Device) -> DType {
     dtype
@@ -67,6 +69,14 @@ pub trait Backend: Send + Sync {
     /// Retrieve a tensor based on the name.
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor>;
 
+    /// Retrieve a tensor in its packed quantized form when the backend stores
+    /// one (GGUF). Dense backends return `None` and callers fall back to
+    /// [`Backend::get`].
+    fn get_quantized(&self, name: &str, dev: &Device) -> Result<Option<QTensor>> {
+        let _ = (name, dev);
+        Ok(None)
+    }
+
     fn contains_tensor(&self, name: &str) -> bool;
 }
 
@@ -83,6 +93,13 @@ pub trait SimpleBackend: Send + Sync {
 
     /// Retrieve a tensor based on the name.
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor>;
+
+    /// Retrieve a tensor in its packed quantized form when the backend stores
+    /// one (GGUF). Dense backends keep the default `None`.
+    fn get_quantized(&self, name: &str, dev: &Device) -> Result<Option<QTensor>> {
+        let _ = (name, dev);
+        Ok(None)
+    }
 
     fn contains_tensor(&self, name: &str) -> bool;
 }
@@ -102,6 +119,10 @@ impl Backend for Box<dyn SimpleBackend + '_> {
 
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
         self.as_ref().get_unchecked(name, dtype, dev)
+    }
+
+    fn get_quantized(&self, name: &str, dev: &Device) -> Result<Option<QTensor>> {
+        self.as_ref().get_quantized(name, dev)
     }
 
     fn contains_tensor(&self, name: &str) -> bool {
@@ -234,6 +255,18 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
             .get_unchecked(&name, dtype, &self.data.device)
     }
 
+    /// Retrieve the packed quantized tensor associated with the given name.
+    ///
+    /// Only backends that store quantized tensors (GGUF) return `Some`; dense
+    /// backends return `None` so callers can keep the regular [`Self::get`]
+    /// path. This does not validate a target shape or cast the dtype: the
+    /// caller decides whether to keep the packed representation (e.g.
+    /// `QMatMul`) or dequantize.
+    pub fn get_quantized(&self, name: &str) -> Result<Option<QTensor>> {
+        let name = self.path(name);
+        self.data.backend.get_quantized(&name, &self.data.device)
+    }
+
     /// Retrieve the tensor associated with the given name & dtype at the current path.
     pub fn get_with_hints_dtype<S: Into<Shape>>(
         &self,
@@ -293,6 +326,71 @@ impl SimpleBackend for Zeros {
 
     fn contains_tensor(&self, _name: &str) -> bool {
         true
+    }
+}
+
+/// Backend for GGUF files: keeps packed quantized tensors available via
+/// [`SimpleBackend::get_quantized`] and dequantizes on the dense [`get`] path.
+///
+/// The file is read lazily under a mutex; tensor reads seek to the recorded
+/// offset, so model build order (sequential for our loaders) keeps the IO
+/// pattern sequential without preloading the whole checkpoint.
+struct Gguf {
+    content: gguf_file::Content,
+    file: Mutex<std::fs::File>,
+}
+
+impl Gguf {
+    fn open(path: &Path) -> Result<Self> {
+        let mut file = std::fs::File::open(path).map_err(Error::wrap)?;
+        let content = gguf_file::Content::read(&mut file)?;
+        Ok(Self {
+            content,
+            file: Mutex::new(file),
+        })
+    }
+
+    fn tensor(&self, name: &str, dev: &Device) -> Result<QTensor> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| Error::Msg(format!("GGUF lock poisoned while reading {name}")).bt())?;
+        self.content.tensor(&mut *file, name, dev)
+    }
+}
+
+impl SimpleBackend for Gguf {
+    fn get(
+        &self,
+        s: Shape,
+        name: &str,
+        _: crate::Init,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Tensor> {
+        let tensor = self.tensor(name, dev)?.dequantize(dev)?.to_dtype(dtype)?;
+        if tensor.shape() != &s {
+            Err(Error::UnexpectedShape {
+                msg: format!("shape mismatch for {name}"),
+                expected: s,
+                got: tensor.shape().clone(),
+            }
+            .bt())
+        } else {
+            Ok(tensor)
+        }
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
+        self.tensor(name, dev)?.dequantize(dev)?.to_dtype(dtype)
+    }
+
+    fn get_quantized(&self, name: &str, dev: &Device) -> Result<Option<QTensor>> {
+        Ok(Some(self.tensor(name, dev)?))
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.content.tensor_infos.contains_key(name)
     }
 }
 
@@ -633,6 +731,17 @@ impl<'a> VarBuilder<'a> {
     /// returned if no tensor is available under the requested path or on shape mismatches.
     pub fn from_tensors(ts: HashMap<String, Tensor>, dtype: DType, dev: &Device) -> Self {
         Self::from_backend(Box::new(ts), dtype, dev.clone())
+    }
+
+    /// Initializes a `VarBuilder` backed by a GGUF file.
+    ///
+    /// Quantized tensors stay packed for [`Self::get_quantized`] callers (e.g.
+    /// `QMatMul`), while [`Self::get`] returns a dense tensor dequantized to the
+    /// builder dtype. Keeping both paths on one builder lets a model mix
+    /// quantized linears with dense norms, convolutions, and biases.
+    pub fn from_gguf<P: AsRef<Path>>(p: P, dtype: DType, dev: &Device) -> Result<Self> {
+        let backend = Gguf::open(p.as_ref())?;
+        Ok(Self::from_backend(Box::new(backend), dtype, dev.clone()))
     }
 
     /// Initializes a `VarBuilder` using a `VarMap`. The requested tensors are created and
