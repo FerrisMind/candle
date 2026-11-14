@@ -8300,15 +8300,19 @@ impl VulkanStorage {
         };
         let spirv = candle_vulkan_kernels::spirv(spirv_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
+        // get_rows.comp grid-strides over the Y/Z dispatch dimensions, so cap
+        // them at the device limits and let the shader cover the remainder.
+        let groups_y = u32::try_from(ids_len)?
+            .min(src.device.inner.max_workgroup_count_y)
+            .max(1);
+        let groups_z = u32::try_from(left_size)?
+            .min(src.device.inner.max_workgroup_count_z)
+            .max(1);
         src.device.run_compute_3d(
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
-            (
-                right_size.div_ceil(128).try_into()?,
-                ids_len.try_into()?,
-                left_size.try_into()?,
-            ),
+            (right_size.div_ceil(128).try_into()?, groups_y, groups_z),
         )?;
         Ok(dst)
     }
@@ -8399,11 +8403,22 @@ impl VulkanStorage {
         };
         let spirv = candle_vulkan_kernels::spirv(spirv_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
+        // The shader grid-strides over `gl_NumWorkGroups.y/z` (see
+        // get_rows.comp), so cap each dispatch dimension at the device limit
+        // instead of rejecting or under-dispatching large gathers. Some
+        // Vulkan implementations expose only 65535 workgroups on Y/Z, while
+        // gathers can legitimately exceed that (e.g. a 1024x1024 image).
+        let groups_y = u32::try_from(ids_dim)?
+            .min(src.device.inner.max_workgroup_count_y)
+            .max(1);
+        let groups_z = u32::try_from(left_size)?
+            .min(src.device.inner.max_workgroup_count_z)
+            .max(1);
         src.device.run_compute_3d(
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
-            (1, ids_dim.try_into()?, left_size.try_into()?),
+            (1, groups_y, groups_z),
         )?;
         Ok(dst)
     }
@@ -10131,15 +10146,18 @@ impl VulkanStorage {
         let spirv_name = format!("get_rows_{}_f32", vulkan_quantized_stem(qdtype)?);
         let spirv = candle_vulkan_kernels::spirv(&spirv_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
+        // The quantized get_rows shader also grid-strides over Y/Z.
+        let groups_y = u32::try_from(ids_len)?
+            .min(self.device.inner.max_workgroup_count_y)
+            .max(1);
+        let groups_z = u32::try_from(left_size)?
+            .min(self.device.inner.max_workgroup_count_z)
+            .max(1);
         self.device.run_compute_3d(
             spirv,
             &bindings,
             Some(any_as_bytes(&params)),
-            (
-                right_size.div_ceil(1024).try_into()?,
-                ids_len.try_into()?,
-                left_size.try_into()?,
-            ),
+            (right_size.div_ceil(1024).try_into()?, groups_y, groups_z),
         )?;
         Ok(dst)
     }
