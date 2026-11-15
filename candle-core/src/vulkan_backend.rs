@@ -2095,6 +2095,24 @@ impl VulkanDevice {
         })
     }
 
+    /// Small host transfers stay on the compute queue even when the caller
+    /// asks for the dedicated transfer queue. Moving a few KB between queues
+    /// costs two WDDM submissions plus blocking host fence waits around the
+    /// next dispatch; recording the copy in the active compute batch reuses
+    /// the in-batch barrier and avoids that extra submission/fence pair.
+    /// Override via `CANDLE_VK_TRANSFER_COPY_MIN_BYTES`.
+    const DEFAULT_TRANSFER_COPY_MIN_BYTES: usize = 1024 * 1024;
+
+    fn transfer_copy_min_bytes() -> usize {
+        static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("CANDLE_VK_TRANSFER_COPY_MIN_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(Self::DEFAULT_TRANSFER_COPY_MIN_BYTES)
+        })
+    }
+
     fn max_batch_descriptor_sets() -> u32 {
         // A dense-model dispatch consumes ~2-8 descriptor sets (inputs, dst,
         // params/uniform); capping sets at 1x dispatches closed batches after
@@ -3470,17 +3488,18 @@ impl VulkanDevice {
             return Ok(());
         }
         self.cleanup_pending_submissions_amortized()?;
-        let (queue, queue_family_index, queue_kind) = self.copy_queue_and_family(prefer_transfer);
+        let total_bytes = regions.iter().try_fold(0usize, |acc, region| {
+            acc.checked_add(region.size as usize)
+                .ok_or_else(|| Error::msg("vulkan copy batch byte count overflow"))
+        })?;
+        let use_transfer = prefer_transfer && total_bytes >= Self::transfer_copy_min_bytes();
+        let (queue, queue_family_index, queue_kind) = self.copy_queue_and_family(use_transfer);
         if queue_kind == SubmissionQueueKind::Compute {
             self.wait_for_transfer_dependencies()?;
         } else {
             self.flush_active_batch(SubmissionQueueKind::Compute, "transfer_copy_dependency")?;
             self.cleanup_pending_submissions_for_queue(SubmissionQueueKind::Compute, true)?;
         }
-        let total_bytes = regions.iter().try_fold(0usize, |acc, region| {
-            acc.checked_add(region.size as usize)
-                .ok_or_else(|| Error::msg("vulkan copy batch byte count overflow"))
-        })?;
         let (transfer_bytes_to_add, compute_bytes_to_add) = match queue_kind {
             SubmissionQueueKind::Transfer => (total_bytes, 0),
             SubmissionQueueKind::Compute => (0, total_bytes),
@@ -3560,7 +3579,8 @@ impl VulkanDevice {
     /// plus a PCIe copy per zeroed tensor.
     fn submit_fill_zero_and_track(&self, dst: &Arc<VulkanBuffer>) -> Result<()> {
         self.cleanup_pending_submissions_amortized()?;
-        let (queue, queue_family_index, queue_kind) = self.copy_queue_and_family(true);
+        let use_transfer = dst.size >= Self::transfer_copy_min_bytes();
+        let (queue, queue_family_index, queue_kind) = self.copy_queue_and_family(use_transfer);
         if queue_kind == SubmissionQueueKind::Compute {
             self.wait_for_transfer_dependencies()?;
         } else {
@@ -3614,10 +3634,9 @@ impl VulkanDevice {
         self.cleanup_pending_submissions(true)?;
         let staging = self.create_readback_staging_buffer(buffer.size)?;
         self.submit_copy_and_track(buffer, &staging, buffer.size, true)?;
-        self.flush_active_batch(
-            self.copy_queue_and_family(true).2,
-            "read_buffer_after_copy_record",
-        )?;
+        // The copy may have been routed to either queue by the transfer size
+        // gate; flush both so the staging buffer is current for the readback.
+        self.flush_all_active_batches("read_buffer_after_copy_record")?;
         self.cleanup_pending_submissions(true)?;
         let mut bytes = self.map_read_host_buffer(staging.as_ref())?;
         // The GPU copy above wrote exactly `buffer.size` bytes into the staging
@@ -4989,6 +5008,13 @@ impl VulkanStorage {
     fn materialize_rank_gt4_compact(&self, layout: &Layout) -> Result<(Self, Layout)> {
         let compact_shape = Self::compact_rank_gt4_shape(layout);
         let compact_layout = Layout::contiguous(compact_shape.clone());
+        // A contiguous rank>4 tensor is already in compact order: one bulk
+        // copy is enough. The per-prefix loop below would otherwise submit one
+        // tiny copy per leading index; casting a stored F16 3x3x3 conv weight
+        // (e.g. [O, I, 3, 3, 3]) to F32 issued O*I copies of 54 bytes each.
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            return Ok((self.try_clone(layout)?, compact_layout));
+        }
         let mut out = unsafe { self.device.alloc_uninit(&compact_shape, self.dtype)? };
         let rank = layout.dims().len();
         let slice_shape = Shape::from(vec![
@@ -5021,6 +5047,11 @@ impl VulkanStorage {
         rows: usize,
         cols: usize,
     ) -> Result<Self> {
+        // A contiguous operand is already in the (batch, rows, cols) order the
+        // matmul flattening expects; cloning once avoids one copy per batch.
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            return self.try_clone(layout);
+        }
         let out_shape = Shape::from(vec![batch, rows, cols]);
         let mut out = unsafe { self.device.alloc_uninit(&out_shape, self.dtype)? };
         let matrix_shape = Shape::from(vec![rows, cols]);

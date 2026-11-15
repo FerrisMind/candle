@@ -7830,6 +7830,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     fn materialize_rank_gt4_compact(&self, layout: &Layout) -> Result<(Self, Layout)> {
         let compact_shape = Self::compact_rank_gt4_shape(layout);
         let compact_layout = Layout::contiguous(compact_shape.clone());
+        // A contiguous rank>4 tensor is already in compact order: one bulk
+        // copy is enough. The per-prefix loop below would otherwise record one
+        // tiny copy (or dispatch, for unaligned F16 slices) per leading index;
+        // casting a stored F16 3x3x3 conv weight issued O*I copies of 54 bytes.
+        if layout.is_contiguous() && layout.start_offset() == 0 {
+            return Ok((self.try_clone(layout)?, compact_layout));
+        }
         let mut out = unsafe { self.device.alloc_uninit(&compact_shape, self.dtype)? };
         let rank = layout.dims().len();
         let slice_shape = Shape::from(vec![
