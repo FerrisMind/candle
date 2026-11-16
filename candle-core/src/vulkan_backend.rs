@@ -779,8 +779,6 @@ struct VulkanPendingSubmission {
     transfer_bytes: usize,
     compute_bytes: usize,
     retained_buffers: Vec<Arc<VulkanBuffer>>,
-    /// Total device bytes of `retained_buffers`, used to bound in-flight VRAM.
-    retained_bytes: u64,
     /// Profiler metadata; consumed (and aggregated) when the submission retires.
     profile: Option<VulkanBatchProfile>,
 }
@@ -864,7 +862,7 @@ pub struct VulkanCpuProfilePhase {
 }
 
 pub static VULKAN_CPU_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
-pub static VULKAN_CPU_PROFILE_PHASES: [VulkanCpuProfilePhase; 13] = [
+pub static VULKAN_CPU_PROFILE_PHASES: [VulkanCpuProfilePhase; 26] = [
     VulkanCpuProfilePhase {
         name: "transfer_deps",
         nanos: AtomicU64::new(0),
@@ -907,6 +905,71 @@ pub static VULKAN_CPU_PROFILE_PHASES: [VulkanCpuProfilePhase; 13] = [
     },
     VulkanCpuProfilePhase {
         name: "alloc_allocator",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_vkcreate",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_vkreqs",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_gpu_alloc",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_bind",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_sync_retry",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_size_lt1m",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_size_lt16m",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_size_lt64m",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_size_lt256m",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_size_ge256m",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "upload_staging",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "upload_map",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "upload_copy",
         nanos: AtomicU64::new(0),
         count: AtomicU64::new(0),
     },
@@ -1005,6 +1068,13 @@ pub fn vulkan_cpu_profile_report() -> Option<Vec<(&'static str, u64, f64)>> {
     }
     rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     Some(rows)
+}
+
+/// Size class for the reusable GPU buffer pool: power of two, so buffers of
+/// similar transient shapes share an entry and a larger freed buffer can serve
+/// a smaller later request.
+fn gpu_pool_class(size: usize) -> usize {
+    size.max(1).next_power_of_two()
 }
 
 /// Budget (bytes) of retained in-flight submission buffers before
@@ -1705,9 +1775,8 @@ fn quantize_f32_storage_to_q8_k_packed(
     // (Q8_K_BYTES = 272 in q8k_layout.glsl, 12 B tail padding included).
     let out_size = num_blocks as usize * 272;
     let out = device.create_buffer(out_size, "candle-vulkan-quantize-q8_k-packed")?;
-    let spirv = candle_vulkan_kernels::spirv(spirv_name).ok_or_else(|| {
-        Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt()
-    })?;
+    let spirv = candle_vulkan_kernels::spirv(spirv_name)
+        .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
     let params = VulkanQuantizeQ8_1Params {
         ne: elem_count.try_into()?,
         num_blocks,
@@ -2226,10 +2295,10 @@ impl VulkanDevice {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 // 0: no retained transient pool. Large checkpoints (TripoSG
-                // 7.4 GiB, VGGT) already fill most of a 12 GiB card; a 2 GiB
-                // pool inflated their peak by ~1-2 GiB over CUDA. Pooling was
-                // only worth ~5-10% wall time on pi3x, so memory parity wins.
-                // Override with CANDLE_VK_POOL_MAX_BYTES for latency-first runs.
+                // 7.4 GiB, VGGT, TRELLIS.2 q8 8.9 GiB) already fill most of a
+                // 12 GiB card; a retained pool inflates the peak and pushes
+                // the allocator into failure retries. Override with
+                // CANDLE_VK_POOL_MAX_BYTES for latency-first runs.
                 .unwrap_or(0)
         })
     }
@@ -2530,6 +2599,30 @@ impl VulkanDevice {
         }
     }
 
+    /// Bytes this submission holds that no other owner (live tensor, weight,
+    /// or another pending submission) still references. Retiring this fence
+    /// can free them; duplicates and shared buffers cannot be credited twice.
+    fn reclaimable_retained_bytes(retained: &[Arc<VulkanBuffer>]) -> u64 {
+        if retained.is_empty() {
+            return 0;
+        }
+        let mut occurrences: HashMap<vk::Buffer, usize> = HashMap::default();
+        for buffer in retained {
+            *occurrences.entry(buffer.buffer).or_insert(0) += 1;
+        }
+        let mut counted: HashMap<vk::Buffer, ()> = HashMap::default();
+        let mut bytes = 0u64;
+        for buffer in retained {
+            if counted.insert(buffer.buffer, ()).is_some() {
+                continue;
+            }
+            if Arc::strong_count(buffer) == occurrences[&buffer.buffer] {
+                bytes += buffer.size as u64;
+            }
+        }
+        bytes
+    }
+
     fn flush_active_batch(
         &self,
         queue_kind: SubmissionQueueKind,
@@ -2642,11 +2735,6 @@ impl VulkanDevice {
                     .map_err(Error::wrap)?
             );
         }
-        let retained_bytes: u64 = batch
-            .retained_buffers
-            .iter()
-            .map(|buffer| buffer.size as u64)
-            .sum();
         self.inner
             .pending_submissions
             .lock()
@@ -2659,7 +2747,6 @@ impl VulkanDevice {
                 transfer_bytes: batch.transfer_bytes,
                 compute_bytes: batch.compute_bytes,
                 retained_buffers: batch.retained_buffers,
-                retained_bytes,
                 profile: batch_profile,
             });
         // Byte-budget drain (see `vulkan_inflight_byte_budget`): bound the
@@ -2674,7 +2761,7 @@ impl VulkanDevice {
             .lock()
             .map_err(|e| Error::wrap(e.to_string()))?
             .iter()
-            .map(|submission| submission.retained_bytes)
+            .map(|submission| Self::reclaimable_retained_bytes(&submission.retained_buffers))
             .sum();
         let budget = vulkan_inflight_byte_budget();
         let blocking_threshold = (budget as f64 * vulkan_inflight_grace_multiplier()) as u64;
@@ -2767,6 +2854,23 @@ impl VulkanDevice {
         staging_kind: StagingKind,
         dedicated_allocation: bool,
     ) -> Result<Arc<VulkanBuffer>> {
+        if VULKAN_CPU_PROFILE_ENABLED.load(Ordering::Relaxed) {
+            let name = if size < 1024 * 1024 {
+                "alloc_size_lt1m"
+            } else if size < 16 * 1024 * 1024 {
+                "alloc_size_lt16m"
+            } else if size < 64 * 1024 * 1024 {
+                "alloc_size_lt64m"
+            } else if size < 256 * 1024 * 1024 {
+                "alloc_size_lt256m"
+            } else {
+                "alloc_size_ge256m"
+            };
+            let idx = cpu_phase_index(name);
+            VULKAN_CPU_PROFILE_PHASES[idx]
+                .count
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.cleanup_pending_submissions_amortized()?;
         let mut info = vk::BufferCreateInfo::default()
             .size(size as u64)
@@ -2783,9 +2887,13 @@ impl VulkanDevice {
         } else {
             info = info.sharing_mode(vk::SharingMode::EXCLUSIVE);
         }
-        let buffer =
-            unsafe { self.inner.device.create_buffer(&info, None) }.map_err(Error::wrap)?;
-        let requirements = unsafe { self.inner.device.get_buffer_memory_requirements(buffer) };
+        let buffer = cpu_phase!(
+            "alloc_vkcreate",
+            unsafe { self.inner.device.create_buffer(&info, None) }.map_err(Error::wrap)
+        )?;
+        let requirements = cpu_phase!("alloc_vkreqs", unsafe {
+            self.inner.device.get_buffer_memory_requirements(buffer)
+        });
         let alloc_scheme = if dedicated_allocation {
             // Dedicated, exact-sized block per weight tensor: avoids the intra-block
             // slack from sub-allocating many mid-size weights into shared 256MB
@@ -2814,32 +2922,58 @@ impl VulkanDevice {
                 .map_err(Error::wrap)
         };
 
-        let allocation = match allocate_once() {
+        let allocation = match cpu_phase!("alloc_gpu_alloc", allocate_once()) {
             Ok(allocation) => allocation,
             Err(first_err) => {
-                // Long-running async submit bursts can temporarily retain GPU allocations
-                // until fences are observed. Synchronize once and retry allocation.
-                self.synchronize_pending()?;
-                match allocate_once() {
-                    Ok(allocation) => allocation,
-                    Err(second_err) => {
-                        unsafe {
-                            self.inner.device.destroy_buffer(buffer, None);
+                // Allocation failure means the device/allocator is out of
+                // memory: the in-flight submissions still retain buffers and
+                // the deferred list may hold freed ones. Retire the oldest
+                // pending submissions one at a time (freeing their retained
+                // buffers and any deferred buffers) and retry after each.
+                // A full `synchronize_pending` waits for the newest queued
+                // submission as well, which on a deep async queue costs
+                // seconds (measured 1.3-1.4 s per failure) while the oldest
+                // fence is usually about to retire.
+                let mut last_err = first_err;
+                let mut retry = None;
+                loop {
+                    if !self.retire_oldest_pending_submission()? {
+                        break;
+                    }
+                    match cpu_phase!("alloc_gpu_alloc", allocate_once()) {
+                        Ok(allocation) => {
+                            retry = Some(allocation);
+                            break;
                         }
-                        return Err(Error::Msg(format!(
-                            "vulkan allocation retry failed after synchronize: first={first_err}, second={second_err}"
-                        ))
-                        .bt());
+                        Err(err) => last_err = err,
+                    }
+                }
+                match retry {
+                    Some(allocation) => allocation,
+                    None => {
+                        cpu_phase!("alloc_sync_retry", self.synchronize_pending())?;
+                        match cpu_phase!("alloc_gpu_alloc", allocate_once()) {
+                            Ok(allocation) => allocation,
+                            Err(second_err) => {
+                                unsafe {
+                                    self.inner.device.destroy_buffer(buffer, None);
+                                }
+                                return Err(Error::Msg(format!(
+                                    "vulkan allocation retry failed after reclaim: first={last_err}, second={second_err}"
+                                ))
+                                .bt());
+                            }
+                        }
                     }
                 }
             }
         };
-        unsafe {
+        cpu_phase!("alloc_bind", unsafe {
             self.inner
                 .device
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
-                .map_err(Error::wrap)?;
-        }
+                .map_err(Error::wrap)
+        })?;
         Ok(Arc::new(VulkanBuffer {
             device: self.clone(),
             buffer,
@@ -2915,15 +3049,26 @@ impl VulkanDevice {
         )
     }
 
-    /// Pop a reusable non-staging compute buffer of the exact byte `size` from
-    /// the recycle pool, if one is available.
+    /// Pop a reusable non-staging compute buffer of at least the requested
+    /// `size` from the recycle pool, if one is available. Buffers are pooled
+    /// by power-of-two size class, so a slightly larger freed buffer can serve
+    /// a later smaller request; exact-size matching produced almost no hits
+    /// for transient activations (each new shape missed and paid a full
+    /// `vkAllocateMemory`, ~1 ms on WDDM).
     fn take_pooled_gpu_buffer(&self, size: usize) -> Result<Option<Arc<VulkanBuffer>>> {
         let mut pool = self
             .inner
             .gpu_buffer_pool
             .lock()
             .map_err(|e| Error::wrap(e.to_string()))?;
-        Ok(pool.get_mut(&size).and_then(|entry| entry.pop()))
+        let class = gpu_pool_class(size);
+        let Some(entry) = pool.get_mut(&class) else {
+            return Ok(None);
+        };
+        let Some(index) = entry.iter().position(|buffer| buffer.size >= size) else {
+            return Ok(None);
+        };
+        Ok(Some(entry.swap_remove(index)))
     }
 
     /// Power-of-two size class for staging buffer pooling.
@@ -3085,6 +3230,49 @@ impl VulkanDevice {
         )
     }
 
+    /// Wait for and retire the oldest pending submission, freeing the buffers
+    /// it retained and recycling its command buffer/fence. Used by the
+    /// allocation-failure path to reclaim the minimum amount of GPU memory
+    /// instead of synchronizing the whole queue.
+    fn retire_oldest_pending_submission(&self) -> Result<bool> {
+        let submission = {
+            let mut pending = self
+                .inner
+                .pending_submissions
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            if pending.is_empty() {
+                return Ok(false);
+            }
+            // FIFO among compute submissions; transfer submissions retire on
+            // the regular poll and carry little retained memory.
+            let index = pending
+                .iter()
+                .position(|submission| submission.queue_kind == SubmissionQueueKind::Compute)
+                .unwrap_or(0);
+            pending.remove(index)
+        };
+        unsafe {
+            self.inner
+                .device
+                .wait_for_fences(
+                    std::slice::from_ref(&submission.resources.fence),
+                    true,
+                    u64::MAX,
+                )
+                .map_err(Error::wrap)?;
+        }
+        drop(submission.retained_buffers);
+        if let (Some(profile), Some(profiler)) =
+            (submission.profile.as_ref(), self.inner.gpu_profile.as_ref())
+        {
+            profiler.collect(profile);
+        }
+        self.recycle_submission_resources(submission.queue_kind, submission.resources)?;
+        self.destroy_deferred_buffers()?;
+        Ok(true)
+    }
+
     fn destroy_deferred_buffers(&self) -> Result<()> {
         let deferred = {
             let mut deferred = self
@@ -3133,19 +3321,23 @@ impl VulkanDevice {
     fn cleanup_pending_submissions_byte_budget(&self, budget: u64) -> Result<()> {
         loop {
             self.cleanup_pending_submissions_impl(false, None)?;
+            let in_flight: u64 = self
+                .inner
+                .pending_submissions
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?
+                .iter()
+                .map(|submission| Self::reclaimable_retained_bytes(&submission.retained_buffers))
+                .sum();
+            if in_flight <= budget {
+                return Ok(());
+            }
             let oldest = {
                 let pending = self
                     .inner
                     .pending_submissions
                     .lock()
                     .map_err(|e| Error::wrap(e.to_string()))?;
-                let in_flight: u64 = pending
-                    .iter()
-                    .map(|submission| submission.retained_bytes)
-                    .sum();
-                if in_flight <= budget {
-                    return Ok(());
-                }
                 // FIFO: the earliest submission still pending. Only compute
                 // submissions carry the chunky retained GPU buffers; transfer
                 // submissions are drained by the poll above when ready.
@@ -3274,91 +3466,16 @@ impl VulkanDevice {
             }
             self.recycle_submission_resources(submission.queue_kind, submission.resources)?;
         }
-        let pending_empty = self
-            .inner
-            .pending_submissions
-            .lock()
-            .map_err(|e| Error::wrap(e.to_string()))?
-            .is_empty();
-        let active_batches_empty = self
-            .inner
-            .active_compute_batch
-            .lock()
-            .map_err(|e| Error::wrap(e.to_string()))?
-            .is_none()
-            && self
-                .inner
-                .active_transfer_batch
-                .lock()
-                .map_err(|e| Error::wrap(e.to_string()))?
-                .is_none();
-        if pending_empty && active_batches_empty {
-            self.drain_staging_pending()?;
-            self.destroy_deferred_buffers()?;
-        } else {
-            // Always drain staging pending when we can
-            self.drain_staging_pending()?;
-            // Cap check: if deferred list is too large, force drain
-            let deferred_exceeded = {
-                self.inner
-                    .deferred_buffer_frees
-                    .lock()
-                    .map_err(|e| Error::wrap(e.to_string()))?
-                    .len()
-                    > Self::MAX_DEFERRED_BUFFER_FREES
-            };
-            if deferred_exceeded {
-                // Force-wait: drain all remaining pending submissions
-                if !wait {
-                    let mut pending = self
-                        .inner
-                        .pending_submissions
-                        .lock()
-                        .map_err(|e| Error::wrap(e.to_string()))?;
-                    let remaining: Vec<_> = pending.drain(..).collect();
-                    drop(pending);
-                    for submission in remaining {
-                        unsafe {
-                            self.inner
-                                .device
-                                .wait_for_fences(
-                                    std::slice::from_ref(&submission.resources.fence),
-                                    true,
-                                    u64::MAX,
-                                )
-                                .map_err(Error::wrap)?;
-                        }
-                        drop(submission.retained_buffers);
-                        if let (Some(profile), Some(profiler)) =
-                            (submission.profile.as_ref(), self.inner.gpu_profile.as_ref())
-                        {
-                            profiler.collect(profile);
-                        }
-                        self.recycle_submission_resources(
-                            submission.queue_kind,
-                            submission.resources,
-                        )?;
-                    }
-                }
-                // Now drain staging pending and destroy deferred
-                self.drain_staging_pending()?;
-                self.destroy_deferred_buffers()?;
-                // Verify cap is now satisfied
-                let still_exceeded = self
-                    .inner
-                    .deferred_buffer_frees
-                    .lock()
-                    .map_err(|e| Error::wrap(e.to_string()))?
-                    .len()
-                    > Self::MAX_DEFERRED_BUFFER_FREES;
-                if still_exceeded {
-                    return Err(Error::Msg(
-                        "vulkan: deferred buffer cap still exceeded after force drain".to_string(),
-                    )
-                    .bt());
-                }
-            }
-        }
+        // Buffers reach `deferred_buffer_frees` only after their storage Arc is
+        // gone and every submission that referenced them has retired (the
+        // batch's `retained_buffers` clone is dropped above), so freeing them
+        // now cannot race in-flight GPU work. Do it unconditionally: holding
+        // them until the whole pipeline drains made the allocator believe VRAM
+        // was exhausted, so large transients (the 2M-row sparse-VAE stage)
+        // failed allocation and paid a full `synchronize_pending` (~1.3 s) per
+        // failure instead of reusing the freed blocks.
+        self.drain_staging_pending()?;
+        self.destroy_deferred_buffers()?;
         Ok(())
     }
 
@@ -3622,9 +3739,18 @@ impl VulkanDevice {
             buffer_bytes = buffer.size
         )
         .entered();
-        let staging = self.create_upload_staging_buffer(buffer.size)?;
-        self.map_write_host_buffer(staging.as_ref(), bytes)?;
-        self.submit_copy_and_track(&staging, buffer, buffer.size, true)?;
+        let staging = cpu_phase!(
+            "upload_staging",
+            self.create_upload_staging_buffer(buffer.size)
+        )?;
+        cpu_phase!(
+            "upload_map",
+            self.map_write_host_buffer(staging.as_ref(), bytes)
+        )?;
+        cpu_phase!(
+            "upload_copy",
+            self.submit_copy_and_track(&staging, buffer, buffer.size, true)
+        )?;
         Ok(())
     }
 
@@ -10364,8 +10490,7 @@ impl VulkanStorage {
                 "quantize_q8_k_packed"
             } else {
                 "quantize_q8_k_packed_f16"
-            })
-        {
+            }) {
             let name = format!("matmul_{}_q8k", vulkan_quantized_stem(qdtype)?);
             vulkan_spirv_exists(&name).then_some(name)
         } else {
@@ -10983,7 +11108,7 @@ impl Drop for VulkanBuffer {
                 if self.size > 0 {
                     if let Ok(mut pool) = self.device.inner.gpu_buffer_pool.lock() {
                         let total_bytes: usize = pool.values().flatten().map(|b| b.size).sum();
-                        let entry = pool.entry(self.size).or_default();
+                        let entry = pool.entry(gpu_pool_class(self.size)).or_default();
                         if entry.len() < VulkanDevice::max_gpu_pool_per_size_class()
                             && total_bytes + self.size <= VulkanDevice::max_gpu_pool_total_bytes()
                         {
@@ -11061,7 +11186,6 @@ impl Drop for VulkanInner {
                                         transfer_bytes: batch.transfer_bytes,
                                         compute_bytes: batch.compute_bytes,
                                         retained_buffers: batch.retained_buffers,
-                                        retained_bytes: 0,
                                         profile: None,
                                     });
                                     return;
