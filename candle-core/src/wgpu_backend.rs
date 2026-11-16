@@ -19,8 +19,27 @@ const WGPU_DISPATCH_WG_CAP: u32 = 65535;
 fn wgpu_inflight_byte_budget() -> u64 {
     std::env::var("CANDLE_WGPU_INFLIGHT_MAX_BYTES")
         .ok()
-        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(|v| v.parse().ok())
         .unwrap_or(512 * 1024 * 1024)
+}
+
+/// Allocation size that forces the active batch to submit.
+///
+/// The old hardcoded 16 MiB threshold flushed on nearly every TRELLIS.2
+/// intermediate (a single 4096x8192 f32 activation is 128 MiB), so the
+/// intended 32-dispatch batching never formed and the pipeline degenerated
+/// into one submit+poll per op. Keep a flush for truly huge lone buffers, but
+/// let the normal intermediates batch; the in-flight budget remains the
+/// memory backstop. Override via `CANDLE_WGPU_LARGE_ALLOC_FLUSH_BYTES`
+/// (`0` disables the allocation-triggered flush entirely).
+fn wgpu_large_alloc_flush_bytes() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CANDLE_WGPU_LARGE_ALLOC_FLUSH_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256 * 1024 * 1024)
+    })
 }
 
 fn wgpu_dispatch_wg_cap(device: &WgpuDevice) -> u32 {
@@ -1071,6 +1090,40 @@ fn wgpu_buffer_key(buffer: &wgpu::Buffer) -> usize {
     std::ptr::from_ref(buffer) as usize
 }
 
+/// Bytes this submission keeps alive that no other owner holds.
+///
+/// A dispatch retains every binding, including long-lived weights and
+/// intermediates that a live `WgpuStorage` still owns, and repeated bindings
+/// of the same buffer add it again. Summing all retained sizes therefore
+/// overstates the in-flight footprint by an order of magnitude and makes the
+/// byte budget drain the whole queue on nearly every batch. Count a buffer
+/// only when this submission holds the last references (its occurrence count
+/// equals the `Arc` strong count), i.e. when retiring this submission can
+/// actually release the memory.
+fn wgpu_reclaimable_retained_bytes(retained: &[Arc<wgpu::Buffer>]) -> u64 {
+    if retained.is_empty() {
+        return 0;
+    }
+    let mut occurrences: HashMap<usize, usize> = HashMap::new();
+    for buffer in retained {
+        *occurrences
+            .entry(wgpu_buffer_key(buffer.as_ref()))
+            .or_insert(0) += 1;
+    }
+    let mut counted: HashSet<usize> = HashSet::new();
+    let mut bytes = 0u64;
+    for buffer in retained {
+        let key = wgpu_buffer_key(buffer.as_ref());
+        if !counted.insert(key) {
+            continue;
+        }
+        if Arc::strong_count(buffer) == occurrences[&key] {
+            bytes += buffer.size();
+        }
+    }
+    bytes
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 enum WgpuBindingKindKey {
     Storage {
@@ -1572,9 +1625,10 @@ impl WgpuDevice {
     /// when recycled so bind-group cache keys stay stable across pool reuse.
     fn create_storage_buffer_arc(&self, size: usize, label: &'static str) -> Arc<wgpu::Buffer> {
         // Do not flush the active batch on every small alloc — that forced one
-        // submit per output tensor. Large allocs still flush to bound memory.
+        // submit per output tensor. Only truly large lone buffers still flush
+        // to bound memory (`CANDLE_WGPU_LARGE_ALLOC_FLUSH_BYTES`).
         // Standalone copy/readback paths must call flush_before_standalone_submit.
-        const LARGE_ALLOC: usize = 16 * 1024 * 1024;
+        let large_alloc = wgpu_large_alloc_flush_bytes();
         /// Hot rings for latency-sensitive sizes (stable Arc → BG cache hits).
         /// 1MiB: tall matmul C/A (64×4096 f32). 4MiB: 1024² elementwise / GEMM C.
         const HOT_RING_MAX: usize = 32;
@@ -1612,7 +1666,7 @@ impl WgpuDevice {
                 }
             }
         }
-        if key >= LARGE_ALLOC as u64 {
+        if large_alloc > 0 && key >= large_alloc as u64 {
             let has_work = self
                 .inner
                 .active_batch
@@ -2571,7 +2625,7 @@ impl WgpuDevice {
         }
         const MAX_IN_FLIGHT_SUBMISSIONS: usize = 32;
         // Retained device bytes of this submission (before the move below).
-        let retained_bytes: u64 = batch.retained_buffers.iter().map(|b| b.size()).sum();
+        let retained_bytes = wgpu_reclaimable_retained_bytes(&batch.retained_buffers);
         let mut pending = self
             .inner
             .pending_submissions
@@ -11964,10 +12018,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // Large F32 GEMM binds contiguous (K,N) RHS as a virtual B^T via
         // stride_0k — measured faster than materializing on RTX 3060 (including
         // tall 64×4096: materialize regressed ~6× batch20). Keep virtual.
+        // F16 reg-tile takes the same virtual-B^T path when eligible (no VEC:
+        // stride_0k != 1 rules the vectorized variant out below).
         #[cfg(target_arch = "wasm32")]
         let will_use_warptile = false;
         #[cfg(not(target_arch = "wasm32"))]
-        let will_use_warptile = self.dtype == DType::F32 && m >= 64 && n >= 64 && k >= 64;
+        let will_use_warptile = (self.dtype == DType::F32 && m >= 64 && n >= 64 && k >= 64)
+            || (self.dtype == DType::F16
+                && self
+                    .device
+                    .inner
+                    .features
+                    .contains(wgpu::Features::SHADER_F16)
+                && m.max(n) >= 32
+                && k >= 32);
         let rhs_skip_transpose = will_use_warptile
             && rhs_l.is_contiguous()
             && rhs_l.start_offset() == 0
@@ -12194,16 +12258,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 } // not(wasm32)
             }
             DType::F16 => {
-                // f16 reg-tile is valid (shmem is f16). Restrict to tile-aligned
-                // dims for residual-edge correctness under tight smoke tols.
-                let tile_ok = m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(32);
+                // f16 reg-tile is valid (shmem is f16). The shader zero-fills
+                // out-of-range shared-memory loads and clips its stores, so
+                // ragged M/N/K are safe; only the VEC variant needs aligned
+                // dims/strides (a partial trailing vec4 would be dropped).
+                // Odd voxel counts are the norm in the sparse VAE, so the old
+                // tile-aligned-only gate routed every sparse-conv GEMM to the
+                // naive one-thread-per-output kernel (measured 158 ms/GEMM on
+                // TRELLIS.2 vs 1.8 ms through reg-tile).
                 if self
                     .device
                     .inner
                     .features
                     .contains(wgpu::Features::SHADER_F16)
-                    && tile_ok
-                    && m.max(n) >= 64
+                    && m.max(n) >= 32
+                    && k >= 32
                 {
                     matmul_label = "candle-wgpu-matmul-fast";
                     use_reg_tile = true;
@@ -12211,8 +12280,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     // mirroring the F32 reg-tile selection. The native inputs are
                     // materialized contiguous here (or the RHS virtual B^T).
                     // Same VEC_SIZE-alignment requirement as the F32 branch:
-                    // k%32==0 from tile_ok already makes the row strides 4-aligned,
-                    // but batch strides / storage offsets are layout-dependent.
+                    // batch strides / storage offsets are layout-dependent.
                     let vectorized = params.stride_0k == 1
                         && params.stride_1k == 1
                         && m.is_multiple_of(4)
@@ -17245,9 +17313,10 @@ impl BackendDevice for WgpuDevice {
             eprintln!("{bt}");
         }
         // 1024² f32 = 4 MiB — common matmul dst size. Waiting here forced a
-        // full GPU stall on every GEMM. Only block for truly large buffers, and
-        // only if there is actually in-flight work.
-        if alloc_size >= 16 * 1024 * 1024 {
+        // full GPU stall on every GEMM. Only submit for truly large buffers
+        // (see `wgpu_large_alloc_flush_bytes`), and only if there is work.
+        let large_alloc = wgpu_large_alloc_flush_bytes();
+        if large_alloc > 0 && alloc_size >= large_alloc {
             let flushed = self.flush_active_batch("large_alloc")?;
             // Poll-only, never `wait_indefinitely` here. A blocking drain on every
             // >=16MiB alloc serializes decode: llama allocates ~80 such buffers per

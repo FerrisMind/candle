@@ -90,6 +90,10 @@ const MUL_MAT_TILE_N: u32 = 4;
 const MUL_MAT_WG_SIZE_M: u32 = 8;
 const MUL_MAT_WG_SIZE_N: u32 = 8;
 const MUL_MAT_REG_TILE_K_FLOAT: u32 = 8;
+// mul_mat_reg_tile.wgsl unrolls the register tile into sixteen named
+// accumulators (register promotion instead of a local-memory array), so its
+// tile shape is fixed at 4x4.
+const _: () = assert!(MUL_MAT_TILE_M == 4 && MUL_MAT_TILE_N == 4);
 const QUANT_MUL_MAT_TILE_M: u32 = MUL_MAT_TILE_M;
 const QUANT_MUL_MAT_TILE_N: u32 = MUL_MAT_TILE_N;
 const QUANT_MUL_MAT_WG_SIZE_M: u32 = MUL_MAT_WG_SIZE_M;
