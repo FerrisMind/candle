@@ -141,7 +141,9 @@ struct indexer_t<IndexT, true> {
 struct Divide {
     template<typename T>
     METAL_FUNC T operator()(T a, T b) { return a / b; }
-    METAL_FUNC float  operator()(float  a, float  b) { return fast::divide(a, b); }
+    // Bare division honors the compile-time math mode; fast::divide would keep
+    // the fast approximation even when precise math is requested.
+    METAL_FUNC float  operator()(float  a, float  b) { return a / b; }
     METAL_FUNC half   operator()(half   a, half   b) { return divide(a, b); }
     #if defined(__HAVE_BFLOAT__)
     METAL_FUNC bfloat  operator()(bfloat  a, bfloat  b) { return static_cast<bfloat>(fast::divide(a, b)); }
@@ -151,7 +153,9 @@ struct Divide {
 struct Exp {
     template<typename T>
     METAL_FUNC T operator()(T a) { return fast::exp(a); }
-    METAL_FUNC float  operator()(float  a) { return fast::exp(a); }
+    // Bare exp resolves to fast::exp under fast math and to a precise
+    // implementation under precise math (CANDLE_METAL_ENABLE_FAST_MATH=0).
+    METAL_FUNC float  operator()(float  a) { return exp(a); }
     METAL_FUNC half   operator()(half   a) { return exp(a); }
     #if defined(__HAVE_BFLOAT__)
     METAL_FUNC bfloat  operator()(bfloat  a) { return static_cast<bfloat>(fast::exp(a)); }
