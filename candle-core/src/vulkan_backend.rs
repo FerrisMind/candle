@@ -11,7 +11,7 @@ use gpu_allocator::MemoryLocation;
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::trace_span;
 
@@ -71,13 +71,93 @@ fn vulkan_dense_gemm_prefers_tiled(m: usize, n: usize, k: usize) -> bool {
     m > VULKAN_DENSE_MUL_MAT_VEC_MAX_ROWS
 }
 
+/// Umbrella switch for the approximate tensor-core paths
+/// (`CANDLE_VK_FAST=1`). Enables the f16 coopmat Q8_0 GEMM and the unaligned
+/// F32 coopmat GEMM, which are the measured wins on the DiT/encoder shapes but
+/// shift results at the ~1e-3 relative level (f16 MMA mantissa), so the exact
+/// dp4a/fp32 paths stay the default. Read once; sits on the matmul path.
+fn vulkan_fast_mode() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CANDLE_VK_FAST").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// Opt-in for the unaligned F32 coopmat GEMM (TF32-class reduced precision).
 /// Read once and cached: this sits on the per-dispatch matmul path.
 fn vulkan_unaligned_f32_coopmat_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("CANDLE_VULKAN_F32_UNALIGNED_COOPMAT")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        match std::env::var("CANDLE_VULKAN_F32_UNALIGNED_COOPMAT")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .ok()
+            .as_deref()
+        {
+            Some("1") | Some("true") => true,
+            // An explicit off value overrides the CANDLE_VK_FAST umbrella.
+            Some("0") | Some("false") | Some("off") => false,
+            _ => vulkan_fast_mode(),
+        }
+    })
+}
+
+/// Opt-in coopmat Q8_0 GEMM (`CANDLE_VK_Q8_COOPMAT`). Off by default: the dp4a
+/// `matmul_q8_0_q8_1` kernel stays the default until the tensor-core variant is
+/// measured per shape. The f16 MMA (`matmul_q8_0_f32_aligned_cm1`) dequantizes
+/// q8_0 in-shader and reads the raw f32 activations (f16 MMA operands, ~10-bit
+/// mantissa); it measured 1.45-2.35x faster than dp4a on the DiT shapes.
+/// "1"/"true"/"f16" enable it, "0"/"false"/"off" disable it, and unavailable
+/// shapes always fall back to dp4a. `CANDLE_VK_FAST=1` selects "auto" as part
+/// of the umbrella fast mode.
+///
+/// An int8 coopmat variant existed for one session: exact int32 per block and
+/// bit-identical to dp4a, but 1.6x SLOWER (ff_in 21.2 vs 13.4 ms) because
+/// VK_KHR_cooperative_matrix does not fix the register layout, so the per-block
+/// f32 scale cannot be applied in place and every output element needs a
+/// shared store + load. It also required an upstream-shader-generator edit
+/// (registering the SPIR-V), which this fork does not carry.
+fn vulkan_q8_coopmat_mode() -> Option<&'static str> {
+    static MODE: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("CANDLE_VK_Q8_COOPMAT").ok()?.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "f16" => Some("auto"),
+            // An explicit off value overrides the CANDLE_VK_FAST umbrella.
+            // "int8" is gone (see above) and also counts as off.
+            "0" | "false" | "off" | "int8" => None,
+            _ if vulkan_fast_mode() => Some("auto"),
+            _ => None,
+        }
+    })
+}
+
+/// Allow the virtual-B^T F32 GEMM for square/wide shapes too (not only
+/// tall-skinny). The virtual kernel reads a contiguous (K,N) RHS with
+/// stride_a = N and avoids materializing a full N×K transposed copy; for
+/// attention scores (16k×16k, K=64) that copy is ~64 MiB per GEMM.
+/// `CANDLE_VK_VIRTUAL_BT_ALL=1` opts in for measurement.
+fn vulkan_virtual_bt_all() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CANDLE_VK_VIRTUAL_BT_ALL")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Cap on the number of power-of-two size classes the GPU buffer pool may skip
+/// upward when reusing a larger buffer. 0 (default) keeps the unbounded search:
+/// on dense vision models (vggt/pi3/pi3x) bounding it to 4x raised the
+/// deferred-free traffic from 166 GiB to 421 GiB and doubled vggt's wall time.
+/// The residency that unbounded reuse pins is bounded separately by
+/// `CANDLE_VK_POOL_MAX_PINNED_SLACK_BYTES`; set a positive value here to bound
+/// the per-request ratio as well.
+fn vulkan_pool_max_slack_classes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CANDLE_VK_POOL_MAX_SLACK_CLASSES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
     })
 }
 
@@ -122,7 +202,6 @@ struct GgmlUnaryParams {
     ne00: u32,
     ne01: u32,
     ne02: u32,
-    ne03: u32,
     nb00: u32,
     nb01: u32,
     nb02: u32,
@@ -130,7 +209,6 @@ struct GgmlUnaryParams {
     ne10: u32,
     ne11: u32,
     ne12: u32,
-    ne13: u32,
     nb10: u32,
     nb11: u32,
     nb12: u32,
@@ -571,6 +649,11 @@ struct VulkanInner {
     shader_float64: bool,
     /// VK_KHR_cooperative_matrix enabled (tensor-core style GEMM shaders).
     cooperative_matrix: bool,
+    /// Device exposes subgroup cooperative matrices with signed 8-bit A/B and
+    /// signed 32-bit accumulate/result (int8 tensor-core MMA usable by the
+    /// mmq coopmat kernel). `coopmat_int8_k` is the MMA K size (16 or 32).
+    coopmat_int8: bool,
+    coopmat_int8_k: u32,
     subgroup_arithmetic: bool,
     subgroup_size: u32,
     subgroup_size_control: bool,
@@ -599,6 +682,17 @@ struct VulkanInner {
     active_transfer_batch: Mutex<Option<VulkanActiveBatch>>,
     reusable_compute_submissions: Mutex<Vec<VulkanSubmissionResources>>,
     reusable_transfer_submissions: Mutex<Vec<VulkanSubmissionResources>>,
+    /// Same-queue submission ordering. Each submission waits on the previous
+    /// submission's signal semaphore, so submission N+1 cannot start executing
+    /// on the GPU before N has fully completed. This is what makes
+    /// `gpu_buffer_pool` reuse (including reuse of a buffer whose tensor was
+    /// freed by the CPU while its last submission is still in flight) safe
+    /// without host fence waits: memory handed to the next command is
+    /// guaranteed to be done with its previous use. Pipeline barriers alone
+    /// were measured insufficient here (sporadic VK_ERROR_DEVICE_LOST on
+    /// WDDM/NVIDIA when the CPU recorded far ahead).
+    compute_submit_sync: VulkanQueueSubmitSync,
+    transfer_submit_sync: VulkanQueueSubmitSync,
     deferred_buffer_frees: Mutex<Vec<VulkanDeferredBuffer>>,
     /// Hot-path counter tracking ops since the last amortized submission cleanup.
     /// See `cleanup_pending_submissions_amortized` / `CLEANUP_DEBT_THRESHOLD`.
@@ -610,14 +704,36 @@ struct VulkanInner {
     /// Staging buffers whose GPU references have been released and are pending
     /// return to the pool (drained during cleanup).
     staging_pending_return: Mutex<Vec<Arc<VulkanBuffer>>>,
-    /// Pool of reusable non-staging GPU compute buffers, keyed by exact byte
-    /// size. MoE per-layer dequant buffers are allocated with identical sizes
-    /// every layer; recycling them here (analogous to the staging pool) stops
-    /// the allocator from accumulating transient buffers across layers, which
-    /// otherwise surfaces as monotonic VRAM growth and OOM on 12GB cards.
+    /// Pool of reusable non-staging GPU compute buffers, keyed by power-of-two
+    /// byte class. A dropped buffer is reusable immediately because every
+    /// same-queue submission is chained to its predecessor by a binary
+    /// semaphore (`VulkanQueueSubmitSync`), so the GPU cannot start commands
+    /// that reuse the memory before the submission that last used it has
+    /// completed. No fence wait is needed to hand memory back out.
     gpu_buffer_pool: Mutex<HashMap<usize, Vec<Arc<VulkanBuffer>>>>,
+    /// Resident bytes in `gpu_buffer_pool`, maintained incrementally so the
+    /// hot drop path does not walk the pool.
+    gpu_pool_bytes: AtomicUsize,
     /// Env-gated (CANDLE_VULKAN_GPU_PROFILE=1) GPU timestamp profiler.
     gpu_profile: Option<VulkanGpuProfiler>,
+    /// Next `VulkanBuffer::alloc_seq` value. See `VulkanBuffer::alloc_seq`.
+    next_buffer_seq: AtomicU64,
+    /// Per-queue submission sequence counters. Every batch gets the next value
+    /// when it starts recording; the value travels with the submission into
+    /// `VulkanPendingSubmission`. Deferred frees wait until the last submission
+    /// that used the buffer retires (see `VulkanBuffer::last_use`).
+    next_compute_batch_seq: AtomicU64,
+    next_transfer_batch_seq: AtomicU64,
+    retired_compute_batch_seq: AtomicU64,
+    retired_transfer_batch_seq: AtomicU64,
+    /// Number of transfer submissions handed to the GPU so far (incremented
+    /// after a successful `queue_submit`). `wait_for_transfer_dependencies`
+    /// uses it to skip the flush + pending scan when nothing was recorded on
+    /// the transfer queue since the previous full drain.
+    transfer_submission_seq: AtomicU64,
+    /// Value of `transfer_submission_seq` observed after the last full
+    /// transfer-dependency drain.
+    transfer_deps_seen: AtomicU64,
 }
 
 impl VulkanDevice {
@@ -771,14 +887,40 @@ enum SubmissionQueueKind {
     Transfer,
 }
 
+/// Per-queue binary-semaphore chain. A submission waits on the previous one's
+/// signal and signals its own; the wait semaphore is returned to `free` when
+/// the waiting submission retires (its wait has then consumed the signal), so
+/// the ring stays bounded by the CPU-ahead window.
+struct VulkanQueueSubmitSync {
+    submit_lock: Mutex<()>,
+    last_signal: Mutex<Option<vk::Semaphore>>,
+    free: Mutex<Vec<vk::Semaphore>>,
+}
+
+impl VulkanQueueSubmitSync {
+    fn new() -> Self {
+        Self {
+            submit_lock: Mutex::new(()),
+            last_signal: Mutex::new(None),
+            free: Mutex::new(Vec::new()),
+        }
+    }
+}
+
 struct VulkanPendingSubmission {
     resources: VulkanSubmissionResources,
     queue_kind: SubmissionQueueKind,
+    /// Batch sequence number (per queue). Retirement advances the queue's
+    /// `retired_*_batch_seq`, which unblocks deferred frees.
+    seq: u64,
     dispatch_count: u32,
     copy_count: u32,
     transfer_bytes: usize,
     compute_bytes: usize,
     retained_buffers: Vec<Arc<VulkanBuffer>>,
+    /// Semaphore this submission waited on (the previous submission's signal).
+    /// Returned to the queue's free list once this submission retires.
+    wait_semaphore: Option<vk::Semaphore>,
     /// Profiler metadata; consumed (and aggregated) when the submission retires.
     profile: Option<VulkanBatchProfile>,
 }
@@ -786,6 +928,8 @@ struct VulkanPendingSubmission {
 struct VulkanActiveBatch {
     resources: VulkanSubmissionResources,
     queue_kind: SubmissionQueueKind,
+    /// Per-queue sequence number assigned when the batch starts recording.
+    seq: u64,
     dispatch_count: u32,
     copy_count: u32,
     descriptor_set_count: u32,
@@ -793,7 +937,23 @@ struct VulkanActiveBatch {
     storage_descriptor_count: u32,
     transfer_bytes: usize,
     compute_bytes: usize,
-    retained_buffers: Vec<Arc<VulkanBuffer>>,
+    /// Distinct buffers bound by this batch. `compute_bytes` is a resident-set
+    /// estimate, so a buffer bound by several dispatches in the batch must only
+    /// be counted once; counting it per dispatch closed a batch every ~6
+    /// dispatches on a 2 GB Q8_0 model and turned each close into a WDDM
+    /// submission.
+    bound_buffers: HashMap<vk::Buffer, ()>,
+    /// `VulkanBuffer::alloc_seq` observed when this batch started. Only buffers
+    /// allocated at or after this point count toward `compute_bytes`: the cap
+    /// exists to bound bytes a batch makes resident, and pre-loaded weights are
+    /// resident regardless of how many dispatches share the batch.
+    start_alloc_seq: u64,
+    /// Staging buffers used by recorded copies/fills. Retained strongly (not
+    /// Weak): a staging buffer returned to the staging pool before the copy
+    /// executes could be overwritten by a later upload in the same batch.
+    /// Non-staging buffers do not need this: `gpu_buffer_pool` keeps their
+    /// memory resident and stream-ordered reuse is safe.
+    copy_retained: Vec<Arc<VulkanBuffer>>,
     cached_descriptor_sets: HashMap<vk::DescriptorSetLayout, SmallVec<[vk::DescriptorSet; 8]>>,
     /// One entry per dispatch (profiler only): the SPIR-V module name.
     profile_names: Vec<Option<&'static str>>,
@@ -822,7 +982,7 @@ const GPU_PROFILE_QUERIES_PER_BATCH: u32 = 2 * 64;
 /// query-pool slot; a slot is only reused after GPU_PROFILE_BATCH_SLOTS later
 /// batches began, which is far more in-flight batches than the amortized
 /// cleanup keeps pending.
-const GPU_PROFILE_BATCH_SLOTS: u32 = 32;
+const GPU_PROFILE_BATCH_SLOTS: u32 = 256;
 const GPU_PROFILE_TOTAL_QUERIES: u32 = GPU_PROFILE_QUERIES_PER_BATCH * GPU_PROFILE_BATCH_SLOTS;
 
 /// Env-gated (CANDLE_VULKAN_GPU_PROFILE=1) GPU timestamp profiler. One query
@@ -862,7 +1022,7 @@ pub struct VulkanCpuProfilePhase {
 }
 
 pub static VULKAN_CPU_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
-pub static VULKAN_CPU_PROFILE_PHASES: [VulkanCpuProfilePhase; 26] = [
+pub static VULKAN_CPU_PROFILE_PHASES: [VulkanCpuProfilePhase; 50] = [
     VulkanCpuProfilePhase {
         name: "transfer_deps",
         nanos: AtomicU64::new(0),
@@ -900,6 +1060,31 @@ pub static VULKAN_CPU_PROFILE_PHASES: [VulkanCpuProfilePhase; 26] = [
     },
     VulkanCpuProfilePhase {
         name: "alloc_pool_hit",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_deferred_hit",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "alloc_scratch_hit",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "scratch_donate",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "drain_scan",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "drain_wait",
         nanos: AtomicU64::new(0),
         count: AtomicU64::new(0),
     },
@@ -993,6 +1178,101 @@ pub static VULKAN_CPU_PROFILE_PHASES: [VulkanCpuProfilePhase; 26] = [
         nanos: AtomicU64::new(0),
         count: AtomicU64::new(0),
     },
+    VulkanCpuProfilePhase {
+        name: "flush_scan",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "sync_wait",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "readback_pre_wait",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "readback_post_wait",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "deferred_drain",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "transfer_flush",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "transfer_scan",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "transfer_wait",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "readback_flush",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "readback_fence",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "pending_cap",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "destroy_deferred",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "cleanup_poll",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "retire_oldest_wait",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "create_pool_scan",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "create_deferred_scan",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "create_cleanup",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "flush_end",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
+    VulkanCpuProfilePhase {
+        name: "flush_recycle",
+        nanos: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    },
 ];
 
 fn cpu_phase_index(name: &str) -> usize {
@@ -1041,8 +1321,87 @@ fn count_flush_reason(reason: &'static str) {
     }
 }
 
-pub fn vulkan_flush_reason_report() -> Option<Vec<(&'static str, u64)>> {
-    if !VULKAN_CPU_PROFILE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+/// Process-wide memory diagnostics for the submission model: deepest pending
+/// queue, deferred-free backlog, and recycle-pool residency. Reported by
+/// `vulkan_memory_report` under the CPU-profile env gate.
+static PENDING_PEAK: AtomicUsize = AtomicUsize::new(0);
+static DEFERRED_BYTES: AtomicUsize = AtomicUsize::new(0);
+static DEFERRED_TOTAL: AtomicUsize = AtomicUsize::new(0);
+static DEFERRED_PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+static DEFERRED_PEAK_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+static POOL_PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Minimum hot-path ops between deferred-backlog checks. Without it a backlog
+/// parked just over the cap makes every op run a cleanup cascade.
+static DEFERRED_DRAIN_COOLDOWN: AtomicU32 = AtomicU32::new(0);
+/// Set while the recycle pool is being flushed on an allocation failure, so
+/// buffers dropped by the flush go to the deferred-free list instead of being
+/// pushed straight back into the pool they are draining.
+static POOL_FLUSH_BYPASS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Sum of `VulkanBuffer::pinned_slack` over all live buffers: idle padding
+/// pinned by cross-class pool reuse. Bounded by
+/// `vulkan_pool_pinned_slack_budget` so the unbounded reuse search cannot
+/// inflate the resident set arbitrarily.
+static PINNED_SLACK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Ceiling for `PINNED_SLACK_BYTES` (`CANDLE_VK_POOL_MAX_PINNED_SLACK_BYTES`).
+/// Cross-class reuse is what keeps the dense vision models (vggt, pi3, pi3x)
+/// off the allocator: a small request takes a parked large buffer instead of
+/// allocating and later deferring a fresh one (measured on vggt: bounding the
+/// reuse to 4x raised deferred-free traffic from 166 GiB to 421 GiB and doubled
+/// the wall). But a pinned buffer is live memory the pool byte cap does not see,
+/// and on the Trellis.2 512 VAE decode that padding reached ~2.8 GiB and the
+/// decode ran out of memory. Bounding the *total* padding keeps the reuse
+/// pattern intact for large tensors while capping the small-request case.
+/// 2 GiB is the smallest budget that leaves vggt at its unbounded wall time
+/// (1 GiB re-introduced the allocator churn: 12.2 s vs 6.7 s).
+fn vulkan_pool_pinned_slack_budget() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CANDLE_VK_POOL_MAX_PINNED_SLACK_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2 * 1024 * 1024 * 1024)
+    })
+}
+
+/// Minimum allocation size that triggers a full pool flush before the
+/// allocator is asked for memory (`CANDLE_VK_POOL_FLUSH_MIN_ALLOC_BYTES`,
+/// default 128 MiB, 0 disables). A parked 900 MiB block can sit inside a
+/// `gpu_allocator` block that a 400 MiB request cannot fit into, so the
+/// Trellis.2 512 texture decode needed the flush to avoid near-OOM thrash. It
+/// also tears down reuse state that the dense point-cloud models keep warm, so
+/// the threshold is a knob rather than a constant.
+fn vulkan_pool_flush_min_alloc_bytes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CANDLE_VK_POOL_FLUSH_MIN_ALLOC_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128 * 1024 * 1024)
+    })
+}
+
+/// `(pending_peak, deferred_peak_entries, deferred_peak_bytes, pool_peak_bytes)`.
+pub fn vulkan_memory_report() -> Option<(usize, usize, usize, usize)> {
+    if !VULKAN_CPU_PROFILE_ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some((
+        PENDING_PEAK.load(Ordering::Relaxed),
+        DEFERRED_PEAK_ENTRIES.load(Ordering::Relaxed),
+        DEFERRED_PEAK_BYTES.load(Ordering::Relaxed),
+        POOL_PEAK_BYTES.load(Ordering::Relaxed),
+    ))
+}
+
+/// Total bytes ever queued for deferred release (diagnostic: tells how much
+/// allocator traffic the deferred path carries over a run).
+pub fn vulkan_deferred_total_bytes() -> u64 {
+    DEFERRED_TOTAL.load(Ordering::Relaxed) as u64
+}
+
+pub fn vulkan_flush_reason_report() -> Option<Vec<(&'static str, u64)>> {    if !VULKAN_CPU_PROFILE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
     let map = FLUSH_REASONS.lock().ok()?;
@@ -1257,6 +1616,16 @@ struct VulkanCachedPipeline {
 struct VulkanDeferredBuffer {
     buffer: vk::Buffer,
     allocation: Allocation,
+    size: usize,
+    /// Staging buffers are host-visible and created without storage usage, so
+    /// they can never be handed out as a compute buffer; the reuse lookup
+    /// skips them and they are only ever destroyed by the retirement gate.
+    is_staging: bool,
+    /// High-water sequence numbers of the last compute/transfer batches that
+    /// referenced this buffer (0 = no command on that queue ever used it). The
+    /// entry is freed only once both queues have retired past them.
+    compute_seq: u64,
+    transfer_seq: u64,
 }
 
 struct VulkanInitGuard {
@@ -1314,6 +1683,8 @@ impl std::fmt::Debug for VulkanInner {
             .field("vendor_id", &self.vendor_id)
             .field("integer_dot_product", &self.integer_dot_product)
             .field("cooperative_matrix", &self.cooperative_matrix)
+            .field("coopmat_int8", &self.coopmat_int8)
+            .field("coopmat_int8_k", &self.coopmat_int8_k)
             .field("subgroup_arithmetic", &self.subgroup_arithmetic)
             .field("subgroup_size", &self.subgroup_size)
             .field("subgroup_size_control", &self.subgroup_size_control)
@@ -1350,6 +1721,49 @@ struct VulkanBuffer {
     size: usize,
     is_staging: bool,
     staging_kind: StagingKind,
+    /// Monotonic allocation sequence. A compute batch uses it to count only
+    /// buffers that became resident while the batch was open: model weights
+    /// allocated at load time must not make the batch look full (see
+    /// `VulkanActiveBatch::start_alloc_seq`).
+    alloc_seq: u64,
+    /// Highest compute-batch sequence that referenced this buffer (0 = never).
+    /// Compute and transfer sequence spaces are independent, so each queue gets
+    /// its own counter: a deferred free must wait for BOTH to retire, whereas a
+    /// single paired (queue, max-seq) value could never be retired when the
+    /// other queue's sequence was larger (measured: 3.2 GiB of permanently
+    /// stuck deferred entries and a blocking drain on every deferred-cap check).
+    last_compute_seq: AtomicU64,
+    /// Highest transfer-batch sequence that referenced this buffer (0 = never).
+    last_transfer_seq: AtomicU64,
+    /// Idle padding in bytes when the recycle pool handed this buffer to a
+    /// smaller request (cross-class reuse). Charged to `PINNED_SLACK_BYTES`
+    /// for as long as the buffer is live and refunded on drop, so the total
+    /// residency inflation from recycling is bounded even though the reuse
+    /// search itself stays unbounded.
+    pinned_slack: AtomicUsize,
+}
+
+impl VulkanBuffer {
+    /// Retirement still required before this buffer's memory may be freed,
+    /// as (compute_seq, transfer_seq) high-water marks.
+    fn last_use(&self) -> (u64, u64) {
+        (
+            self.last_compute_seq.load(Ordering::Relaxed),
+            self.last_transfer_seq.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Record that a command in `queue`'s batch `seq` references this buffer.
+    fn mark_used(&self, queue: SubmissionQueueKind, seq: u64) {
+        match queue {
+            SubmissionQueueKind::Compute => {
+                self.last_compute_seq.fetch_max(seq, Ordering::Relaxed);
+            }
+            SubmissionQueueKind::Transfer => {
+                self.last_transfer_seq.fetch_max(seq, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2251,6 +2665,141 @@ impl VulkanDevice {
     /// force-drain in `cleanup_pending_submissions_impl`), and explicit sync points
     /// (`synchronize`/`read_buffer`/`wait_for_transfer_dependencies`) still poll fences.
     const CLEANUP_DEBT_THRESHOLD: u32 = 128;
+    /// Hot-path ops to skip between deferred-backlog cleanup cascades.
+    const DEFERRED_DRAIN_COOLDOWN_OPS: u32 = 32;
+
+    /// Wait for the oldest pending submission once per amortized cleanup.
+    /// Off by default; enable with `CANDLE_VK_AMORTIZED_WAIT=1` when a driver
+    /// (notably WDDM) reports fences late from non-blocking polls and the
+    /// deferred-free backlog grows.
+    fn amortized_wait_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("CANDLE_VK_AMORTIZED_WAIT")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        })
+    }
+
+    /// Diagnostic: retain every bound buffer strongly until its submission
+    /// retires (the pre-pool lifetime rule). Used to tell apart a pool-ordering
+    /// bug from a genuine allocator/driver issue.
+    fn retain_all_buffers() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("CANDLE_VK_RETAIN_ALL")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        })
+    }
+
+    /// Diagnostic: log every batch flush and blocking fence wait.
+    fn trace_batches() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("CANDLE_VK_TRACE_BATCH").is_some())
+    }
+
+    /// Diagnostic: print each new high-water mark of in-flight submissions.
+    fn trace_pending() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("CANDLE_VK_TRACE_PENDING").is_some())
+    }
+
+    /// Diagnostic: pool reuse only buffers whose capacity equals the request
+    /// exactly. Used to isolate cross-size-class aliasing from reuse ordering.
+    fn pool_exact_size_only() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("CANDLE_VK_POOL_EXACT")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        })
+    }
+
+    /// Hard ceiling on submitted-but-not-retired GPU submissions. WDDM/NVIDIA
+    /// resets the GPU (TDR, `VK_ERROR_DEVICE_LOST`) when the CPU records far
+    /// ahead of the GPU: with the default 64-dispatch batches, TripoSG's SDF
+    /// decode lost the device within ~6 s at an unbounded queue, and the same
+    /// run completes in ~20 s with a cap of 64 (verified 2026-11-23; a bigger
+    /// 8192-dispatch batch also survives, but the cap keeps small-batch
+    /// workloads safe without per-workload tuning). The cap only waits for the
+    /// oldest fence when the window is full, so it costs nothing at steady
+    /// state. `CANDLE_VK_MAX_PENDING_SUBMISSIONS=0` restores the unbounded
+    /// window for measurement.
+    fn max_pending_submissions() -> usize {
+        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CAP.get_or_init(|| {
+            std::env::var("CANDLE_VK_MAX_PENDING_SUBMISSIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64)
+        })
+    }
+
+    /// Whether each queue submission waits on the previous submission's
+    /// binary semaphore. Enabled by default so the recycle pool's ordering is
+    /// explicit on the GPU timeline; `CANDLE_VK_SUBMIT_SEMAPHORES=0` disables
+    /// it (same-queue submissions are already ordered by Vulkan).
+    /// Whether a dedicated transfer-only queue family is used for large
+    /// copies. Enabled when the driver exposes one; `CANDLE_VK_TRANSFER_QUEUE=0`
+    /// keeps every copy on the compute queue, which removes the cross-queue
+    /// flush + fence wait that a dedicated queue needs around each copy.
+    fn transfer_queue_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("CANDLE_VK_TRANSFER_QUEUE")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        })
+    }
+
+    /// Whether each queue submission waits on the previous submission's
+    /// binary semaphore. Enabled by default so the recycle pool's ordering is
+    /// explicit on the GPU timeline; `CANDLE_VK_SUBMIT_SEMAPHORES=0` disables
+    /// it (same-queue submissions are already ordered by Vulkan).
+    fn submit_semaphores_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("CANDLE_VK_SUBMIT_SEMAPHORES")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        })
+    }
+
+    /// Whether buffers parked on the deferred-free list may be handed back
+    /// out as new allocations instead of waiting for `allocator.free`. This is
+    /// the deferred list's second chance: buffers that overflowed the recycle
+    /// pool keep cycling through new work instead of raising the live-VRAM
+    /// high-water mark to pool + deferred + live. Safe because the deferred
+    /// entry is only created once its `VulkanBuffer` storage Arc was dropped
+    /// (no live owner) and new commands are ordered after every queued
+    /// submission by the per-queue semaphore chain. `CANDLE_VK_DEFERRED_REUSE=0`
+    /// keeps the old free-only behaviour for A/B measurements.
+    fn deferred_reuse_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("CANDLE_VK_DEFERRED_REUSE")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        })
+    }
+
+    /// Deferred-free backlog that triggers a full pipe drain. The deferred
+    /// list holds dropped buffers until the submission that last used them
+    /// retires; without a cap it grows to the CPU-ahead window's transient
+    /// footprint (measured 8.5 GiB on pi3x, which pushed the device into WDDM
+    /// paging). One drain costs a single WDDM quantum and frees everything
+    /// retired, so a byte cap is much cheaper than per-buffer waiting.
+    /// Override with `CANDLE_VK_DEFERRED_MAX_BYTES`.
+    fn deferred_max_bytes() -> usize {
+        static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *MAX.get_or_init(|| {
+            std::env::var("CANDLE_VK_DEFERRED_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024 * 1024 * 1024)
+        })
+    }
     /// Maximum number of staging buffers per size class in the pool.
     const MAX_STAGING_PER_SIZE_CLASS: usize = 32;
     // Large upload staging buffers (weight uploads during model load) are
@@ -2270,7 +2819,7 @@ impl VulkanDevice {
             std::env::var("CANDLE_VK_POOL_PER_CLASS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(4)
+                .unwrap_or(16)
         })
     }
 
@@ -2294,12 +2843,14 @@ impl VulkanDevice {
             std::env::var("CANDLE_VK_POOL_MAX_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                // 0: no retained transient pool. Large checkpoints (TripoSG
-                // 7.4 GiB, VGGT, TRELLIS.2 q8 8.9 GiB) already fill most of a
-                // 12 GiB card; a retained pool inflates the peak and pushes
-                // the allocator into failure retries. Override with
-                // CANDLE_VK_POOL_MAX_BYTES for latency-first runs.
-                .unwrap_or(0)
+                // Stream-ordered recycle pool (see `VulkanBuffer::drop`). The
+                // pool is what removes the fence-wait drain from the hot path:
+                // dropped transients are reused in queue order instead of being
+                // retained until their submission retires. 1 GiB absorbs the
+                // per-op transients of the dense 3D pipelines without pushing
+                // the peak much past CUDA's allocator footprint; larger values
+                // trade VRAM for fewer vkAllocateMemory calls.
+                .unwrap_or(1024 * 1024 * 1024)
         })
     }
 
@@ -2468,6 +3019,48 @@ impl VulkanDevice {
         Ok(())
     }
 
+    fn queue_submit_sync(&self, queue_kind: SubmissionQueueKind) -> &VulkanQueueSubmitSync {
+        match queue_kind {
+            SubmissionQueueKind::Compute => &self.inner.compute_submit_sync,
+            SubmissionQueueKind::Transfer => &self.inner.transfer_submit_sync,
+        }
+    }
+
+    /// Grab a binary semaphore for the next submission's signal, reusing one
+    /// whose previous wait has already been consumed.
+    fn acquire_submit_semaphore(&self, queue_kind: SubmissionQueueKind) -> Result<vk::Semaphore> {
+        let sync = self.queue_submit_sync(queue_kind);
+        if let Some(semaphore) = sync
+            .free
+            .lock()
+            .map_err(|e| Error::wrap(e.to_string()))?
+            .pop()
+        {
+            return Ok(semaphore);
+        }
+        unsafe {
+            self.inner
+                .device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                .map_err(Error::wrap)
+        }
+    }
+
+    /// Return the semaphore a retired submission waited on; its wait has been
+    /// consumed, so a later submission may signal it again.
+    fn recycle_wait_semaphore(
+        &self,
+        queue_kind: SubmissionQueueKind,
+        semaphore: Option<vk::Semaphore>,
+    ) {
+        let Some(semaphore) = semaphore else {
+            return;
+        };
+        if let Ok(mut free) = self.queue_submit_sync(queue_kind).free.lock() {
+            free.push(semaphore);
+        }
+    }
+
     fn active_batch_slot(
         &self,
         queue_kind: SubmissionQueueKind,
@@ -2515,6 +3108,18 @@ impl VulkanDevice {
         Ok(VulkanActiveBatch {
             resources,
             queue_kind,
+            seq: match queue_kind {
+                SubmissionQueueKind::Compute => self
+                    .inner
+                    .next_compute_batch_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1,
+                SubmissionQueueKind::Transfer => self
+                    .inner
+                    .next_transfer_batch_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1,
+            },
             dispatch_count: 0,
             copy_count: 0,
             descriptor_set_count: 0,
@@ -2522,7 +3127,12 @@ impl VulkanDevice {
             storage_descriptor_count: 0,
             transfer_bytes: 0,
             compute_bytes: 0,
-            retained_buffers: Vec::new(),
+            bound_buffers: HashMap::default(),
+            start_alloc_seq: self
+                .inner
+                .next_buffer_seq
+                .load(std::sync::atomic::Ordering::Relaxed),
+            copy_retained: Vec::new(),
             cached_descriptor_sets: HashMap::default(),
             profile_names: Vec::new(),
             profile_slot,
@@ -2602,6 +3212,35 @@ impl VulkanDevice {
     /// Bytes this submission holds that no other owner (live tensor, weight,
     /// or another pending submission) still references. Retiring this fence
     /// can free them; duplicates and shared buffers cannot be credited twice.
+    /// Bytes a dispatch adds to the active batch's resident set. Only buffers
+    /// allocated while the batch has been open count; pre-loaded weights are
+    /// already resident and must not close the batch. Bindings the batch
+    /// already holds are skipped, so a buffer bound by several dispatches is
+    /// counted once. `compute_bytes` only feeds the per-batch heuristic cap, so
+    /// this cannot change GPU-visible behaviour.
+    fn new_batch_compute_bytes(
+        active: Option<&VulkanActiveBatch>,
+        bindings: &[VulkanBinding<'_>],
+    ) -> Result<usize> {
+        let Some(batch) = active else {
+            return Ok(0);
+        };
+        let mut seen: HashMap<vk::Buffer, ()> = HashMap::default();
+        bindings.iter().try_fold(0usize, |acc, binding| {
+            let buffer = binding.buffer();
+            let newly_resident = buffer.alloc_seq >= batch.start_alloc_seq;
+            let known = !newly_resident
+                || seen.contains_key(&buffer.buffer)
+                || batch.bound_buffers.contains_key(&buffer.buffer);
+            if known {
+                return Ok(acc);
+            }
+            seen.insert(buffer.buffer, ());
+            acc.checked_add(buffer.size)
+                .ok_or_else(|| Error::msg("vulkan compute batch byte count overflow"))
+        })
+    }
+
     fn reclaimable_retained_bytes(retained: &[Arc<VulkanBuffer>]) -> u64 {
         if retained.is_empty() {
             return 0;
@@ -2642,6 +3281,13 @@ impl VulkanDevice {
             self.recycle_submission_resources(queue_kind, batch.resources)?;
             return Ok(false);
         }
+        // Freeze the keep-alive set before any cleanup can drop tensors. Only
+        // staging buffers used by recorded copies need strong retention: their
+        // memory returns to a host-visible staging pool that would otherwise
+        // hand the same buffer to a later upload while the GPU still reads it.
+        // Non-staging buffers live in `gpu_buffer_pool`, which keeps the memory
+        // resident and relies on stream order for safe reuse.
+        let retained_strong: Vec<Arc<VulkanBuffer>> = std::mem::take(&mut batch.copy_retained);
         count_flush_reason(reason);
         // Snapshot the profiler results into host-visible memory while the
         // command buffer is still recordable; they are read out (aggregated)
@@ -2674,12 +3320,15 @@ impl VulkanDevice {
             } else {
                 None
             };
-        unsafe {
-            self.inner
-                .device
-                .end_command_buffer(batch.resources.command_buffer)
-                .map_err(Error::wrap)?;
-        }
+        cpu_phase!(
+            "flush_end",
+            unsafe {
+                self.inner
+                    .device
+                    .end_command_buffer(batch.resources.command_buffer)
+                    .map_err(Error::wrap)?
+            }
+        );
         let queue = match queue_kind {
             SubmissionQueueKind::Compute => self.inner.queue,
             SubmissionQueueKind::Transfer => self
@@ -2722,47 +3371,158 @@ impl VulkanDevice {
                 .entered(),
             )
         };
-        unsafe {
-            cpu_phase!(
-                "flush_submit",
-                self.inner
-                    .device
-                    .queue_submit(
-                        queue,
-                        std::slice::from_ref(&submit_info),
-                        batch.resources.fence,
-                    )
-                    .map_err(Error::wrap)?
-            );
-        }
-        self.inner
-            .pending_submissions
-            .lock()
-            .map_err(|e| Error::wrap(e.to_string()))?
-            .push(VulkanPendingSubmission {
+        // Chain this submission after the queue's previous one with a binary
+        // semaphore. The GPU then cannot start any command here before the
+        // previous submission completed, which is the ordering the recycle
+        // pool relies on (the CPU may hand out a buffer whose last user is
+        // still in flight). No host fence wait is involved.
+        //
+        // Same-queue submissions already execute in submission order, so the
+        // chain is redundant for correctness there; it exists to make the
+        // ordering explicit. It also serializes batches on the GPU, so it can
+        // be disabled for measurement (`CANDLE_VK_SUBMIT_SEMAPHORES=0`).
+        let wait_semaphore = if Self::submit_semaphores_enabled() {
+            let sync = self.queue_submit_sync(queue_kind);
+            let _submit_guard = sync.submit_lock.lock().map_err(|e| Error::wrap(e.to_string()))?;
+            let wait_semaphore = *sync.last_signal.lock().map_err(|e| Error::wrap(e.to_string()))?;
+            let signal_semaphore = self.acquire_submit_semaphore(queue_kind)?;
+            let wait_semaphores = wait_semaphore
+                .into_iter()
+                .collect::<SmallVec<[vk::Semaphore; 1]>>();
+            let signal_semaphores = [signal_semaphore];
+            let mut submit_info = submit_info;
+            let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+            if !wait_semaphores.is_empty() {
+                submit_info = submit_info
+                    .wait_semaphores(&wait_semaphores)
+                    .wait_dst_stage_mask(&wait_stages);
+            }
+            submit_info = submit_info.signal_semaphores(&signal_semaphores);
+            unsafe {
+                cpu_phase!(
+                    "flush_submit",
+                    self.inner
+                        .device
+                        .queue_submit(
+                            queue,
+                            std::slice::from_ref(&submit_info),
+                            batch.resources.fence,
+                        )
+                        .map_err(Error::wrap)?
+                );
+            }
+            *sync.last_signal.lock().map_err(|e| Error::wrap(e.to_string()))? =
+                Some(signal_semaphore);
+            wait_semaphore
+        } else {
+            unsafe {
+                cpu_phase!(
+                    "flush_submit",
+                    self.inner
+                        .device
+                        .queue_submit(
+                            queue,
+                            std::slice::from_ref(&submit_info),
+                            batch.resources.fence,
+                        )
+                        .map_err(Error::wrap)?
+                );
+            }
+            None
+        };
+        cpu_phase!("flush_recycle", {
+            let mut pending = self
+                .inner
+                .pending_submissions
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            pending.push(VulkanPendingSubmission {
                 resources: batch.resources,
                 queue_kind: batch.queue_kind,
+                seq: batch.seq,
                 dispatch_count: batch.dispatch_count,
                 copy_count: batch.copy_count,
                 transfer_bytes: batch.transfer_bytes,
                 compute_bytes: batch.compute_bytes,
-                retained_buffers: batch.retained_buffers,
+                retained_buffers: retained_strong,
+                wait_semaphore,
                 profile: batch_profile,
             });
+            PENDING_PEAK.fetch_max(pending.len(), Ordering::Relaxed);
+            if batch.queue_kind == SubmissionQueueKind::Transfer {
+                // Published only after the submission is enqueued, so
+                // `wait_for_transfer_dependencies` either sees the new seq
+                // and drains, or ran before this point and has nothing to
+                // wait for (single recording thread).
+                self.inner
+                    .transfer_submission_seq
+                    .fetch_add(1, Ordering::Release);
+            }
+            if Self::trace_pending() {
+                static TRACED_MAX: AtomicUsize = AtomicUsize::new(0);
+                let len = pending.len();
+                if TRACED_MAX.fetch_max(len, Ordering::Relaxed) < len {
+                    eprintln!("[vk-pending] max={len}");
+                }
+            }
+            if Self::trace_batches() {
+                let deferred_bytes = DEFERRED_BYTES.load(Ordering::Relaxed);
+                let deferred_entries = self
+                    .inner
+                    .deferred_buffer_frees
+                    .try_lock()
+                    .map(|deferred| deferred.len())
+                    .unwrap_or(usize::MAX);
+                eprintln!(
+                    "[vk-trace] flush q={queue_name} seq={} reason={reason} disp={} copies={} last={:?} pending={} deferred_entries={deferred_entries} deferred={:.1}MiB pool={:.1}MiB",
+                    batch.seq,
+                    batch.dispatch_count,
+                    batch.copy_count,
+                    batch.profile_names.last(),
+                    pending.len(),
+                    deferred_bytes as f64 / (1024.0 * 1024.0),
+                    self.inner.gpu_pool_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0),
+                );
+            }
+        });
+        // Bounded CPU-ahead window (off by default). See
+        // `max_pending_submissions`: deep submission queues were measured to
+        // reset the GPU on WDDM, so the optional cap backs the window off by
+        // waiting only for the oldest fence.
+        let pending_cap = Self::max_pending_submissions();
+        if pending_cap > 0 {
+            cpu_phase!("pending_cap", {
+                loop {
+                    let len = self
+                        .inner
+                        .pending_submissions
+                        .lock()
+                        .map_err(|e| Error::wrap(e.to_string()))?
+                        .len();
+                    if len <= pending_cap {
+                        break;
+                    }
+                    if !self.retire_oldest_pending_submission()? {
+                        break;
+                    }
+                }
+            });
+        }
         // Byte-budget drain (see `vulkan_inflight_byte_budget`): bound the
         // retained-buffer VRAM so big transients recycle instead of piling up.
         // The blocking fence wait only fires once the total exceeds budget x
         // grace (see `vulkan_inflight_grace_multiplier`); inside the grace
         // band `cleanup_pending_submissions_impl`'s non-blocking poll still
         // retires whatever the GPU already finished.
-        let in_flight_bytes: u64 = self
-            .inner
-            .pending_submissions
-            .lock()
-            .map_err(|e| Error::wrap(e.to_string()))?
-            .iter()
-            .map(|submission| Self::reclaimable_retained_bytes(&submission.retained_buffers))
-            .sum();
+        let in_flight_bytes: u64 = cpu_phase!("flush_scan", {
+            self.inner
+                .pending_submissions
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?
+                .iter()
+                .map(|submission| Self::reclaimable_retained_bytes(&submission.retained_buffers))
+                .sum()
+        });
         let budget = vulkan_inflight_byte_budget();
         let blocking_threshold = (budget as f64 * vulkan_inflight_grace_multiplier()) as u64;
         if in_flight_bytes > blocking_threshold {
@@ -2789,19 +3549,40 @@ impl VulkanDevice {
     }
 
     fn cmd_batch_memory_barrier(&self, command_buffer: vk::CommandBuffer) {
-        let memory_barrier = vk::MemoryBarrier::default()
-            .src_access_mask(
+        // Diagnostic / tuning knob: 0 disables the barrier (timing experiments
+        // only; correctness breaks), 2 uses a producer->consumer access mask.
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let mode = *MODE.get_or_init(|| match std::env::var("CANDLE_VK_BARRIER").as_deref() {
+            Ok("off") => 0,
+            Ok("light") => 2,
+            _ => 1,
+        });
+        if mode == 0 {
+            return;
+        }
+        let (src_access, dst_access) = if mode == 2 {
+            (
+                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
                 vk::AccessFlags::SHADER_READ
                     | vk::AccessFlags::SHADER_WRITE
                     | vk::AccessFlags::TRANSFER_READ
                     | vk::AccessFlags::TRANSFER_WRITE,
             )
-            .dst_access_mask(
+        } else {
+            (
                 vk::AccessFlags::SHADER_READ
                     | vk::AccessFlags::SHADER_WRITE
                     | vk::AccessFlags::TRANSFER_READ
                     | vk::AccessFlags::TRANSFER_WRITE,
-            );
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            )
+        };
+        let memory_barrier = vk::MemoryBarrier::default()
+            .src_access_mask(src_access)
+            .dst_access_mask(dst_access);
         unsafe {
             self.inner.device.cmd_pipeline_barrier(
                 command_buffer,
@@ -2819,18 +3600,46 @@ impl VulkanDevice {
         if self.inner.transfer_queue.is_none() {
             return Ok(());
         }
-        self.flush_active_batch(SubmissionQueueKind::Transfer, "transfer_dependency")?;
-        let has_pending_transfer = self
-            .inner
-            .pending_submissions
+        // Fast path: nothing was recorded on the transfer queue since the
+        // last full drain, so there is no new cross-queue dependency. This
+        // runs before every compute dispatch and every transfer copy, and on
+        // decode loops almost none of them follow a new upload — the
+        // redundant flush + scan measured 5.4 s of a 20 s TripoSG run.
+        let seq = self.inner.transfer_submission_seq.load(Ordering::Acquire);
+        let batch_open = self
+            .active_batch_slot(SubmissionQueueKind::Transfer)
             .lock()
             .map_err(|e| Error::wrap(e.to_string()))?
-            .iter()
-            .any(|submission| submission.queue_kind == SubmissionQueueKind::Transfer);
+            .is_some();
+        if !batch_open && seq == self.inner.transfer_deps_seen.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        cpu_phase!(
+            "transfer_flush",
+            self.flush_active_batch(SubmissionQueueKind::Transfer, "transfer_dependency")?
+        );
+        let has_pending_transfer = cpu_phase!("transfer_scan", {
+            self.inner
+                .pending_submissions
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?
+                .iter()
+                .any(|submission| submission.queue_kind == SubmissionQueueKind::Transfer)
+        });
         if has_pending_transfer {
             let _wait_span = trace_span!("vulkan.transfer.wait_before_compute").entered();
-            self.cleanup_pending_submissions_for_queue(SubmissionQueueKind::Transfer, true)?;
+            cpu_phase!(
+                "transfer_wait",
+                self.cleanup_pending_submissions_for_queue(SubmissionQueueKind::Transfer, true)?
+            );
         }
+        // Store the seq that was current when this call *started*, not a
+        // reload: a submission pushed by another recording thread after our
+        // scan must leave `transfer_deps_seen` behind so the next call drains
+        // it instead of being skipped.
+        self.inner
+            .transfer_deps_seen
+            .store(seq, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2872,6 +3681,21 @@ impl VulkanDevice {
                 .fetch_add(1, Ordering::Relaxed);
         }
         self.cleanup_pending_submissions_amortized()?;
+        // Large allocation: return every parked recycle buffer to the
+        // allocator first. Parked buffers are unused by definition, but a
+        // parked 900 MiB block can sit inside a gpu_allocator block that a
+        // 400 MiB request then cannot fit into, forcing fragmentation
+        // fallbacks. The Trellis.2 512 texture decode allocates ~400 MiB
+        // buffers while holding a 1 GiB parked pool and ran 100 s slower
+        // (near-OOM thrash) without this. Small allocations keep the pool.
+        let flush_min = vulkan_pool_flush_min_alloc_bytes();
+        if flush_min > 0
+            && size >= flush_min
+            && self.inner.gpu_pool_bytes.load(Ordering::Relaxed) > 0
+        {
+            self.flush_gpu_buffer_pool();
+            self.destroy_deferred_buffers()?;
+        }
         let mut info = vk::BufferCreateInfo::default()
             .size(size as u64)
             .usage(usage);
@@ -2894,15 +3718,17 @@ impl VulkanDevice {
         let requirements = cpu_phase!("alloc_vkreqs", unsafe {
             self.inner.device.get_buffer_memory_requirements(buffer)
         });
-        let alloc_scheme = if dedicated_allocation {
-            // Dedicated, exact-sized block per weight tensor: avoids the intra-block
-            // slack from sub-allocating many mid-size weights into shared 256MB
-            // blocks (measured ~754MB slack on the 16B MoE). Load-time only.
-            AllocationScheme::DedicatedBuffer(buffer)
-        } else {
-            AllocationScheme::GpuAllocatorManaged
-        };
-        let allocate_once = || -> Result<Allocation> {
+        // Two allocation schemes, and either can rescue the other. The
+        // managed suballocator reuses existing blocks and is the right default
+        // (a dedicated block per weight tensor leaves ~754 MiB of intra-block
+        // slack on the 16B MoE), but a large request can fail on heap
+        // fragmentation even when the heap has enough free bytes — measured as
+        // a 512 MiB SDF-decode transient failing on a 12 GiB card while
+        // `CANDLE_VK_POOL_MAX_BYTES=0` runs passed. A dedicated request asks
+        // the device for an exact-size block and bypasses the suballocator, so
+        // try it as the fallback (and the managed scheme when the caller asked
+        // for dedicated).
+        let allocate_once = |dedicated: bool| -> Result<Allocation> {
             let mut allocator = self
                 .inner
                 .allocator
@@ -2911,55 +3737,136 @@ impl VulkanDevice {
             let allocator = allocator
                 .as_mut()
                 .ok_or_else(|| Error::msg("vulkan allocator already dropped"))?;
+            let allocation_scheme = if dedicated {
+                AllocationScheme::DedicatedBuffer(buffer)
+            } else {
+                AllocationScheme::GpuAllocatorManaged
+            };
             allocator
                 .allocate(&AllocationCreateDesc {
                     name,
                     requirements,
                     location,
                     linear: true,
-                    allocation_scheme: alloc_scheme,
+                    allocation_scheme,
                 })
                 .map_err(Error::wrap)
         };
 
-        let allocation = match cpu_phase!("alloc_gpu_alloc", allocate_once()) {
-            Ok(allocation) => allocation,
-            Err(first_err) => {
+        // One attempt with a single scheme. The fallback to the other scheme
+        // is reserved for the last stage: trying a dedicated block on the
+        // first managed failure bypasses the reclaim path (whose pool flush is
+        // what keeps the allocator heap compact) and measured the Trellis.2
+        // 512 geometry decode at 97 s versus 62 s with the reclaim-first order.
+        let try_one = |dedicated: bool, last_err: &mut Option<Error>| -> Option<Allocation> {
+            match cpu_phase!("alloc_gpu_alloc", allocate_once(dedicated)) {
+                Ok(allocation) => Some(allocation),
+                Err(err) => {
+                    *last_err = Some(err);
+                    None
+                }
+            }
+        };
+        let mut last_err = None;
+        let allocation = match try_one(dedicated_allocation, &mut last_err) {
+            Some(allocation) => allocation,
+            None => {
                 // Allocation failure means the device/allocator is out of
                 // memory: the in-flight submissions still retain buffers and
-                // the deferred list may hold freed ones. Retire the oldest
-                // pending submissions one at a time (freeing their retained
-                // buffers and any deferred buffers) and retry after each.
+                // the deferred list may hold freed ones. Order of reclaim:
+                //   1. recycle pool — resident device memory that no one owns,
+                //      freed without a fence wait. Cross-class reuse pins
+                //      large pooled buffers for small requests and that
+                //      residency is not bounded by the pool byte cap; on the
+                //      Trellis.2 VAE decode it was the ~2.8 GiB that turned a
+                //      working decode into an OOM. The flush routes those
+                //      buffers through the deferred list, so destroy there too
+                //      or the memory stays resident when nothing is in flight.
+                //   2. pending submissions, oldest first, retrying after each.
+                //   3. a full synchronize, then the final attempt.
                 // A full `synchronize_pending` waits for the newest queued
                 // submission as well, which on a deep async queue costs
                 // seconds (measured 1.3-1.4 s per failure) while the oldest
                 // fence is usually about to retire.
-                let mut last_err = first_err;
+                // One-shot diagnostic: a transient failure that the reclaim
+                // path recovers from is invisible otherwise, and it is the
+                // signal that the pinned-slack / pool knobs are near a limit.
+                let first_err = last_err.as_ref().map(|err| err.to_string());
+                {
+                    static REPORTED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !REPORTED.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "[vk-alloc] transient allocation failure size={size} MiB={:.1} name={name}: {}",
+                            size as f64 / (1024.0 * 1024.0),
+                            first_err.as_deref().unwrap_or("no error recorded")
+                        );
+                    }
+                }
+                self.flush_gpu_buffer_pool();
+                self.destroy_deferred_buffers()?;
                 let mut retry = None;
                 loop {
                     if !self.retire_oldest_pending_submission()? {
                         break;
                     }
-                    match cpu_phase!("alloc_gpu_alloc", allocate_once()) {
-                        Ok(allocation) => {
-                            retry = Some(allocation);
-                            break;
-                        }
-                        Err(err) => last_err = err,
+                    if let Some(allocation) = try_one(dedicated_allocation, &mut last_err) {
+                        retry = Some(allocation);
+                        break;
                     }
                 }
                 match retry {
                     Some(allocation) => allocation,
                     None => {
                         cpu_phase!("alloc_sync_retry", self.synchronize_pending())?;
-                        match cpu_phase!("alloc_gpu_alloc", allocate_once()) {
-                            Ok(allocation) => allocation,
-                            Err(second_err) => {
+                        // Retirement during the loop may have recycled buffers
+                        // back into the pool; drop them again (and free the
+                        // now-unblocked deferred entries) before the last
+                        // attempt.
+                        self.flush_gpu_buffer_pool();
+                        self.destroy_deferred_buffers()?;
+                        // Last resort: the exact-size dedicated block bypasses
+                        // the managed heap, so it can still succeed when the
+                        // free bytes are fragmented across blocks.
+                        let retry = try_one(dedicated_allocation, &mut last_err).or_else(|| {
+                            let dedicated = !dedicated_allocation;
+                            let allocation = try_one(dedicated, &mut last_err);
+                            if allocation.is_some() {
+                                static REPORTED: std::sync::atomic::AtomicBool =
+                                    std::sync::atomic::AtomicBool::new(false);
+                                if !REPORTED.swap(true, Ordering::Relaxed) {
+                                    eprintln!(
+                                        "[vk-alloc] fallback to {} allocation size={size} MiB={:.1} name={name}",
+                                        if dedicated { "dedicated" } else { "managed" },
+                                        size as f64 / (1024.0 * 1024.0)
+                                    );
+                                }
+                            }
+                            allocation
+                        });
+                        match retry {
+                            Some(allocation) => allocation,
+                            None => {
                                 unsafe {
                                     self.inner.device.destroy_buffer(buffer, None);
                                 }
+                                let pending = self
+                                    .inner
+                                    .pending_submissions
+                                    .lock()
+                                    .map(|pending| pending.len())
+                                    .unwrap_or(0);
                                 return Err(Error::Msg(format!(
-                                    "vulkan allocation retry failed after reclaim: first={last_err}, second={second_err}"
+                                    "vulkan allocation retry failed after reclaim: size={size} MiB={:.1} name={name} pending={pending} deferred={:.1}MiB pool={:.1}MiB last={}",
+                                    size as f64 / (1024.0 * 1024.0),
+                                    DEFERRED_BYTES.load(Ordering::Relaxed) as f64
+                                        / (1024.0 * 1024.0),
+                                    self.inner.gpu_pool_bytes.load(Ordering::Relaxed) as f64
+                                        / (1024.0 * 1024.0),
+                                    last_err
+                                        .as_ref()
+                                        .map(|err| err.to_string())
+                                        .unwrap_or_else(|| "no error recorded".to_string()),
                                 ))
                                 .bt());
                             }
@@ -2981,25 +3888,54 @@ impl VulkanDevice {
             size,
             is_staging,
             staging_kind,
+            alloc_seq: self
+                .inner
+                .next_buffer_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            last_compute_seq: AtomicU64::new(0),
+            last_transfer_seq: AtomicU64::new(0),
+            pinned_slack: AtomicUsize::new(0),
         }))
     }
 
     fn create_buffer(&self, size: usize, name: &'static str) -> Result<Arc<VulkanBuffer>> {
         // Reuse a pooled non-staging buffer of the exact requested size before
-        // allocating a fresh one. Pooled buffers are only returned to the pool
-        // after every submission referencing them completes (they are retained
-        // via `batch.retained_buffers` Arc clones), so reusing them is safe and
-        // skips the allocator's deferred-free round-trip — which otherwise
+        // allocating a fresh one. Pooled buffers are handed out in queue order
+        // and every submission is chained to its predecessor by a semaphore
+        // (see `VulkanQueueSubmitSync`), so reuse skips the allocator's
+        // deferred-free round-trip safely. That round-trip otherwise
         // accumulates per-layer dequant buffers on MoE prefill and grows VRAM
         // monotonically (the reported vulkan OOM). Mirror of the staging pool.
         if size > 0 {
-            if let Some(buf) = self.take_pooled_gpu_buffer(size)? {
+            if let Some(buf) = cpu_phase!("create_pool_scan", self.take_pooled_gpu_buffer(size))? {
                 // Pool hit: still advance the amortized cleanup counter so fence
                 // polling and deferred-drain cadence are maintained even though
                 // we skip the allocation path below.
-                self.cleanup_pending_submissions_amortized()?;
+                cpu_phase!(
+                    "create_cleanup",
+                    self.cleanup_pending_submissions_amortized()
+                )?;
                 if VULKAN_CPU_PROFILE_ENABLED.load(Ordering::Relaxed) {
                     let idx = cpu_phase_index("alloc_pool_hit");
+                    VULKAN_CPU_PROFILE_PHASES[idx]
+                        .count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(buf);
+            }
+            // Pool miss: revive a parked deferred buffer of sufficient size
+            // before asking the allocator for new memory. The deferred list
+            // otherwise only shrinks on allocator frees, so on decode loops it
+            // pins the high-water mark at pool + deferred + live bytes.
+            if let Some(buf) =
+                cpu_phase!("create_deferred_scan", self.take_deferred_gpu_buffer(size))?
+            {
+                cpu_phase!(
+                    "create_cleanup",
+                    self.cleanup_pending_submissions_amortized()
+                )?;
+                if VULKAN_CPU_PROFILE_ENABLED.load(Ordering::Relaxed) {
+                    let idx = cpu_phase_index("alloc_deferred_hit");
                     VULKAN_CPU_PROFILE_PHASES[idx]
                         .count
                         .fetch_add(1, Ordering::Relaxed);
@@ -3055,20 +3991,161 @@ impl VulkanDevice {
     /// a later smaller request; exact-size matching produced almost no hits
     /// for transient activations (each new shape missed and paid a full
     /// `vkAllocateMemory`, ~1 ms on WDDM).
+    ///
+    /// Reuse is safe because every submission waits on the previous
+    /// submission's semaphore (see `VulkanQueueSubmitSync`): commands that use
+    /// the recycled memory cannot start before the submission that last used
+    /// it has fully completed, even though the CPU freed the tensor and handed
+    /// the buffer out long before that completion.
     fn take_pooled_gpu_buffer(&self, size: usize) -> Result<Option<Arc<VulkanBuffer>>> {
         let mut pool = self
             .inner
             .gpu_buffer_pool
             .lock()
             .map_err(|e| Error::wrap(e.to_string()))?;
-        let class = gpu_pool_class(size);
-        let Some(entry) = pool.get_mut(&class) else {
+        // Try the request's own size class first, then larger classes: any
+        // buffer at least `size` bytes can serve the request, and a large
+        // pooled buffer that would otherwise be freed can absorb a small
+        // transient. Exact-class-only matching left big classes hoarding
+        // memory while small requests missed and allocated fresh (measured
+        // 98 GiB of deferred-free traffic on pi3x).
+        let exact = Self::pool_exact_size_only();
+        let mut class = gpu_pool_class(size);
+        // Cross-class reuse: any larger pooled buffer can serve the request and
+        // avoids a fresh allocation. It inflates the resident set when a small
+        // request pins a much larger buffer, so the search is bounded by
+        // `CANDLE_VK_POOL_MAX_SLACK_CLASSES` (default 1 = up to 4x, see the
+        // helper; the earlier unbounded default OOM'd the Trellis.2 VAE
+        // decode). A tightened slack was measured to regress TripoSG SDF from
+        // 10s to 74s through allocator/deferred churn before deferred-buffer
+        // reuse existed; 4x preserves that reuse path.
+        let max_cross_class = if exact {
+            class
+        } else {
+            let slack = vulkan_pool_max_slack_classes();
+            if slack == 0 {
+                usize::MAX
+            } else {
+                class.saturating_mul(1 << slack.min(20))
+            }
+        };
+        loop {
+            if let Some(entry) = pool.get_mut(&class) {
+                let mut best: Option<usize> = None;
+                for (index, buffer) in entry.iter().enumerate() {
+                    if buffer.size < size || (exact && buffer.size != size) {
+                        continue;
+                    }
+                    match best {
+                        Some(best_index) if entry[best_index].size <= buffer.size => {}
+                        _ => best = Some(index),
+                    }
+                }
+                if let Some(index) = best {
+                    let buffer = entry.swap_remove(index);
+                    let slack = buffer.size - size;
+                    if slack > 0 {
+                        // Charge the padding to the global budget before the
+                        // buffer becomes live. `best` is the smallest buffer
+                        // that fits, so if it would overflow the budget every
+                        // other candidate in every larger class is worse:
+                        // allocate fresh instead.
+                        let prev = PINNED_SLACK_BYTES.fetch_add(slack, Ordering::Relaxed);
+                        if prev + slack > vulkan_pool_pinned_slack_budget() {
+                            PINNED_SLACK_BYTES.fetch_sub(slack, Ordering::Relaxed);
+                            entry.push(buffer);
+                            return Ok(None);
+                        }
+                        buffer.pinned_slack.store(slack, Ordering::Relaxed);
+                    }
+                    self.inner
+                        .gpu_pool_bytes
+                        .fetch_sub(buffer.size, Ordering::Relaxed);
+                    return Ok(Some(buffer));
+                }
+            }
+            if class >= max_cross_class {
+                return Ok(None);
+            }
+            let Some(next) = class.checked_mul(2) else {
+                return Ok(None);
+            };
+            class = next;
+        }
+    }
+
+    /// Second chance for allocations that missed the recycle pool: take the
+    /// smallest deferred entry that can hold `size` and revive it as a fresh
+    /// `VulkanBuffer`. Deferred entries are buffers whose storage Arc was
+    /// already dropped, so there is no live owner; correctness rests on the
+    /// same ordering argument as the pool — every submission is chained after
+    /// the previous one by a binary semaphore, so a new command that writes
+    /// this memory is ordered after the batch that last read it. Without the
+    /// chain (semaphores disabled) fall back to the destroy gate: require both
+    /// queues to have retired past the entry's high-water marks.
+    fn take_deferred_gpu_buffer(&self, size: usize) -> Result<Option<Arc<VulkanBuffer>>> {
+        if size == 0 || !Self::deferred_reuse_enabled() {
+            return Ok(None);
+        }
+        let chained = Self::submit_semaphores_enabled();
+        let retired_compute = self
+            .inner
+            .retired_compute_batch_seq
+            .load(Ordering::Relaxed);
+        let retired_transfer = self
+            .inner
+            .retired_transfer_batch_seq
+            .load(Ordering::Relaxed);
+        let entry = {
+            let mut deferred = self
+                .inner
+                .deferred_buffer_frees
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            let mut best: Option<usize> = None;
+            for (index, entry) in deferred.iter().enumerate() {
+                if entry.is_staging || entry.size < size {
+                    continue;
+                }
+                // The compute semaphore chain orders new compute work after
+                // every queued compute submission, so a compute-only entry is
+                // safe to revive. It says nothing about the transfer queue:
+                // an entry last referenced by a transfer batch (upload copy)
+                // must wait for that submission to retire, otherwise the copy
+                // can overwrite the memory after the new dispatch started.
+                if entry.transfer_seq > 0 && retired_transfer < entry.transfer_seq {
+                    continue;
+                }
+                if !chained && retired_compute < entry.compute_seq {
+                    continue;
+                }
+                match best {
+                    Some(best_index) if deferred[best_index].size <= entry.size => {}
+                    _ => best = Some(index),
+                }
+            }
+            best.map(|index| deferred.swap_remove(index))
+        };
+        let Some(entry) = entry else {
             return Ok(None);
         };
-        let Some(index) = entry.iter().position(|buffer| buffer.size >= size) else {
-            return Ok(None);
-        };
-        Ok(Some(entry.swap_remove(index)))
+        DEFERRED_BYTES.fetch_sub(entry.size, Ordering::Relaxed);
+        // `alloc_seq = 0` marks the memory as already resident: it was charged
+        // to the batch budget when it was first allocated, and pool hits are
+        // accounted the same way. Fetching a fresh sequence here would make the
+        // open batch treat recycled bytes as newly allocated and flush early.
+        Ok(Some(Arc::new(VulkanBuffer {
+            device: self.clone(),
+            buffer: entry.buffer,
+            allocation: Mutex::new(Some(entry.allocation)),
+            size: entry.size,
+            is_staging: false,
+            staging_kind: StagingKind::None,
+            alloc_seq: 0,
+            last_compute_seq: AtomicU64::new(0),
+            last_transfer_seq: AtomicU64::new(0),
+            pinned_slack: AtomicUsize::new(0),
+        })))
     }
 
     /// Power-of-two size class for staging buffer pooling.
@@ -3154,12 +4231,7 @@ impl VulkanDevice {
                     // Not a staging buffer, defer free
                     if let Ok(mut alloc) = buf.allocation.lock() {
                         if let Some(allocation) = alloc.take() {
-                            if let Ok(mut deferred) = self.inner.deferred_buffer_frees.lock() {
-                                deferred.push(VulkanDeferredBuffer {
-                                    buffer: buf.buffer,
-                                    allocation,
-                                });
-                            }
+                            self.push_deferred_free(buf.buffer, allocation, buf.size, true, 0, 0);
                         }
                     }
                     continue;
@@ -3176,12 +4248,7 @@ impl VulkanDevice {
                 drop(pool);
                 if let Ok(mut alloc) = buf.allocation.lock() {
                     if let Some(allocation) = alloc.take() {
-                        if let Ok(mut deferred) = self.inner.deferred_buffer_frees.lock() {
-                            deferred.push(VulkanDeferredBuffer {
-                                buffer: buf.buffer,
-                                allocation,
-                            });
-                        }
+                        self.push_deferred_free(buf.buffer, allocation, buf.size, true, 0, 0);
                     }
                 }
             } else if entry.len() < Self::MAX_STAGING_PER_SIZE_CLASS {
@@ -3191,12 +4258,7 @@ impl VulkanDevice {
                 drop(pool);
                 if let Ok(mut alloc) = buf.allocation.lock() {
                     if let Some(allocation) = alloc.take() {
-                        if let Ok(mut deferred) = self.inner.deferred_buffer_frees.lock() {
-                            deferred.push(VulkanDeferredBuffer {
-                                buffer: buf.buffer,
-                                allocation,
-                            });
-                        }
+                        self.push_deferred_free(buf.buffer, allocation, buf.size, true, 0, 0);
                     }
                 }
             }
@@ -3230,6 +4292,59 @@ impl VulkanDevice {
         )
     }
 
+    /// Drop every buffer parked in the recycle pool.
+    ///
+    /// Used by the allocation-failure path: pooled buffers are resident device
+    /// memory that nobody owns, so they can come back without waiting on a
+    /// fence. The pool's byte cap bounds what is *parked*, but a parked buffer
+    /// handed out through cross-class reuse stays live (and uncapped) for the
+    /// lifetime of an unrelated small tensor, so the resident set can sit well
+    /// above the cap — measured ~2.8 GiB during the Trellis.2 VAE decode.
+    /// Draining the pool routes those buffers to the deferred-free list
+    /// (`POOL_FLUSH_BYPASS` stops `VulkanBuffer::drop` from re-parking them),
+    /// where the next cleanup pass releases them to the allocator.
+    fn flush_gpu_buffer_pool(&self) {
+        let mut drained = Vec::new();
+        match self.inner.gpu_buffer_pool.lock() {
+            Ok(mut pool) => {
+                for (_, entry) in pool.drain() {
+                    drained.extend(entry);
+                }
+            }
+            Err(_) => return,
+        }
+        self.inner.gpu_pool_bytes.store(0, Ordering::Relaxed);
+        if drained.is_empty() {
+            return;
+        }
+        POOL_FLUSH_BYPASS.store(true, Ordering::Relaxed);
+        drop(drained);
+        POOL_FLUSH_BYPASS.store(false, Ordering::Relaxed);
+    }
+
+    /// Retire submissions oldest-first until the deferred-free backlog is
+    /// under `cap`.
+    ///
+    /// The previous behaviour was `cleanup_pending_submissions(true)`, one
+    /// `vkWaitForFences` over every in-flight submission. With 64-deep
+    /// batches that blocks until the GPU has caught up with the whole window
+    /// (75 ms per call, 48 calls = 3.6 s of a 20 s TripoSG run) and leaves
+    /// the queue empty afterwards. Retiring one submission at a time reclaims
+    /// the same memory without draining work that is still useful, and stops
+    /// as soon as the cap is satisfied.
+    fn drain_deferred_to_cap(&self, cap: usize) -> Result<()> {
+        self.cleanup_pending_submissions(false)?;
+        while DEFERRED_BYTES.load(Ordering::Relaxed) > cap {
+            // Nothing pending means every fence is retired, so the remaining
+            // entries are gated on atomics that are already satisfied and the
+            // next real cleanup will free them; waiting cannot help.
+            if !self.retire_oldest_pending_submission()? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Wait for and retire the oldest pending submission, freeing the buffers
     /// it retained and recycling its command buffer/fence. Used by the
     /// allocation-failure path to reclaim the minimum amount of GPU memory
@@ -3253,15 +4368,20 @@ impl VulkanDevice {
             pending.remove(index)
         };
         unsafe {
-            self.inner
-                .device
-                .wait_for_fences(
-                    std::slice::from_ref(&submission.resources.fence),
-                    true,
-                    u64::MAX,
-                )
-                .map_err(Error::wrap)?;
+            cpu_phase!(
+                "retire_oldest_wait",
+                self.inner
+                    .device
+                    .wait_for_fences(
+                        std::slice::from_ref(&submission.resources.fence),
+                        true,
+                        u64::MAX,
+                    )
+                    .map_err(Error::wrap)?
+            );
         }
+        self.note_submission_retired(submission.queue_kind, submission.seq);
+        self.recycle_wait_semaphore(submission.queue_kind, submission.wait_semaphore);
         drop(submission.retained_buffers);
         if let (Some(profile), Some(profiler)) =
             (submission.profile.as_ref(), self.inner.gpu_profile.as_ref())
@@ -3285,6 +4405,29 @@ impl VulkanDevice {
         if deferred.is_empty() {
             return Ok(());
         }
+        // Only free entries whose last referencing submission has retired.
+        // Entries produced by the recycle-pool overflow path can still be
+        // referenced by in-flight command buffers; destroying them early would
+        // be a use-after-free on the GPU.
+        let retired_compute = self
+            .inner
+            .retired_compute_batch_seq
+            .load(Ordering::Relaxed);
+        let retired_transfer = self
+            .inner
+            .retired_transfer_batch_seq
+            .load(Ordering::Relaxed);
+        let (ready, keep): (Vec<_>, Vec<_>) = deferred.into_iter().partition(|entry| {
+            retired_compute >= entry.compute_seq && retired_transfer >= entry.transfer_seq
+        });
+        if !keep.is_empty() {
+            if let Ok(mut deferred) = self.inner.deferred_buffer_frees.lock() {
+                deferred.extend(keep);
+            }
+        }
+        if ready.is_empty() {
+            return Ok(());
+        }
         let mut allocator = self
             .inner
             .allocator
@@ -3293,13 +4436,55 @@ impl VulkanDevice {
         let allocator = allocator
             .as_mut()
             .ok_or_else(|| Error::msg("vulkan allocator already dropped"))?;
-        for deferred in deferred {
+        for deferred in ready {
+            DEFERRED_BYTES.fetch_sub(deferred.size, Ordering::Relaxed);
             unsafe {
                 self.inner.device.destroy_buffer(deferred.buffer, None);
             }
             allocator.free(deferred.allocation).map_err(Error::wrap)?;
         }
         Ok(())
+    }
+
+    /// Advance the retired sequence number for a queue. In-order execution
+    /// means every submission up to `seq` has completed once this one retires;
+    /// deferred frees gated on `seq` can proceed.
+    fn note_submission_retired(&self, queue_kind: SubmissionQueueKind, seq: u64) {
+        let counter = match queue_kind {
+            SubmissionQueueKind::Compute => &self.inner.retired_compute_batch_seq,
+            SubmissionQueueKind::Transfer => &self.inner.retired_transfer_batch_seq,
+        };
+        counter.fetch_max(seq, Ordering::Relaxed);
+    }
+
+    /// Queue a buffer for allocator release. `compute_seq`/`transfer_seq` are
+    /// the last batch sequence numbers that referenced it on each queue (0 =
+    /// never); the free happens only after both queues retire past them.
+    /// Entries may be handed back out by `take_deferred_gpu_buffer` instead of
+    /// being freed, so `is_staging` must accurately mark host-visible ones.
+    fn push_deferred_free(
+        &self,
+        buffer: vk::Buffer,
+        allocation: Allocation,
+        size: usize,
+        is_staging: bool,
+        compute_seq: u64,
+        transfer_seq: u64,
+    ) {
+        if let Ok(mut deferred) = self.inner.deferred_buffer_frees.lock() {
+            deferred.push(VulkanDeferredBuffer {
+                buffer,
+                allocation,
+                size,
+                is_staging,
+                compute_seq,
+                transfer_seq,
+            });
+            let bytes = DEFERRED_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+            DEFERRED_TOTAL.fetch_add(size, Ordering::Relaxed);
+            DEFERRED_PEAK_BYTES.fetch_max(bytes, Ordering::Relaxed);
+            DEFERRED_PEAK_ENTRIES.fetch_max(deferred.len(), Ordering::Relaxed);
+        }
     }
 
     fn cleanup_pending_submissions_for_queue(
@@ -3321,14 +4506,15 @@ impl VulkanDevice {
     fn cleanup_pending_submissions_byte_budget(&self, budget: u64) -> Result<()> {
         loop {
             self.cleanup_pending_submissions_impl(false, None)?;
-            let in_flight: u64 = self
-                .inner
-                .pending_submissions
-                .lock()
-                .map_err(|e| Error::wrap(e.to_string()))?
-                .iter()
-                .map(|submission| Self::reclaimable_retained_bytes(&submission.retained_buffers))
-                .sum();
+            let in_flight = cpu_phase!("drain_scan", {
+                self.inner
+                    .pending_submissions
+                    .lock()
+                    .map_err(|e| Error::wrap(e.to_string()))?
+                    .iter()
+                    .map(|submission| Self::reclaimable_retained_bytes(&submission.retained_buffers))
+                    .sum::<u64>()
+            });
             if in_flight <= budget {
                 return Ok(());
             }
@@ -3350,10 +4536,13 @@ impl VulkanDevice {
                 return Ok(());
             };
             unsafe {
-                self.inner
-                    .device
-                    .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)
-                    .map_err(Error::wrap)?;
+                cpu_phase!(
+                    "drain_wait",
+                    self.inner
+                        .device
+                        .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)
+                        .map_err(Error::wrap)?
+                );
             }
         }
     }
@@ -3370,6 +4559,28 @@ impl VulkanDevice {
     /// `cleanup_pending_submissions_impl`. Fences are still polled and staging
     /// pending still retired on every amortized cleanup.
     fn cleanup_pending_submissions_amortized(&self) -> Result<()> {
+        // Cheap guard: bound the deferred-free backlog before it turns into
+        // driver-visible memory pressure. Retired submissions are already safe
+        // to free, so poll first (no fence wait) and only pay a blocking drain
+        // when the backlog is dominated by in-flight work. A short cooldown
+        // keeps a backlog sitting just over the cap from running the cascade
+        // on every op.
+        if DEFERRED_BYTES.load(Ordering::Relaxed) > Self::deferred_max_bytes() {
+            let cooldown = DEFERRED_DRAIN_COOLDOWN.load(Ordering::Relaxed);
+            if cooldown > 0 {
+                DEFERRED_DRAIN_COOLDOWN.fetch_sub(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            DEFERRED_DRAIN_COOLDOWN.store(Self::DEFERRED_DRAIN_COOLDOWN_OPS, Ordering::Relaxed);
+            self.cleanup_pending_submissions(false)?;
+            if DEFERRED_BYTES.load(Ordering::Relaxed) > Self::deferred_max_bytes() {
+                return cpu_phase!(
+                    "deferred_drain",
+                    self.drain_deferred_to_cap(Self::deferred_max_bytes())
+                );
+            }
+            return Ok(());
+        }
         // Cheap guard: if the deferred free list is already near its cap, don't
         // skip — run the real cleanup so the force-drain boundary honors the cap.
         let deferred_near_cap = {
@@ -3394,6 +4605,15 @@ impl VulkanDevice {
             self.inner
                 .alloc_cleanup_debt
                 .fetch_sub(Self::CLEANUP_DEBT_THRESHOLD, Ordering::Relaxed);
+            // Diagnostic/tuning knob: WDDM may not report a fence as signaled
+            // from a non-blocking poll until the GPU context is scheduled, so
+            // a purely poll-based retirement can lag the recording thread by
+            // gigabytes of deferred frees. Waiting for the oldest submission
+            // once per threshold bounds that backlog at the cost of one quantum
+            // per threshold ops.
+            if Self::amortized_wait_enabled() {
+                let _ = self.retire_oldest_pending_submission()?;
+            }
             return self.cleanup_pending_submissions(false);
         }
         Ok(())
@@ -3404,7 +4624,7 @@ impl VulkanDevice {
         wait: bool,
         only_queue_kind: Option<SubmissionQueueKind>,
     ) -> Result<()> {
-        let ready = {
+        let ready = cpu_phase!("cleanup_poll", {
             let mut pending = self
                 .inner
                 .pending_submissions
@@ -3436,28 +4656,38 @@ impl VulkanDevice {
                 }
             }
             ready
-        };
-        for submission in ready {
-            if wait {
-                let _wait_span = trace_span!(
-                    "vulkan.submit.wait_fence",
-                    dispatches_in_batch = submission.dispatch_count,
-                    copies_in_batch = submission.copy_count,
-                    transfer_bytes_in_batch = submission.transfer_bytes,
-                    compute_bytes_in_batch = submission.compute_bytes
-                )
-                .entered();
-                unsafe {
-                    self.inner
-                        .device
-                        .wait_for_fences(
-                            std::slice::from_ref(&submission.resources.fence),
-                            true,
-                            u64::MAX,
-                        )
-                        .map_err(Error::wrap)?;
-                }
+        });
+        if wait && !ready.is_empty() {
+            // Wait for every fence of this batch of ready submissions in ONE
+            // `vkWaitForFences` call. Sequential waits cost one WDDM quantum
+            // each even when the work is long done (measured 18-25 ms per call
+            // with 10+ pending submissions), while the array form pays that
+            // cost once.
+            let fences = ready
+                .iter()
+                .map(|submission| submission.resources.fence)
+                .collect::<SmallVec<[vk::Fence; 16]>>();
+            if Self::trace_batches() {
+                eprintln!(
+                    "[vk-trace] wait queue={only_queue_kind:?} fences={} seqs={:?}",
+                    fences.len(),
+                    ready.iter().map(|s| s.seq).collect::<SmallVec<[u64; 16]>>()
+                );
             }
+            let _wait_span = trace_span!("vulkan.submit.wait_fences", count = fences.len()).entered();
+            unsafe {
+                self.inner
+                    .device
+                    .wait_for_fences(&fences, true, u64::MAX)
+                    .map_err(Error::wrap)?;
+            }
+            if Self::trace_batches() {
+                eprintln!("[vk-trace] wait done queue={only_queue_kind:?}");
+            }
+        }
+        for submission in ready {
+            self.note_submission_retired(submission.queue_kind, submission.seq);
+            self.recycle_wait_semaphore(submission.queue_kind, submission.wait_semaphore);
             drop(submission.retained_buffers);
             if let (Some(profile), Some(profiler)) =
                 (submission.profile.as_ref(), self.inner.gpu_profile.as_ref())
@@ -3475,18 +4705,20 @@ impl VulkanDevice {
         // failed allocation and paid a full `synchronize_pending` (~1.3 s) per
         // failure instead of reusing the freed blocks.
         self.drain_staging_pending()?;
-        self.destroy_deferred_buffers()?;
+        cpu_phase!("destroy_deferred", self.destroy_deferred_buffers())?;
         Ok(())
     }
 
     fn synchronize_pending(&self) -> Result<()> {
-        let _wait_span = trace_span!(
-            "vulkan.submit.wait_fences",
-            wait_transfer = self.inner.transfer_queue.is_some()
-        )
-        .entered();
-        self.flush_all_active_batches("synchronize")?;
-        self.cleanup_pending_submissions(true)
+        cpu_phase!("sync_wait", {
+            let _wait_span = trace_span!(
+                "vulkan.submit.wait_fences",
+                wait_transfer = self.inner.transfer_queue.is_some()
+            )
+            .entered();
+            self.flush_all_active_batches("synchronize")?;
+            self.cleanup_pending_submissions(true)
+        })
     }
 
     fn mapped_memory_range(&self, allocation: &Allocation, size: u64) -> vk::MappedMemoryRange<'_> {
@@ -3549,11 +4781,8 @@ impl VulkanDevice {
                     .cast::<u8>()
             };
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped_ptr, bytes.len());
-            if bytes.len() < buffer.size {
-                std::ptr::write_bytes(mapped_ptr.add(bytes.len()), 0, buffer.size - bytes.len());
-            }
         }
-        self.flush_mapped(allocation, buffer.size as u64)?;
+        self.flush_mapped(allocation, bytes.len() as u64)?;
         if allocation.mapped_ptr().is_none() {
             unsafe {
                 self.inner.device.unmap_memory(allocation.memory());
@@ -3653,8 +4882,28 @@ impl VulkanDevice {
             batch.copy_count += 1;
             batch.transfer_bytes += transfer_bytes_to_add;
             batch.compute_bytes += compute_bytes_to_add;
-            batch.retained_buffers.push(src.clone());
-            batch.retained_buffers.push(dst.clone());
+            // Copies record these buffers into the command buffer just like a
+            // dispatch. Keep them strongly retained until the submission
+            // retires (staging buffers must not return to the upload pool while
+            // a recorded copy may still read them).
+            if !src.is_staging {
+                batch.bound_buffers.insert(src.buffer, ());
+            }
+            if !dst.is_staging {
+                batch.bound_buffers.insert(dst.buffer, ());
+            }
+            src.mark_used(queue_kind, batch.seq);
+            dst.mark_used(queue_kind, batch.seq);
+            if src.is_staging {
+                batch.copy_retained.push(src.clone());
+            }
+            if dst.is_staging {
+                batch.copy_retained.push(dst.clone());
+            }
+            if Self::retain_all_buffers() {
+                batch.copy_retained.push(src.clone());
+                batch.copy_retained.push(dst.clone());
+            }
         }
         let _ = queue;
         Ok(())
@@ -3726,7 +4975,16 @@ impl VulkanDevice {
                 self.cmd_batch_memory_barrier(batch.resources.command_buffer);
             }
             batch.copy_count += 1;
-            batch.retained_buffers.push(dst.clone());
+            if !dst.is_staging {
+                batch.bound_buffers.insert(dst.buffer, ());
+            }
+            dst.mark_used(queue_kind, batch.seq);
+            if dst.is_staging {
+                batch.copy_retained.push(dst.clone());
+            }
+            if Self::retain_all_buffers() {
+                batch.copy_retained.push(dst.clone());
+            }
         }
         let _ = queue;
         Ok(())
@@ -3739,31 +4997,69 @@ impl VulkanDevice {
             buffer_bytes = buffer.size
         )
         .entered();
-        let staging = cpu_phase!(
-            "upload_staging",
-            self.create_upload_staging_buffer(buffer.size)
-        )?;
-        cpu_phase!(
-            "upload_map",
-            self.map_write_host_buffer(staging.as_ref(), bytes)
-        )?;
+        if bytes.len() > buffer.size {
+            crate::bail!("vulkan write larger than buffer")
+        }
+        // Copy only the bytes the caller actually owns, not the buffer's full
+        // capacity: a recycle-pool hit can return a larger buffer, and copying
+        // the whole capacity made small uploads look large enough to be routed
+        // to the transfer queue (each later dispatch then waited on their
+        // fences) and doubled the host->device traffic.
+        let len = bytes.len();
+        if len == 0 {
+            return Ok(());
+        }
+        let staging = cpu_phase!("upload_staging", self.create_upload_staging_buffer(len))?;
+        cpu_phase!("upload_map", self.map_write_host_buffer(staging.as_ref(), bytes))?;
         cpu_phase!(
             "upload_copy",
-            self.submit_copy_and_track(&staging, buffer, buffer.size, true)
+            self.submit_copy_and_track(&staging, buffer, len, true)
         )?;
         Ok(())
     }
 
     fn read_buffer(&self, buffer: &Arc<VulkanBuffer>) -> Result<Vec<u8>> {
+        if std::env::var_os("CANDLE_VK_READBACK_TRACE").is_some() {
+            eprintln!(
+                "[vk-readback] size={} bytes\n{}",
+                buffer.size,
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         let _readback_span = trace_span!("vulkan.readback", buffer_bytes = buffer.size).entered();
-        self.flush_all_active_batches("read_buffer_before_wait")?;
-        self.cleanup_pending_submissions(true)?;
+        // No pre-copy drain: the readback copy is recorded after every command
+        // that may have written the source, and `submit_copy_and_track` already
+        // orders the copy against the other queue when it crosses queues. The
+        // previous unconditional `cleanup_pending_submissions(true)` here cost
+        // a full WDDM quantum per readback (measured 55 readbacks x ~32 ms on
+        // pi3x) without changing the data the copy sees.
         let staging = self.create_readback_staging_buffer(buffer.size)?;
         self.submit_copy_and_track(buffer, &staging, buffer.size, true)?;
         // The copy may have been routed to either queue by the transfer size
         // gate; flush both so the staging buffer is current for the readback.
-        self.flush_all_active_batches("read_buffer_after_copy_record")?;
-        self.cleanup_pending_submissions(true)?;
+        cpu_phase!("readback_post_wait", {
+            cpu_phase!(
+                "readback_flush",
+                self.flush_all_active_batches("read_buffer_after_copy_record")?
+            );
+            let pending_before = self
+                .inner
+                .pending_submissions
+                .lock()
+                .map(|pending| pending.len())
+                .unwrap_or(usize::MAX);
+            let wait_started = std::time::Instant::now();
+            cpu_phase!("readback_fence", self.cleanup_pending_submissions(true))?;
+            if std::env::var_os("CANDLE_VK_READBACK_TRACE").is_some() {
+                eprintln!(
+                    "[vk-readback] size={} pending_before={} wait_ms={:.1}",
+                    buffer.size,
+                    pending_before,
+                    wait_started.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            Ok::<(), Error>(())
+        })?;
         let mut bytes = self.map_read_host_buffer(staging.as_ref())?;
         // The GPU copy above wrote exactly `buffer.size` bytes into the staging
         // buffer, which may be a recycled pooled buffer whose capacity exceeds
@@ -4047,10 +5343,16 @@ impl VulkanDevice {
                 Self::SUBMISSION_DESCRIPTOR_CAPACITY
             );
         }
-        let compute_bytes = bindings.iter().try_fold(0usize, |acc, binding| {
-            acc.checked_add(binding.buffer().size)
-                .ok_or_else(|| Error::msg("vulkan compute batch byte count overflow"))
-        })?;
+        // Bytes this dispatch adds to the batch's resident set. Bindings the
+        // batch already holds (weights reused by every dispatch, the previous
+        // op's output) are not counted again; see `bound_buffers`.
+        let compute_bytes = {
+            let slot = self
+                .active_batch_slot(SubmissionQueueKind::Compute)
+                .lock()
+                .map_err(|e| Error::wrap(e.to_string()))?;
+            Self::new_batch_compute_bytes(slot.as_ref(), &bindings)?
+        };
         cpu_phase!(
             "batch_capacity",
             self.ensure_active_batch_capacity(
@@ -4207,7 +5509,7 @@ impl VulkanDevice {
                 unsafe {
                     self.inner.device.cmd_write_timestamp(
                         command_buffer,
-                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
                         profiler.query_pool,
                         batch.profile_slot * GPU_PROFILE_QUERIES_PER_BATCH
                             + 2 * profile_start_index,
@@ -4224,7 +5526,7 @@ impl VulkanDevice {
                 unsafe {
                     self.inner.device.cmd_write_timestamp(
                         command_buffer,
-                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
                         profiler.query_pool,
                         batch.profile_slot * GPU_PROFILE_QUERIES_PER_BATCH
                             + 2 * profile_start_index
@@ -4238,10 +5540,20 @@ impl VulkanDevice {
         batch.profile_names.push(cached.spirv_name);
         batch.descriptor_set_count += 1;
         batch.storage_descriptor_count += storage_count;
-        batch.compute_bytes += compute_bytes;
-        batch
-            .retained_buffers
-            .extend(bindings.iter().map(VulkanBinding::retained_buffer));
+        for binding in bindings {
+            let buffer = binding.buffer();
+            if batch.bound_buffers.insert(buffer.buffer, ()).is_none()
+                && buffer.alloc_seq >= batch.start_alloc_seq
+            {
+                batch.compute_bytes += buffer.size;
+            }
+            buffer.mark_used(SubmissionQueueKind::Compute, batch.seq);
+        }
+        if Self::retain_all_buffers() {
+            for binding in bindings {
+                batch.copy_retained.push(binding.strong().clone());
+            }
+        }
         let _ = pipeline_cache_hit;
         Ok(())
     }
@@ -4258,15 +5570,15 @@ impl VulkanBinding<'_> {
         }
     }
 
-    fn descriptor_type(&self) -> vk::DescriptorType {
+    fn strong(&self) -> &Arc<VulkanBuffer> {
         match self {
-            Self::Storage(_) => vk::DescriptorType::STORAGE_BUFFER,
+            Self::Storage(buffer) => buffer,
         }
     }
 
-    fn retained_buffer(&self) -> Arc<VulkanBuffer> {
+    fn descriptor_type(&self) -> vk::DescriptorType {
         match self {
-            Self::Storage(buffer) => (*buffer).clone(),
+            Self::Storage(_) => vk::DescriptorType::STORAGE_BUFFER,
         }
     }
 }
@@ -5489,7 +6801,6 @@ impl VulkanStorage {
             ne00: src_dims[0],
             ne01: src_dims[1],
             ne02: src_dims[2],
-            ne03: src_dims[3],
             nb00: src_strides[0],
             nb01: src_strides[1],
             nb02: src_strides[2],
@@ -5497,7 +6808,6 @@ impl VulkanStorage {
             ne10: dst_dims[0],
             ne11: dst_dims[1],
             ne12: dst_dims[2],
-            ne13: dst_dims[3],
             nb10: dst_strides[0],
             nb11: dst_strides[1],
             nb12: dst_strides[2],
@@ -6128,7 +7438,6 @@ impl VulkanStorage {
             ne00: src_dims[0],
             ne01: src_dims[1],
             ne02: src_dims[2],
-            ne03: src_dims[3],
             nb00: src_strides[0],
             nb01: src_strides[1],
             nb02: src_strides[2],
@@ -6136,7 +7445,6 @@ impl VulkanStorage {
             ne10: dst_dims[0],
             ne11: dst_dims[1],
             ne12: dst_dims[2],
-            ne13: dst_dims[3],
             nb10: dst_strides[0],
             nb11: dst_strides[1],
             nb12: dst_strides[2],
@@ -9118,8 +10426,7 @@ impl VulkanStorage {
             && n >= 64
             && k >= 64
             && k.is_multiple_of(64)
-            && m.min(n) < 256
-            && m.max(n) >= 512
+            && (vulkan_virtual_bt_all() || (m.min(n) < 256 && m.max(n) >= 512))
             && rhs_l.is_contiguous()
             && rhs_l.start_offset() == 0
             && rhs_l.dims().len() == rank
@@ -10467,6 +11774,41 @@ impl VulkanStorage {
         } else {
             None
         };
+        // Opt-in coopmat Q8_0 GEMM (CANDLE_VK_Q8_COOPMAT, off by default).
+        // The f16 MMA (`matmul_q8_0_f32_aligned_cm1`) dequantizes q8_0
+        // in-shader and reads the raw f32 activations (mat2x4 vec8 loads);
+        // it accumulates in f32 per 32-wide block and is the faster variant
+        // in measurement, so "auto" selects it.
+        // M/N tiles are loaded unguarded, so weight/activation row counts must
+        // be tile-aligned; anything else falls back to dp4a.
+        let q8_coopmat_f16 = match vulkan_q8_coopmat_mode() {
+            Some(mode)
+                if qdtype == GgmlDType::Q8_0
+                    && src.dtype == DType::F32
+                    && self.device.inner.cooperative_matrix =>
+            {
+                // The kernel pulls full BM=64 x BK and BK x BN=64 tiles from
+                // the SSBOs with no bounds parameter (coopMatLoad on storage
+                // buffers cannot mask), so a partial tile would read past the
+                // end of the weight buffer — undefined behaviour on Vulkan
+                // without robustness2. The 16-wide MMA tile is not the
+                // constraint; the 64-row/column workgroup tile is.
+                let aligned_mn = n % 64 == 0 && input_m % 64 == 0;
+                matches!(mode, "auto" | "f16")
+                    && aligned_mn
+                    && k.is_multiple_of(32)
+                    && vulkan_spirv_exists("matmul_q8_0_f32_aligned_cm1")
+            }
+            _ => false,
+        };
+        // Only the f16 coopmat kernel reads the raw f32 activations; the dp4a
+        // kernel keeps the q8_1_x4 quantization pre-pass.
+        let use_q8_1_rhs = use_q8_1_rhs && !q8_coopmat_f16;
+        let q8_1_rhs_spirv_name = if use_q8_1_rhs {
+            q8_1_rhs_spirv_name
+        } else {
+            None
+        };
         // Fused Q8K dp4a path: the B side is the packed `block_q8_k` grid
         // (f32 d + int8 qs) consumed by the `matmul_{stem}_q8k` kernels.
         // F32 and F16 activations are both fused here: the F16 producer
@@ -10538,7 +11880,9 @@ impl VulkanStorage {
                 }
             }
         };
-        let spirv_name = if let Some(spirv_name) = q8_1_rhs_spirv_name {
+        let spirv_name = if q8_coopmat_f16 {
+            "matmul_q8_0_f32_aligned_cm1".to_string()
+        } else if let Some(spirv_name) = q8_1_rhs_spirv_name {
             spirv_name
         } else if let Some(spirv_name) = fused_q8k_spirv_name {
             spirv_name
@@ -10547,7 +11891,24 @@ impl VulkanStorage {
         };
         let spirv = candle_vulkan_kernels::spirv(&spirv_name)
             .ok_or_else(|| Error::Msg(format!("vulkan shader {spirv_name} not generated")).bt())?;
-        let spec = if use_q8_1_rhs {
+        let spec = if q8_coopmat_f16 {
+            // f16 coopmat (mul_mm cm1) tiles, mirroring the dense path; BK=32
+            // (constant_id 3) is the quant A panel size.
+            let warp = self.device.inner.subgroup_size.max(1);
+            vec![
+                (0, warp * 4),
+                (1, 64),
+                (2, 64),
+                (3, 32),
+                (4, 32),
+                (5, 32),
+                (6, 2),
+                (7, 16),
+                (8, 16),
+                (9, 16),
+                (10, warp),
+            ]
+        } else if use_q8_1_rhs {
             let subgroup = self.device.inner.subgroup_size.max(8);
             let subgroup32 = self.device.inner.subgroup_size.max(32);
             if vulkan_is_k_quant(qdtype) && (input_m <= 32 || n <= 32) {
@@ -10562,8 +11923,16 @@ impl VulkanStorage {
                     (8, 1),
                     (10, subgroup),
                 ]
+                .to_vec()
             } else if vulkan_is_k_quant(qdtype) {
                 [
+                    // Tile coverage: BLOCK/WARP == (BM/WM)*(BN/WN). Here
+                    // BM=BN=64, WM=subgroup, WN=32, so the tile takes
+                    // (64/subgroup)*2 warps and BLOCK stays 128 for both
+                    // 32-wide (NVIDIA: 2x2 warps) and 64-wide (AMD: 1x2)
+                    // subgroups. Do not scale this by the subgroup size: on
+                    // AMD it would produce 4 warps and warp_c >= 1 would
+                    // write past the 64-column shared panel.
                     (0, 128),
                     (1, 64),
                     (2, 64),
@@ -10574,23 +11943,54 @@ impl VulkanStorage {
                     (8, 2),
                     (10, subgroup),
                 ]
+                .to_vec()
             } else {
-                // Legacy quants always use the 128-thread 64x64 tile. The
-                // 32x32 single-warp config is only valid for the fused k-quant
-                // mul_mmq variants: with Q8_0/Q4_0 weights and n <= 32 it
-                // produced NaN/garbage rows (verified on TripoSG's VAE
-                // (1, 1024) output projection at m >= 64).
-                [
-                    (0, 128),
-                    (1, 64),
-                    (2, 64),
-                    (4, subgroup),
-                    (5, 32),
-                    (6, 2),
-                    (7, 2),
-                    (8, 2),
-                    (10, subgroup),
-                ]
+                // Legacy quants use a 64x64 tile by default (CUDA's mmq for
+                // Q8_0 runs 64 rows x 128 cols). `CANDLE_VK_Q8_TILE` selects
+                // wider register blocking so both can be measured on the same
+                // binary: 64x64 (32 accs/thread, default), 64x128 and 128x64
+                // (64 accs/thread). All three keep the
+                // BLOCK/WARP == (BM/WM)*(BN/WN) invariant, so BLOCK stays 128
+                // and WNITER = (WM*WN)/(WARP*TM*TN*WMITER) is an integer.
+                let tile = std::env::var("CANDLE_VK_Q8_TILE").unwrap_or_default();
+                match tile.trim().to_ascii_lowercase().as_str() {
+                    "64x128" => [
+                        (0, 128),
+                        (1, 64),
+                        (2, 128),
+                        (4, subgroup),
+                        (5, 64),
+                        (6, 2),
+                        (7, 2),
+                        (8, 2),
+                        (10, subgroup),
+                    ]
+                    .to_vec(),
+                    "128x64" => [
+                        (0, 128),
+                        (1, 128),
+                        (2, 64),
+                        (4, 64),
+                        (5, 32),
+                        (6, 2),
+                        (7, 2),
+                        (8, 2),
+                        (10, subgroup),
+                    ]
+                    .to_vec(),
+                    _ => [
+                        (0, 128),
+                        (1, 64),
+                        (2, 64),
+                        (4, subgroup),
+                        (5, 32),
+                        (6, 2),
+                        (7, 2),
+                        (8, 2),
+                        (10, subgroup),
+                    ]
+                    .to_vec(),
+                }
             }
         } else if fused_q8k {
             // k-quant fused configs: WMITER=(6,1), unlike the standard-quant
@@ -10610,8 +12010,12 @@ impl VulkanStorage {
                     (8, 1),
                     (10, subgroup),
                 ]
+                .to_vec()
             } else {
                 [
+                    // Same BLOCK/WARP == (BM/WM)*(BN/WN) invariant as the
+                    // standard-quant branch: WM=subgroup, so 128 threads
+                    // covers the 64x64 tile on 32- and 64-wide subgroups.
                     (0, 128),
                     (1, 64),
                     (2, 64),
@@ -10622,16 +12026,25 @@ impl VulkanStorage {
                     (8, 2),
                     (10, subgroup),
                 ]
+                .to_vec()
             }
         } else {
-            // L63 fix: 128 threads (4 warps). mul_mm.comp splits a workgroup
-            // into warp_r = warp_i % (BM / WM) and warp_c = warp_i / (BM / WM)
-            // warps; with BM=64/BN=64/WM=32/WN=32 a full 64x64 tile needs
-            // 2x2=4 warps. 64 threads gave warp_c == 0 for every invocation,
-            // so only rows [0, WN) of each BN=64 tile were computed and the
-            // remaining rows kept their zero-initialized dst values.
+            // L63 fix: 128 threads (4 warps) on 32-wide subgroups. mul_mm.comp
+            // splits a workgroup into warp_r = warp_i % (BM / WM) and
+            // warp_c = warp_i / (BM / WM) warps; with BM=64/BN=64/WM=32/WN=32
+            // a full 64x64 tile needs 2x2=4 warps. 64 threads gave warp_c == 0
+            // for every invocation, so only rows [0, WN) of each BN=64 tile
+            // were computed and the remaining rows kept their zero-initialized
+            // dst values. The same invariant bites 64-wide subgroups (AMD GCN/
+            // RDNA): a fixed 128 threads yields only 2 warps of 64, so warp_c
+            // is always 0 and columns [32, 64) of every tile keep the
+            // uninitialized dst garbage (non-finite meshes on the RX 570).
+            // Scale the workgroup with the subgroup size — four warps — which
+            // keeps 128 (4x32) on NVIDIA and 256 (4x64) on AMD, matching the
+            // dense-GEMM `warp * 4` convention above.
+            let subgroup = self.device.inner.subgroup_size.max(1);
             [
-                (0, 128),
+                (0, subgroup * 4),
                 (1, 64),
                 (2, 64),
                 (4, 32),
@@ -10639,8 +12052,9 @@ impl VulkanStorage {
                 (6, 2),
                 (7, 4),
                 (8, 2),
-                (10, self.device.inner.subgroup_size.max(1)),
+                (10, subgroup),
             ]
+            .to_vec()
         };
         // The fused k-quant small config tiles 32x32; every legacy kernel is
         // 64x64. Never hardcode 64 here — it breaks the 32 config.
@@ -10649,22 +12063,37 @@ impl VulkanStorage {
         } else {
             (64, 64)
         };
-        self.device.run_compute_specialized(
-            spirv,
-            &bindings,
-            Some(any_as_bytes(&params)),
-            // Tile-based dispatch: mul_mm maps gl_WorkGroupID.x -> ir (M tiles
-            // of BM) and .y -> ic (N tiles of BN); dispatching raw
-            // n/input_m oversubscribed x by ~64x: ik >= 1 workgroups have an
-            // empty K loop and write zeros at ik*batch_stride_d offsets,
-            // out of bounds past dst.
-            (
-                n.div_ceil(gemm_bm).try_into()?,
-                input_m.div_ceil(gemm_bn).try_into()?,
-                batch_count.try_into()?,
-            ),
-            Some(&spec),
-        )?;
+        let dispatch = (
+            n.div_ceil(gemm_bm).try_into()?,
+            input_m.div_ceil(gemm_bn).try_into()?,
+            batch_count.try_into()?,
+        );
+        if q8_coopmat_f16 {
+            // Coopmat needs a full subgroup of the hardware size.
+            let warp = self.device.inner.subgroup_size.max(1);
+            self.device.run_compute_specialized_with_options(
+                spirv,
+                &bindings,
+                Some(any_as_bytes(&params)),
+                dispatch,
+                Some(&spec),
+                self.device.inner.compute_full_subgroups,
+                Some(warp),
+            )?;
+        } else {
+            self.device.run_compute_specialized(
+                spirv,
+                &bindings,
+                Some(any_as_bytes(&params)),
+                // Tile-based dispatch: mul_mm maps gl_WorkGroupID.x -> ir (M tiles
+                // of BM) and .y -> ic (N tiles of BN); dispatching raw
+                // n/input_m oversubscribed x by ~64x: ik >= 1 workgroups have an
+                // empty K loop and write zeros at ik*batch_stride_d offsets,
+                // out of bounds past dst.
+                dispatch,
+                Some(&spec),
+            )?;
+        }
         drop(src_contiguous);
         Ok((dst, dst_shape))
     }
@@ -11080,67 +12509,83 @@ impl VulkanStorage {
 
 impl Drop for VulkanBuffer {
     fn drop(&mut self) {
-        if let Ok(mut allocation) = self.allocation.lock() {
-            if let Some(allocation) = allocation.take() {
-                if self.is_staging {
-                    // Return to staging pending list instead of deferred free
-                    if let Ok(mut pending) = self.device.inner.staging_pending_return.lock() {
-                        let buf = Arc::new(VulkanBuffer {
-                            device: self.device.clone(),
-                            buffer: self.buffer,
-                            allocation: Mutex::new(Some(allocation)),
-                            size: self.size,
-                            is_staging: true,
-                            staging_kind: self.staging_kind,
-                        });
-                        pending.push(buf);
-                        return;
-                    }
-                }
-                // Non-staging GPU compute buffers: recycle into the exact-size
-                // reuse pool before falling back to the deferred-free list.
-                // Pooled buffers are retained via `retained_buffers` until every
-                // referencing submission completes, so a buffer reaching this
-                // point is confirmed free of in-flight GPU work — making reuse
-                // safe. This is what lets per-layer MoE dequant buffers (fixed
-                // per-layer sizes) be recycled instead of re-allocated, which is
-                // the allocator accumulation that caused the vulkan prefill OOM.
-                if self.size > 0 {
-                    if let Ok(mut pool) = self.device.inner.gpu_buffer_pool.lock() {
-                        let total_bytes: usize = pool.values().flatten().map(|b| b.size).sum();
-                        let entry = pool.entry(gpu_pool_class(self.size)).or_default();
-                        if entry.len() < VulkanDevice::max_gpu_pool_per_size_class()
-                            && total_bytes + self.size <= VulkanDevice::max_gpu_pool_total_bytes()
-                        {
-                            entry.push(Arc::new(VulkanBuffer {
-                                device: self.device.clone(),
-                                buffer: self.buffer,
-                                allocation: Mutex::new(Some(allocation)),
-                                size: self.size,
-                                is_staging: self.is_staging,
-                                staging_kind: self.staging_kind,
-                            }));
-                            return;
-                        }
-                    }
-                }
-                // Pool full (or 0-byte buffer): route through the device-level
-                // deferred-free list: the actual `allocator.free` runs in
-                // `destroy_deferred_buffers` under the allocator lock (never
-                // here — VulkanBuffer::drop can run while that lock is held).
-                // Without this, allocator sub-blocks are only reclaimed when a
-                // submission cycle happens to observe the buffer; test-suite
-                // devices that never run another op leak their first blocks
-                // for the process lifetime (compounding across the smoke
-                // suite's ~44 leaked devices).
-                if let Ok(mut deferred) = self.device.inner.deferred_buffer_frees.lock() {
-                    deferred.push(VulkanDeferredBuffer {
-                        buffer: self.buffer,
-                        allocation,
-                    });
+        let Ok(mut allocation) = self.allocation.lock() else {
+            return;
+        };
+        let Some(allocation) = allocation.take() else {
+            return;
+        };
+        // Refund the recycle-pool padding this buffer was charged for while it
+        // was live for a smaller request (see `pinned_slack`).
+        let slack = self.pinned_slack.swap(0, Ordering::Relaxed);
+        if slack > 0 {
+            PINNED_SLACK_BYTES.fetch_sub(slack, Ordering::Relaxed);
+        }
+        let (last_compute_seq, last_transfer_seq) = self.last_use();
+        // Rebuild the owning Arc for the pool/deferred list with the same
+        // identity and last-use metadata.
+        let make = |allocation: Allocation| {
+            Arc::new(VulkanBuffer {
+                device: self.device.clone(),
+                buffer: self.buffer,
+                allocation: Mutex::new(Some(allocation)),
+                size: self.size,
+                is_staging: self.is_staging,
+                staging_kind: self.staging_kind,
+                alloc_seq: self.alloc_seq,
+                last_compute_seq: AtomicU64::new(last_compute_seq),
+                last_transfer_seq: AtomicU64::new(last_transfer_seq),
+                pinned_slack: AtomicUsize::new(0),
+            })
+        };
+        if self.is_staging {
+            // Staging buffers go back to the host-visible staging pool. Their
+            // GPU references are held by `copy_retained` until the submission
+            // retires, so reaching Drop means the copy has finished.
+            if let Ok(mut pending) = self.device.inner.staging_pending_return.lock() {
+                pending.push(make(allocation));
+                return;
+            }
+        } else if self.size > 0 && !POOL_FLUSH_BYPASS.load(Ordering::Relaxed) {
+            // Stream-ordered recycle pool (Vulkan equivalent of CUDA's
+            // `cuMemAllocAsync`): the buffer's last GPU use is already recorded
+            // earlier in the queue, so a later command may reuse the memory
+            // without waiting for a fence. This is what lets transients be
+            // reused while their submission is still in flight instead of
+            // forcing the byte-budget drain's WDDM stalls.
+            if let Ok(mut pool) = self.device.inner.gpu_buffer_pool.lock() {
+                let class = gpu_pool_class(self.size);
+                let total = self.device.inner.gpu_pool_bytes.load(Ordering::Relaxed);
+                let entry = pool.entry(class).or_default();
+                if entry.len() < VulkanDevice::max_gpu_pool_per_size_class()
+                    && total + self.size <= VulkanDevice::max_gpu_pool_total_bytes()
+                {
+                    entry.push(make(allocation));
+                    let bytes = self
+                        .device
+                        .inner
+                        .gpu_pool_bytes
+                        .fetch_add(self.size, Ordering::Relaxed)
+                        + self.size;
+                    POOL_PEAK_BYTES.fetch_max(bytes, Ordering::Relaxed);
+                    return;
                 }
             }
         }
+        // Pool full (or 0-byte buffer): route through the device-level
+        // deferred-free list: the actual `allocator.free` runs in
+        // `destroy_deferred_buffers` under the allocator lock (never here —
+        // VulkanBuffer::drop can run while that lock is held). The entry is
+        // gated by the last submission that referenced the buffer: freeing
+        // earlier would race in-flight GPU work.
+        self.device.push_deferred_free(
+            self.buffer,
+            allocation,
+            self.size,
+            self.is_staging,
+            last_compute_seq,
+            last_transfer_seq,
+        );
     }
 }
 
@@ -11159,13 +12604,15 @@ impl Drop for VulkanInner {
             let mut flush_active_batch_for_drop =
                 |slot: &Mutex<Option<VulkanActiveBatch>>, queue: vk::Queue| {
                     if let Ok(mut slot) = slot.lock() {
-                        if let Some(batch) = slot.take() {
+                        if let Some(mut batch) = slot.take() {
                             if batch.has_commands()
                                 && self
                                     .device
                                     .end_command_buffer(batch.resources.command_buffer)
                                     .is_ok()
                             {
+                                let retained_strong: Vec<Arc<VulkanBuffer>> =
+                                    std::mem::take(&mut batch.copy_retained);
                                 let submit_info = vk::SubmitInfo::default().command_buffers(
                                     std::slice::from_ref(&batch.resources.command_buffer),
                                 );
@@ -11181,11 +12628,13 @@ impl Drop for VulkanInner {
                                     submitted_active_batches.push(VulkanPendingSubmission {
                                         resources: batch.resources,
                                         queue_kind: batch.queue_kind,
+                                        seq: batch.seq,
                                         dispatch_count: batch.dispatch_count,
                                         copy_count: batch.copy_count,
                                         transfer_bytes: batch.transfer_bytes,
                                         compute_bytes: batch.compute_bytes,
-                                        retained_buffers: batch.retained_buffers,
+                                        retained_buffers: retained_strong,
+                                        wait_semaphore: None,
                                         profile: None,
                                     });
                                     return;
@@ -11220,7 +12669,22 @@ impl Drop for VulkanInner {
 
             if let Ok(mut pending) = self.pending_submissions.lock() {
                 for submission in pending.drain(..) {
+                    if let Some(semaphore) = submission.wait_semaphore {
+                        self.device.destroy_semaphore(semaphore, None);
+                    }
                     destroy_submission_resources(submission.resources);
+                }
+            }
+            for sync in [&self.compute_submit_sync, &self.transfer_submit_sync] {
+                if let Ok(mut last) = sync.last_signal.lock() {
+                    if let Some(semaphore) = last.take() {
+                        self.device.destroy_semaphore(semaphore, None);
+                    }
+                }
+                if let Ok(mut free) = sync.free.lock() {
+                    for semaphore in free.drain(..) {
+                        self.device.destroy_semaphore(semaphore, None);
+                    }
                 }
             }
             if let Ok(mut reusable) = self.reusable_compute_submissions.lock() {
@@ -12492,7 +13956,16 @@ impl BackendDevice for VulkanDevice {
                     })
             })
             .ok_or_else(|| Error::msg("no vulkan compute queue family found"))?;
-        let transfer_queue_family_index = queue_families
+        let transfer_queue_family_index = if !VulkanDevice::transfer_queue_enabled() {
+            // Measurement/debug knob: a dedicated transfer queue forces a full
+            // cross-queue synchronisation around every large copy (compute
+            // flushes and waits before the copy is recorded, and compute waits
+            // for the copy to retire), which on WDDM costs a fence wait per
+            // copy. With copies on the compute queue the same ordering is
+            // implicit in submission order.
+            None
+        } else {
+            queue_families
             .iter()
             .enumerate()
             .find_map(|(index, props)| {
@@ -12512,7 +13985,8 @@ impl BackendDevice for VulkanDevice {
                             .then_some(index as u32)
                     })
             })
-            .filter(|idx| *idx != queue_family_index);
+            .filter(|idx| *idx != queue_family_index)
+        };
         let robust_buffer_access = physical_features2.features.robust_buffer_access == vk::TRUE;
         let shader_int64 = physical_features2.features.shader_int64 == vk::TRUE;
         let shader_float64 = physical_features2.features.shader_float64 == vk::TRUE;
@@ -12523,6 +13997,33 @@ impl BackendDevice for VulkanDevice {
         let cooperative_matrix = has_cooperative_matrix_ext
             && cooperative_matrix_features.cooperative_matrix == vk::TRUE
             && vulkan_spirv_exists("matmul_f32_f32_aligned_cm1");
+        // Int8 tensor-core MMA shape for the mmq coopmat kernel: signed 8-bit
+        // A/B, signed 32-bit accumulate/result, subgroup scope, 16x16 tiles.
+        // K size (16 or 32) is passed to the kernel as the TK spec constant.
+        let (coopmat_int8, coopmat_int8_k) = if has_cooperative_matrix_ext {
+            let mut int8_k = 0u32;
+            if let Ok(props) = unsafe {
+                ash::khr::cooperative_matrix::Instance::new(&entry, &instance)
+                    .get_physical_device_cooperative_matrix_properties(physical_device)
+            } {
+                for prop in props {
+                    if prop.m_size == 16
+                        && prop.n_size == 16
+                        && (prop.k_size == 16 || prop.k_size == 32)
+                        && prop.scope == vk::ScopeKHR::SUBGROUP
+                        && prop.a_type == vk::ComponentTypeKHR::SINT8
+                        && prop.b_type == vk::ComponentTypeKHR::SINT8
+                        && prop.c_type == vk::ComponentTypeKHR::SINT32
+                        && prop.result_type == vk::ComponentTypeKHR::SINT32
+                    {
+                        int8_k = int8_k.max(prop.k_size);
+                    }
+                }
+            }
+            (int8_k != 0, int8_k)
+        } else {
+            (false, 0)
+        };
         let subgroup_size_control = has_subgroup_size_control_ext
             && subgroup_size_control_features.subgroup_size_control == vk::TRUE;
         let compute_full_subgroups = subgroup_size_control
@@ -12670,6 +14171,8 @@ impl BackendDevice for VulkanDevice {
             integer_dot_product,
             shader_float64,
             cooperative_matrix,
+            coopmat_int8,
+            coopmat_int8_k,
             subgroup_arithmetic,
             subgroup_size,
             subgroup_size_control,
@@ -12698,13 +14201,23 @@ impl BackendDevice for VulkanDevice {
             active_transfer_batch: Mutex::new(None),
             reusable_compute_submissions: Mutex::new(Vec::new()),
             reusable_transfer_submissions: Mutex::new(Vec::new()),
+            compute_submit_sync: VulkanQueueSubmitSync::new(),
+            transfer_submit_sync: VulkanQueueSubmitSync::new(),
             deferred_buffer_frees: Mutex::new(Vec::new()),
             alloc_cleanup_debt: AtomicU32::new(0),
             upload_staging_pool: Mutex::new(HashMap::default()),
             readback_staging_pool: Mutex::new(HashMap::default()),
             staging_pending_return: Mutex::new(Vec::new()),
             gpu_buffer_pool: Mutex::new(HashMap::default()),
+            gpu_pool_bytes: AtomicUsize::new(0),
             gpu_profile,
+            next_buffer_seq: AtomicU64::new(1),
+            next_compute_batch_seq: AtomicU64::new(0),
+            next_transfer_batch_seq: AtomicU64::new(0),
+            retired_compute_batch_seq: AtomicU64::new(0),
+            retired_transfer_batch_seq: AtomicU64::new(0),
+            transfer_submission_seq: AtomicU64::new(0),
+            transfer_deps_seen: AtomicU64::new(0),
         });
         // Device cache: `Device::new_vulkan(ordinal)` is called per test /
         // per component in the wild, but VulkanInner holds GPU resources that

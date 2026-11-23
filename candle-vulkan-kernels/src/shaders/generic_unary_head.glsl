@@ -4,8 +4,8 @@
 layout (push_constant) uniform parameter
 {
     uint ne;
-    uint ne00; uint ne01; uint ne02; uint ne03; uint nb00; uint nb01; uint nb02; uint nb03;
-    uint ne10; uint ne11; uint ne12; uint ne13; uint nb10; uint nb11; uint nb12; uint nb13;
+    uint ne00; uint ne01; uint ne02; uint nb00; uint nb01; uint nb02; uint nb03;
+    uint ne10; uint ne11; uint ne12; uint nb10; uint nb11; uint nb12; uint nb13;
     uint misalign_offsets;
     float param1; float param2;
 
