@@ -22,7 +22,9 @@ struct QuantizeParams {
     ne: u32,
     num_blocks: u32,
     src_is_f16: u32,
-    _pad0: u32,
+    // Linearizes 2D dispatches above the 65535-per-dimension wgpu limit:
+    // block id = wid.x + wid.y * num_wg_x.
+    num_wg_x: u32,
 };
 
 @group(0) @binding(0) var<storage, read> src: array<u32>;
@@ -46,8 +48,8 @@ fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    // One workgroup per 256-element block; each thread covers 4 elements.
-    let ib = wid.x;
+    // One workgroup per 256-element block; 2D dispatches are linearized.
+    let ib = wid.x + wid.y * params.num_wg_x;
     let t = lid.x;
     let base = ib * 256u + t * 4u;
 

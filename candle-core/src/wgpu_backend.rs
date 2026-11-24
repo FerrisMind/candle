@@ -13841,12 +13841,21 @@ fn main(
         struct QuantizeParams {
             ne: u32,
             num_blocks: u32,
+            num_wg_x: u32,
+            _pad0: u32,
         }
         const _: () = assert!(size_of::<QuantizeParams>() <= 256);
+
+        // 33.5M-element activations need 131072 workgroups, above the
+        // 65535-per-dimension wgpu limit; the shader linearizes the 2D grid.
+        let num_wgs = (num_blocks as u32).div_ceil(8);
+        let (wg_x, wg_y) = compute_2d_workgroups(num_wgs, wgpu_dispatch_wg_cap(&self.device));
 
         let params = QuantizeParams {
             ne: elem_count as u32,
             num_blocks: num_blocks as u32,
+            num_wg_x: wg_x,
+            _pad0: 0,
         };
 
         let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
@@ -13865,12 +13874,11 @@ fn main(
         let shader_source = candle_wgpu_kernels::quantize_q8_1_shader()
             .ok_or_else(|| Error::Msg("wgpu quantize_q8_1 shader not found".into()).bt())?;
 
-        let num_wgs = (num_blocks as u32).div_ceil(8);
         self.device.run_compute_xyz(
             &shader_source,
             &entries,
             &bindings,
-            (num_wgs, 1, 1),
+            (wg_x, wg_y, 1),
             &[],
             None,
             "candle-wgpu-quantize-q8-1",
@@ -13984,15 +13992,20 @@ fn main(
             ne: u32,
             num_blocks: u32,
             src_is_f16: u32,
-            _pad0: u32,
+            num_wg_x: u32,
         }
         const _: () = assert!(size_of::<QuantizeParams>() <= 256);
+
+        // 33.5M-element activations need 131072 blocks, above the wgpu
+        // 65535-per-dimension dispatch limit; grid.y is folded back in-shader.
+        let (wg_x, wg_y) =
+            compute_2d_workgroups(num_blocks as u32, wgpu_dispatch_wg_cap(&self.device));
 
         let params = QuantizeParams {
             ne: elem_count as u32,
             num_blocks: num_blocks as u32,
             src_is_f16,
-            _pad0: 0,
+            num_wg_x: wg_x,
         };
 
         let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
@@ -14014,12 +14027,12 @@ fn main(
             })?;
 
         // One workgroup per 256-element block.
-        let num_wgs = num_blocks as u32;
+        // One workgroup per 256-element block; oversized grids go onto grid.y.
         self.device.run_compute_xyz(
             &shader_source,
             &entries,
             &bindings,
-            (num_wgs, 1, 1),
+            (wg_x, wg_y, 1),
             &[],
             None,
             "candle-wgpu-quantize-q8-k-roundtrip",
@@ -14064,12 +14077,20 @@ fn main(
         struct QuantizeParams {
             ne: u32,
             num_blocks: u32,
+            num_wg_x: u32,
+            _pad0: u32,
         }
         const _: () = assert!(size_of::<QuantizeParams>() <= 256);
+
+        // Workgroups above 65535 per dimension are spilled onto grid.y; the
+        // shader linearizes it back through num_wg_x for block and dst indices.
+        let (wg_x, wg_y) = compute_2d_workgroups(num_wgs, wgpu_dispatch_wg_cap(&self.device));
 
         let params = QuantizeParams {
             ne: elem_count as u32,
             num_blocks: num_blocks as u32,
+            num_wg_x: wg_x,
+            _pad0: 0,
         };
 
         let param_buffer = self.device.write_uniform_params(any_as_bytes(&params))?;
@@ -14088,12 +14109,11 @@ fn main(
         let shader_source = candle_wgpu_kernels::quantize_q8_0_shader()
             .ok_or_else(|| Error::Msg("wgpu quantize_q8_0 shader not found".into()).bt())?;
 
-        let num_wgs = (num_blocks as u32).div_ceil(8);
         self.device.run_compute_xyz(
             &shader_source,
             &entries,
             &bindings,
-            (num_wgs, 1, 1),
+            (wg_x, wg_y, 1),
             &[],
             None,
             "candle-wgpu-quantize-q8-0",

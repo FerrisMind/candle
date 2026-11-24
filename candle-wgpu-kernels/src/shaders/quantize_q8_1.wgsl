@@ -9,6 +9,10 @@ struct BlockQ8_1 {
 struct QuantizeParams {
     ne: u32,
     num_blocks: u32,
+    // Splits dispatches above the 65535-per-dimension wgpu limit into 2D:
+    // block id = (wgid.x + wgid.y * num_wg_x) * 8 + block_in_wg.
+    num_wg_x: u32,
+    _pad0: u32,
 };
 
 @group(0) @binding(0) var<storage, read> src: array<f32>;
@@ -27,7 +31,8 @@ fn main(
     let tid = lid.x;
     let block_in_wg = tid / 8u;
     let iqs = tid % 8u;
-    let ib = wgid.x * 8u + block_in_wg;
+    let wg = wgid.x + wgid.y * params.num_wg_x;
+    let ib = wg * 8u + block_in_wg;
 
     if (ib >= params.num_blocks) {
         return;

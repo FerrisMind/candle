@@ -11,6 +11,9 @@ enable f16;
 struct QuantizeParams {
     ne: u32,
     num_blocks: u32,
+    // Linearizes 2D dispatches above the 65535-per-dimension wgpu limit.
+    num_wg_x: u32,
+    _pad0: u32,
 };
 
 @group(0) @binding(0) var<storage, read> src: array<f32>;
@@ -33,7 +36,8 @@ fn main(
     let tid = lid.x;
     let block_in_wg = tid / 8u;
     let iqs = tid % 8u;
-    let ib = wgid.x * 8u + block_in_wg;
+    let wg = wgid.x + wgid.y * params.num_wg_x;
+    let ib = wg * 8u + block_in_wg;
 
     var v0: f32 = 0.0;
     var v1: f32 = 0.0;
@@ -83,17 +87,17 @@ fn main(
 
     // Word assembly: each of the 68 words (bytes 4w..4w+4 of the workgroup's
     // 272-byte range) is written by exactly one thread. The assembler takes
-    // the workgroup-LOCAL byte offset (0..272); `dst[wgid.x * 68 + w]` already
+    // the workgroup-LOCAL byte offset (0..272); `dst[wg * 68 + w]` already
     // places the word in this workgroup's span, and a global byte offset
     // divided by the 34-byte block size would give the global block index,
     // failing the `block_in_wg < 8` guard for every workgroup after the first.
     let w0 = tid;
     if (w0 < 68u) {
-        dst[wgid.x * 68u + w0] = assemble_word(w0 * 4u);
+        dst[wg * 68u + w0] = assemble_word(w0 * 4u);
     }
     if (tid < 4u) {
         let wext = 64u + tid;
-        dst[wgid.x * 68u + wext] = assemble_word(wext * 4u);
+        dst[wg * 68u + wext] = assemble_word(wext * 4u);
     }
 }
 
